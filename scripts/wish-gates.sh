@@ -295,8 +295,11 @@ _install_pip_dev() {
     _origin_check "$workspace/venv/bin/python" "$workspace/project/packages/neurostack-core" "$workspace"
 }
 
+# docker-compose.yml is the development stack and aborts unless
+# NEUROSTACK_DEV_STACK is set; this row is a deliberate dev-stack use under a
+# disposable project name, so it sets the variable for its own commands only.
 _install_compose() {
-    docker compose -p "$_INSTALL_COMPOSE_PROJECT" -f "$_WISH_GATES_ROOT/docker-compose.yml" \
+    NEUROSTACK_DEV_STACK=1 docker compose -p "$_INSTALL_COMPOSE_PROJECT" -f "$_WISH_GATES_ROOT/docker-compose.yml" \
         run --build --rm --no-deps -e PYTHONTZPATH="" api python - \
         --mode editable --expected-source /app/packages/neurostack-core \
         < "$_WISH_GATES_ROOT/scripts/assert-neurostack-core-origin.py"
@@ -342,7 +345,7 @@ install_surface_gate() (
 
     _install_cleanup() {
         if [ -n "${_INSTALL_COMPOSE_PROJECT:-}" ]; then
-            docker compose -p "$_INSTALL_COMPOSE_PROJECT" \
+            NEUROSTACK_DEV_STACK=1 docker compose -p "$_INSTALL_COMPOSE_PROJECT" \
                 -f "$_WISH_GATES_ROOT/docker-compose.yml" down --volumes \
                 --remove-orphans --rmi local >/dev/null 2>&1 || true
         fi
@@ -372,7 +375,10 @@ install_surface_gate() (
 # in tests/fixtures/compose/production-synthetic.env (the same set used by
 # tests/scripts/test_production_compose.py). The caller's environment is
 # dropped with `env -i` and `--env-file` replaces the project `.env`, so no
-# real secret is read; a missing Docker CLI fails, it is never skipped. Every
+# real secret is read; a missing Docker CLI fails, it is never skipped. The
+# dev file aborts unless NEUROSTACK_DEV_STACK is set, so this config-only
+# render passes it explicitly; the synthetic production inputs never carry it
+# (tests/scripts/test_guard_alembic_upgrade_head.py pins that). Every
 # step carries an explicit status: bash ignores `set -e` inside a function
 # called from an `||`, `if` or `!` context.
 _production_compose_render() (
@@ -396,7 +402,7 @@ _production_compose_render() (
         fi
     done
     cd "$_WISH_GATES_ROOT" || return 1
-    env -i "${passthrough[@]}" "${fake_vars[@]}" \
+    env -i "${passthrough[@]}" "${fake_vars[@]}" NEUROSTACK_DEV_STACK=1 \
         docker compose --env-file "$fake_env" \
         -f docker-compose.yml -f docker-compose.production.yml config --quiet || {
         echo "production Compose render failed" >&2

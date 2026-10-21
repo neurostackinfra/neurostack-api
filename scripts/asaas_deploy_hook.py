@@ -213,6 +213,33 @@ _CLI_LOG_KEYS = frozenset(
 # Fixed ``startedBy`` marker: the single-flight key (ListTasks filters on it)
 # and the identity check on the described task.
 STARTED_BY = "neurostack-asaas-webhook-reconcile"
+# The exact RunTask top-level key set (checked by assert_run_task_invariants).
+# Live evidence (staging, 2026-10-20): a RunTask with exactly cluster,
+# taskDefinition, launchType FARGATE, count 1, startedBy, enableExecuteCommand
+# false, networkConfiguration.awsvpcConfiguration {subnets, securityGroups,
+# assignPublicIp DISABLED} and overrides.containerOverrides [{name, command}]
+# was accepted. clientToken, enableECSManagedTags and platformVersion (FARGATE
+# only, copied from the service) are documented RunTask parameters but are
+# UNVERIFIED LIVE in this request: the first real registration run is the
+# check, and on InvalidParameterException the operator stops and reports the
+# exact message (runbook). ``propagateTags`` is omitted on purpose: the live
+# RunTask API rejects ``NONE`` ("Invalid value for propagateTags") although the
+# botocore model lists it; omitting the parameter means no propagation.
+RUN_TASK_REQUIRED_KEYS = frozenset(
+    {
+        "cluster",
+        "taskDefinition",
+        "count",
+        "launchType",
+        "networkConfiguration",
+        "overrides",
+        "startedBy",
+        "enableExecuteCommand",
+        "enableECSManagedTags",
+        "clientToken",
+    }
+)
+RUN_TASK_OPTIONAL_KEYS = frozenset({"platformVersion"})
 # ECS has no maximum runtime for a RunTask task, the container ``stopTimeout``
 # (at most 120 s on Fargate) cannot be overridden in RunTask, and StopTask is
 # outside what this hook may emit. The run is bounded by the command's own
@@ -1030,7 +1057,7 @@ def build_run_task_request(
             ]
         },
         "startedBy": STARTED_BY,
-        "propagateTags": "NONE",
+        # No ``propagateTags``: RunTask rejects NONE; absent = no propagation.
         "enableECSManagedTags": False,
         "enableExecuteCommand": False,
     }
@@ -1044,11 +1071,27 @@ def build_run_task_request(
 def assert_run_task_invariants(request: Any, expected_arn: str) -> None:
     """Defence in depth: the rendered RunTask can never widen."""
 
-    vpc = (
-        (request.get("networkConfiguration") or {}).get("awsvpcConfiguration") or {}
-        if isinstance(request, dict)
-        else {}
+    _require(
+        not (isinstance(request, dict) and "propagateTags" in request),
+        "run_task_request_invariant:propagate_tags_rejected_by_run_task_api",
     )
+    _require(
+        isinstance(request, dict)
+        and RUN_TASK_REQUIRED_KEYS
+        <= set(request)
+        <= RUN_TASK_REQUIRED_KEYS | RUN_TASK_OPTIONAL_KEYS,
+        "run_task_request_invariant:key_set",
+    )
+    network = request.get("networkConfiguration")
+    _require(
+        isinstance(network, dict)
+        and set(network) == {"awsvpcConfiguration"}
+        and isinstance(network["awsvpcConfiguration"], dict)
+        and set(network["awsvpcConfiguration"])
+        == {"subnets", "securityGroups", "assignPublicIp"},
+        "run_task_request_invariant:network_key_set",
+    )
+    vpc = network["awsvpcConfiguration"]
     overrides = request.get("overrides") if isinstance(request, dict) else None
     container_overrides = (
         overrides.get("containerOverrides") if isinstance(overrides, dict) else None
@@ -1060,9 +1103,11 @@ def assert_run_task_invariants(request: Any, expected_arn: str) -> None:
         and request.get("count") == 1
         and request.get("launchType") == "FARGATE"
         and request.get("startedBy") == STARTED_BY
-        and request.get("propagateTags") == "NONE"
         and request.get("enableExecuteCommand") is False
         and request.get("enableECSManagedTags") is False
+        and isinstance(request.get("clientToken"), str)
+        and re.fullmatch(r"asaas-webhook-[0-9a-f]{40}", request["clientToken"])
+        is not None
         and vpc.get("assignPublicIp") == "DISABLED"
         and bool(vpc.get("subnets"))
         and bool(vpc.get("securityGroups"))
@@ -1536,6 +1581,10 @@ def verify_result(
         assert readback.run_task is not None
         params = readback.run_task["params"]
         response = readback.run_task["response"]
+        if isinstance(params, dict) and "propagateTags" in params:
+            # The live RunTask API rejects propagateTags=NONE; the hook never
+            # renders the key, so a recorded one is foreign evidence.
+            verdict.fail("run_task_request_propagate_tags_present", "evidence_mismatch")
         verdict.force, verdict.attempt = _rendered_variant(context, params)
         if verdict.attempt is None:
             verdict.fail("run_task_request_not_rendered_by_hook", "evidence_mismatch")

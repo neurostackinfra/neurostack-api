@@ -48,16 +48,85 @@ require_command find
 require_command mktemp
 require_command ln
 
-if ! docker compose version >/dev/null 2>&1; then
-    error "Docker Compose is unavailable"
-    exit 1
-fi
 if [[ ! -f docker-compose.yml ]]; then
     error "docker-compose.yml not found; run this script from neurostack-api"
     exit 1
 fi
 if [[ ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
     error "RETENTION_DAYS must be a non-negative integer"
+    exit 1
+fi
+
+# The PostgreSQL container is found with plain `docker`, never through
+# `docker compose`: loading a compose file here would load the DEVELOPMENT
+# docker-compose.yml (no -f), which refuses to load on a production checkout
+# (NEUROSTACK_DEV_STACK), and docker-compose.production.yml needs variables the
+# production .env cannot carry. Both files share the Compose project of this
+# checkout, so the container is the one running PostgreSQL service of that
+# project, identified by the labels Compose puts on it.
+
+# Compose's default project name for this checkout: the directory name,
+# lowercased, keeping only [a-z0-9_-], leading '_'/'-' removed (measured with
+# `docker compose config`), or COMPOSE_PROJECT_NAME, which Compose accepts only
+# when it is already valid. A non-ASCII directory name must set it explicitly.
+compose_project_name() {
+    local LC_ALL=C
+    local directory name
+    if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+        name="$COMPOSE_PROJECT_NAME"
+        if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+            error "COMPOSE_PROJECT_NAME is not a valid Compose project name"
+            return 1
+        fi
+    else
+        directory="$(pwd -P)"
+        directory="${directory##*/}"
+        if [[ "$directory" =~ [^\ -~] ]]; then
+            error "The checkout directory name is not ASCII; set COMPOSE_PROJECT_NAME"
+            return 1
+        fi
+        name="${directory,,}"
+        name="${name//[^a-z0-9_-]/}"
+        while [[ "$name" == [_-]* ]]; do
+            name="${name:1}"
+        done
+        if [[ -z "$name" ]]; then
+            error "Cannot derive a Compose project name; set COMPOSE_PROJECT_NAME"
+            return 1
+        fi
+    fi
+    printf '%s\n' "$name"
+}
+
+# Exactly one running, non one-off container of the PostgreSQL service.
+resolve_postgres_container() {
+    local project="$1" listing
+    local -a containers=()
+    if ! listing="$(docker ps --quiet --no-trunc \
+        --filter "label=com.docker.compose.project=$project" \
+        --filter "label=com.docker.compose.service=$POSTGRES_SERVICE" \
+        --filter "label=com.docker.compose.oneoff=False")"; then
+        error "docker ps failed; cannot locate the PostgreSQL container"
+        return 1
+    fi
+    if [[ -n "$listing" ]]; then
+        mapfile -t containers <<<"$listing"
+    fi
+    if [[ "${#containers[@]}" -ne 1 ]]; then
+        error "Expected exactly one running '$POSTGRES_SERVICE' container in Compose project '$project', found ${#containers[@]}"
+        return 1
+    fi
+    if [[ ! "${containers[0]}" =~ ^[0-9a-f]{12,64}$ ]]; then
+        error "docker ps returned an unexpected container id"
+        return 1
+    fi
+    printf '%s\n' "${containers[0]}"
+}
+
+if ! compose_project="$(compose_project_name)"; then
+    exit 1
+fi
+if ! postgres_container="$(resolve_postgres_container "$compose_project")"; then
     exit 1
 fi
 
@@ -92,7 +161,7 @@ temp_file="$(mktemp "$BACKUP_DIR/.postgres_${timestamp}.sql.gz.age.tmp.XXXXXX")"
 chmod 600 "$temp_file"
 
 info "Starting encrypted PostgreSQL backup"
-if ! docker compose exec -T "$POSTGRES_SERVICE" \
+if ! docker exec -i "$postgres_container" \
     pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" 2>/dev/null \
     | gzip -c \
     | age --encrypt --recipient "$BACKUP_AGE_RECIPIENT" \

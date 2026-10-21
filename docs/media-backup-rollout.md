@@ -31,6 +31,18 @@ Run from the repository directory:
 BACKUP_AGE_RECIPIENT="$SECRET_MANAGER_RECIPIENT" scripts/backup.sh
 ```
 
+The script never loads a Compose file (on a production checkout the development
+`docker-compose.yml` refuses to load). It finds the PostgreSQL container with
+plain Docker: `docker ps` filtered by the Compose labels of this checkout's
+project (`com.docker.compose.project`, `com.docker.compose.service`, default
+`postgres` or `POSTGRES_SERVICE`, and `com.docker.compose.oneoff=False`). The
+project is `COMPOSE_PROJECT_NAME` when set, otherwise Compose's default for the
+checkout directory (its name lowercased, keeping only `a-z`, `0-9`, `_` and `-`,
+leading `_`/`-` removed; a non-ASCII name must set `COMPOSE_PROJECT_NAME`).
+Exactly one running container must match; zero, several or a failing
+`docker ps` stop the backup with a visible error before anything is written.
+The dump then runs through `docker exec -i <container> pg_dump`.
+
 The script streams `pg_dump` through gzip and `age` into a mode-`0600`
 encrypted temporary in the destination. It publishes by creating an exclusive
 same-filesystem hard link at `postgres_<timestamp>.sql.gz.age`, then removes the

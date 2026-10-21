@@ -644,7 +644,7 @@ Use esse JSON como corpo do objeto `config` ao criar ou atualizar um tenant. O b
 ## Migração e persistência
 
 - **Criar/atualizar ClinicConfig:** use `TenantRepository.upsert_clinic_config(tenant_id, clinic_config: ClinicConfig)` para gravar na tabela `clinic_configs`.
-- **Migração Alembic:** revisão `002` cria a tabela `clinic_configs`. Execute `alembic upgrade head` para aplicar.
+- **Migração Alembic:** revisão `002` cria a tabela `clinic_configs`. Para aplicar, migre para a revisão aprovada para o ambiente (`alembic upgrade <revisão>`; `head` só num banco local de desenvolvimento, via `make db-migrate`).
 
 ## Credenciais e catálogo público de provedores
 

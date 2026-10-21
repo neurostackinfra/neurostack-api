@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import random
+import re
 import ssl
 import subprocess
 import sys
@@ -1707,10 +1708,17 @@ def test_entry_point_short_token_never_reaches_the_network(tmp_path: Path) -> No
 
 
 def test_production_image_ships_the_module() -> None:
-    """The final stage copies ``src/`` whole; ``scripts/`` is not shipped."""
+    """The ``production`` stage copies ``src/`` whole; ``scripts/`` is not shipped.
+
+    The stage is found by its alias, whatever image it builds ``FROM``.
+    """
 
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    production = dockerfile.split("FROM base AS production", 1)[1]
+    header = re.search(
+        r"^FROM\s+\S+\s+AS\s+production\s*$", dockerfile, re.MULTILINE | re.IGNORECASE
+    )
+    assert header is not None, "Dockerfile has no production stage"
+    production = re.split(r"^FROM\s", dockerfile[header.end() :], flags=re.MULTILINE)[0]
     assert "COPY --chown=neurostack:neurostack src ./src" in production
     assert (ROOT / "src/ops/__init__.py").is_file()
     assert (ROOT / "src/ops/asaas_webhook.py").is_file()

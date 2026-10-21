@@ -1321,10 +1321,21 @@ service's current revision, `count` 1, `launchType` `FARGATE`, the service's
 `platformVersion`, the service's subnets and security groups with
 `assignPublicIp` `DISABLED`, `overrides.containerOverrides` exactly
 `[{"name": "app", "command": ["python", "-m", "src.ops.asaas_webhook", "reconcile"]}]`,
-`startedBy` `neurostack-asaas-webhook-reconcile`, `propagateTags` `NONE`,
-`enableECSManagedTags` and `enableExecuteCommand` false, and a `clientToken`
-derived from the deployment ID, the request and the attempt: a retried call
-cannot start a second task. Single flight is the `ListTasks` precondition plus
+`startedBy` `neurostack-asaas-webhook-reconcile`, `enableECSManagedTags` and
+`enableExecuteCommand` false, and a `clientToken` derived from the deployment
+ID, the request and the attempt: a retried call cannot start a second task.
+`propagateTags` is omitted on purpose: the live RunTask API rejects `NONE`
+(`InvalidParameterException: Invalid value for propagateTags`) even though the
+SDK model lists it, and omission means no propagation. The hook refuses to
+render a request that carries the key, and a recorded RunTask that carries it
+is `run_task_request_propagate_tags_present`. The top-level key set is pinned
+by the hook and its tests. A request with only `cluster`, `taskDefinition`,
+`launchType`, `count`, `startedBy`, `enableExecuteCommand`,
+`networkConfiguration` and `overrides` was accepted live; `clientToken`,
+`platformVersion` and `enableECSManagedTags` are documented RunTask parameters
+not yet verified live in this request. The first real registration run is that
+check: on any `InvalidParameterException` from RunTask, stop (do not edit the
+request, do not retry) and report the exact error message. Single flight is the `ListTasks` precondition plus
 that token; two operators planning at the same instant can still both start
 a task (the window between the listing and the RunTask), in which case the
 command itself reports `ambiguous` and deletes nothing.
@@ -1391,6 +1402,7 @@ differs.
 
 Hook-level reasons that are also `DEPLOYED_WEBHOOK_PENDING`: `run_task_failed`
 (RunTask started nothing), `run_task_request_not_rendered_by_hook`,
+`run_task_request_propagate_tags_present`,
 `task_identity_mismatch` and `task_command_override_mismatch` (alert kind
 `evidence_mismatch`), `task_watch_deadline_exceeded`, `log_events_truncated`
 and `log_forbidden_material` (rotate per
@@ -1613,7 +1625,13 @@ Since PRs #90 and #91, the production `Dockerfile` builds the SPA in the
 (`src/api/spa.py`); `/billing` is the hosted-checkout return page named by
 `ASAAS_CHECKOUT_RETURN_URL`. A local `linux/amd64` build of the whole image,
 this stage included, and the offline image smoke below passed on 2026-10-19
-(not the protected workflow); the browser CSP check is still open.
+(not the protected workflow); the browser CSP check is still open. With the
+compiler-free production stage, a local `linux/amd64` build and the extended
+smoke passed on 2026-10-20, again not the protected workflow and not
+`linux/arm64`. The smoke runs eleven checks, in this order: `imports`,
+`site-packages`, `no-build-toolchain`, `native-libraries`,
+`no-world-writable`, `src-imports`, `kms-signers`, `alembic-heads`,
+`spa-index`, `alembic-offline-sql` and `serve` (see "Image smoke" below).
 
 Network access the image build needs (from the Dockerfile; the 2026-10-19
 build succeeded with it, the exact hosts were not captured):
@@ -1623,13 +1641,15 @@ build succeeded with it, the exact hosts were not captured):
   resolved to on 2026-10-19; tag and digests are recorded in the Dockerfile)
   and `node:22.22.3-bookworm-slim@sha256:e21fc383…`.
 - **Debian package mirrors** (`deb.debian.org`): `build-essential`, `curl`,
-  `libpq-dev`.
+  `libpq-dev` for the build stages (`base`, `deps`, `development`); `curl`
+  alone for the production stage.
 - **PyPI** (`pypi.org`, `files.pythonhosted.org`), every download checked
   against a recorded sha256:
   - `pip==26.2.1`, `setuptools==84.0.0` and `packaging==26.2`, the base
     interpreter's own packages at their `poetry.lock` versions, from
     `scripts/requirements-production-base.txt` (the lock's wheel hashes,
-    `pip install --require-hashes --only-binary :all:`).
+    `pip install --require-hashes --only-binary :all:`), installed in `base`
+    and again in the production stage.
   - `poetry==2.4.1` and its 48 dependencies, from
     `scripts/requirements-poetry.txt`, after the venv's bundled pip is
     replaced from the base file. Poetry 2.4.1 wrote `poetry.lock` and is the CI
@@ -1645,10 +1665,46 @@ build succeeded with it, the exact hosts were not captured):
   installs into the system interpreter, so neither Poetry nor its
   dependencies reach the production image, whose `site-packages` holds
   exactly the locked main group plus the base image's `pip`, `setuptools` and
-  `wheel`. The production stage still builds on `base`, so the system
-  compilers and headers of `build-essential` and `libpq-dev` (gcc, g++,
-  make, ld, as, cpp, `pg_config`; about 353 MB uncompressed) are in the
-  image. A compiler-free runtime stage is a separate owner decision.
+  `wheel`.
+
+  The production stage is a fresh runtime stage (owner decision 2026-10-19:
+  no compilers in the production image). It starts from the same pinned
+  `python:3.11.17-slim-trixie@sha256:e88e9763…` as `base` (the two FROM
+  lines must stay identical), installs `curl` alone with
+  `--no-install-recommends` (the HEALTHCHECK runs it, and the rollout
+  verifier's task-definition fixture probes with `curl -fsS .../ready`:
+  dropping curl requires changing the task definition's health check first;
+  the apt lists are removed in the same layer), installs the hashed base
+  requirements, then
+  copies the `deps` site-packages and console scripts, the app, `alembic/`,
+  `scripts/bootstrap_admin.py` and the SPA. `build-essential` and
+  `libpq-dev` (gcc, g++, make, binutils, cpp, `pg_config`, the C headers;
+  about 353 MB uncompressed) stay in the build stages. No runtime library is
+  added: every shared library the interpreter and the locked wheels link
+  against ships with the pinned image (measured once with `ldd` and
+  `dpkg -S`; the smoke's `native-libraries` check now runs `ldd` over every
+  ELF file under `/usr/local` on every smoke run; the protected build
+  workflow, `.github/workflows/asaas-build-attestation.yml`, only builds and
+  pushes and never runs the smoke), and `asyncpg` speaks the
+  PostgreSQL protocol itself (the lock has no psycopg). The base requirements
+  are installed BEFORE the copy: the
+  fresh image ships `pip` 24.0, `setuptools` 79.0.1 and `packaging` 26.3, and
+  the copied 26.2 metadata would otherwise sit next to the image's 26.3. The
+  only C headers left are CPython's own under
+  `/usr/local/include/python3.11`, shipped by the pinned image (harmless
+  without a compiler; deleting them in a later layer would not shrink the
+  image). `tests/scripts/test_production_dockerfile_frontend.py` pins the
+  stage statically; the smoke below checks the built image.
+
+  The apt layer is NOT pinned or reproducible: `apt-get install curl` takes
+  whatever the Debian mirror serves on build day (on 2026-10-20 curl
+  `8.14.1-2+deb13u7` and 21 libraries). The security update path for the
+  interpreter and every Debian package of the image is the base image
+  digest: at review time (2026-10-20) one trixie-security update was pending
+  for a package of the pinned image (`liblzma5` `5.8.1-1+deb13u1` to
+  `deb13u2`, reported by the review, not re-checked here). The remedy is to
+  bump both FROM digests (base and production) together, re-resolved and
+  recorded as above; that is a separate, owner-approved change.
 - **npm registry** (`registry.npmjs.org`):
   - The pnpm tarball, fetched by `corepack prepare` and checked against the
     sha512 in `PNPM_PIN`. The host is corepack's documented default registry
@@ -1667,7 +1723,16 @@ build succeeded with it, the exact hosts were not captured):
 ### Image smoke (local, before the signed build)
 
 The live chain's S5 dry run runs the smoke explicitly, from the reviewed
-checkout, on a host with Docker and the build network:
+checkout, on a host with Docker and the build network. The S5 dry run and the
+S6 bridge build MUST run from a clone on the Linux filesystem (for example
+`git clone` into `/tmp` or `~`), never from the `/mnt/c` checkout: DrvFs
+shows every file as 0777 and `COPY` keeps that mode, so an image built from
+`/mnt/c` ships its application code world-writable (299 of 303 files under
+`/app` in the 2026-10-20 review; the earlier local images
+`neurostack-api:asaas-g6-rc` and `neurostack-staging:candidate` have every
+`/app` file at 0777, while the local copy of the ECR image
+`neurostack-staging:55651b58dd41…` has none). The smoke's
+`no-world-writable` check fails such an image.
 
 ```bash
 RUN_DOCKER_IMAGE_SMOKE=1 poetry run pytest -p no:cacheprovider -rs \
@@ -1677,8 +1742,15 @@ RUN_DOCKER_IMAGE_SMOKE=1 poetry run pytest -p no:cacheprovider -rs \
 or, for the JSON summary on stdout:
 
 ```bash
-poetry run python scripts/production_image_smoke.py --expected-head 037 --build-log /tmp/build.log
+poetry run python scripts/production_image_smoke.py --expected-head <head of the image> --build-log /tmp/build.log
 ```
+
+`--expected-head` is the head of the migrations CONTAINED in the image, that
+is of `alembic/versions` in the checkout being built: `035` on `main` today,
+`036` once PR #121 (migration 036) is merged. It is not the production
+migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
+checked offline as `032:035` whatever the image's head is. Whichever of this
+change and PR #121 lands second only changes the number given here.
 
 It runs `docker buildx build --platform linux/amd64 --load --target production`
 on the working tree (no push, no registry login) with `VCS_REF` set to the git
@@ -1686,18 +1758,38 @@ revision (`-dirty` when the tree is modified), then runs each check in the
 image, addressed by its image ID with `--pull never` and `--network none`:
 `import src.api.main, boto3, botocore`; the interpreter's Python
 distributions are exactly the locked main group at the locked versions plus
-`pip`, `setuptools` and `wheel` (no Poetry, no Python build backend other
-than setuptools and wheel, no duplicate metadata; the system compilers are
-not checked and are still present); every top-level import under `src/`
-resolves; both KMS
+`pip`, `setuptools` (both at their locked versions) and `wheel` (no Poetry,
+no Python build backend other than setuptools and wheel, no duplicate
+metadata); no compiler, linker, binutils, make, pkg-config or `pg_config`
+(bare, `<triplet>-` prefixed or versioned) in PATH or the system binary
+directories, no `/usr/lib/gcc*` or `/usr/libexec/gcc*`, no C header outside
+`/usr/local/include/python3.11` (any file name: the C++ standard headers
+have no extension), empty apt lists and no build or `-dev` package in the
+dpkg database; `ldd` resolves every library of every ELF file under
+`/usr/local` (the interpreter, libpython, lib-dynload, every site-packages
+extension and vendored library) and every symbol version it needs (a
+library that is present but too old makes ldd print ``version `GLIBC_2.38'
+not found (required by …)`` and still exit 0: that fails the check too, as
+does ldd itself failing), the only exception being CPython's `_tkinter`
+missing Tk and Tcl (they are not in python:slim and nothing imports
+tkinter); no file or directory under `/app` or site-packages is
+world-writable; every top-level import under `src/` resolves; both KMS
 signer factories build their clients (no KMS call); `alembic heads` prints
-exactly the tree's head (`037 (head)` since Group 10 E6; the image carries
-036 and 037, which the exact-revision window never applies);
-`/app/spa/index.html` exists; and `alembic upgrade
-032:035 --sql` emits the migration window as one transaction. The window
+exactly one line, `<expected head> (head)`, the head of the migrations in
+the image given with `--expected-head` (`035` on `main` today, `036` once
+PR #121 is merged); `/app/spa/index.html` exists; and `alembic upgrade
+032:035 --sql` emits the production migration window, which stays `032:035`
+whatever the image's head, as one transaction. The window
 starts at `032` because migration `017` reads rows, which offline mode cannot
-do. It prints a JSON summary (image ID, build time, image size, warnings,
-checks) and exits 0 only when everything passes. Push the image by that image
+do. Last, `serve` starts the image's own CMD (as `neurostack`, still with
+`--network none`) with `ENVIRONMENT=staging`, a throwaway `SECRET_KEY`, no
+database and `--lifespan off` (the lifespan opens with a `SELECT 1` and stops
+the app without a database); from inside the container, `/health` must
+answer 200, `/` must serve `/app/spa/index.html` byte for byte and
+`/v1/sessions` must answer 401, then the image's own HEALTHCHECK command must
+exit 0, and the container is force-removed whatever the outcome. It prints a
+JSON summary (image ID, build time, image size, warnings, checks) and exits 0
+only when everything passes. Push the image by that image
 ID (tag the ID, then push); never rebuild it for the push, or the pushed image
 is not the one that was checked. The pytest end-to-end test is opt-in: without
 `RUN_DOCKER_IMAGE_SMOKE=1` it is skipped with that reason, so the normal

@@ -1166,12 +1166,130 @@ def test_render_prints_the_exact_run_task_request(
         },
         "overrides": {"containerOverrides": [{"name": "app", "command": COMMAND}]},
         "startedBy": hook.STARTED_BY,
-        "propagateTags": "NONE",
         "enableECSManagedTags": False,
         "enableExecuteCommand": False,
     }
+    assert "propagateTags" not in out
     assert re.fullmatch(r"asaas-webhook-[0-9a-f]{40}", token)
     assert len(token) <= 64
+
+
+# The live RunTask API accepted exactly these keys (2026-10-20, staging):
+LIVE_ACCEPTED_RUN_TASK_KEYS = {
+    "cluster",
+    "taskDefinition",
+    "launchType",
+    "count",
+    "startedBy",
+    "enableExecuteCommand",
+    "networkConfiguration",
+    "overrides",
+}
+# Documented RunTask parameters the hook also sends; unverified live until the
+# first real registration run (runbook: stop and report the exact message on
+# InvalidParameterException).
+UNVERIFIED_LIVE_RUN_TASK_KEYS = {
+    "clientToken",
+    "platformVersion",
+    "enableECSManagedTags",
+}
+
+
+def test_rendered_run_task_key_set_is_pinned(tmp_path: Path) -> None:
+    """Nothing new reaches RunTask unnoticed; propagateTags never does."""
+
+    request = render(World(), tmp_path)
+    assert set(request) == LIVE_ACCEPTED_RUN_TASK_KEYS | UNVERIFIED_LIVE_RUN_TASK_KEYS
+    assert set(request["networkConfiguration"]) == {"awsvpcConfiguration"}
+    assert set(request["networkConfiguration"]["awsvpcConfiguration"]) == {
+        "subnets",
+        "securityGroups",
+        "assignPublicIp",
+    }
+    assert set(request["overrides"]) == {"containerOverrides"}
+    assert [set(row) for row in request["overrides"]["containerOverrides"]] == [
+        {"name", "command"}
+    ]
+    assert hook.RUN_TASK_REQUIRED_KEYS == frozenset(
+        LIVE_ACCEPTED_RUN_TASK_KEYS | {"clientToken", "enableECSManagedTags"}
+    )
+    assert hook.RUN_TASK_OPTIONAL_KEYS == frozenset({"platformVersion"})
+    assert (
+        "propagateTags" not in hook.RUN_TASK_REQUIRED_KEYS | hook.RUN_TASK_OPTIONAL_KEYS
+    )
+    forced = render(World(), tmp_path, force=True, attempt=2)
+    assert set(forced) == set(request)
+
+
+@pytest.mark.parametrize("value", ["NONE", "TASK_DEFINITION", "SERVICE", None, ""])
+def test_run_task_invariant_refuses_propagate_tags_with_any_value(
+    value: Any, tmp_path: Path
+) -> None:
+    request = render(World(), tmp_path)
+    request["propagateTags"] = value
+    with pytest.raises(
+        hook.HookError,
+        match="^run_task_request_invariant:propagate_tags_rejected_by_run_task_api$",
+    ):
+        hook.assert_run_task_invariants(request, EXPECTED_ARN)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda r: r.__setitem__("tags", [{"key": "a", "value": "b"}]),
+        lambda r: r.__setitem__("group", "family:x"),
+        lambda r: r.__setitem__("capacityProviderStrategy", []),
+        lambda r: r.pop("clientToken"),
+        lambda r: r.__setitem__("clientToken", "x" * 64),
+        lambda r: r.pop("enableECSManagedTags"),
+        lambda r: r["networkConfiguration"].__setitem__("extra", {}),
+        lambda r: r["networkConfiguration"]["awsvpcConfiguration"].__setitem__(
+            "extra", "x"
+        ),
+    ],
+)
+def test_run_task_invariant_refuses_a_changed_key_set(
+    mutate: Callable[[dict[str, Any]], None], tmp_path: Path
+) -> None:
+    request = render(World(), tmp_path)
+    mutate(request)
+    with pytest.raises(hook.HookError, match="^run_task_request_invariant"):
+        hook.assert_run_task_invariants(request, EXPECTED_ARN)
+
+
+def test_run_task_invariant_allows_an_absent_platform_version(tmp_path: Path) -> None:
+    request = render(World(), tmp_path)
+    request.pop("platformVersion")
+    hook.assert_run_task_invariants(request, EXPECTED_ARN)
+
+
+@pytest.mark.parametrize("value", ["NONE", "TASK_DEFINITION", "SERVICE"])
+def test_a_recorded_run_with_propagate_tags_is_pending(
+    value: str, tmp_path: Path
+) -> None:
+    world = World()
+    params = render(world, tmp_path)
+    params["propagateTags"] = value
+    world.record_run(tmp_path, params=params)
+    world.finish(*ok_lines())
+    result = verify(world, tmp_path)
+    assert result["outcome"] == "DEPLOYED_WEBHOOK_PENDING"
+    assert "run_task_request_propagate_tags_present" in result["reasons"]
+    assert "run_task_request_not_rendered_by_hook" in result["reasons"]
+
+
+def test_runbook_says_propagate_tags_is_omitted_on_purpose() -> None:
+    text = " ".join(
+        (ROOT / "docs/runbooks/asaas-deployment.md").read_text(encoding="utf-8").split()
+    )
+    assert "`propagateTags` `NONE`" not in text
+    assert "`propagateTags` is omitted on purpose" in text
+    assert "rejects `NONE`" in text
+    assert "run_task_request_propagate_tags_present" in text
+    assert "InvalidParameterException" in text
+    for key in sorted(UNVERIFIED_LIVE_RUN_TASK_KEYS):
+        assert f"`{key}`" in text
 
 
 def test_force_rewrite_token_is_explicit_and_off_by_default(
@@ -1280,6 +1398,7 @@ def test_platform_version_is_copied_only_when_valid(tmp_path: Path) -> None:
         lambda r: r["overrides"]["containerOverrides"][0].__setitem__("name", "otel"),
         lambda r: r.__setitem__("launchType", "EC2"),
         lambda r: r.__setitem__("propagateTags", "TASK_DEFINITION"),
+        lambda r: r.__setitem__("propagateTags", "NONE"),
         lambda r: r.__setitem__("startedBy", "ecs-svc/1"),
         lambda r: r.__setitem__("cluster", "other"),
         lambda r: r.__setitem__("enableExecuteCommand", True),
