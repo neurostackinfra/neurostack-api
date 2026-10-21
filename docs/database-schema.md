@@ -120,8 +120,16 @@ sessions (1) ──┬── (N) events          [session_id opcional em events]
 
 ## Aplicar migrações
 
+Para a revisão aprovada para o ambiente (`alembic upgrade <revision>`; `head` só num
+banco local de desenvolvimento, via `make db-migrate`, que roda
+`scripts/guard_alembic_upgrade_head.py` antes do Alembic):
+
 ```bash
-alembic upgrade head
+# Banco local de desenvolvimento
+make db-migrate
+
+# Qualquer outro ambiente: a revisão aprovada para ele
+alembic upgrade <revision>
 ```
 
 Reverter apenas a revisão 003 (índices e trigger clinic_configs):

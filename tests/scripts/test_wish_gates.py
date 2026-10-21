@@ -254,6 +254,7 @@ def _candidate_repo(tmp_path: Path) -> tuple[Path, Path]:
         'echo "docker-env SECRET_KEY=${SECRET_KEY-unset}'
         " ASAAS_API_KEY=${ASAAS_API_KEY-unset}"
         " CALL_LOG=${CALL_LOG-unset}"
+        " NEUROSTACK_DEV_STACK=${NEUROSTACK_DEV_STACK-unset}"
         f' OPERATOR_ONLY=${{OPERATOR_ONLY-unset}}" >>"{log}"\n'
         f'if [ -f "{tmp_path / "docker-fails"}" ]; then exit 17; fi\n'
         "exit 0\n"
@@ -500,6 +501,8 @@ def test_release_gate_renders_compose_with_synthetic_env_only(tmp_path: Path) ->
     assert "ASAAS_API_KEY=test-asaas-api-key" in calls
     assert "OPERATOR_ONLY=unset" in calls
     assert "CALL_LOG=unset" in calls
+    # The merged render parses the dev file, which requires the dev-stack flag.
+    assert "NEUROSTACK_DEV_STACK=1" in calls
     assert "real-operator" not in calls
 
 

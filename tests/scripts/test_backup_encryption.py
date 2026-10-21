@@ -200,12 +200,19 @@ def _install_fake_docker(fake_bin: Path) -> Path:
     dump_marker = fake_bin / "pg_dump.called"
     real_pg_dump = shutil.which("pg_dump")
     assert real_pg_dump is not None
+    # backup.sh must never load a compose file (on a production checkout the
+    # development docker-compose.yml refuses to load): `compose` fails, `ps`
+    # lists one container and `exec -i <that id>` runs the dump.
     _write_executable(
         fake_bin / "docker",
         "#!/usr/bin/env bash\n"
         "set -eu\n"
-        'if [[ "$1" == "compose" && "$2" == "version" ]]; then exit 0; fi\n'
-        'if [[ "$1" == "compose" && "$2" == "exec" ]]; then\n'
+        'if [[ "$1" == "compose" ]]; then\n'
+        '  echo "compose must not be called" >&2\n'
+        "  exit 97\n"
+        "fi\n"
+        'if [[ "$1" == "ps" ]]; then printf \'%064d\\n\' 7; exit 0; fi\n'
+        'if [[ "$1" == "exec" && "$2" == "-i" && "$3" == "$(printf \'%064d\' 7)" ]]; then\n'
         '  : > "$PG_DUMP_MARKER"\n'
         '  if [[ -n "${BACKUP_TEST_STALL_MARKER:-}" ]]; then\n'
         '    : > "$BACKUP_TEST_STALL_MARKER"\n'

@@ -99,6 +99,16 @@ docker compose logs -f api
 docker compose down
 ```
 
+This is the local development stack only. Every `docker compose` command on
+`docker-compose.yml` aborts unless `NEUROSTACK_DEV_STACK=1` is in your local
+`.env` (it is in `.env.example`; any non-empty value, even `0`, enables the
+file, so never set it at all on a production host). Its
+`migrate` service migrates the database to the newest revision, and runs
+`scripts/guard_alembic_upgrade_head.py` first, which refuses anything but a
+development database. On a production checkout use `scripts/deploy-vps.sh` (see
+Deployment below), never this file: both files share the Compose project name
+and the `postgres_data` volume.
+
 ---
 
 ## 📚 API Endpoints

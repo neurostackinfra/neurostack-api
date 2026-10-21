@@ -265,8 +265,10 @@ Registro de handoffs humanos.
 As migrations são gerenciadas pelo Alembic. Ver `alembic/README.md` para comandos.
 
 ```bash
-# Aplicar migrations
-alembic upgrade head
+# Aplicar migrations: a revisão aprovada para o ambiente
+# (`head` só num banco local de desenvolvimento, via `make db-migrate`)
+alembic upgrade <revision>
+make db-migrate  # banco local de desenvolvimento
 
 # Reverter última migration
 alembic downgrade -1
