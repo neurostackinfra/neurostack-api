@@ -12,7 +12,8 @@
 # sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce,
 # whose linux/amd64 manifest is
 # sha256:e529028263dbe6910a2d96f7d2b8f5266385e917fd45d286ef166977c094a51e.
-# Every Python stage derives from this one FROM.
+# The build stages derive from this FROM; the production stage starts afresh
+# from the same image, and its FROM must stay byte-identical to this one.
 FROM python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS base
 
 # Set environment variables
@@ -22,7 +23,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
+# Build-time system packages: compilers and headers for the deps and
+# development stages. None of them reaches the production stage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -30,10 +32,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # The interpreter's own packages, at the poetry.lock versions and wheel hashes.
-# The production stage merges the deps stage's site-packages over this stage's,
-# so a package the deps install had to replace would leave its old metadata
-# behind (the image ships packaging 26.3, the lock pins 26.2); pip and
-# setuptools move past the base image's known advisories.
+# The production stage repeats this install on its fresh interpreter and then
+# copies the deps stage's site-packages over it: a package the deps install
+# had to replace would otherwise leave its old metadata behind (the image
+# ships packaging 26.3, the lock pins 26.2); pip and setuptools move past the
+# base image's known advisories.
 COPY scripts/requirements-production-base.txt /opt/requirements/production-base.txt
 RUN pip install --require-hashes --only-binary :all: -r /opt/requirements/production-base.txt
 
@@ -137,13 +140,50 @@ RUN PORT="${FRONTEND_PORT}" BASE_PATH="${FRONTEND_BASE_PATH}" NODE_ENV=productio
     && test -z "$(find artifacts/neurostack/dist/public \( -name '*.ts' -o -name '*.tsx' -o -name '*.mts' \) -print -quit)"
 
 # ============================================
-# Stage 5: Production image
+# Stage 5: Production image (runtime only, no compilers)
 # ============================================
-FROM base AS production
+# A fresh stage on the same pinned image as base (the pin is recorded above
+# the base FROM; the two FROM lines must stay identical). It never builds on
+# base, so build-essential and libpq-dev (gcc, g++, make, binutils, cpp,
+# pg_config, the C headers) stay out: the image gets only what the
+# application needs to run. scripts/production_image_smoke.py checks it.
+FROM python:3.11.17-slim-trixie@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS production
+
+# Same as base.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Runtime system packages: curl only, for the HEALTHCHECK below (and any
+# orchestrator probe that runs curl in the container, e.g. an ECS task
+# health check: change that first before dropping curl). Every shared library
+# the interpreter and the locked wheels link against already ships with the
+# pinned image (the smoke's native-libraries check runs ldd over every ELF
+# file under /usr/local), and asyncpg speaks the PostgreSQL protocol itself:
+# no libpq. No -dev package, no recommends, no apt lists left behind. Not
+# pinned: the versions are whatever the Debian mirror serves on build day.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# BEFORE the deps site-packages are copied: this fresh interpreter ships pip
+# 24.0, setuptools 79.0.1 and packaging 26.3, and a copied packaging 26.2
+# dist-info next to the image's 26.3 one would leave two metadata directories
+# for one package. After this install both sides hold the same versions.
+COPY scripts/requirements-production-base.txt /opt/requirements/production-base.txt
+RUN pip install --require-hashes --only-binary :all: -r /opt/requirements/production-base.txt
+
+# Non-root user, same ids as base.
+RUN groupadd --gid 1000 neurostack \
+    && useradd --uid 1000 --gid 1000 --shell /bin/bash --create-home neurostack
 
 WORKDIR /app
 
-# Copy installed packages from deps stage
+# The deps interpreter's packages (the lock's main group over the same base
+# tooling as above) and console scripts; the .so files load against the
+# pinned image's libraries, the deps stage's compilers stay behind.
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
 COPY --from=deps --chown=neurostack:neurostack /app/packages/neurostack-core /app/packages/neurostack-core
@@ -165,7 +205,7 @@ USER neurostack
 # Expose port
 EXPOSE 8000
 
-# Health check
+# Health check (curl is the runtime package installed above)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
