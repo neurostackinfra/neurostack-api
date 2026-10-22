@@ -11,15 +11,22 @@
 #   plan             read-only AWS readback compared with this manifest
 #   render-taskdef   the proposed task definition (secrets as references only)
 #   check            the existing evidence validators against that rendering
-#   render-migrations-taskdef
-#                    a new one-off migrations revision with the pinned command
+#   render-migrations-taskdef --window 035|036|037 --purpose migrate|read
+#                    a new one-off migrations revision with that window's
+#                    pinned upgrade (migrate), or window 037's SELECT-only
+#                    readback (read); no default window or purpose
 #
 # scripts/asaas_deploy_hook.py (pure, readback files only) plans, renders and
 # verifies the post-deploy webhook registration task (step
 # webhook_exposure_and_registration).
+#
+# scripts/asaas_migration_window.py (pure, readback files only) holds the
+# window table (035, 036, 037) and plans, renders and verifies each window's
+# snapshot, SELECT-only readbacks and one-off migration task (steps
+# migrations_033_035, migrations_036 and migrations_037).
 schema_version: asaas_production_wiring_manifest.v1
 context:
-  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the D3 source revision and one migrations revision baking the pinned upgrade; the post-deploy hook (scripts/asaas_deploy_hook.py) renders the webhook registration task; the rollback target is the field rollback_target; financial egress stays closed by the absence of any AppConfig configuration
+  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the D3 source revision and, per migration window, one migrations revision baking that window's pinned upgrade; the post-deploy hook (scripts/asaas_deploy_hook.py) renders the webhook registration task and scripts/asaas_migration_window.py runs the windows; the rollback target is the field rollback_target; financial egress stays closed by the absence of any AppConfig configuration
   must:
     - Read AWS only through Describe*, Get* and List* calls; never call GetSecretValue and never print a secret value.
     - Resolve every secret ARN, random suffix included, from DescribeSecret at plan time.
@@ -144,25 +151,32 @@ task_definition:
   # :latest tag resolved to on 2026-10-19 (no behaviour change). Moving it is a
   # reviewed edit of this field.
   otel_image: public.ecr.aws/aws-observability/aws-otel-collector@sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e
-  # PENDING OWNER CONFIRMATION. Owner approval A4 (2026-10-19) moved the two
-  # ECS IAM roles to ManagedBy=manual; tagging the new task-definition
-  # revisions the same way is the engineer's inference (truthful: no code
-  # manages them; reversible). Confirm or change it before registering.
+  # OWNER CONFIRMED (2026-10-20, asaas-payment-gateway wish): ManagedBy=manual
+  # on the two ECS IAM roles (approval A4, 2026-10-19) and on every new
+  # task-definition revision, app and migrations alike (no code manages them).
   tag_overrides:
     ManagedBy: manual
 
 # The one-off migrations family. Revision 3 bakes an unpinned upgrade, so it is
 # only read (roles, the DATABASE_URL secret, sizing, logs) and never run.
-# render-migrations-taskdef registers a new revision whose command is exactly
-# the planner constant MIGRATIONS_COMMAND, on the reviewed bridge image
-# (parameters.app_image_override).
+# render-migrations-taskdef --window <W> --purpose migrate registers a new
+# revision per window whose command is exactly that window's upgrade (the
+# window table of scripts/asaas_migration_window.py), on the reviewed image
+# (parameters.app_image_override; for 036 and 037 the image deployed on the
+# service, which contains the migration). --purpose read (window 037 only,
+# listed under read_revisions) registers a separate read-only revision on the
+# same image, role and secret whose baked command is the window's SELECT-only
+# readback program, which never invokes the migration tool (it reads the
+# alembic_version table); its command and environment never mention the tool.
 migrations_task_definition:
   family: neurostack-staging-migrations
   source_revision: 3
   database_secret_name: neurostack/staging/database-url-migrations
   image: app_image_override
-  command: MIGRATIONS_COMMAND
-  # PENDING OWNER CONFIRMATION (see task_definition.tag_overrides).
+  command: per_window_exact_upgrade
+  windows: ['035', '036', '037']
+  read_revisions: ['037']
+  # OWNER CONFIRMED on 2026-10-20 (see task_definition.tag_overrides).
   tag_overrides:
     ManagedBy: manual
 
@@ -265,12 +279,13 @@ steps:
     approval: separate owner approval required; not performed by this manifest
     why: the image built from main needs the schema at Alembic revision 035; production was read at 032 on 2026-10-17
     preconditions:
-      - Read back the exact revision first; continue only if alembic_version == 032.
+      - Read back the exact revision first (the window's SELECT-only pre-read, with the zero reads of scripts/migration_033_035_zero_reads.sql); continue only if alembic_version == 032 and every count is 0.
       - Expand-only window; the running image keeps working on the expanded schema.
+      - Manual RDS snapshot pre-033-035-<date> available and recent before the run.
       - Revisions 036 and 037 are outside this window; each needs its own explicit owner instruction, 036 before 037, after a fresh SELECT showing zero legacy rows.
-    change: register a new neurostack-staging-migrations revision with render-migrations-taskdef (the bridge image digest, the command baked to exactly `alembic upgrade 035`, the roles and database-url-migrations secret of revision 3, ManagedBy=manual) and run that revision once as a one-off task with no command override; revision 3 is never run (never the head)
+    change: register a new neurostack-staging-migrations revision with render-migrations-taskdef --window 035 --purpose migrate (the bridge image digest, the command baked to exactly `alembic upgrade 035`, the roles and database-url-migrations secret of revision 3, ManagedBy=manual) and run that revision once as a one-off task with no command override, through scripts/asaas_migration_window.py --window 035 (plan, render-run-task, verify-result); revision 3 is never run (never the head)
     verification:
-      - read back alembic_version == 035 (exact; 036 and 037 not applied).
+      - read back alembic_version == 035 (exact; 036 and 037 not applied), with the window's post-read after verify-result reports the three upgrade lines 032 -> 033 -> 034 -> 035.
     rollback: none; never downgrade the schema as part of a rollback
 
   - id: service_deployment
@@ -328,6 +343,34 @@ steps:
       None from the hook: DEPLOYED_WEBHOOK_PENDING is an alert, never a service
       rollback and never a service update. Disabling or deleting the provider
       webhook at ASAAS is a manual provider operation with its own approval.
+
+  - id: migrations_036
+    scope: separate_approval
+    approval: separate owner approval required for this window alone (confirmed on 2026-10-20 with the 032-036 rehearsal; the run still needs the owner's explicit order at the time); not performed by this manifest
+    why: migration 036 decouples ASAAS billing from the legacy roster and drops the three columns the deployed image no longer maps
+    preconditions:
+      - Window 035 applied and verified first; read back the exact revision with the window's SELECT-only pre-read and continue only if alembic_version == 035.
+      - The image containing 036 is deployed and running on every service task, by digest (an earlier image cannot read the 036 schema); the window's migrations revision carries that same digest.
+      - rollback_target re-pinned to revision 9 (reviewed manifest edit) and revision 9 ACTIVE, because revision 8 reads columns 036 drops.
+      - Manual RDS snapshot pre-036-<date> available and recent; the preflight of scripts/migration_036_preflight.sql reads every count 0 right before the run.
+    change: register the window's neurostack-staging-migrations revision with render-migrations-taskdef --window 036 --purpose migrate (the deployed image digest, the command baked to exactly `alembic upgrade 036`) and run it once through scripts/asaas_migration_window.py --window 036 (plan, render-run-task, verify-result), with no command override and no propagateTags
+    verification:
+      - verify-result reports exactly the upgrade line 035 -> 036; then the post-read must read back alembic_version == 036.
+    rollback: none from this step; the 036 downgrade is a separate owner decision (docs/runbooks/asaas-deployment.md); SQLSTATE 55P03, 40P01 or 55000 means nothing changed, report and stop
+
+  - id: migrations_037
+    scope: separate_approval
+    approval: separate owner approval required for this window alone, after its own rehearsal from 032 to 037 with the downgrade to 036; not performed by this manifest
+    why: migration 037 drops the legacy saga and roster objects 036 left behind
+    preconditions:
+      - Window 036 applied and verified first; the window's pre-read runs scripts/migration_037_readback.sql as the migration role, on the window's dedicated read revision, and must read eleven ok, the first being alembic_version == 036.
+      - The image containing 037 is deployed and running on every service task, by digest; the window's migrations revision carries that same digest.
+      - rollback_target stays revision 9 and revision 9 is ACTIVE.
+      - Manual RDS snapshot pre-037-<date> available and recent before the run.
+    change: register two separate neurostack-staging-migrations revisions on the deployed image digest, the read revision with render-migrations-taskdef --window 037 --purpose read (its command baked to the SELECT-only readback program, which never invokes the migration tool and only reads the alembic_version table) and the migrate revision with render-migrations-taskdef --window 037 --purpose migrate (the command baked to exactly `alembic upgrade 037`); run the read revision for the pre-read and the migrate revision once through scripts/asaas_migration_window.py --window 037 (plan, render-run-task, verify-result), with no command override and no propagateTags
+    verification:
+      - verify-result reports exactly the upgrade line 036 -> 037; then the post-read must read back alembic_version == 037 and the four legacy tables gone.
+    rollback: none from this step; the 037 downgrade is a separate owner decision (docs/runbooks/asaas-deployment.md); SQLSTATE 55P03, 40P01 or 55000 means nothing changed, report and stop
 
   - id: rollout_transitions
     scope: separate_approval

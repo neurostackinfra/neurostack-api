@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from typing import Any
 import pytest
 import yaml
 
+from scripts import asaas_migration_window as mw
 from scripts import asaas_producer_rollout_evidence as evidence
 from scripts import asaas_production_wiring as wiring
 from scripts import verify_asaas_producer_image_rollout as rollout
@@ -2220,11 +2222,37 @@ def _migrations_step(manifest: dict[str, Any]) -> dict[str, Any]:
     return next(row for row in manifest["steps"] if row["id"] == "migrations_033_035")
 
 
-def test_migrations_window_constants_pin_revision_035() -> None:
-    assert wiring.MIGRATIONS_SOURCE_REVISION == "032"
-    assert wiring.MIGRATIONS_TARGET_REVISION == "035"
-    assert wiring.MIGRATIONS_COMMAND == ("alembic", "upgrade", "035")
-    assert wiring.MIGRATIONS_VERIFICATION == "read back alembic_version == 035"
+def test_migration_windows_pin_each_exact_upgrade() -> None:
+    """One table entry per window; the planner uses the window module's table."""
+
+    assert wiring.MIGRATION_WINDOWS is mw.WINDOWS
+    assert {name: (w.before, w.after, w.command) for name, w in mw.WINDOWS.items()} == {
+        "035": ("032", "035", ("alembic", "upgrade", "035")),
+        "036": ("035", "036", ("alembic", "upgrade", "036")),
+        "037": ("036", "037", ("alembic", "upgrade", "037")),
+    }
+    assert mw.WINDOW_035.verification == "read back alembic_version == 035"
+    assert mw.WINDOW_036.verification == "read back alembic_version == 036"
+    assert mw.WINDOW_037.verification == "read back alembic_version == 037"
+    assert set(wiring.MIGRATIONS_EXCLUDED) == set(mw.WINDOWS)
+    window_steps = [w.manifest_step for w in mw.WINDOWS.values()]
+    assert window_steps == ["migrations_033_035", "migrations_036", "migrations_037"]
+    assert [s for s, _scope in wiring.STEPS if s.startswith("migrations")] == (
+        window_steps
+    )
+    assert all(
+        scope == "separate_approval"
+        for step, scope in wiring.STEPS
+        if step in window_steps
+    )
+    for legacy in (
+        "MIGRATIONS_STEP",
+        "MIGRATIONS_SOURCE_REVISION",
+        "MIGRATIONS_TARGET_REVISION",
+        "MIGRATIONS_COMMAND",
+        "MIGRATIONS_VERIFICATION",
+    ):
+        assert not hasattr(wiring, legacy), legacy
 
 
 def test_manifest_migrations_step_upgrades_to_exactly_035() -> None:
@@ -2796,12 +2824,18 @@ def test_planner_code_never_hardcodes_the_rollback_revision() -> None:
 
 
 def _migrations(
-    fake: FakeAws | None = None, **changes: Any
+    fake: FakeAws | None = None,
+    *,
+    window: Any = mw.WINDOW_035,
+    purpose: str = "migrate",
+    **changes: Any,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     parameters = _validated(**({"app_image_override": OVERRIDE_IMAGE} | changes))
     aws = wiring.ReadOnlyAws((fake or FakeAws(applied=True)).transport)
     readback = wiring.collect_migrations_readback(aws, parameters)
-    return wiring.plan_migrations(readback, parameters, pins=_pins())
+    return wiring.plan_migrations(
+        readback, parameters, pins=_pins(), window=window, purpose=purpose
+    )
 
 
 def _put_migrations(
@@ -2825,12 +2859,8 @@ def test_migrations_revision_bakes_the_pinned_upgrade_on_the_bridge_image() -> N
     assert status["state"] == "would_register"
     assert rendered is not None
     (container,) = rendered["containerDefinitions"]
-    assert container["command"] == [
-        "alembic",
-        "upgrade",
-        wiring.MIGRATIONS_TARGET_REVISION,
-    ]
-    assert container["command"] == list(wiring.MIGRATIONS_COMMAND)
+    assert container["command"] == ["alembic", "upgrade", "035"]
+    assert container["command"] == list(mw.WINDOW_035.command)
     assert container["image"] == OVERRIDE_IMAGE
     assert container["secrets"] == [
         {"name": "DATABASE_URL", "valueFrom": MIGRATIONS_DB_ARN}
@@ -2881,26 +2911,71 @@ def test_migrations_render_refuses_any_command_but_the_pinned_upgrade(
             _migrations_task_definition(),
             image=OVERRIDE_IMAGE,
             pins=_pins(),
+            window=mw.WINDOW_035,
+            purpose="migrate",
             command=command,
         )
 
 
 @pytest.mark.parametrize(
-    "pinned", [("alembic", "upgrade", "heads"), ("alembic", "upgrade", "35")]
+    "widened",
+    [
+        {"command": ("alembic", "upgrade", "heads")},
+        {"command": ("alembic", "upgrade", "head")},
+        {"command": ("alembic", "upgrade", "035:037")},
+        {"command": ("alembic", "upgrade", "+1")},
+        {"after": "35", "command": ("alembic", "upgrade", "35")},
+        {"after": "037", "command": ("alembic", "upgrade", "037")},
+    ],
 )
-def test_migrations_render_refuses_a_widened_pin_constant(
-    pinned: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+def test_migrations_render_refuses_a_widened_window_table(
+    widened: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pins = _pins()
-    monkeypatch.setattr(wiring, "MIGRATIONS_COMMAND", pinned)
-    monkeypatch.setattr(wiring, "MIGRATIONS_TARGET_REVISION", pinned[2])
+    window = dataclasses.replace(mw.WINDOW_035, **widened)
+    table = dict(mw.WINDOWS) | {"035": window}
+    monkeypatch.setattr(wiring, "MIGRATION_WINDOWS", table)
+    if window.command == ("alembic", "upgrade", window.after) and window.after == "037":
+        # A consistent but different table entry renders its own command;
+        # the manifest validator is what refuses it (the step says 035).
+        with pytest.raises(wiring.WiringError, match="manifest_migrations_window"):
+            _pins()
+        return
     with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
         wiring.render_migrations_task_definition(
-            _migrations_task_definition(), image=OVERRIDE_IMAGE, pins=pins
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=pins,
+            window=window,
+            purpose="migrate",
         )
     # The manifest validator refuses the widened window on its own as well.
     with pytest.raises(wiring.WiringError, match="manifest_migrations_window"):
         _pins()
+
+
+@pytest.mark.parametrize("name", ["035", "036", "037"])
+def test_a_window_outside_the_table_is_refused(name: str) -> None:
+    """Only the table's own entries render: an equal-looking copy with any
+    field changed is not a window."""
+
+    impostor = dataclasses.replace(mw.WINDOWS[name], started_by="someone-else")
+    with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=_pins(),
+            window=impostor,
+            purpose="migrate",
+        )
+    with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=_pins(),
+            window=name,  # type: ignore[arg-type]
+            purpose="migrate",
+        )
 
 
 def _migrations_with(**changes: Any) -> dict[str, Any]:
@@ -3042,7 +3117,11 @@ def test_migrations_render_requires_the_reviewed_bridge_image() -> None:
 def test_migrations_render_refuses_an_image_not_pinned_by_digest(image: str) -> None:
     with pytest.raises(wiring.WiringError, match="migrations_image_not_digest_pinned"):
         wiring.render_migrations_task_definition(
-            _migrations_task_definition(), image=image, pins=_pins()
+            _migrations_task_definition(),
+            image=image,
+            pins=_pins(),
+            window=mw.WINDOW_035,
+            purpose="migrate",
         )
 
 
@@ -3078,6 +3157,10 @@ def test_cli_render_migrations_taskdef_from_a_readback_file(
     code, out, err = _run(
         [
             "render-migrations-taskdef",
+            "--window",
+            "035",
+            "--purpose",
+            "migrate",
             "--params",
             str(params),
             "--readback-file",
@@ -3098,6 +3181,10 @@ def test_cli_render_migrations_taskdef_from_a_readback_file(
     code, out, err = _run(
         [
             "render-migrations-taskdef",
+            "--window",
+            "035",
+            "--purpose",
+            "migrate",
             "--params",
             str(params),
             "--readback-file",
@@ -3252,6 +3339,10 @@ def test_cli_render_migrations_refuses_to_register_an_identical_revision_again(
     params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
     args = [
         "render-migrations-taskdef",
+        "--window",
+        "035",
+        "--purpose",
+        "migrate",
         "--params",
         str(params),
         "--readback-file",
@@ -3310,7 +3401,11 @@ def test_manifest_f1_and_deployment_text_is_current() -> None:
     ):
         assert stale not in text, stale
     raw = MANIFEST.read_text(encoding="utf-8")
-    assert raw.count("PENDING OWNER CONFIRMATION") == 2
+    # The owner confirmed ManagedBy=manual on 2026-10-20 (roles and new
+    # task-definition revisions): no pending wording is left.
+    assert "PENDING OWNER CONFIRMATION" not in raw.upper()
+    assert raw.count("OWNER CONFIRMED") == 2
+    assert "every new\n  # task-definition revision, app and migrations alike" in raw
     assert "PR #118" in text and "PR #120" in text
     for current in (
         "residual 5",
@@ -3381,6 +3476,10 @@ def test_an_equal_newest_revision_outside_this_family_is_never_reused(
     code, out, err = _run(
         [
             "render-migrations-taskdef",
+            "--window",
+            "035",
+            "--purpose",
+            "migrate",
             "--params",
             str(params),
             "--readback-file",
@@ -3404,3 +3503,460 @@ def test_an_equal_newest_revision_of_this_family_is_reported(
     )
     status, _again = _migrations(fake)
     assert status["run_task_definition"] == MIGRATIONS_NEXT_ARN
+
+
+# ---------------------------------------------------------------------------
+# T8: three explicit windows (035, 036, 037), one table, no default window
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["035", "036", "037"])
+def test_each_window_renders_only_its_own_baked_upgrade(name: str) -> None:
+    window = mw.WINDOWS[name]
+    status, rendered = _migrations(window=window)
+    assert status["blocks"] == [], status
+    assert status["window"] == name
+    assert status["command"] == f"alembic upgrade {name}"
+    assert rendered is not None
+    (container,) = rendered["containerDefinitions"]
+    assert container["command"] == ["alembic", "upgrade", name]
+    text = json.dumps(rendered)
+    assert UPGRADE_HEAD.search(text) is None
+    assert "neurostack-staging-migrations:3" not in text
+    others = {other for other in mw.WINDOWS if other != name}
+    assert not any(f'"upgrade", "{other}"' in text for other in others)
+
+
+@pytest.mark.parametrize(
+    "name,command",
+    [
+        (name, command)
+        for name in ("035", "036", "037")
+        for command in (
+            ("alembic", "upgrade", "head"),
+            ("alembic", "upgrade", "heads"),
+            ("alembic", "upgrade", "035:037"),
+            ("alembic", "upgrade", "+1"),
+            *[
+                ("alembic", "upgrade", other)
+                for other in ("035", "036", "037")
+                if other != name
+            ],
+        )
+    ],
+)
+def test_a_window_refuses_every_other_command(
+    name: str, command: tuple[str, ...]
+) -> None:
+    with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=_pins(),
+            window=mw.WINDOWS[name],
+            purpose="migrate",
+            command=command,
+        )
+
+
+def _registered_for(window: Any, arn: str = MIGRATIONS_NEXT_ARN) -> Any:
+    _status, rendered = _migrations(window=window)
+    assert rendered is not None
+    return _registered_migrations(arn, rendered)
+
+
+@pytest.mark.parametrize(
+    "newest,target,state_or_block",
+    [
+        ("035", "036", "would_register"),
+        ("035", "037", "would_register"),
+        ("036", "037", "would_register"),
+        ("036", "035", "migrations_newest_revision_is_a_later_window"),
+        ("037", "035", "migrations_newest_revision_is_a_later_window"),
+        ("037", "036", "migrations_newest_revision_is_a_later_window"),
+        ("036", "036", "registered"),
+    ],
+)
+def test_the_newest_revision_of_another_window_is_never_reused(
+    newest: str, target: str, state_or_block: str
+) -> None:
+    fake = FakeAws(applied=True)
+    _put_migrations(fake, _registered_for(mw.WINDOWS[newest]), latest=True)
+    status, rendered = _migrations(fake, window=mw.WINDOWS[target])
+    if state_or_block == "would_register":
+        assert status["state"] == "would_register", status
+        assert status["newest_revision_window"] == newest
+        assert status["run_task_definition"] is None
+        assert rendered is not None
+        assert rendered["containerDefinitions"][0]["command"] == [
+            "alembic",
+            "upgrade",
+            target,
+        ]
+    elif state_or_block == "registered":
+        assert status["state"] == f"registered:{MIGRATIONS_NEXT_ARN}"
+        assert status["run_task_definition"] == MIGRATIONS_NEXT_ARN
+    else:
+        assert rendered is None
+        assert f"{state_or_block}:{MIGRATIONS_NEXT_ARN}" in status["blocks"]
+        assert status["run_task_definition"] is None
+
+
+def test_an_earlier_window_revision_that_was_tampered_with_blocks() -> None:
+    fake = FakeAws(applied=True)
+    tampered = _registered_for(mw.WINDOW_035)
+    tampered["taskDefinition"]["containerDefinitions"][0]["environment"] = [
+        {"name": "EXTRA", "value": "1"}
+    ]
+    _put_migrations(fake, tampered, latest=True)
+    status, rendered = _migrations(fake, window=mw.WINDOW_036)
+    assert rendered is None
+    assert (
+        f"migrations_newer_revision_differs:{MIGRATIONS_NEXT_ARN}" in status["blocks"]
+    )
+
+
+def test_cli_render_migrations_taskdef_requires_an_explicit_window(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
+    params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
+    base = ["--params", str(params), "--readback-file", str(snapshot)]
+    for window in (None, "", "head", "034", "038", "035:037"):
+        argv = ["render-migrations-taskdef", *base]
+        if window is not None:
+            argv += ["--window", window]
+        with pytest.raises(SystemExit) as raised:
+            wiring.main(argv)
+        assert raised.value.code == 2
+        assert capsys.readouterr().out == ""
+    for name in ("035", "036", "037"):
+        code, out, err = _run(
+            [
+                "render-migrations-taskdef",
+                "--window",
+                name,
+                "--purpose",
+                "migrate",
+                *base,
+            ],
+            capsys,
+        )
+        assert code == 0, err
+        assert json.loads(out)["containerDefinitions"][0]["command"] == [
+            "alembic",
+            "upgrade",
+            name,
+        ]
+
+
+def test_plan_reports_every_window_step_from_the_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
+    code, out, err = _run(
+        ["plan", "--params", str(PARAMS), "--readback-file", str(snapshot)], capsys
+    )
+    assert code == 0, err
+    plan = json.loads(out)
+    for window in mw.WINDOWS.values():
+        step = _step(plan, window.manifest_step)
+        assert step["scope"] == "separate_approval"
+        assert step["state"] == "not_performed"
+        info = step["info"]
+        assert info["window"] == window.name
+        assert info["command"] == f"alembic upgrade {window.after}"
+        assert info["required_current_revision"] == window.before
+        assert info["target_revision"] == window.after
+        assert info["verification"] == window.verification
+        assert info["snapshot_name_pattern"] == window.snapshot_pattern
+        assert info["run_tooling"] == (
+            f"scripts/asaas_migration_window.py --window {window.name}"
+        )
+    assert UPGRADE_HEAD.search(out) is None
+
+
+def _window_step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
+    step_id = mw.WINDOWS[name].manifest_step
+    return next(row for row in manifest["steps"] if row["id"] == step_id)
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        (name, mutate)
+        for name in ("036", "037")
+        for mutate in (
+            lambda s, n: s.__setitem__(
+                "change",
+                s["change"].replace(f"`alembic upgrade {n}`", "`alembic upgrade head`"),
+            ),
+            lambda s, n: s.__setitem__(
+                "change", s["change"].replace(f"--window {n}", "--window 035")
+            ),
+            lambda s, n: s.__setitem__(
+                "change",
+                (
+                    s["change"] + " then `alembic upgrade 037`"
+                    if n == "036"
+                    else s["change"] + " then `alembic upgrade 036`"
+                ),
+            ),
+            lambda s, n: s.__setitem__(
+                "preconditions",
+                [
+                    row.replace(
+                        f"alembic_version == {mw.WINDOWS[n].before}",
+                        "alembic_version == 032",
+                    )
+                    for row in s["preconditions"]
+                ],
+            ),
+            lambda s, n: s.__setitem__(
+                "verification",
+                [
+                    row.replace(f"alembic_version == {n}", "alembic_version == 035")
+                    for row in s["verification"]
+                ],
+            ),
+            lambda s, n: s.__setitem__(
+                "preconditions",
+                [
+                    row.replace(f"pre-{n}-<date>", "pre-snapshot-<date>")
+                    for row in s["preconditions"]
+                ],
+            ),
+        )
+    ],
+)
+def test_manifest_validator_pins_the_036_and_037_window_steps(
+    name: str, mutate: Callable[[dict[str, Any], str], None]
+) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    mutate(_window_step(manifest, name), name)
+    with pytest.raises(wiring.WiringError, match="manifest_migrations_window"):
+        wiring.validate_manifest(manifest)
+
+
+def test_manifest_window_steps_say_their_own_upgrade_exactly_once() -> None:
+    manifest = wiring.validate_manifest(wiring.load_yaml(MANIFEST))
+    for name, window in mw.WINDOWS.items():
+        step = _window_step(manifest, name)
+        assert wiring._ALEMBIC_UPGRADE.findall(json.dumps(step)) == [name]
+        assert f"`alembic upgrade {name}`" in step["change"]
+        assert f"--window {name}" in step["change"]
+        assert window.snapshot_pattern in json.dumps(step)
+        assert "separate owner approval" in step["approval"]
+    assert manifest["migrations_task_definition"]["windows"] == ["035", "036", "037"]
+
+
+# ---------------------------------------------------------------------------
+# T8 loop: window 037's dedicated read revision (--purpose read)
+# ---------------------------------------------------------------------------
+
+
+def test_the_037_read_revision_bakes_only_the_readback() -> None:
+    status, rendered = _migrations(window=mw.WINDOW_037, purpose="read")
+    assert status["blocks"] == [] and status["purpose"] == "read", status
+    assert rendered is not None
+    (container,) = rendered["containerDefinitions"]
+    command = container["command"]
+    assert command[:2] == ["python", "-c"]
+    assert mw.normalized_read_command(command) == mw.normalized_read_command(
+        ["python", "-c", mw.read_program(mw.WINDOW_037, mw.WINDOW_037.pre_read)]
+    )
+    for field in ("command", "entryPoint", "environment"):
+        assert "alembic" not in json.dumps(container.get(field)).lower(), field
+    _status, migrate = _migrations(window=mw.WINDOW_037, purpose="migrate")
+    assert migrate is not None
+    (migrate_container,) = migrate["containerDefinitions"]
+    assert migrate_container["command"] == ["alembic", "upgrade", "037"]
+    # Same family, image, roles, secret, logs and tags: only the command differs.
+    assert {k: v for k, v in container.items() if k != "command"} == {
+        k: v for k, v in migrate_container.items() if k != "command"
+    }
+    assert {k: v for k, v in rendered.items() if k != "containerDefinitions"} == {
+        k: v for k, v in migrate.items() if k != "containerDefinitions"
+    }
+
+
+@pytest.mark.parametrize("name", ["035", "036"])
+def test_only_window_037_has_a_read_revision(
+    name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, rendered = _migrations(window=mw.WINDOWS[name], purpose="read")
+    assert rendered is None
+    assert f"migrations_read_revision_not_needed:{name}" in status["blocks"]
+    snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
+    params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
+    code, out, err = _run(
+        [
+            "render-migrations-taskdef",
+            "--window",
+            name,
+            "--purpose",
+            "read",
+            "--params",
+            str(params),
+            "--readback-file",
+            str(snapshot),
+        ],
+        capsys,
+    )
+    assert code == 2 and out == ""
+    assert f"migrations_read_revision_not_needed:{name}" in err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("alembic", "upgrade", "037"),
+        (
+            "python",
+            "-c",
+            mw.read_program(mw.WINDOW_037, mw.WINDOW_037.pre_read) + "# alembic",
+        ),
+        (
+            "python",
+            "-c",
+            mw.read_program(mw.WINDOW_036, mw.WINDOW_036.pre_read),
+        ),
+        ("sh", "-c", "alembic upgrade 037"),
+    ],
+)
+def test_the_read_purpose_refuses_any_other_command(command: tuple[str, ...]) -> None:
+    with pytest.raises(wiring.WiringError, match="migrations_command_not_pinned"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=_pins(),
+            window=mw.WINDOW_037,
+            purpose="read",
+            command=command,
+        )
+
+
+def test_a_read_revision_never_carries_the_migration_tool_in_its_environment() -> None:
+    fake = FakeAws(applied=True)
+    _put_migrations(
+        fake,
+        _migrations_task_definition(
+            environment=[{"name": "ALEMBIC_CONFIG", "value": "/app/alembic.ini"}]
+        ),
+    )
+    status, rendered = _migrations(fake, window=mw.WINDOW_037, purpose="read")
+    assert rendered is None
+    assert "migrations_read_revision_names_the_migration_tool" in status["blocks"]
+
+
+@pytest.mark.parametrize("purpose", ["", "both", "head", None])
+def test_the_purpose_is_explicit_and_required(
+    purpose: str | None, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
+    params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
+    argv = [
+        "render-migrations-taskdef",
+        "--window",
+        "037",
+        "--params",
+        str(params),
+        "--readback-file",
+        str(snapshot),
+    ]
+    if purpose is not None:
+        argv += ["--purpose", purpose]
+    with pytest.raises(SystemExit) as raised:
+        wiring.main(argv)
+    assert raised.value.code == 2
+    assert capsys.readouterr().out == ""
+    with pytest.raises(wiring.WiringError, match="migrations_purpose_unknown"):
+        wiring.render_migrations_task_definition(
+            _migrations_task_definition(),
+            image=OVERRIDE_IMAGE,
+            pins=_pins(),
+            window=mw.WINDOW_037,
+            purpose=purpose or "",
+        )
+
+
+@pytest.mark.parametrize(
+    "newest,target,expected",
+    [
+        ("read", "migrate", "would_register"),
+        ("migrate", "read", "would_register"),
+        ("read", "read", "registered"),
+        ("migrate", "migrate", "registered"),
+    ],
+)
+def test_the_037_read_and_migrate_revisions_are_registered_separately(
+    newest: str, target: str, expected: str
+) -> None:
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(window=mw.WINDOW_037, purpose=newest)
+    assert rendered is not None
+    _put_migrations(
+        fake, _registered_migrations(MIGRATIONS_NEXT_ARN, rendered), latest=True
+    )
+    status, again = _migrations(fake, window=mw.WINDOW_037, purpose=target)
+    if expected == "registered":
+        assert status["state"] == f"registered:{MIGRATIONS_NEXT_ARN}"
+        assert status["run_task_definition"] == MIGRATIONS_NEXT_ARN
+    else:
+        assert status["state"] == "would_register", status
+        assert status["newest_revision_purpose"] == newest
+        assert status["run_task_definition"] is None
+        assert again is not None
+
+
+def test_a_read_revision_rendered_by_another_zlib_is_still_recognised() -> None:
+    import base64
+    import gzip
+
+    fake = FakeAws(applied=True)
+    _status, rendered = _migrations(window=mw.WINDOW_037, purpose="read")
+    assert rendered is not None
+    registered = _registered_migrations(MIGRATIONS_NEXT_ARN, rendered)
+    container = registered["taskDefinition"]["containerDefinitions"][0]
+    header = mw._READ_HEADER.match(container["command"][2])
+    assert header is not None
+    other = base64.b64encode(
+        gzip.compress(mw.read_payload(mw.WINDOW_037.pre_read), compresslevel=1, mtime=0)
+    ).decode()
+    assert other != header.group("payload")
+    container["command"][2] = container["command"][2].replace(
+        header.group("payload"), other
+    )
+    _put_migrations(fake, registered, latest=True)
+    status, _again = _migrations(fake, window=mw.WINDOW_037, purpose="read")
+    assert status["state"] == f"registered:{MIGRATIONS_NEXT_ARN}"
+
+
+@pytest.mark.parametrize("purpose", ["migrate", "read"])
+def test_the_same_window_and_purpose_on_another_image_is_never_reused(
+    purpose: str,
+) -> None:
+    """P03: the newest revision is this window's and purpose's exact rendering
+    but on another image: a new registration would silently fork the window,
+    so it blocks for review instead."""
+
+    window = mw.WINDOW_037 if purpose == "read" else mw.WINDOW_036
+    other_image = OVERRIDE_IMAGE.replace("sha256:" + "2" * 64, "sha256:" + "5" * 64)
+    assert other_image != OVERRIDE_IMAGE
+    rendered = wiring.render_migrations_task_definition(
+        _migrations_task_definition(),
+        image=other_image,
+        pins=_pins(),
+        window=window,
+        purpose=purpose,
+    )
+    fake = FakeAws(applied=True)
+    _put_migrations(
+        fake, _registered_migrations(MIGRATIONS_NEXT_ARN, rendered), latest=True
+    )
+    status, again = _migrations(fake, window=window, purpose=purpose)
+    assert again is None
+    assert status["run_task_definition"] is None
+    assert (
+        f"migrations_newer_revision_differs:{MIGRATIONS_NEXT_ARN}" in status["blocks"]
+    )

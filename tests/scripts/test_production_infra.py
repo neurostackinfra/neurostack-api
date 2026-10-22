@@ -27,6 +27,7 @@ EXPECTED_TESTS = (
     "tests/scripts/test_package_asaas_build_ui_evidence.py",
     "tests/scripts/test_asaas_production_wiring.py",
     "tests/scripts/test_asaas_deploy_hook.py",
+    "tests/scripts/test_asaas_migration_window.py",
     "tests/scripts/test_production_migration_window.py",
     "tests/api/test_billing_producer_build_trust.py",
 )

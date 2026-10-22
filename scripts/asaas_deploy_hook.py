@@ -533,6 +533,10 @@ def load_readback(path: Path) -> Readback:
 class LogTarget:
     group: str
     stream_prefix: str
+    # The awslogs stream is <prefix>/<container>/<task id>. The hook reads the
+    # ``app`` container; scripts/asaas_migration_window.py reuses the reader
+    # for the one-container migrations and read task families.
+    container: str = APP_CONTAINER
 
 
 def validate_expected_arn(value: Any) -> str:
@@ -583,7 +587,7 @@ def describe_tasks_request(task_arn: str) -> dict[str, Any]:
 def log_events_request(
     log: LogTarget, task_id: str, next_token: str | None = None
 ) -> dict[str, Any]:
-    """One page of the task's ``app`` stream, oldest first.
+    """One page of the task's container stream (``app`` here), oldest first.
 
     The first page has no ``nextToken``. Each later page sends the previous
     response's ``nextForwardToken``; the stream is read to its end when a
@@ -592,7 +596,7 @@ def log_events_request(
 
     request: dict[str, Any] = {
         "logGroupName": log.group,
-        "logStreamName": f"{log.stream_prefix}/{APP_CONTAINER}/{task_id}",
+        "logStreamName": f"{log.stream_prefix}/{log.container}/{task_id}",
         "startFromHead": True,
         "limit": LOG_EVENTS_LIMIT,
     }
