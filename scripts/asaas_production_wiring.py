@@ -8,10 +8,15 @@ JSON diff: what would change, what is already compliant and what blocks.
 ``render-taskdef`` prints the proposed task definition request, derived from the
 live D3 source revision, with secrets as ARN references only, the otel image
 pinned by digest and ``ManagedBy=manual``. ``check`` runs the existing rollout
-evidence validators against that request. ``render-migrations-taskdef`` prints
-a new ``neurostack-staging-migrations`` revision that bakes exactly
-``MIGRATIONS_COMMAND`` on the reviewed bridge image; revision 3 is only read.
-The service rollback target is the manifest field ``rollback_target``.
+evidence validators against that request. ``render-migrations-taskdef
+--window 035|036|037 --purpose migrate|read`` (both required, no default)
+prints a new ``neurostack-staging-migrations`` revision that bakes exactly
+that window's ``alembic upgrade <window>`` (``migrate``) or, for window 037
+only, its SELECT-only readback program run as the migration role (``read``);
+revision 3 is only read.
+The windows are the table of ``scripts/asaas_migration_window.py``, which also
+runs them. The service rollback target is the manifest field
+``rollback_target``.
 
 Every AWS request passes through :class:`ReadOnlyAws`, which allows only an
 exact list of Describe/Get/List operations and never ``GetSecretValue``;
@@ -42,6 +47,7 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
+from scripts import asaas_migration_window as migration_window  # noqa: E402
 from scripts import asaas_producer_rollout_evidence as evidence  # noqa: E402
 from scripts import verify_asaas_producer_image_rollout as rollout  # noqa: E402
 from src.config.settings import Settings  # noqa: E402
@@ -180,29 +186,39 @@ ADDED_ENVIRONMENT: dict[str, tuple[str, str]] = {
 ADDED_SECRETS = tuple(row[0] for row in SECRET_REFERENCES)
 FORBIDDEN_NAME_PREFIXES = ("ABACATEPAY_", "APPCONFIG_")
 FORBIDDEN_NAMES = frozenset({"SPA_ENABLED", "SPA_DIST_DIR"})
+# Three production migration windows, each its own separately approved step:
+# the window table of scripts/asaas_migration_window.py is the single source
+# (command, alembic_version before and after, snapshot name, readback, image
+# prerequisite). Each window bakes exactly ``alembic upgrade <window>``, never
+# the head, so 036 and 037 only ever run on their own owner instruction, 036
+# before 037, after a fresh SELECT showing zero legacy rows.
+MIGRATION_WINDOWS = migration_window.WINDOWS
 STEPS: tuple[tuple[str, str], ...] = (
     ("secret_access_stack", "d3_apply"),
     ("task_definition_revision", "d3_apply"),
     ("financial_egress_closed", "d3_apply"),
     ("signed_image_build_and_attestation", "separate_approval"),
-    ("migrations_033_035", "separate_approval"),
+    (migration_window.WINDOW_035.manifest_step, "separate_approval"),
     ("service_deployment", "separate_approval"),
     ("spa_serving", "separate_approval"),
     ("webhook_exposure_and_registration", "separate_approval"),
+    (migration_window.WINDOW_036.manifest_step, "separate_approval"),
+    (migration_window.WINDOW_037.manifest_step, "separate_approval"),
     ("rollout_transitions", "separate_approval"),
 )
-# The 033-035 window applies exactly revision 035. Migrations 036 and 037 each
-# need their own explicit owner instruction (036 before 037, after a fresh
-# SELECT showing zero legacy rows), so the window never upgrades to the head.
-MIGRATIONS_STEP = "migrations_033_035"
-MIGRATIONS_SOURCE_REVISION = "032"
-MIGRATIONS_TARGET_REVISION = "035"
-MIGRATIONS_COMMAND = ("alembic", "upgrade", MIGRATIONS_TARGET_REVISION)
-MIGRATIONS_VERIFICATION = f"read back alembic_version == {MIGRATIONS_TARGET_REVISION}"
-MIGRATIONS_EXCLUDED = (
-    "036 and 037: each needs its own explicit owner instruction, 036 before "
-    "037, after a fresh SELECT showing zero legacy rows"
-)
+# What each window leaves to a later window (printed by plan).
+MIGRATIONS_EXCLUDED: Mapping[str, str] = {
+    "035": (
+        "036 and 037: their own windows (migrations_036, migrations_037), each "
+        "on its own explicit owner instruction, 036 before 037, after a fresh "
+        "SELECT showing zero legacy rows"
+    ),
+    "036": (
+        "037: its own window (migrations_037), on its own explicit owner "
+        "instruction after 036 is verified"
+    ),
+    "037": "none: 037 is the last written revision",
+}
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)
 _ALEMBIC_UPGRADE = re.compile(r"alembic\s+upgrade\s+([^\s`'\"),.;]+)", re.IGNORECASE)
 _ALEMBIC_VERSION = re.compile(r"alembic_version\s*==\s*(\w+)")
@@ -210,13 +226,13 @@ _PINNED_ALEMBIC_REVISION = re.compile(r"^[0-9]{3}$")
 # The one-off migrations family. Revision 3 bakes the unpinned upgrade, so it
 # is only read (roles, the database-url-migrations secret, sizing, logs) and
 # never run: render-migrations-taskdef registers a new revision whose command
-# is exactly MIGRATIONS_COMMAND, on the reviewed bridge image.
-MIGRATIONS_FAMILY = "neurostack-staging-migrations"
-MIGRATIONS_TASK_SOURCE_REVISION = 3
+# is exactly the chosen window's upgrade.
+MIGRATIONS_FAMILY = migration_window.MIGRATIONS_FAMILY
+MIGRATIONS_TASK_SOURCE_REVISION = migration_window.MIGRATIONS_SOURCE_REVISION
 MIGRATIONS_TASK_SOURCE_ARN = task_definition_arn(
     MIGRATIONS_FAMILY, MIGRATIONS_TASK_SOURCE_REVISION
 )
-MIGRATIONS_DATABASE_SECRET_NAME = "neurostack/staging/database-url-migrations"
+MIGRATIONS_DATABASE_SECRET_NAME = migration_window.MIGRATIONS_DATABASE_SECRET
 _MIGRATIONS_DATABASE_SECRET_ARN = re.compile(
     rf"^arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:"
     rf"{re.escape(MIGRATIONS_DATABASE_SECRET_NAME)}-[A-Za-z0-9]{{6}}$"
@@ -629,7 +645,13 @@ def _expected_migrations_section() -> dict[str, Any]:
         "source_revision": MIGRATIONS_TASK_SOURCE_REVISION,
         "database_secret_name": MIGRATIONS_DATABASE_SECRET_NAME,
         "image": IMAGE_PARAMETER,
-        "command": "MIGRATIONS_COMMAND",
+        "command": "per_window_exact_upgrade",
+        "windows": list(MIGRATION_WINDOWS),
+        "read_revisions": [
+            name
+            for name, window in MIGRATION_WINDOWS.items()
+            if migration_window.needs_read_revision(window)
+        ],
         "tag_overrides": dict(TAG_OVERRIDES),
     }
 
@@ -853,29 +875,56 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     _require(
         serialized.count("ABACATEPAY") == 1, "manifest_abacatepay_outside_forbidden"
     )
-    _validate_migrations_window(document, serialized)
+    _validate_migration_windows(document, serialized)
     return document
 
 
-def _validate_migrations_window(document: dict[str, Any], serialized: str) -> None:
-    """The 033-035 window names exactly ``alembic upgrade 035``, nothing wider."""
+def _validate_migration_windows(document: dict[str, Any], serialized: str) -> None:
+    """Each window step names exactly its own upgrade; nothing else names one.
 
-    step = next(row for row in document["steps"] if row["id"] == MIGRATIONS_STEP)
-    command = "`" + " ".join(MIGRATIONS_COMMAND) + "`"
+    The step of window W says ``alembic upgrade W`` once (in its change, in
+    backticks, with ``--window W`` and its snapshot name pattern), reads back
+    ``alembic_version == <before>`` first and ``== W`` after; no other text of
+    the manifest names an upgrade, and nothing names the head or a relative
+    target.
+    """
+
+    window_steps = {window.manifest_step for window in MIGRATION_WINDOWS.values()}
+    remainder = dict(document)
+    remainder["steps"] = [
+        row for row in document["steps"] if row["id"] not in window_steps
+    ]
     _require(
         _UNPINNED_UPGRADE.search(serialized) is None
-        and _ALEMBIC_UPGRADE.findall(serialized) == [MIGRATIONS_TARGET_REVISION]
-        and command in step["change"],
-        "manifest_migrations_window_not_pinned_to_035",
+        and _ALEMBIC_UPGRADE.findall(_canonical(remainder)) == [],
+        "manifest_migrations_window_upgrade_outside_its_step",
     )
-    preconditions = "\n".join(step["preconditions"])
-    verification = "\n".join(step["verification"])
-    _require(
-        _ALEMBIC_VERSION.findall(preconditions) == [MIGRATIONS_SOURCE_REVISION]
-        and MIGRATIONS_VERIFICATION in verification
-        and _ALEMBIC_VERSION.findall(verification) == [MIGRATIONS_TARGET_REVISION],
-        "manifest_migrations_window_readback_not_pinned",
-    )
+    steps = {row["id"]: row for row in document["steps"]}
+    for window in MIGRATION_WINDOWS.values():
+        step = steps[window.manifest_step]
+        text = _canonical(step)
+        purposes = ["migrate"] + (
+            ["read"] if migration_window.needs_read_revision(window) else []
+        )
+        _require(
+            _ALEMBIC_UPGRADE.findall(text) == [window.after]
+            and f"`{window.command_text}`" in step["change"]
+            and all(
+                f"--window {window.name} --purpose {purpose}" in step["change"]
+                for purpose in purposes
+            )
+            and ("--purpose read" in step["change"]) == ("read" in purposes)
+            and window.snapshot_pattern in text,
+            f"manifest_migrations_window_not_pinned:{window.name}",
+        )
+        preconditions = "\n".join(step["preconditions"])
+        verification = "\n".join(step["verification"])
+        _require(
+            _ALEMBIC_VERSION.findall(preconditions) == [window.before]
+            and window.verification in verification
+            and _ALEMBIC_VERSION.findall(verification) == [window.after],
+            f"manifest_migrations_window_readback_not_pinned:{window.name}",
+        )
 
 
 def validate_parameters(raw: Any) -> dict[str, Any]:
@@ -1513,12 +1562,64 @@ def render_task_definition(
     return request
 
 
-def _migrations_command_pinned(command: tuple[str, ...]) -> bool:
+# What a migrations revision is for: ``migrate`` bakes the window's exact
+# upgrade; ``read`` (window 037 only) bakes the window's SELECT-only readback
+# program, run as the migration role, which never invokes the migration tool
+# (it reads the alembic_version table; as a backstop the rendered command,
+# entry point and environment never mention the tool).
+MIGRATIONS_PURPOSES = ("migrate", "read")
+
+
+def _read_spec(window: migration_window.MigrationWindow) -> Any:
+    """The window's read that runs as the migration role."""
+
+    for spec in (window.pre_read, window.post_read):
+        if spec.role == migration_window.READ_ROLE_MIGRATIONS:
+            return spec
+    raise WiringError(f"migrations_read_revision_not_needed:{window.name}")
+
+
+def migrations_command(
+    window: migration_window.MigrationWindow, purpose: str
+) -> tuple[str, ...]:
+    """The command a migrations revision bakes for this window and purpose."""
+
+    _require(purpose in MIGRATIONS_PURPOSES, "migrations_purpose_unknown")
+    if purpose == "migrate":
+        return tuple(window.command)
     return (
-        _PINNED_ALEMBIC_REVISION.fullmatch(MIGRATIONS_TARGET_REVISION) is not None
-        and tuple(MIGRATIONS_COMMAND)
-        == ("alembic", "upgrade", MIGRATIONS_TARGET_REVISION)
-        and tuple(command) == tuple(MIGRATIONS_COMMAND)
+        "python",
+        "-c",
+        migration_window.read_program(window, _read_spec(window)),
+    )
+
+
+def _migrations_command_pinned(
+    window: Any, purpose: Any, command: tuple[str, ...]
+) -> bool:
+    """The window is a table entry and the command is exactly its baked one."""
+
+    name = getattr(window, "name", None)
+    if not (
+        isinstance(name, str)
+        and MIGRATION_WINDOWS.get(name) == window
+        and _PINNED_ALEMBIC_REVISION.fullmatch(window.after) is not None
+        and tuple(window.command) == ("alembic", "upgrade", window.after)
+    ):
+        return False
+    if purpose == "migrate":
+        return tuple(command) == tuple(window.command)
+    if purpose != "read":
+        return False
+    # migrations_command refuses a window without a migration-role read.
+    normalized = migration_window.normalized_read_command(list(command))
+    return (
+        normalized is not None
+        and normalized
+        == migration_window.normalized_read_command(
+            list(migrations_command(window, "read"))
+        )
+        and migration_window._MIGRATION_TOOL.search(json.dumps(list(command))) is None
     )
 
 
@@ -1546,18 +1647,31 @@ def render_migrations_task_definition(
     *,
     image: str,
     pins: ManifestPins,
+    window: migration_window.MigrationWindow,
+    purpose: str,
     command: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """A new migrations revision: revision 3 with the image and command replaced.
 
-    The command is baked into the revision (no override at run time) and must be
-    exactly ``MIGRATIONS_COMMAND``; anything else is refused. Roles, the
+    The command is baked into the revision (no override at run time). For
+    ``purpose="migrate"`` it must be exactly the window's ``alembic upgrade
+    <window>``; for ``purpose="read"`` (window 037 only) exactly the window's
+    SELECT-only readback program, with no mention of the migration tool in the
+    command, entry point or environment. Anything else is refused. Roles, the
     ``database-url-migrations`` secret, sizing and logs come from revision 3,
     which is only read and never run.
     """
 
+    _require(purpose in MIGRATIONS_PURPOSES, "migrations_purpose_unknown")
+    # For "read", migrations_command refuses a window without a migration-role
+    # read (migrations_read_revision_not_needed:<window>).
+    baked = (
+        migrations_command(window, purpose)
+        if command is None and isinstance(window, migration_window.MigrationWindow)
+        else (command or ())
+    )
     _require(
-        _migrations_command_pinned(MIGRATIONS_COMMAND if command is None else command),
+        _migrations_command_pinned(window, purpose, baked),
         "migrations_command_not_pinned",
     )
     definition = (
@@ -1609,7 +1723,18 @@ def render_migrations_task_definition(
         "migrations_database_secret_mismatch",
     )
     container["image"] = image
-    container["command"] = list(MIGRATIONS_COMMAND)
+    container["command"] = list(baked)
+    if purpose == "read":
+        _require(
+            all(
+                migration_window._MIGRATION_TOOL.search(
+                    json.dumps(container.get(field))
+                )
+                is None
+                for field in ("command", "entryPoint", "environment")
+            ),
+            "migrations_read_revision_names_the_migration_tool",
+        )
     apply_tag_overrides(request, pins.tag_overrides)
     forbidden = forbidden_names_in(request)
     _require(not forbidden, "forbidden_name_in_rendering:" + ",".join(forbidden))
@@ -1645,16 +1770,74 @@ def collect_migrations_readback(
     }
 
 
+def _window_of_revision(
+    latest_response: Any, source_response: Any, pins: ManifestPins
+) -> tuple[migration_window.MigrationWindow, str] | None:
+    """The (window, purpose) a registered revision exactly renders, if any."""
+
+    definition = (
+        latest_response.get("taskDefinition")
+        if isinstance(latest_response, dict)
+        else None
+    )
+    rows = (
+        definition.get("containerDefinitions") if isinstance(definition, dict) else None
+    )
+    if not (isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)):
+        return None
+    command, image = rows[0].get("command"), rows[0].get("image")
+    for window in MIGRATION_WINDOWS.values():
+        for purpose in MIGRATIONS_PURPOSES:
+            if purpose == "read" and not migration_window.needs_read_revision(window):
+                continue
+            expected = list(migrations_command(window, purpose))
+            if not isinstance(image, str) or (
+                command != expected
+                and (
+                    migration_window.normalized_read_command(command) is None
+                    or migration_window.normalized_read_command(command)
+                    != migration_window.normalized_read_command(expected)
+                )
+            ):
+                continue
+            try:
+                rendered = render_migrations_task_definition(
+                    source_response,
+                    image=image,
+                    pins=pins,
+                    window=window,
+                    purpose=purpose,
+                )
+                same = _comparable(
+                    _request_from_response(_without_fault_injection(latest_response))
+                ) == _comparable(rendered)
+            except WiringError:
+                return None
+            return (window, purpose) if same else None
+    return None
+
+
 def plan_migrations(
-    readback: dict[str, Any], parameters: dict[str, Any], *, pins: ManifestPins
+    readback: dict[str, Any],
+    parameters: dict[str, Any],
+    *,
+    pins: ManifestPins,
+    window: migration_window.MigrationWindow,
+    purpose: str,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Status of the migrations revision plus the request, None when blocked."""
+    """Status of the window's migrations revision plus the request, or None."""
 
     image = parameters[IMAGE_PARAMETER]
     status: dict[str, Any] = {
         "family": MIGRATIONS_FAMILY,
         "read_only_source": MIGRATIONS_TASK_SOURCE_ARN,
-        "command": " ".join(MIGRATIONS_COMMAND),
+        "window": getattr(window, "name", None),
+        "purpose": purpose,
+        "command": (
+            " ".join(getattr(window, "command", ()))
+            if purpose == "migrate"
+            else "SELECT-only readback program (python -c)"
+        ),
         "blocks": [],
         "state": None,
         "run_task_definition": None,
@@ -1671,7 +1854,11 @@ def plan_migrations(
         status["blocks"].append("migrations_image_not_found_in_ecr")
     try:
         rendered = render_migrations_task_definition(
-            readback.get("source"), image=image, pins=pins
+            readback.get("source"),
+            image=image,
+            pins=pins,
+            window=window,
+            purpose=purpose,
         )
     except WiringError as exc:
         status["blocks"].append(str(exc))
@@ -1696,9 +1883,29 @@ def plan_migrations(
             ) == _comparable(rendered)
         except WiringError:
             same = False
+        order = list(MIGRATION_WINDOWS)
+        previous = (
+            None
+            if same
+            else _window_of_revision(latest_response, readback.get("source"), pins)
+        )
         if same and isinstance(latest_arn, str):
             status["state"] = f"registered:{latest_arn}"
             status["run_task_definition"] = latest_arn
+        elif previous is not None and (
+            order.index(previous[0].name) < order.index(window.name)
+            or (previous[0].name == window.name and previous[1] != purpose)
+        ):
+            # The newest revision is an exact rendering of an earlier window,
+            # or of this window's other purpose: this one gets its own new
+            # revision (one migrates, the other only reads).
+            status["state"] = "would_register"
+            status["newest_revision_window"] = previous[0].name
+            status["newest_revision_purpose"] = previous[1]
+        elif previous is not None and previous[0].name != window.name:
+            status["blocks"].append(
+                f"migrations_newest_revision_is_a_later_window:{latest_arn}"
+            )
         else:
             status["blocks"].append(f"migrations_newer_revision_differs:{latest_arn}")
     if status["blocks"]:
@@ -1732,6 +1939,11 @@ def _comparable(request: dict[str, Any]) -> str:
         for container in containers:
             if not isinstance(container, dict):
                 continue
+            # A baked read program compares by its SQL digest, not by the
+            # gzip bytes of whichever zlib build rendered it.
+            read = migration_window.normalized_read_command(container.get("command"))
+            if read is not None:
+                container["command"] = read
             for field in ("environment", "secrets"):
                 rows = container.get(field)
                 if isinstance(rows, list):
@@ -2705,19 +2917,28 @@ def _plan_gates(
             "F1_group5_template_validator_regression:not_evaluated"
         )
 
-    steps[MIGRATIONS_STEP].info.update(
-        {
-            "alembic_version": (
-                "not readable through AWS APIs; read it back with the migrations "
-                "one-off task before the window"
-            ),
-            "required_current_revision": MIGRATIONS_SOURCE_REVISION,
-            "command": " ".join(MIGRATIONS_COMMAND),
-            "target_revision": MIGRATIONS_TARGET_REVISION,
-            "verification": MIGRATIONS_VERIFICATION,
-            "excluded_revisions": MIGRATIONS_EXCLUDED,
-        }
-    )
+    for window in MIGRATION_WINDOWS.values():
+        steps[window.manifest_step].info.update(
+            {
+                "window": window.name,
+                "alembic_version": (
+                    "not readable through AWS APIs; read back with a SELECT-only "
+                    "read task before and after the window"
+                ),
+                "required_current_revision": window.before,
+                "command": window.command_text,
+                "target_revision": window.after,
+                "verification": window.verification,
+                "snapshot_name_pattern": window.snapshot_pattern,
+                "pre_read": window.pre_read.sql_file,
+                "image_prerequisite": window.image_rule,
+                "run_tooling": (
+                    f"scripts/asaas_migration_window.py --window {window.name}"
+                ),
+                "plan_steps": dict(window.plan_steps),
+                "excluded_revisions": MIGRATIONS_EXCLUDED[window.name],
+            }
+        )
 
     deployment = steps["service_deployment"]
     _plan_rollback_target(deployment, readback, pins)
@@ -2998,10 +3219,17 @@ def _render_migrations_from_args(
 
     manifest, parameters, digests = load_inputs(args.manifest, args.params)
     assert parameters is not None
+    window = MIGRATION_WINDOWS.get(args.window)
+    _require(window is not None, "migrations_window_unknown")
+    assert window is not None
     aws = _aws_from_args(args, transport_factory, digests)
     readback = collect_migrations_readback(aws, parameters)
     status, rendered = plan_migrations(
-        readback, parameters, pins=manifest_pins(manifest)
+        readback,
+        parameters,
+        pins=manifest_pins(manifest),
+        window=window,
+        purpose=args.purpose,
     )
     _require(rendered is not None, "migrations_blocked:" + ",".join(status["blocks"]))
     assert rendered is not None
@@ -3035,6 +3263,13 @@ def main(
             sub.add_argument("--readback-file", type=Path, default=None)
         if name == "render-migrations-taskdef":
             sub.add_argument("--force-new-revision", action="store_true")
+            # Required, no default: a window is never rendered by accident.
+            sub.add_argument(
+                "--window", required=True, choices=tuple(MIGRATION_WINDOWS)
+            )
+            # Required, no default: ``migrate`` bakes the window's upgrade,
+            # ``read`` (window 037) bakes its SELECT-only readback.
+            sub.add_argument("--purpose", required=True, choices=MIGRATIONS_PURPOSES)
     args = parser.parse_args(argv)
     try:
         if args.command == "check-manifest":

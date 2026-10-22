@@ -1,0 +1,176 @@
+{
+ "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app).",
+ "runs": {
+  "post_035_at_035": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"035\",\"phase\":\"post\",\"payload_sha256\":\"58db831ad117baa99eaf9b53caa20348065920687b32f6f71152d22f887e56b9\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"035\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"ok\",\"rows\":0}"
+   ]
+  },
+  "post_036_after_refusal": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"036\",\"phase\":\"post\",\"payload_sha256\":\"58db831ad117baa99eaf9b53caa20348065920687b32f6f71152d22f887e56b9\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"035\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"ok\",\"rows\":0}"
+   ]
+  },
+  "post_036_at_035": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"036\",\"phase\":\"post\",\"payload_sha256\":\"58db831ad117baa99eaf9b53caa20348065920687b32f6f71152d22f887e56b9\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"035\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"ok\",\"rows\":0}"
+   ]
+  },
+  "post_036_at_036": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"036\",\"phase\":\"post\",\"payload_sha256\":\"58db831ad117baa99eaf9b53caa20348065920687b32f6f71152d22f887e56b9\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"036\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"ok\",\"rows\":0}"
+   ]
+  },
+  "post_037_at_037": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"037\",\"phase\":\"post\",\"payload_sha256\":\"3cda8fbb1ba6a11d83c7fda64ed526af9c2f449e6cf82e6c798ca0e66f52b369\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"037\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"public.billing_migration_absence_reads\",true]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"public.billing_migration_receipts\",true]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"public.billing_migrations\",true]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"public.billing_roster_control\",true]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"end\",\"status\":\"ok\",\"rows\":4}"
+   ]
+  },
+  "pre_035_at_032": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"035\",\"phase\":\"pre\",\"payload_sha256\":\"4552770b831da889276906d05da77ac1cc5b8b81f07d7bc1684059b96f533054\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"032\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"transactions\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"billing_subscriptions\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"billing_checkout_sessions\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"billing_webhook_deliveries\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[\"billing_migrations\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[\"billing_migration_receipts\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[\"billing_migration_absence_reads\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[\"roster revision not 0\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"row\",\"values\":[\"rollout not disabled\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[\"row level security on counted tables\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"end\",\"status\":\"ok\",\"rows\":10}"
+   ]
+  },
+  "pre_035_rls_red": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"035\",\"phase\":\"pre\",\"payload_sha256\":\"4552770b831da889276906d05da77ac1cc5b8b81f07d7bc1684059b96f533054\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"032\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"transactions\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"billing_subscriptions\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"billing_checkout_sessions\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"billing_webhook_deliveries\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[\"billing_migrations\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[\"billing_migration_receipts\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[\"billing_migration_absence_reads\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[\"roster revision not 0\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"row\",\"values\":[\"rollout not disabled\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[\"row level security on counted tables\",1]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"end\",\"status\":\"ok\",\"rows\":10}"
+   ]
+  },
+  "pre_036_at_035": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"036\",\"phase\":\"pre\",\"payload_sha256\":\"d567c39dd3d8c6338841e868feab60f4c7937672c1d75efb415e61b2fc43f2f0\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"035\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"billing_migrations\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"billing_migration_receipts\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"billing_migration_absence_reads\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"roster revision not 0\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[\"subscriptions not asaas\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[\"subscriptions roster_revision not 1\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[\"checkouts with migration_id\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[\"readiness roster_revision not 0\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"row\",\"values\":[\"unexpired readiness\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[\"row level security on counted tables\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"end\",\"status\":\"ok\",\"rows\":10}"
+   ]
+  },
+  "pre_036_at_036": {
+   "exit_code": 3,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"036\",\"phase\":\"pre\",\"payload_sha256\":\"d567c39dd3d8c6338841e868feab60f4c7937672c1d75efb415e61b2fc43f2f0\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"036\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"error\",\"error_class\":\"UndefinedColumnError\",\"sqlstate\":\"42703\"}"
+   ]
+  },
+  "pre_037_at_036_app_role": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"037\",\"phase\":\"pre\",\"payload_sha256\":\"c2b5178bd97d1871ad23bec800e49ac7b773a8a798042fde3f4dda79887a19bb\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"036\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[1,\"revision\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[2,\"billing_migrations rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[3,\"billing_migration_receipts rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[4,\"billing_migration_absence_reads rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[5,\"roster revision\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[6,\"functions to drop exist\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[7,\"catalog dependents\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[8,\"function sources\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"row\",\"values\":[9,\"columns\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[10,\"owners and privileges\",\"owners or privileges the downgrade would not recreate as neurostack_app: function billing_evidence_timestamp(timestamp with time zone) (owner neurostack_owner, acl default), function billing_migration_snapshot_is_valid(jsonb,text,text,text,text,text,bigint) (owner neurostack_owner, acl default), function billing_provider_evidence_digest(text,text,timestamp with time zone,text,uuid,timestamp with time zone,text,uuid,text,text) (owner neurostack_owner, acl default), function lock_billing_roster_statement() (owner neurostack_owner, acl default), function protect_billing_roster_control() (owner neurostack_owner, acl default), function protect_bound_billing_migration_target() (owner neurostack_owner, acl default), function validate_billing_migration_absence_read() (owner neurostack_owner, acl default), function validate_billing_migration_receipt() (owner neurostack_owner, acl default), function validate_billing_migration_receipt_commit() (owner neurostack_owner, acl default), function validate_billing_provider_evidence() (owner neurostack_owner, acl default), table billing_migration_absence_reads (owner neurostack_owner, acl {neurostack_owner=arwdDxt/neurostack_owner,neurostack_app=arwd/neurostack_owner}), table billing_migration_receipts (owner neurostack_owner, acl {neurostack_owner=arwdDxt/neurostack_owner,neurostack_app=arwd/neurostack_owner}), table billing_migrations (owner neurostack_owner, acl {neurostack_owner=arwdDxt/neurostack_owner,neurostack_app=arwd/neurostack_owner}), table billing_roster_control (owner neurostack_owner, acl {neurostack_owner=arwdDxt/neurostack_owner,neurostack_app=arwd/neurostack_owner})\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"row\",\"values\":[11,\"comments\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":13,\"kind\":\"end\",\"status\":\"ok\",\"rows\":11}"
+   ]
+  },
+  "pre_037_at_036_migration_role": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"037\",\"phase\":\"pre\",\"payload_sha256\":\"c2b5178bd97d1871ad23bec800e49ac7b773a8a798042fde3f4dda79887a19bb\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"036\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[1,\"revision\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[2,\"billing_migrations rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[3,\"billing_migration_receipts rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[4,\"billing_migration_absence_reads rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[5,\"roster revision\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[6,\"functions to drop exist\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[7,\"catalog dependents\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[8,\"function sources\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"row\",\"values\":[9,\"columns\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[10,\"owners and privileges\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"row\",\"values\":[11,\"comments\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":13,\"kind\":\"end\",\"status\":\"ok\",\"rows\":11}"
+   ]
+  },
+  "pre_037_at_037_migration_role": {
+   "exit_code": 3,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"037\",\"phase\":\"pre\",\"payload_sha256\":\"c2b5178bd97d1871ad23bec800e49ac7b773a8a798042fde3f4dda79887a19bb\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"037\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"error\",\"error_class\":\"UndefinedTableError\",\"sqlstate\":\"42P01\"}"
+   ]
+  },
+  "pre_037_comment_red": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"037\",\"phase\":\"pre\",\"payload_sha256\":\"c2b5178bd97d1871ad23bec800e49ac7b773a8a798042fde3f4dda79887a19bb\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"036\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[1,\"revision\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[2,\"billing_migrations rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[3,\"billing_migration_receipts rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[4,\"billing_migration_absence_reads rows\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[5,\"roster revision\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[6,\"functions to drop exist\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[7,\"catalog dependents\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[8,\"function sources\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"row\",\"values\":[9,\"columns\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[10,\"owners and privileges\",\"ok\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"row\",\"values\":[11,\"comments\",\"comments the downgrade would not restore: table public.billing_migrations\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":13,\"kind\":\"end\",\"status\":\"ok\",\"rows\":11}"
+   ]
+  }
+ }
+}

@@ -235,8 +235,10 @@ These are prerequisites to check, not steps to execute now:
 
 Written and tested on disposable PostgreSQL 16 only; **not applied in
 production**. Running it needs its own explicit owner instruction, after
-033-035 are applied and verified, and the production window stays pinned to
-`alembic upgrade 035` until that instruction (see "How the pin moves" below).
+033-035 are applied and verified. Window `036` of
+`scripts/asaas_migration_window.py` runs it, and only that window (see
+"Windows, not a moving pin" below and
+[Migration windows: the run tooling](#migration-windows-the-run-tooling)).
 
 ### What 036 changes
 
@@ -288,18 +290,23 @@ production**. Running it needs its own explicit owner instruction, after
 ### Preflight (SELECT only, immediately before the run)
 
 Read back `alembic_version` (must be `035`), then run these on the target
-database. Every count must be `0`:
+database. Every count must be `0`, including the last row (the counted tables
+with row-level security enabled or forced: under RLS a count could hide
+rows). This query is
+`scripts/migration_036_preflight.sql` (the file adds only comment lines; a
+test keeps the two equal), which window `036` runs as its pre-read:
 
 ```sql
-SELECT 'billing_migrations' AS check, count(*) FROM billing_migrations
-UNION ALL SELECT 'billing_migration_receipts', count(*) FROM billing_migration_receipts
-UNION ALL SELECT 'billing_migration_absence_reads', count(*) FROM billing_migration_absence_reads
-UNION ALL SELECT 'roster revision not 0', count(*) FROM billing_roster_control WHERE billing_roster_revision <> 0
-UNION ALL SELECT 'subscriptions not asaas', count(*) FROM billing_subscriptions WHERE provider IS DISTINCT FROM 'asaas'
-UNION ALL SELECT 'subscriptions roster_revision not 1', count(*) FROM billing_subscriptions WHERE roster_revision <> 1
-UNION ALL SELECT 'checkouts with migration_id', count(*) FROM billing_checkout_sessions WHERE migration_id IS NOT NULL
-UNION ALL SELECT 'readiness roster_revision not 0', count(*) FROM billing_rollout_readiness_receipts WHERE roster_revision <> 0
-UNION ALL SELECT 'unexpired readiness', count(*) FROM billing_rollout_readiness_receipts WHERE expires_at > now();
+SELECT 'billing_migrations' AS check, count(*) FROM public.billing_migrations
+UNION ALL SELECT 'billing_migration_receipts', count(*) FROM public.billing_migration_receipts
+UNION ALL SELECT 'billing_migration_absence_reads', count(*) FROM public.billing_migration_absence_reads
+UNION ALL SELECT 'roster revision not 0', count(*) FROM public.billing_roster_control WHERE billing_roster_revision <> 0
+UNION ALL SELECT 'subscriptions not asaas', count(*) FROM public.billing_subscriptions WHERE provider IS DISTINCT FROM 'asaas'
+UNION ALL SELECT 'subscriptions roster_revision not 1', count(*) FROM public.billing_subscriptions WHERE roster_revision <> 1
+UNION ALL SELECT 'checkouts with migration_id', count(*) FROM public.billing_checkout_sessions WHERE migration_id IS NOT NULL
+UNION ALL SELECT 'readiness roster_revision not 0', count(*) FROM public.billing_rollout_readiness_receipts WHERE roster_revision <> 0
+UNION ALL SELECT 'unexpired readiness', count(*) FROM public.billing_rollout_readiness_receipts WHERE expires_at > now()
+UNION ALL SELECT 'row level security on counted tables', count(*) FROM pg_catalog.pg_class WHERE (relrowsecurity OR relforcerowsecurity) AND oid IN ('public.billing_migrations'::regclass, 'public.billing_migration_receipts'::regclass, 'public.billing_migration_absence_reads'::regclass, 'public.billing_roster_control'::regclass, 'public.billing_subscriptions'::regclass, 'public.billing_checkout_sessions'::regclass, 'public.billing_rollout_readiness_receipts'::regclass);
 ```
 
 These are the same checks the migration runs itself, under `ACCESS
@@ -329,9 +336,15 @@ that lock. While the migration waits, every new read of that table queues
 behind it, which is why the wait is bounded. A timeout raises SQLSTATE
 `55P03` (`canceling statement due to lock timeout`). **55P03 means nothing
 changed**: the whole migration transaction rolled back and `alembic_version`
-is unchanged. Wait for the blocking transaction to end (see
-`pg_stat_activity` and `pg_locks` for the holder; never kill it without the
-owner) and rerun the same one-off task.
+is unchanged. A session that holds one of the seven tables and then asks for
+one the migration already holds can instead make PostgreSQL cancel the
+migration with `40P01` (`deadlock detected`, observed on PostgreSQL 16 in the
+T8 capture): nothing changed either. Report to the owner and stop
+(`verify-result` says so; the post-read confirms `alembic_version` still
+reads `035`). Find the blocking transaction (`pg_stat_activity` and
+`pg_locks`; never kill it without the owner); a rerun is a new attempt of the
+same window on the owner's instruction, with a fresh readback file and
+`render-run-task --attempt <n+1>`.
 
 ### What the application needs
 
@@ -346,24 +359,33 @@ three columns. Verified on PostgreSQL 16 on 2026-10-19:
   NULL without default). That happens only through a handoff or a readiness
   record, which cannot happen while the rollout is `disabled` everywhere.
 
-Order (each step stops on any divergence and returns to the owner):
+Order (each step stops on any divergence and returns to the owner; the
+subcommands are `scripts/asaas_migration_window.py --window 036`, see
+[Migration windows: the run tooling](#migration-windows-the-run-tooling)):
 
 1. **Deploy the E5 image** while every environment sharing the database is
    `disabled`. **Verify:** the ECS deployment is `COMPLETED` and every RUNNING
    task runs the new task definition revision: no task of an earlier image is
    left, because an earlier image cannot read the 036 schema. A `/ready` 200
    alone proves nothing here: under `ENVIRONMENT=staging` it does not probe
-   the database.
+   the database. `plan` checks it again right before the run: every service
+   task on the expected revision and on the image digest of the window's
+   migrations revision, and no task still stopping. The rollback target is
+   re-pinned to revision 9 before this window (gate 6); `plan` refuses
+   otherwise.
 2. **RDS snapshot** (owner decision 2026-10-19 b): take a manual snapshot
    named `pre-036-<date>` of the production database and wait until its
-   status is `available` before going on.
+   status is `available` before going on (`render-snapshot-requests`).
 3. **Preflight readback** (the SELECT above) right before the run; every
-   count `0`, `alembic_version` == `035`.
+   count `0`, `alembic_version` == `035` (`render-pre-read`,
+   `verify-pre-read`).
 4. **Run 036** as a one-off `neurostack-staging-migrations` task on the same
    E5 image, with the command fixed to the exact revision
-   (`alembic upgrade 036`). The service itself never migrates. On `55P03`
-   see "Lock wait" above.
-5. **Verify** `alembic_version` == `036`.
+   (`alembic upgrade 036`; `render-migrations-taskdef --window 036 --purpose migrate`, then
+   `plan`, `render-run-task`, `verify-result`). The service itself never
+   migrates. On `55P03` see "Lock wait" above.
+5. **Verify** `alembic_version` == `036` (`render-post-read`,
+   `verify-post-read`).
 
 Never run 036 under an earlier image.
 
@@ -396,26 +418,31 @@ restored columns are appended, so their physical position differs.
   `migration_id = NULL`.
 - An earlier image runs again only after the downgrade succeeded.
 
-### How the pin moves (separate, deliberate step)
+### Windows, not a moving pin
 
-The production window stays `alembic upgrade 035`: the manifest
-`infra/production/asaas-production-wiring.yaml`, the planner constants in
-`scripts/asaas_production_wiring.py`, gate 5 above,
-`docs/configuration.md` and their tests (`tests/scripts/test_production_migration_window.py`,
-`tests/scripts/test_asaas_production_wiring.py`). Only after the owner's
-explicit instruction to run 036, one reviewed change moves the pin to the
-exact revision `036` in all of them together, with this section's preflight
-as the readback before the run. 037 gets its own instruction and its own
-change. The command always names the exact revision, never the head.
+There is no single production pin to move. There are three fixed windows,
+`035` (migrations 033-035), `036` and `037`, each a separate manifest step
+(`migrations_033_035`, `migrations_036`, `migrations_037`) that runs only on
+its own explicit owner instruction, in that order. The window table of
+`scripts/asaas_migration_window.py` is their single source: the planner
+(`scripts/asaas_production_wiring.py`) validates the three manifest steps
+against it and renders each window's migrations revision from it, and
+`tests/scripts/test_production_migration_window.py` and
+`tests/scripts/test_asaas_production_wiring.py` pin it. Every tool requires
+`--window`; none has a default, so a window is never run by accident. The
+command always names the exact revision, never the head.
+`scripts/deploy-vps.sh` (`APPROVED_ALEMBIC_REVISION`) and
+`docs/configuration.md` name the first window, `035`, and stay there: they
+describe the compose-local database of the VPS and the first-access
+bootstrap, not the production windows.
 
 ## Migration 037: drop the legacy saga and roster objects (Group 10 E6)
 
 Written and tested on disposable PostgreSQL 16 only; **not applied in
 production**. Running it needs its own explicit owner instruction, after 036
-is applied and verified (036 before 037, owner condition of 2026-10-17). The
-production window stays pinned to `alembic upgrade 035`; moving the pin to
-`036` and later to `037` is a separate reviewed change each (see "How the pin
-moves" above).
+is applied and verified (036 before 037, owner condition of 2026-10-17).
+Window `037` of `scripts/asaas_migration_window.py` runs it, and only that
+window (see "Windows, not a moving pin" above).
 
 ### What 037 changes
 
@@ -573,9 +600,9 @@ changed (unrealistic on RDS: the functions were created by migrations, not by
 an extension).
 
 **"036 first" is procedural.** Neither check knows whether 036 was verified
-in production: the production window is pinned to an exact revision (see
-"How the pin moves"), and 037 gets its own owner instruction after 036 is
-verified. A mechanical guard would break the run of the whole chain on a
+in production: each production window bakes an exact revision (see
+"Windows, not a moving pin"), and 037 gets its own owner instruction after
+036 is verified. A mechanical guard would break the run of the whole chain on a
 fresh database in development and CI, which applies 036 and 037 together.
 
 No readiness-receipt check, unlike 036: 037 changes no live column, so no
@@ -600,9 +627,12 @@ session holds one of these tables and waits for one the migration already
 holds, PostgreSQL breaks the cycle and may cancel the migration with SQLSTATE
 `40P01` (`deadlock detected`). **55P03 and 40P01 both mean nothing changed**:
 the whole migration transaction rolled back and `alembic_version` is
-unchanged. Wait for the blocking transaction to end (see `pg_stat_activity`
-and `pg_locks` for the holder; never kill it without the owner) and rerun the
-same one-off task. Once the locks are granted the run takes milliseconds.
+unchanged. Report to the owner and stop (`verify-result` says so; the
+post-read confirms `alembic_version` still reads `036`). Find the blocking
+transaction (`pg_stat_activity` and `pg_locks`; never kill it without the
+owner); a rerun is a new attempt of the same window on the owner's
+instruction, with a fresh readback file and `render-run-task --attempt <n+1>`.
+Once the locks are granted the run takes milliseconds.
 
 ### What the application needs (deploy order)
 
@@ -620,23 +650,39 @@ ORM deletion of a builder that `DELETE /v1/admin/builders/{id}` performs):
   transaction rolls back (nothing deleted). No other code path of that image
   touches the dropped tables.
 
-Order (each step stops on any divergence and returns to the owner):
+Order (each step stops on any divergence and returns to the owner; the
+subcommands are `scripts/asaas_migration_window.py --window 037`, see
+[Migration windows: the run tooling](#migration-windows-the-run-tooling)):
 
 1. **Deploy this release's image** (the one that contains 037). **Verify:**
    the ECS deployment is `COMPLETED` and every RUNNING task runs the new task
    definition revision. A `/ready` 200 alone proves nothing here: under
-   `ENVIRONMENT=staging` it does not probe the database.
+   `ENVIRONMENT=staging` it does not probe the database. `plan` checks it
+   again right before the run, as for 036.
 2. **RDS snapshot** (owner decision 2026-10-19 b): take a manual snapshot
-   named `pre-037-<date>` and wait until its status is `available`.
+   named `pre-037-<date>` and wait until its status is `available`
+   (`render-snapshot-requests`).
 3. **Preflight readback** (`scripts/migration_037_readback.sql`, above) right
    before the run, connected with the migrations database URL (the role that
    runs step 4, never the application role), as `BEGIN READ ONLY; ...;
-   ROLLBACK;` with nothing left open: eleven `ok`.
+   ROLLBACK;` with nothing left open: eleven `ok` (`render-pre-read`,
+   `verify-pre-read`: the read runs on the window's dedicated **read
+   revision**, registered separately with `render-migrations-taskdef --window
+   037 --purpose read`: the same family, image, role and
+   `database-url-migrations` secret as the revision that migrates, its
+   command baked to the SELECT-only readback program, which never invokes the
+   migration tool (it reads the `alembic_version` table; as a backstop the
+   command and environment never mention the tool); its RunTask carries no
+   override at all, and the tools refuse the read revision for the run and
+   the migrate revision for the read).
 4. **Run 037** as a one-off `neurostack-staging-migrations` task on the same
    image, with the command fixed to the exact revision
-   (`alembic upgrade 037`). The service itself never migrates. On `55P03` or
-   `40P01` see "Lock wait" above.
-5. **Verify** `alembic_version` == `037` and the four tables are gone.
+   (`alembic upgrade 037`; `render-migrations-taskdef --window 037 --purpose
+   migrate`, then `plan`, `render-run-task`, `verify-result`). The service
+   itself never migrates. On `55P03` or `40P01` see "Lock wait" above.
+5. **Verify** `alembic_version` == `037` and the four tables are gone
+   (`render-post-read`, `verify-post-read` with
+   `scripts/migration_037_post_read.sql`).
 
 ### Rollback (downgrade 037 -> 036)
 
@@ -685,14 +731,295 @@ restored guards refuse what they refused.
   `asaas_release_candidate_postgres_suites`; add them there (the CI job runs
   that function) when the PostgreSQL 16 job lands. The characterization
   module's server-log audit needs `logging_collector` on, as the job sets.
-- **T8 (planner pins and zero-read SQL):** reuse
-  `scripts/migration_037_readback.sql` verbatim, run as the migration role in
-  a read-only transaction; eleven `ok` is the green readback. It shares the
-  migration's checks except two things that are migration-only: the
-  `ACCESS EXCLUSIVE` locks (the readback is a snapshot) and the probe table
-  and function behind the privilege check (the readback computes the same
-  expectation from `pg_default_acl`; see the table in "Preflight readback").
-  Running it as any other role makes the privilege row answer for that role.
+- **T8 (planner pins and zero-read SQL), done:** window `037` of
+  `scripts/asaas_migration_window.py` runs
+  `scripts/migration_037_readback.sql` verbatim, as the migration role, in a
+  read-only transaction that is rolled back; eleven `ok` is the green
+  readback. It shares the migration's checks except two things that are
+  migration-only: the `ACCESS EXCLUSIVE` locks (the readback is a snapshot)
+  and the probe table and function behind the privilege check (the readback
+  computes the same expectation from `pg_default_acl`; see the table in
+  "Preflight readback"). Running it as any other role makes the privilege
+  row answer for that role (reproduced on PostgreSQL 16 in the T8 capture:
+  as the application role row 10 is red).
+
+## Migration windows: the run tooling
+
+Three production migration windows, each its own manifest step and each run
+only on its own explicit owner instruction, in this order. The window table
+of `scripts/asaas_migration_window.py` (`WINDOWS`) is the only source: the
+planner validates the manifest steps against it and renders each window's
+migrations revision from it.
+
+| Window | Manifest step | Plan steps | Baked command | `alembic_version` before, after | Snapshot | SELECT-only readback before the run | Image prerequisite |
+|---|---|---|---|---|---|---|---|
+| `035` | `migrations_033_035` | S10-S13 | `alembic upgrade 035` | `032`, `035` | `pre-033-035-<date>` | `scripts/migration_033_035_zero_reads.sql`, application role | the migrations revision carries the bridge image by digest (in ECR); every service task runs its own revision's image (revision 8 may still serve, by tag) |
+| `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 9, `ACTIVE` |
+| `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 9, `ACTIVE` |
+
+After the run every window reads back `alembic_version` as the application
+role; it must be exactly the window's "after" (window `037` also reads
+`scripts/migration_037_post_read.sql`: the four legacy tables gone).
+`windows` prints this table.
+
+There is **no default window**: every subcommand of the tool, and the
+planner's `render-migrations-taskdef`, require `--window`; the planner also
+requires `--purpose migrate|read` (`read` only for window `037`).
+`scripts/deploy-vps.sh` and `docs/configuration.md` name the first window,
+`035`, and stay there (see "Windows, not a moving pin").
+
+**Who does what.** The tool is pure, like the deploy hook: it never calls
+AWS. It renders requests and verifies recorded responses. The orchestrator
+sends every request with its own tools (aws-mcp), writes each response into
+the readback file and runs the next subcommand; the owner gives each
+window's order. The only requests the tool renders are `ecs:RunTask`,
+`ecs:DescribeTasks`, `ecs:ListTasks`, `ecs:DescribeServices`,
+`ecs:DescribeTaskDefinition`, `logs:GetLogEvents`, `rds:CreateDBSnapshot`,
+`rds:DescribeDBSnapshots` and `ecr:DescribeImages`. It never renders a
+service update, a task-definition registration (the planner renders the
+migrations revision; the orchestrator registers it under the window's
+approval), a snapshot deletion, a task stop or a reverting step, and its
+output guard refuses to print one. Stopping is the default: every anomaly is
+a blocked plan or the alert `MIGRATION_WINDOW_STOPPED` with its reasons, and
+there is no option to continue anyway.
+
+**Read tasks.** The SELECT-only readbacks run the read program,
+`python -c <program>`. It never invokes the migration tool: it reads the
+`alembic_version` table. The program carries every SQL text it runs (the
+`public.alembic_version` read and the readback file) as one payload,
+gzip-compressed and base64-encoded and checked against its SHA-256. It
+connects with the task's `DATABASE_URL` exactly as the application's
+SQLAlchemy asyncpg dialect derives the connection arguments, with the
+session parameter `default_transaction_read_only=on`, opens a `REPEATABLE
+READ, READ ONLY` transaction with `lock_timeout` 3 s, `statement_timeout`
+60 s and `search_path=public` (the SQL files also name `public.` tables), reads the
+revision, runs the file as one statement, prints one JSON line per result
+(`asaas_migration_window_read.v1`: `begin`, `version`, one `row` per row,
+`end`) and always rolls back. PostgreSQL itself refuses anything but a read
+there: a write or DDL statement fails with SQLSTATE `25006`, a second
+statement with `42601` (the opt-in PostgreSQL 16 test
+`tests/integration/test_migration_window_read_postgres.py` proves both). On
+an error it prints only the exception class and the SQLSTATE, never a server
+message, host or URL. The absence of the word `alembic` from the program
+text, and from the command, entry point and environment of the revisions the
+reads run on, is a spelling backstop, not the guarantee.
+
+- Application-role reads (windows `035` and `036` before the run, every
+  window after it) run on the read family `neurostack-staging-consulta` (its
+  `DATABASE_URL` secret must be `neurostack/staging/database-url`; the family
+  the orchestrator used for the SELECT-only query of 2026-10-20) with the
+  program as the one container override (under 7680 of the 8192 characters
+  ECS allows). Their SQL is row counts and the revision read: no ownership
+  or privilege check, so the application role answers them as the migration
+  would (reproduced on PostgreSQL 16 in the T8 capture). Dropping the
+  override there would start the family's own baked command, so that
+  command, its entry point and its environment must not mention the
+  migration tool: `plan-pre-read`, `plan-post-read`, `verify-*-read` and
+  `plan` refuse the read family's revision otherwise
+  (`read_family_names_the_migration_tool`).
+- Window `037`'s readback needs the migration role (only it gets eleven
+  `ok`). It runs on the window's **read revision**: a separate
+  `neurostack-staging-migrations` revision rendered by `render-migrations-taskdef
+  --window 037 --purpose read`, on the same image, roles and
+  `database-url-migrations` secret as the migrate revision, with the program
+  **baked** as its command (it never invokes the migration tool; as a
+  backstop its command, entry point and environment never mention it). Its
+  RunTask carries **no override**, so a
+  request that loses a field can never migrate. `plan-pre-read` requires the
+  read revision (`--migrations-read-task-definition`, required for `037`,
+  refused for the other windows, never equal to `--migrations-task-definition`)
+  and refuses the migrate revision in its place; `plan` refuses the read
+  revision as the migration (`migrations_revision_is_a_read_revision`).
+
+**Files**, in a private directory (`workdir="$(mktemp -d)" && chmod 700 "$workdir"; umask 077`), one set per attempt:
+
+| File | Content |
+|------|---------|
+| `window-readback.json` | schema `asaas_migration_window_readback.v1`: `schema_version`, `account_id` `388460142431`, `region` `us-east-1`, `window` (must equal `--window`), `captured_at_utc` (aware ISO 8601, the time of the latest reads), `reads` (`service`, `operation`, `params`, `response`, one per exact request; an AWS error is `{"__error_code__": "<Code>"}`) and, once sent, `pre_read`, `migration` and `post_read` (each `params`, `response` of its RunTask). |
+| `window-snapshot-plan.json`, `window-snapshot.json` | outputs of `plan-snapshot` and `render-snapshot-requests` |
+| `window-pre-read-task.json`, `window-pre-read-result.json` | outputs of `render-pre-read` and `verify-pre-read` |
+| `window-plan.json`, `window-run-task.json` | outputs of `plan` and `render-run-task` |
+| `window-verify-reads.json`, `window-result.json` | outputs of `render-verify-reads --target migration` and `verify-result` |
+| `window-post-read-task.json`, `window-post-read-result.json` | outputs of `render-post-read` and `verify-post-read` |
+
+Every subcommand but `windows` takes the same arguments (each at most once:
+a repeated option is refused; `plan-snapshot` and `render-snapshot-requests`
+take no `--snapshot-id`, they name today's snapshot). There is no `--now`:
+every freshness window is judged against the system clock.
+
+```bash
+tool=scripts/asaas_migration_window.py
+args=(--window "$W"                                   # 035, 036 or 037: the owner's order
+      --readback-file "$workdir/window-readback.json"
+      --service-task-definition "$SERVICE_TD"         # the revision the service runs
+      --migrations-task-definition "$MIGRATIONS_TD"   # registered for this window (> :3)
+      --read-task-definition "$READ_TD"               # neurostack-staging-consulta:<n>
+      --snapshot-id "$SNAPSHOT_ID")                   # printed by render-snapshot-requests
+# window 037 only (required there, refused for 035 and 036):
+args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read revision
+```
+
+**Sequence** (each step stops on any divergence and returns to the owner;
+`plan-*` and `plan` list the reads still missing as `next_requests`, with
+status `incomplete`: send them, record the responses, run them again):
+
+| Phase | Plan step (035 / 036 / 037) | Subcommands, in order | Done when |
+|---|---|---|---|
+| register | S10 / S20 / S23 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
+| snapshot | S11 / S20 / S23 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target); `render-snapshot-requests`; send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
+| pre-read | S12 / S21 / S24 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
+| run | S12 / S21 / S24 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
+| verify | S13 / S22 / S24 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
+| post-read | S13 / S22 / S24 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" |
+
+The S labels in this table are the ones this tooling uses (the window
+table's `plan_steps`, printed by `windows`). They map the S1-S24 plan of
+2026-10-19 by the ranges given for each window (S10-S13, S20-S22, S23-S24);
+the plan's own step texts are not in this repository, so the mapping is
+inferred, and a label whose step differs is renamed here and in the window
+table together.
+
+**Same-day snapshot retry: a known limitation.** The snapshot name is
+`pre-<span>-<date>` (owner decision 2026-10-19 b) and has no second slot for
+the same day. A retry within 60 minutes of the snapshot's creation reuses it.
+A retry later the same day cannot take a new snapshot under the pattern
+(`CreateDBSnapshot` refuses the existing name) and `plan` refuses the old one
+(`snapshot_too_old`): stop and ask the owner to approve a suffixed name for
+that retry. The tools do not extend the pattern.
+
+**What `plan` checks** (all from the recorded reads, against the system
+clock): the reads captured within the last 10 minutes (60 s of clock
+skew forward); the service with exactly one deployment, `PRIMARY` and
+`COMPLETED`, on `$SERVICE_TD`, `runningCount == desiredCount > 0`, nothing
+pending, Fargate, private awsvpc; `ListTasks` of the service listing exactly
+`desiredCount` tasks, each `RUNNING` on `$SERVICE_TD` with the `app`
+container on the expected image digest, and no task told to stop still
+running (`desiredStatus` `STOPPED` listing all `STOPPED`); the expected digest
+is, for 036 and 037, the migrations revision's image, which must equal the
+service revision's `app` image exactly, and for 035 the service revision's
+own image (a tag resolved through `ecr:DescribeImages`); the migrations
+revision of this window: family `neurostack-staging-migrations`, revision
+above 3, `ACTIVE`, Fargate, awsvpc, one essential container without entry
+point, the command exactly the window's, the image by digest and present in
+ECR, `DATABASE_URL` only as the `database-url-migrations` secret, `awslogs`;
+the snapshot `$SNAPSHOT_ID` of `neurostack-staging-db`, manual, `postgres`,
+`available`, created within the last 60 minutes and named for its creation
+date (or the day before); no task of the migrations family, of the
+window's `startedBy` or of the read family running; for 036 and 037 the
+manifest's `rollback_target` revision 9 with no pending re-pin and revision 9
+`ACTIVE` on an image by digest; for 037 the read revision (baked readback,
+no mention of the migration tool, same image as the migrate revision) and the
+migrate revision never swapped; the recorded pre-read verified `read_ok`,
+stopped within the last 15 minutes and created at or after the snapshot; no
+migration RunTask already recorded in the file; and, from `ListTasks` of the
+migrations family with `desiredStatus` `STOPPED` and their `DescribeTasks`,
+no task of this window's `startedBy` that stopped at or after the recorded
+pre-read was created (`window_task_stopped_after_pre_read`).
+
+**Retry after a stopped run.** A run that ended (`55P03`, `40P01`, `55000`,
+any failure) is never re-run from the same evidence: a retry is a new
+explicit owner instruction, a new readback file, a new pre-read that starts
+after the earlier task stopped (the plan refuses an older one) and
+`render-run-task --attempt <n+1>` (a new `clientToken`). ECS lists stopped
+tasks only for a while (about an hour); older runs are kept out by the fresh
+snapshot and pre-read, and by the owner instruction. `plan` prints every
+earlier task of the window it sees (`earlier_window_tasks`: task, container
+exit codes, stop time).
+
+**A re-run after a clean run is not supported.** When any container of an
+earlier task of this window exited 0 (the window applied; perhaps the database
+was restored from the snapshot afterwards), `plan` refuses with
+`window_already_ran_cleanly` whatever the pre-read says: this tool supports
+retrying a failed run, not re-applying a window. That needs a new owner
+decision and a fresh plan.
+
+**The RunTask.** `cluster` `neurostack-staging`, `taskDefinition`
+`$MIGRATIONS_TD`, `count` 1, `launchType` `FARGATE`, the service's subnets and
+security groups with `assignPublicIp` `DISABLED`, `startedBy`
+`neurostack-migration-window-<W>`, `enableExecuteCommand` and
+`enableECSManagedTags` false, the service's `platformVersion` when it has
+one, and a `clientToken` derived from the window, the snapshot, the attempt
+and the request. **No `overrides`** (the command is baked) and **no
+`propagateTags`** (RunTask rejects every value of it). The key set is pinned
+by the tool and its tests. Read tasks on the read family add exactly one
+container override (the program); window `037`'s pre-read on its read
+revision carries none. Both use `startedBy`
+`neurostack-migration-read-<W>-pre` or `-post`. Live evidence (2026-10-20) covers cluster, task definition,
+`FARGATE`, count, `startedBy`, `enableExecuteCommand`, the network block and
+a command override; `clientToken`, `platformVersion` and
+`enableECSManagedTags` are documented RunTask parameters the deploy hook
+renders too, not yet verified live: on any `InvalidParameterException`, stop
+and report the exact message (do not edit the request, do not retry).
+
+**`verify-result`** reads the task's container exit code and every log page
+of `<awslogs-stream-prefix>/<container>/<task id>` (pages followed through
+`nextForwardToken` until a response returns the token that was sent; a page
+without one is `log_pages_incomplete`; more than 20 pages is
+`log_events_truncated`). Exit 0 `applied` only for container exit 0 and
+exactly the window's Alembic lines `Running upgrade <before> -> ...` in order,
+with no traceback and no SQLSTATE marker. Exit 3 `in_progress` (poll:
+`next_requests`). Exit 4 `MIGRATION_WINDOW_STOPPED`:
+
+| Seen in the log | Classification | Meaning and action |
+|---|---|---|
+| `LockNotAvailableError` / `canceling statement due to lock timeout`, with a nonzero exit code | `lock_timeout_55P03_nothing_changed` | nothing changed (one transaction); report and stop; the post-read confirms the "before" revision |
+| `DeadlockDetectedError` / `deadlock detected` | `deadlock_40P01_nothing_changed` | the same |
+| `ObjectNotInPrerequisiteStateError` | `preflight_refused_55000_nothing_changed` | the migration's own preflight refused; `refusal_lines` carries its message verbatim (object names only; a line that would trip the output guard is withheld and counted); report and stop |
+| any other traceback, `FAILED:`, or a nonzero exit | `migration_failed_unclassified` | report and stop; the post-read shows what the database holds |
+| an upgrade line outside the window (for example `035 -> 036` in window 035) | `upgrade_outside_window` | schema beyond the approved window; report at once |
+| a URL, `user@host`, an IPv4 address, an AWS host, a password or token | `log_exposure_suspected` | the line is never echoed; rotate per [`asaas-secret-rotation.md`](./asaas-secret-rotation.md) if it could carry a secret |
+| a SQLSTATE marker while the container exited 0 (or without an exit code) | `migration_log_inconsistent` | never "nothing changed": the log and the process disagree; report and stop, the post-read shows the revision |
+| a RunTask the tool did not render, any override on the described task (a container `command`, `environment` or resource override, or a task-level role, `cpu`, `memory` or storage override) or `propagateTags`, another task definition or `startedBy` | `evidence_mismatch` reasons (`task_overrides_present`, `read_task_overrides_present`) | report and stop |
+
+The single SQLAlchemy line `(Background on this error at: https://sqlalche.me/e/<n>/<code>)`
+is the only URL the exposure scan tolerates; the captured failures above
+(T8, PostgreSQL 16) print it after every database error.
+
+**Time bounds.** The tool cannot stop a task. The migration watch is 900 s
+from the task's `createdAt` (Fargate start 180 s + Alembic 300 s + stop
+60 s = 540 s, with margin); after it `verify-result` reports
+`migration_watch_deadline_exceeded`: start nothing else, report. A read
+task's watch is 600 s. A stream still empty within 120 s of `stoppedAt` is
+`log_events_not_delivered` (in progress), and so is a clean exit (code 0)
+whose upgrade lines are a strict beginning of the window's within those
+120 s (the last lines are still on their way); later it is
+`upgrade_lines_mismatch`.
+
+**Crash recovery.** If the orchestrator stops after sending a RunTask but
+before recording it: re-send the saved request unchanged (the same
+`clientToken` makes ECS return the task it already started, as long as ECS
+still honours the token) and record that response. If that cannot be done,
+`plan` stays blocked (`migrations_task_running` or `window_task_running`)
+while the task runs; once it stopped, run `render-verify-reads --target
+migration --task-arn <ARN>` and `verify-result --task-arn <ARN>` on a
+readback file without a `migration` record: the task is accepted only with
+the window's `startedBy`, task definition and no override at all, created
+at or after the snapshot (`recovered_without_run_record: true`). A read task
+lost the same way is simply read again with a new attempt
+(`render-pre-read --attempt <n+1>` in a new file) once it stopped:
+`plan-pre-read` and `plan-post-read` stay blocked (`read_task_running`) while
+a task with the read's `startedBy` runs, and `plan` while any task of the
+read family runs. Never start a second migration while the first may run.
+
+**Not verified live.** The RDS snapshot request and response shapes
+(`SnapshotCreateTime` is recorded as an aware timestamp string), whether ECS
+honours `clientToken` for a re-sent RunTask and for how long, the delivery
+latency of the task logs, the consulta family's container definition
+(`plan-pre-read` checks it: one container, no entry point, the application
+`DATABASE_URL` secret, an application image of this registry, `awslogs`),
+and whether the application role may read `alembic_version` and the counted
+tables in production (a `permission denied` read is `read_failed` with
+SQLSTATE `42501`: stop).
+
+**Residual risks, accepted.** `--manifest` (on `plan`, `render-run-task`,
+`plan-snapshot`, `render-snapshot-requests`) points the rollback-target check
+at any file the operator names: the default is the reviewed manifest of the
+tree, and the planner's full validation applies to whatever file is given,
+but nothing proves it is the reviewed one; run from a clean checkout of
+`main` without the flag. Nothing cross-checks that the read tasks and the
+migration task reach the same database: the read family's and the
+migrations family's `DATABASE_URL` secrets are different names, and the
+tool only checks that each names its own secret.
 
 ## Production wiring (Group 9 D3/D4)
 
@@ -719,8 +1046,14 @@ python scripts/asaas_production_wiring.py check-manifest --params "$params"
 python scripts/asaas_production_wiring.py plan           --params "$params"
 python scripts/asaas_production_wiring.py render-taskdef --params "$params"
 python scripts/asaas_production_wiring.py check          --params "$params"
-python scripts/asaas_production_wiring.py render-migrations-taskdef --params "$params"
+python scripts/asaas_production_wiring.py render-migrations-taskdef --window 035 --purpose migrate --params "$params"
 ```
+
+`render-migrations-taskdef` requires `--window` (`035`, `036` or `037`) and
+`--purpose` (`migrate`, or `read` for window `037` only); neither has a
+default. `migrate` bakes exactly the window's own upgrade; `read` bakes
+window `037`'s SELECT-only readback program on the same image, roles and
+secret, as a separate revision.
 
 - The service rollback target is the manifest field `rollback_target`
   (revision 8 today). Every code path reads it from there; it moves to
@@ -801,9 +1134,8 @@ python scripts/asaas_production_wiring.py render-migrations-taskdef --params "$p
    image becomes `task_definition.otel_image`, the digest the mutable
    `:latest` tag resolved to on 2026-10-19 (no behaviour change, never a tag
    again), and the tags carry `ManagedBy=manual` (`task_definition.tag_overrides`,
-   **pending owner confirmation**: owner approval A4 covered the two ECS
-   roles; tagging the new revisions the same way is an inference, truthful
-   and reversible, to confirm before registering).
+   **confirmed by the owner on 2026-10-20** for the two ECS roles and for
+   every new task-definition revision, app and migrations alike).
    It adds the following to `app` only:
    - secrets, as `valueFrom` ARN references: `ASAAS_API_KEY`,
      `ASAAS_WEBHOOK_TOKEN`, `BILLING_OBSERVABILITY_SMOKE_TOKEN`;
@@ -916,17 +1248,18 @@ own explicit owner approval and is never performed from the manifest.
    `DATABASE_URL` fingerprint) is fixed (F1 item 5 below). It also needs the build
    network access listed under
    [Frontend build and deployment](#frontend-build-and-deployment).
-5. **Gate: migrations 033-035 (separate approval).** In an expand-only
-   window, read back the exact `alembic_version` first (it was `032` on
-   2026-10-17), continue only if it is still `032`. Revision 3 of the
-   one-off family `neurostack-staging-migrations` bakes an unpinned upgrade,
-   so it is **never run**. Register a new revision instead, on the same
-   bridge image as the deployment (`app_image_override` in the parameters
-   file), with the command baked to exactly `alembic upgrade 035` (the planner
-   constant `MIGRATIONS_COMMAND`); the roles, the `database-url-migrations`
-   secret, sizing and logs are read from revision 3, and the tags carry
-   `ManagedBy=manual` (pending owner confirmation, as for the app revision).
-   The readback file holds three reads:
+5. **Gate: migrations 033-035 (separate approval; window `035`).** In an
+   expand-only window, read back the exact `alembic_version` first (it was
+   `032` on 2026-10-17), continue only if it is still `032` and every zero
+   read below is still `0`. Revision 3 of the one-off family
+   `neurostack-staging-migrations` bakes an unpinned upgrade, so it is
+   **never run**. Register a new revision instead, on the same bridge image
+   as the deployment (`app_image_override` in the parameters file), with the
+   command baked to exactly `alembic upgrade 035` (window `035` of the table
+   in `scripts/asaas_migration_window.py`); the roles, the
+   `database-url-migrations` secret, sizing and logs are read from revision
+   3, and the tags carry `ManagedBy=manual` (confirmed by the owner on 2026-10-20, as
+   for the app revision). The readback file holds three reads:
    `ecs:DescribeTaskDefinition` of `neurostack-staging-migrations:3` and of
    `neurostack-staging-migrations` (latest), both with `"include": ["TAGS"]`,
    and `ecr:DescribeImages` of the bridge digest.
@@ -936,29 +1269,57 @@ own explicit owner approval and is never performed from the manifest.
    workdir="$(mktemp -d)" && chmod 700 "$workdir"
    umask 077
    python scripts/asaas_production_wiring.py render-migrations-taskdef \
+     --window 035 --purpose migrate \
      --params "$params" --readback-file "$workdir/migrations-readback.json" \
      > "$workdir/migrations-taskdef.json" || exit 1
    ```
 
-   It prints nothing and exits 2 for any command other than the pin, a
-   revision 3 other than the reviewed shape (roles, the
-   `database-url-migrations` secret as a plain ARN, one container, no entry
-   point), an image missing from ECR, or a newer migrations revision that
-   differs from the rendering, or a newest revision whose ARN is not
+   It prints nothing and exits 2 for a missing or unknown `--window`, for
+   any command other than the window's pin, a revision 3 other than the
+   reviewed shape (roles, the `database-url-migrations` secret as a plain
+   ARN, one container, no entry point), an image missing from ECR, a newer
+   migrations revision that differs from the rendering and is not an exact
+   rendering of an earlier window (`migrations_newer_revision_differs`), one
+   that renders a later window (`migrations_newest_revision_is_a_later_window`),
+   or a newest revision whose ARN is not
    `arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-migrations:<n>`
    with `n` at least 3 (`migrations_newest_revision_invalid`). If the newest
    revision already equals the rendering it prints nothing on stdout, `already registered: <ARN>` on
    stderr, and exits 3: run that revision instead of registering again
    (`--force-new-revision` prints the request anyway). Otherwise register
-   `migrations-taskdef.json` (`ecs:RegisterTaskDefinition`), take a manual
-   RDS snapshot (`pre-033-035-<date>`, status `available`), then run the new
-   revision once as a one-off Fargate task in the service's private subnets
-   with **no** command override. Never upgrade to the head: once migrations
-   `036` and `037` (decouple and drop the legacy objects) are on main, the
-   image carries them and the head would apply them in the same run. Each of
-   them needs its own explicit owner instruction, 036 before 037, after a
-   fresh SELECT showing zero legacy rows. **Verify:** read back
+   `migrations-taskdef.json` (`ecs:RegisterTaskDefinition`). Then run the
+   window with `scripts/asaas_migration_window.py --window 035` (see
+   [Migration windows: the run tooling](#migration-windows-the-run-tooling)):
+   a manual RDS snapshot (`pre-033-035-<date>`, status `available`), the
+   SELECT-only pre-read (`alembic_version` and the zero reads below), `plan`,
+   the new revision once as a one-off Fargate task in the service's private
+   subnets with **no** command override (`render-run-task`), `verify-result`
+   (exactly the upgrade lines `032 -> 033`, `033 -> 034`, `034 -> 035`) and
+   the post-read. Never upgrade to the head: once migrations `036` and `037`
+   (decouple and drop the legacy objects) are on main, the image carries
+   them and the head would apply them in the same run. Each of them needs its
+   own explicit owner instruction, 036 before 037, after a fresh SELECT
+   showing zero legacy rows (windows `036` and `037`). **Verify:** read back
    `alembic_version` == `035`. Never downgrade.
+
+   The zero reads are `scripts/migration_033_035_zero_reads.sql` (the file
+   adds only comment lines; a test keeps the two equal): the counts the
+   SELECT-only read of 2026-10-17 found at zero, and the counted tables with
+   row-level security enabled or forced (none then; under RLS a count could
+   hide rows). Any other value stops the window.
+
+   ```sql
+   SELECT 'transactions' AS check_name, count(*) AS found FROM public.transactions
+   UNION ALL SELECT 'billing_subscriptions', count(*) FROM public.billing_subscriptions
+   UNION ALL SELECT 'billing_checkout_sessions', count(*) FROM public.billing_checkout_sessions
+   UNION ALL SELECT 'billing_webhook_deliveries', count(*) FROM public.billing_webhook_deliveries
+   UNION ALL SELECT 'billing_migrations', count(*) FROM public.billing_migrations
+   UNION ALL SELECT 'billing_migration_receipts', count(*) FROM public.billing_migration_receipts
+   UNION ALL SELECT 'billing_migration_absence_reads', count(*) FROM public.billing_migration_absence_reads
+   UNION ALL SELECT 'roster revision not 0', count(*) FROM public.billing_roster_control WHERE billing_roster_revision <> 0
+   UNION ALL SELECT 'rollout not disabled', count(*) FROM public.billing_rollout_control WHERE state <> 'disabled' OR topup_commercial_enabled
+   UNION ALL SELECT 'row level security on counted tables', count(*) FROM pg_catalog.pg_class WHERE (relrowsecurity OR relforcerowsecurity) AND oid IN ('public.transactions'::regclass, 'public.billing_subscriptions'::regclass, 'public.billing_checkout_sessions'::regclass, 'public.billing_webhook_deliveries'::regclass, 'public.billing_migrations'::regclass, 'public.billing_migration_receipts'::regclass, 'public.billing_migration_absence_reads'::regclass, 'public.billing_roster_control'::regclass, 'public.billing_rollout_control'::regclass);
+   ```
 6. **Gate: service deployment (separate approval).** Two paths (see F1
    below):
    - **Path A (owner approval A1, 2026-10-19).** Deploy the registered D3
@@ -987,7 +1348,11 @@ own explicit owner approval and is never performed from the manifest.
    other value). Revision 8 is not safe after 036: it reads columns 036
    drops. `plan` then reports `rollback_target` = revision 9 and checks that
    it is `ACTIVE` and runs an image pinned by digest
-   (`rollback_target_revision_unusable` otherwise).
+   (`rollback_target_revision_unusable` otherwise). The `plan` of windows
+   `036` and `037` (`scripts/asaas_migration_window.py`) reads the same field
+   through the planner and refuses until it is revision 9 with no pending
+   re-pin (`rollback_target_not_repinned`) and revision 9 is `ACTIVE` on an
+   image pinned by digest.
 
    What the current image does with the D3 names (not verified for the image
    itself): it was pushed on 2026-10-14, and commit `55651b58` on
@@ -1609,7 +1974,7 @@ and a new binary to the image supply chain.
   task definition family were tagged `ManagedBy=terraform`. Owner approval A4
   (2026-10-19) moves the two ECS roles to `ManagedBy=manual`. Every new
   revision rendered here (app and migrations) carries `ManagedBy=manual`;
-  that part is pending owner confirmation (A4 named only the roles).
+  the owner confirmed that on 2026-10-20 (A4 had named only the roles).
   Whether a Terraform state still manages inline policies exclusively, or
   the service's task definition, was not verified. Confirm that a later apply
   leaves them alone.

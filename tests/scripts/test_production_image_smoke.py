@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from scripts import asaas_migration_window as migration_window
 from scripts import production_image_smoke as smoke
 from src.api.spa import INDEX_FILE
 from tests.alembic_graph import current_head, migration_revisions
@@ -182,10 +183,12 @@ def test_runbook_lists_every_check_in_the_order_the_smoke_runs_them() -> None:
 
 
 def test_offline_window_is_the_runbook_window_of_the_tree() -> None:
-    assert re.search(
-        rf'^MIGRATIONS_SOURCE_REVISION = "{smoke.WINDOW_FROM}"$',
-        PLANNER.read_text(encoding="utf-8"),
-        re.MULTILINE,
+    # The first production window of the window table (the one gate 5 and the
+    # VPS pin name); the planner reads the same table.
+    first = migration_window.WINDOWS[migration_window.PINNED_WINDOW]
+    assert (smoke.WINDOW_FROM, smoke.WINDOW_TO) == (first.before, first.after)
+    assert f"migration_window.WINDOW_{first.name}.manifest_step" in PLANNER.read_text(
+        encoding="utf-8"
     )
     assert f"`alembic upgrade {smoke.WINDOW_TO}`" in RUNBOOK.read_text(encoding="utf-8")
     revisions = {revision: down for revision, down in migration_revisions().values()}

@@ -17,8 +17,9 @@ readonly ENV_FILE="${REPO_ROOT}/.env"
 # The one Alembic revision this deploy may migrate to. Bumping it is a
 # deliberate, owner-approved change, exactly like the production migration
 # window pin it mirrors: infra/production/asaas-production-wiring.yaml
-# (migrations_033_035), MIGRATIONS_TARGET_REVISION in
-# scripts/asaas_production_wiring.py and the migrations gate in
+# (migrations_033_035), window 035 of the window table that
+# scripts/asaas_production_wiring.py reads (scripts/asaas_migration_window.py)
+# and the migrations gate in
 # docs/runbooks/asaas-deployment.md. Revisions 036 and 037 each need their own
 # owner instruction first. tests/scripts/test_production_migration_window.py
 # fails if this pin and the window disagree. Never use the head, heads, base or
