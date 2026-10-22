@@ -13,6 +13,19 @@ _SUITES_FUNCTION = "asaas_release_candidate_postgres_suites"
 _TRIGGER_CHARACTERIZATION = (
     "tests/integration/test_asaas_subscription_triggers_postgres.py"
 )
+# The release-candidate PostgreSQL suites, pinned in order here too: this
+# module is the one the CI job runs, so dropping, adding or reordering a
+# suite fails CI itself (tests/scripts/test_wish_gates.py pins the call).
+_RELEASE_CANDIDATE_POSTGRES_SUITES = (
+    "tests/integration/test_asaas_billing_postgres.py",
+    "tests/integration/test_asaas_checkout_service_postgres.py",
+    "tests/integration/test_asaas_webhook_postgres.py",
+    _TRIGGER_CHARACTERIZATION,
+    "tests/integration/test_billing_producer_handoff_postgres.py",
+    "tests/integration/test_migration_036_postgres.py",
+    "tests/integration/test_migration_037_postgres.py",
+    "tests/integration/test_migration_window_read_postgres.py",
+)
 _PRODUCTION_COMPOSE = _ROOT / "docker-compose.production.yml"
 _LOG_STEP = "Enable the server log the trigger characterization audits"
 _SUITES_STEP = "Run the release-candidate PostgreSQL suites"
@@ -233,14 +246,13 @@ def test_ci_and_release_gate_share_one_postgres_suite_list() -> None:
     code = "\n".join(
         line for line in source.splitlines() if not line.lstrip().startswith("#")
     )
-    suites = re.findall(
-        r"tests/integration/\S+_postgres\.py",
-        _gate_function_body(source, _SUITES_FUNCTION),
-    )
+    # Every test path the function names, whatever its directory or suffix,
+    # so an extra module cannot hide from the exact pin below.
+    suites = re.findall(r"tests/\S+", _gate_function_body(source, _SUITES_FUNCTION))
     gate = _gate_function_body(source, "asaas_release_candidate_gate")
 
     assert suites, "the shared function lists no PostgreSQL suite"
-    assert _TRIGGER_CHARACTERIZATION in suites
+    assert tuple(suites) == _RELEASE_CANDIDATE_POSTGRES_SUITES
     assert f"    {_SUITES_FUNCTION} || return 1\n" in gate
     assert "tests/integration/" not in gate
     for suite in suites:

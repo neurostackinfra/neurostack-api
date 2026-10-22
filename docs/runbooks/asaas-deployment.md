@@ -164,9 +164,21 @@ These are prerequisites to check, not steps to execute now:
    `logging_collector`, so the server-log audit in
    `tests/integration/test_asaas_subscription_triggers_postgres.py` runs
    instead of skipping, and migrates a separate service database to the
-   current Alembic head. To add or remove a suite, edit the function; CI and this gate
-   follow together. A green CI job does not replace this gate. These run
-   only here: the contract suites
+   current Alembic head. The list includes the migration 036 and 037
+   round-trip and preflight suites
+   (`tests/integration/test_migration_036_postgres.py`,
+   `tests/integration/test_migration_037_postgres.py`) and the
+   migration-window read program's read-only proof
+   (`tests/integration/test_migration_window_read_postgres.py`). To add or
+   remove a suite, edit the function; CI and this gate follow together, and
+   `tests/scripts/test_billing_postgres_integration_workflow.py` (run by
+   the CI job) and `tests/scripts/test_wish_gates.py` pin the full list in
+   order. The disposable cluster the gate needs: loopback over TCP, the
+   `postgres` maintenance database, a superuser role with an unquoted lowercase
+   name, with or without a password (scram-sha-256 host auth, as in CI, and trust both
+   work; the suites give the throwaway roles they log in as their own
+   passwords). A green CI job does not replace this gate. These run only
+   here: the contract suites
    (`tests/contracts/test_billing_fact_producer_consumer.py`,
    `tests/scripts/test_deploy_vps_gate.py`,
    `tests/scripts/test_production_compose.py`,
@@ -726,11 +738,13 @@ restored guards refuse what they refused.
   `scripts/verify-asaas-observability.py`, in the same coordinated digest
   rotation. E6 left them: the metric is still registered and the rules
   digest must not move here.
-- **E8 / A8 (CI):** `tests/integration/test_migration_036_postgres.py` and
-  `tests/integration/test_migration_037_postgres.py` are not in
-  `asaas_release_candidate_postgres_suites`; add them there (the CI job runs
-  that function) when the PostgreSQL 16 job lands. The characterization
-  module's server-log audit needs `logging_collector` on, as the job sets.
+- **E8 / A8 (CI), done:** `tests/integration/test_migration_036_postgres.py`,
+  `tests/integration/test_migration_037_postgres.py` and
+  `tests/integration/test_migration_window_read_postgres.py` are in
+  `asaas_release_candidate_postgres_suites`, so the `Billing PostgreSQL
+  suites` CI job and the release-candidate gate run them. The
+  characterization module's server-log audit needs `logging_collector` on,
+  as the job sets.
 - **T8 (planner pins and zero-read SQL), done:** window `037` of
   `scripts/asaas_migration_window.py` runs
   `scripts/migration_037_readback.sql` verbatim, as the migration role, in a
@@ -797,8 +811,9 @@ revision, runs the file as one statement, prints one JSON line per result
 (`asaas_migration_window_read.v1`: `begin`, `version`, one `row` per row,
 `end`) and always rolls back. PostgreSQL itself refuses anything but a read
 there: a write or DDL statement fails with SQLSTATE `25006`, a second
-statement with `42601` (the opt-in PostgreSQL 16 test
-`tests/integration/test_migration_window_read_postgres.py` proves both). On
+statement with `42601` (the PostgreSQL 16 test
+`tests/integration/test_migration_window_read_postgres.py`, one of the
+release-candidate PostgreSQL suites CI runs, proves both). On
 an error it prints only the exception class and the SQLSTATE, never a server
 message, host or URL. The absence of the word `alembic` from the program
 text, and from the command, entry point and environment of the revisions the

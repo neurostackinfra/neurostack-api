@@ -1,6 +1,8 @@
-"""The migration-window read program on real PostgreSQL (opt-in).
+"""The migration-window read program on real PostgreSQL.
 
-Runs only with ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback
+One of the release-candidate PostgreSQL suites
+(``asaas_release_candidate_postgres_suites`` in ``scripts/wish-gates.sh``,
+run by CI); it needs ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback
 cluster, as every PostgreSQL suite here). It proves what the read program's
 contract rests on, independently of any spelling check: the session is read
 only (``default_transaction_read_only=on`` plus a ``READ ONLY`` transaction),

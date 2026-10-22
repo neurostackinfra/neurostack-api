@@ -912,9 +912,11 @@ _asaas_waived_path_audit() {
 # .github/workflows/billing-postgres-integration.yml, so CI and the local gate
 # cannot drift apart. Each suite creates and migrates its own databases from
 # the `postgres` maintenance database that POSTGRES_SMOKE_DATABASE_URL names
-# (a disposable loopback cluster, superuser role). The variable is required
-# because the suites skip without it, and a skipped suite must not read as a
-# pass. Usage:
+# (a disposable loopback cluster reached over TCP; a superuser role with an
+# unquoted lowercase name, with or without a password, so scram-sha-256 host auth as in the CI
+# service container and trust both work; the suites log their own throwaway
+# roles in with their own passwords). The variable is required because the
+# suites skip without it, and a skipped suite must not read as a pass. Usage:
 #   POSTGRES_SMOKE_DATABASE_URL=... \
 #     bash -c 'source scripts/wish-gates.sh && asaas_release_candidate_postgres_suites'
 asaas_release_candidate_postgres_suites() (
@@ -926,7 +928,10 @@ asaas_release_candidate_postgres_suites() (
         tests/integration/test_asaas_checkout_service_postgres.py \
         tests/integration/test_asaas_webhook_postgres.py \
         tests/integration/test_asaas_subscription_triggers_postgres.py \
-        tests/integration/test_billing_producer_handoff_postgres.py -v || {
+        tests/integration/test_billing_producer_handoff_postgres.py \
+        tests/integration/test_migration_036_postgres.py \
+        tests/integration/test_migration_037_postgres.py \
+        tests/integration/test_migration_window_read_postgres.py -v || {
         echo "release-candidate PostgreSQL suites failed" >&2
         return 1
     }

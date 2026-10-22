@@ -42,6 +42,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -50,6 +51,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -142,6 +144,40 @@ class _Baseline:
 
 def _rows(catalog: dict[str, Any], key: str) -> set[tuple[Any, ...]]:
     return set(catalog[key])
+
+
+def _superuser(cluster: _Cluster) -> str:
+    """The admin role of the smoke URL (any name): the role that runs every
+    statement and migration here unless a test logs in as its own role."""
+
+    name = cluster.admin_url.username
+    assert name, "POSTGRES_SMOKE_DATABASE_URL must name its superuser role"
+    return name
+
+
+@dataclass(frozen=True)
+class _Login:
+    """A throwaway LOGIN role with its own password: under password host
+    authentication (``scram-sha-256``, as the CI service container uses) a
+    role without one cannot connect, whatever the URL's password."""
+
+    name: str
+    password: str
+
+    @classmethod
+    def new(cls, name: str) -> "_Login":
+        return cls(name, secrets.token_hex(24))
+
+    def create_sql(self) -> str:
+        # token_hex is [0-9a-f] only: nothing to escape in the literal.
+        return f"CREATE ROLE \"{self.name}\" LOGIN PASSWORD '{self.password}'"
+
+
+def _url_as(cluster: _Cluster, name: str, login: _Login | None) -> URL:
+    url = cluster.url(name)
+    if login is None:
+        return url
+    return url.set(username=login.name, password=login.password)
 
 
 # ---------------------------------------------------------------------------
@@ -693,13 +729,12 @@ _READBACK = (_ROOT / "scripts" / "migration_037_readback.sql").read_text(
 )
 
 
-async def _readback(cluster: _Cluster, name: str, user: str | None = None) -> str:
+async def _readback(cluster: _Cluster, name: str, login: _Login | None = None) -> str:
     """The committed readback, run exactly as the runbook says: connected as
     the migration role, in a READ ONLY transaction.  Returns the refusal
     lines it predicts, joined as the migration joins them ('' = all ok)."""
 
-    url = cluster.url(name) if user is None else cluster.url(name).set(username=user)
-    engine = create_async_engine(url, poolclass=NullPool)
+    engine = create_async_engine(_url_as(cluster, name, login), poolclass=NullPool)
     try:
         async with engine.connect() as connection:
             await connection.exec_driver_sql("SET TRANSACTION READ ONLY")
@@ -714,17 +749,15 @@ async def _readback(cluster: _Cluster, name: str, user: str | None = None) -> st
 
 
 async def _assert_refused_and_unchanged(
-    baseline: _Baseline, name: str, expected: str, *, user: str | None = None
+    baseline: _Baseline, name: str, expected: str, *, login: _Login | None = None
 ) -> None:
     """The readback predicts the refusal line for line, then the migration
     refuses with exactly that message and changes nothing."""
 
     assert expected.startswith(_REFUSED)
-    assert await _readback(baseline.cluster, name, user) == expected[len(_REFUSED) :]
+    assert await _readback(baseline.cluster, name, login) == expected[len(_REFUSED) :]
     before = await _catalog(baseline.cluster, name)
-    url = baseline.cluster.url(name)
-    if user is not None:
-        url = url.set(username=user)
+    url = _url_as(baseline.cluster, name, login)
     code, output = await _alembic(url, "upgrade", "037")
     assert code != 0, output
     assert _refusal(output, _REFUSED) == expected
@@ -814,6 +847,7 @@ async def test_owner_or_privileges_the_downgrade_would_not_recreate_refuse(
     case: str,
 ) -> None:
     cluster = baseline.cluster
+    su = _superuser(cluster)
     app, owner = roles
     statement, item = {
         "table_owner": (
@@ -822,15 +856,15 @@ async def test_owner_or_privileges_the_downgrade_would_not_recreate_refuse(
         ),
         "table_grant": (
             f'GRANT SELECT ON billing_roster_control TO "{app}"',
-            "table billing_roster_control (owner postgres, acl {acl})",
+            "table billing_roster_control (owner {su}, acl {acl})",
         ),
         "column_grant": (
             f'GRANT SELECT (state) ON billing_migrations TO "{app}"',
-            "table billing_migrations (owner postgres, acl {acl})",
+            "table billing_migrations (owner {su}, acl {acl})",
         ),
         "function_revoke": (
             "REVOKE EXECUTE ON FUNCTION lock_billing_roster_statement() FROM PUBLIC",
-            "function lock_billing_roster_statement() (owner postgres, acl {acl})",
+            "function lock_billing_roster_statement() (owner {su}, acl {acl})",
         ),
         "function_owner": (
             f'ALTER FUNCTION lock_billing_roster_statement() OWNER TO "{owner}"',
@@ -853,8 +887,8 @@ async def test_owner_or_privileges_the_downgrade_would_not_recreate_refuse(
         baseline,
         at_036,
         _REFUSED
-        + "owners or privileges the downgrade would not recreate as postgres: "
-        + item.format(owner=owner, acl=acl),
+        + f"owners or privileges the downgrade would not recreate as {su}: "
+        + item.format(owner=owner, acl=acl, su=su),
     )
 
 
@@ -914,9 +948,10 @@ async def test_all_categories_are_reported_together_in_order(
         "SELECT relacl::text FROM pg_class "
         "WHERE oid = 'billing_roster_control'::regclass",
     )
+    su = _superuser(cluster)
     lines = [_LEGACY[category][1] for category in order] + [
-        "owners or privileges the downgrade would not recreate as postgres: "
-        f"table billing_roster_control (owner postgres, acl {acl})",
+        f"owners or privileges the downgrade would not recreate as {su}: "
+        f"table billing_roster_control (owner {su}, acl {acl})",
         "comments the downgrade would not restore: "
         "function public.lock_billing_roster_statement(), "
         "table public.billing_migrations",
@@ -1271,8 +1306,11 @@ async def test_readback_matches_the_migration_under_role_setups(
     suffix = uuid4().hex[:12]
     mig, app = f"g10e6_mig_{suffix}", f"g10e6_app_{suffix}"
     names = {"mig": mig, "app": app}
+    # The migration role logs in with its own password (the URL below carries
+    # it), so this passes under scram-sha-256 host auth, not only trust.
+    mig_login = _Login.new(mig)
     async with cluster.admin.connect() as connection:
-        await connection.exec_driver_sql(f'CREATE ROLE "{mig}" LOGIN')
+        await connection.exec_driver_sql(mig_login.create_sql())
         await connection.exec_driver_sql(f'CREATE ROLE "{app}" NOLOGIN')
     name = await cluster.fresh()
     try:
@@ -1281,7 +1319,7 @@ async def test_readback_matches_the_migration_under_role_setups(
                 f'ALTER DATABASE "{name}" OWNER TO "{mig}"'
             )
         await _execute(cluster, name, *(s.format(**names) for s in before_setup))
-        mig_url = cluster.url(name).set(username=mig)
+        mig_url = _url_as(cluster, name, mig_login)
         await _migrate(mig_url, "upgrade", "036")
         await _execute(
             cluster,
@@ -1290,24 +1328,24 @@ async def test_readback_matches_the_migration_under_role_setups(
             id=_BUILDER,
         )
         await _execute(cluster, name, *(s.format(**names) for s in after_setup))
-        user = mig if runner == "mig" else None
-        predicted = await _readback(cluster, name, user)
+        login = mig_login if runner == "mig" else None
+        predicted = await _readback(cluster, name, login)
         if verdict == "ok":
             assert predicted == ""
             before = await _catalog(cluster, name)
-            url = mig_url if user else cluster.url(name)
+            url = _url_as(cluster, name, login)
             await _migrate(url, "upgrade", "037")
             await _migrate(url, "downgrade", "036")
             assert await _catalog(cluster, name) == before
         else:
-            role = mig if user else "postgres"
+            role = mig if login else _superuser(cluster)
             assert predicted.startswith(
                 f"owners or privileges the downgrade would not recreate as {role}: "
             ), predicted
             kind = "table" if verdict == "tables" else "function"
             assert f"{kind} " in predicted, predicted
             await _assert_refused_and_unchanged(
-                baseline, name, _REFUSED + predicted, user=user
+                baseline, name, _REFUSED + predicted, login=login
             )
     finally:
         await cluster.drop(name)
@@ -1318,49 +1356,55 @@ async def test_readback_matches_the_migration_under_role_setups(
 
 # ---------------------------------------------------------------------------
 # Empty default-privilege entries: PostgreSQL stores an empty merged list as
-# NULL, i.e. the built-in default (superuser-owned database, run as postgres).
+# NULL, i.e. the built-in default (superuser-owned database, run as the smoke
+# URL's superuser, whatever its name).
 # ---------------------------------------------------------------------------
 
 _LEGACY_TABLE_LIST = ", ".join(_TABLES)
 _LEGACY_FUNCTION_LIST = ", ".join(_FUNCTIONS)
 
-# scenario -> (statements, refused items or None for green); {app} = role.
+# scenario -> (statements, refused items or None for green); {app} = role,
+# {su} = the smoke URL's superuser (filled in with str.replace, because the
+# refused items also hold a literal "{}" access list).
 _EMPTY_ENTRIES: dict[str, tuple[tuple[str, ...], set[str] | None]] = {
     "empty_global_table_entry": (
-        ("ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM postgres",),
+        ('ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM "{su}"',),
         None,
     ),
     "empty_global_table_entry_and_revoked_tables": (
         (
-            "ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM postgres",
-            f"REVOKE ALL ON {_LEGACY_TABLE_LIST} FROM postgres",
+            'ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM "{su}"',
+            f'REVOKE ALL ON {_LEGACY_TABLE_LIST} FROM "{{su}}"',
         ),
-        {f"table {table} (owner postgres, acl {{}})" for table in _TABLES},
+        {f"table {table} (owner {{su}}, acl {{}})" for table in _TABLES},
     ),
     "empty_global_function_entry": (
-        ("ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC, postgres",),
+        ('ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC, "{su}"',),
         None,
     ),
     "empty_global_function_entry_and_revoked_functions": (
         (
-            "ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC, postgres",
-            f"REVOKE ALL ON FUNCTION {_LEGACY_FUNCTION_LIST} FROM PUBLIC, postgres",
+            'ALTER DEFAULT PRIVILEGES REVOKE ALL ON FUNCTIONS FROM PUBLIC, "{su}"',
+            f'REVOKE ALL ON FUNCTION {_LEGACY_FUNCTION_LIST} FROM PUBLIC, "{{su}}"',
         ),
-        {
-            f"function {signature} (owner postgres, acl {{}})"
-            for signature in _FUNCTIONS
-        },
+        {f"function {signature} (owner {{su}}, acl {{}})" for signature in _FUNCTIONS},
     ),
     "empty_global_table_entry_with_a_schema_entry": (
         (
-            "ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM postgres",
+            'ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM "{su}"',
             'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO "{app}"',
-            f"REVOKE ALL ON {_LEGACY_TABLE_LIST} FROM postgres",
+            f'REVOKE ALL ON {_LEGACY_TABLE_LIST} FROM "{{su}}"',
             f'GRANT SELECT ON {_LEGACY_TABLE_LIST} TO "{{app}}"',
         ),
         None,
     ),
 }
+
+
+def _fill(template: str, **names: str) -> str:
+    for key, value in names.items():
+        template = template.replace("{" + key + "}", value)
+    return template
 
 
 @pytest.mark.parametrize("scenario", sorted(_EMPTY_ENTRIES))
@@ -1374,9 +1418,10 @@ async def test_readback_matches_the_migration_with_empty_default_entries(
     trip gives back the same catalog), red with the same lines when not."""
 
     cluster = baseline.cluster
+    su = _superuser(cluster)
     app, _ = roles
     statements, refused = _EMPTY_ENTRIES[scenario]
-    await _plant(cluster, at_036, tuple(s.format(app=app) for s in statements))
+    await _plant(cluster, at_036, tuple(_fill(s, app=app, su=su) for s in statements))
     predicted = await _readback(cluster, at_036)
     if refused is None:
         assert predicted == ""
@@ -1386,8 +1431,8 @@ async def test_readback_matches_the_migration_with_empty_default_entries(
         await _migrate(url, "downgrade", "036")
         assert await _catalog(cluster, at_036) == before
         return
-    prefix = "owners or privileges the downgrade would not recreate as postgres: "
+    prefix = f"owners or privileges the downgrade would not recreate as {su}: "
     assert predicted.startswith(prefix), predicted
     items = re.split(r"(?<=\)), (?=(?:table|function) )", predicted[len(prefix) :])
-    assert set(items) == refused
+    assert set(items) == {_fill(item, su=su) for item in refused}
     await _assert_refused_and_unchanged(baseline, at_036, _REFUSED + predicted)
