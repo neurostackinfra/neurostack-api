@@ -31,6 +31,7 @@ context:
     - Read AWS only through Describe*, Get* and List* calls; never call GetSecretValue and never print a secret value.
     - Resolve every secret ARN, random suffix included, from DescribeSecret at plan time.
     - Derive the new revision from the D3 source revision (task_definition.source_revision); change only the names listed under task_definition, the otel image (task_definition.otel_image, a digest) and the tags in task_definition.tag_overrides.
+    - BILLING_FACT_WORKER_ENABLED renders its reviewed parameter exactly ('false' or 'true'; the repository keeps 'false'). A revision that only flips it (worker on, or off again) is its own reviewed parameters edit and owner approval; plan reports it as a register_task_definition change carrying worker_flag.
     - The service rollback target is the field rollback_target; code paths read it from here and it moves only through its documented re-pin.
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
     - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names.
@@ -110,6 +111,10 @@ parameters:
     ASAAS_WEBHOOK_NOTIFICATION_EMAIL:
       validator: operator_email
       path: null
+    # The outbox worker flag: exactly the string 'false' or 'true'.
+    BILLING_FACT_WORKER_ENABLED:
+      validator: exact_false_or_true
+      path: null
   optional:
     app_image_override:
       validator: ecr_image_digest_reference
@@ -128,8 +133,10 @@ task_definition:
       parameter: ASAAS_CHECKOUT_RETURN_URL
     ASAAS_WEBHOOK_NOTIFICATION_EMAIL:
       parameter: ASAAS_WEBHOOK_NOTIFICATION_EMAIL
+    # Rendered from the reviewed parameter ('false' in the repository); the
+    # name is part of the D3 wiring whatever its value.
     BILLING_FACT_WORKER_ENABLED:
-      value: 'false'
+      parameter: BILLING_FACT_WORKER_ENABLED
   forbidden_name_prefixes:
     - ABACATEPAY_
     - APPCONFIG_
@@ -230,6 +237,7 @@ steps:
       - secret_access_stack is compliant, so the smoke token ARN can be read back.
       - Every required parameter is present and valid; both hosts resolve to the ALB and are covered by its certificate.
       - plan runs immediately before rendering, exits 0 and reports no block; render-taskdef refuses otherwise.
+      - BILLING_FACT_WORKER_ENABLED is the reviewed parameter. The D3 approval of 2026-10-18 covered the value 'false'; while the service runs a registered D3 revision, a rendering that differs from it in that value alone (plan change worker_flag, replaces the serving revision) needs its own owner approval.
     change: >-
       Register one new revision of the family with the request printed by
       render-taskdef. Registering does not change the service.

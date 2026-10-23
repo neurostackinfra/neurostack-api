@@ -1,5 +1,5 @@
 # Reviewed, non-secret parameters for the Group 9 D3 production wiring
-# (infra/production/asaas-production-wiring.yaml). All three values were
+# (infra/production/asaas-production-wiring.yaml). The three ASAAS values were
 # confirmed by the product owner on 2026-10-18. Secrets never belong here:
 # the task definition references them by ARN only.
 #
@@ -15,6 +15,14 @@ parameters:
   ASAAS_WEBHOOK_URL: https://staging.api.neurostack.global/v1/billing/webhook/asaas
   # Operator address ASAAS notifies about webhook queue problems.
   ASAAS_WEBHOOK_NOTIFICATION_EMAIL: neurostack.infra@gmail.com
+  # The billing.fact.v1 outbox worker, rendered as the app environment value
+  # BILLING_FACT_WORKER_ENABLED. Exactly the quoted string 'false' or 'true';
+  # a YAML boolean (true, yes, on), any other spelling or a missing value fails
+  # the plan. The repository keeps 'false'. Turning the worker on (or off
+  # again) is a committed, reviewed PR that changes this line and the pin test
+  # test_the_repository_keeps_the_outbox_worker_off, then a new revision
+  # (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
+  BILLING_FACT_WORKER_ENABLED: 'false'
   # null keeps the live app image reference exactly. A value must be an
   # immutable <account ECR repository URI>@sha256:<digest> that exists in ECR;
   # building and attesting that image is a separate gate.

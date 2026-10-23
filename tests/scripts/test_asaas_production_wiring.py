@@ -1254,7 +1254,11 @@ def test_rendering_keeps_app_and_otel_and_adds_exactly_the_d3_names() -> None:
     assert set(app_secrets) == evidence._EXPECTED_APP_SECRET_NAMES | set(
         wiring.ADDED_SECRETS
     )
-    assert app_env["BILLING_FACT_WORKER_ENABLED"] == "false"
+    # The reviewed parameter, rendered as is; its repository value is pinned
+    # once, by test_the_repository_keeps_the_outbox_worker_off.
+    assert app_env["BILLING_FACT_WORKER_ENABLED"] == (
+        _validated()["BILLING_FACT_WORKER_ENABLED"]
+    )
     assert app_env["ASAAS_WEBHOOK_URL"] == (
         "https://staging.api.neurostack.global/v1/billing/webhook/asaas"
     )
@@ -1706,6 +1710,9 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         "ASAAS_CHECKOUT_RETURN_URL": "https://payments.staging.api.neurostack.global/billing",
         "ASAAS_WEBHOOK_URL": "https://staging.api.neurostack.global/v1/billing/webhook/asaas",
         "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": "neurostack.infra@gmail.com",
+        # Present and valid here; its repository value is pinned once, by
+        # test_the_repository_keeps_the_outbox_worker_off.
+        "BILLING_FACT_WORKER_ENABLED": values["BILLING_FACT_WORKER_ENABLED"],
         "app_image_override": None,
     }
     assert (
@@ -4073,3 +4080,725 @@ def test_the_same_window_and_purpose_on_another_image_is_never_reused(
     assert (
         f"migrations_newer_revision_differs:{MIGRATIONS_NEXT_ARN}" in status["blocks"]
     )
+
+
+# ---------------------------------------------------------------------------
+# E7-B0: the outbox worker flag is a reviewed parameter ('false' by default)
+# ---------------------------------------------------------------------------
+
+WORKER_FLAG = "BILLING_FACT_WORKER_ENABLED"
+REVISION_10_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":10"
+# Both rollback targets the manifest may hold, set explicitly: these tests do
+# not depend on which one the reviewed manifest carries.
+WORKER_ROLLBACK_TARGETS: dict[int, dict[str, Any]] = {
+    8: {
+        "revision": 8,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_INITIAL,
+        "repin": {
+            "revision": 9,
+            "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+            "before": "migration_036",
+            "why": "Revision 8 reads legacy columns that migration 036 drops.",
+        },
+    },
+    9: {"revision": 9, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
+}
+# stdout of render-taskdef and check BEFORE the flag became a parameter (the
+# literal 'false', main a42754cd), in the D3 world (service on 8) and in the
+# bridge world (service on 9 registered from the rendering on the bridge image).
+GOLDEN_RENDER_SHA256 = {
+    "d3": "7cd9343411cbaf133f9586dbb6bbae6eca850b42399dfe4cdea5011aa12769d5",
+    "bridge": "ee061bb407528bb48551f22309781528daaea9ff246aabb98a17f6ef194bd784",
+}
+GOLDEN_CHECK_SHA256 = {
+    "d3": "7092b6e117cc91a85ff6fb1b103cbdaff228dadae71f1c966525653056bb9d47",
+    "bridge": "3e6486e0fc5e00c126fb575c39fcd3049a5e85b3c0000ef9d8226994e2f0d617",
+}
+WORKER_WORLDS = [("d3", 8), ("bridge", 8), ("bridge", 9)]
+
+
+def _worker_manifest(rollback: int) -> dict[str, Any]:
+    manifest: dict[str, Any] = wiring.load_yaml(MANIFEST)
+    manifest["rollback_target"] = copy.deepcopy(WORKER_ROLLBACK_TARGETS[rollback])
+    return manifest
+
+
+def _worker_pins(rollback: int) -> Any:
+    return _pins(_worker_manifest(rollback))
+
+
+def _registered_as(arn: str, rendered: dict[str, Any]) -> dict[str, Any]:
+    """DescribeTaskDefinition of ``arn`` as registered from ``rendered``."""
+
+    registered = _task_definition(arn)
+    registered["taskDefinition"]["containerDefinitions"] = copy.deepcopy(
+        rendered["containerDefinitions"]
+    )
+    registered["tags"] = copy.deepcopy(rendered["tags"])
+    return registered
+
+
+def _worker_rendering(flag: str, **changes: Any) -> dict[str, Any]:
+    """The rendering of the D3 world (service on 8) with the flag ``flag``."""
+
+    _plan_result, rendered = _plan(
+        FakeAws(applied=True), pins=_worker_pins(8), **{WORKER_FLAG: flag}, **changes
+    )
+    assert rendered is not None
+    return rendered
+
+
+def _put_app_revision(
+    fake: FakeAws, arn: str, response: dict[str, Any], *, latest: bool
+) -> None:
+    revision = arn.rsplit(":", 1)[1]
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": f"neurostack-staging-app:{revision}", "include": ["TAGS"]},
+        response,
+    )
+    if latest:
+        fake.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app", "include": ["TAGS"]},
+            response,
+        )
+
+
+def _serve(fake: FakeAws, arn: str) -> None:
+    fake.put(
+        "ecs",
+        "DescribeServices",
+        {"cluster": "neurostack-staging", "services": ["neurostack-staging-app"]},
+        _service(arn),
+    )
+
+
+def _bridge_world(flag: str = "false") -> FakeAws:
+    """Live today: the service runs revision 9, the rendering on the bridge
+    image (app_image_override) with the worker flag ``flag``."""
+
+    fake = FakeAws(applied=True)
+    rendered = _worker_rendering(flag, app_image_override=OVERRIDE_IMAGE)
+    _put_app_revision(fake, NEXT_ARN, _registered_as(NEXT_ARN, rendered), latest=True)
+    _serve(fake, NEXT_ARN)
+    return fake
+
+
+def _bridge_plan(
+    flag: str, *, rollback: int = 8, fake: FakeAws | None = None
+) -> tuple[dict[str, Any], Any]:
+    return _plan(
+        fake if fake is not None else _bridge_world(),
+        pins=_worker_pins(rollback),
+        app_image_override=OVERRIDE_IMAGE,
+        **{WORKER_FLAG: flag},
+    )
+
+
+def _worker_cli(
+    command: str,
+    world: str,
+    rollback: int,
+    flag: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[int, str, str]:
+    fake = FakeAws(applied=True) if world == "d3" else _bridge_world()
+    directory = tmp_path / f"{command}-{world}-{rollback}-{flag}"
+    directory.mkdir()
+    manifest = directory / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump(_worker_manifest(rollback)), encoding="utf-8")
+    raw = _parameters(**{WORKER_FLAG: flag})
+    if world == "bridge":
+        raw["parameters"]["app_image_override"] = OVERRIDE_IMAGE
+    params = directory / "params.yaml"
+    params.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    snapshot = fake.snapshot(directory / "readback.json")
+    return _run(
+        [
+            command,
+            "--params",
+            str(params),
+            "--readback-file",
+            str(snapshot),
+            "--manifest",
+            str(manifest),
+        ],
+        capsys,
+    )
+
+
+def test_the_repository_keeps_the_outbox_worker_off() -> None:
+    """An accidental merge can never enable the worker: the default is 'false'.
+
+    The only test that pins the repository value. Turning the worker on (or
+    off again) is a committed, reviewed PR that changes the parameters line
+    and this test deliberately (docs/runbooks/asaas-deployment.md, "The outbox
+    worker flag"); nothing else in the suites depends on the value.
+    """
+
+    assert "\n  BILLING_FACT_WORKER_ENABLED: 'false'\n" in PARAMS.read_text(
+        encoding="utf-8"
+    )
+    assert wiring.validate_parameters(wiring.load_yaml(PARAMS))[WORKER_FLAG] == (
+        "false"
+    )
+    _manifest, parameters, _digests = wiring.load_inputs(MANIFEST, PARAMS)
+    assert parameters is not None and parameters[WORKER_FLAG] == "false"
+    _plan_result, rendered = _plan(FakeAws(applied=True), pins=_worker_pins(8))
+    assert rendered is not None
+    app = evidence._container_map(rendered)["app"]
+    assert evidence._env_map(app)[WORKER_FLAG] == "false"
+    manifest = wiring.load_yaml(MANIFEST)
+    assert manifest["task_definition"]["app_environment_added"][WORKER_FLAG] == {
+        "parameter": WORKER_FLAG
+    }
+    assert manifest["parameters"]["required"][WORKER_FLAG] == {
+        "validator": "exact_false_or_true",
+        "path": None,
+    }
+
+
+@pytest.mark.parametrize("value", ["false", "true"])
+def test_the_worker_flag_parameter_is_exactly_false_or_true(value: str) -> None:
+    parameters = _validated(**{WORKER_FLAG: value})
+    assert parameters[WORKER_FLAG] == value
+    assert type(parameters[WORKER_FLAG]) is str
+
+
+@pytest.mark.parametrize(
+    "value,reason",
+    [
+        (None, "parameter_missing"),
+        ("", "parameter_missing"),
+        ("   ", "parameter_missing"),
+        ("yes", "parameter_invalid"),
+        ("no", "parameter_invalid"),
+        ("on", "parameter_invalid"),
+        ("True", "parameter_invalid"),
+        ("TRUE", "parameter_invalid"),
+        ("False", "parameter_invalid"),
+        ("1", "parameter_invalid"),
+        ("0", "parameter_invalid"),
+        ("enabled", "parameter_invalid"),
+        (" false", "parameter_invalid"),
+        ("false ", "parameter_invalid"),
+        ("true\n", "parameter_invalid"),
+        ("\ttrue", "parameter_invalid"),
+        ("'true'", "parameter_invalid"),
+        # YAML booleans and numbers: the reviewed value is the string itself.
+        (True, "parameter_invalid"),
+        (False, "parameter_invalid"),
+        (1, "parameter_invalid"),
+        (0, "parameter_invalid"),
+        (1.0, "parameter_invalid"),
+        (["true"], "parameter_invalid"),
+        ({"value": "true"}, "parameter_invalid"),
+    ],
+)
+def test_the_worker_flag_parameter_refuses_anything_else(
+    value: Any, reason: str
+) -> None:
+    with pytest.raises(wiring.WiringError, match=f"^{reason}:{WORKER_FLAG}$"):
+        _validated(**{WORKER_FLAG: value})
+
+
+def test_a_missing_worker_flag_parameter_fails_the_plan() -> None:
+    raw = _parameters()
+    del raw["parameters"][WORKER_FLAG]
+    with pytest.raises(wiring.WiringError, match=f"^parameter_missing:{WORKER_FLAG}$"):
+        wiring.validate_parameters(raw)
+
+
+@pytest.mark.parametrize("spelling", ["true", "false", "yes", "on", "True", "1"])
+def test_an_unquoted_yaml_flag_fails_before_any_aws_read(
+    spelling: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text = PARAMS.read_text(encoding="utf-8")
+    line = re.compile(rf"^  {WORKER_FLAG}: '(?:false|true)'$", re.MULTILINE)
+    assert len(line.findall(text)) == 1
+    params = tmp_path / "params.yaml"
+    params.write_text(
+        line.sub(f"  {WORKER_FLAG}: {spelling}", text),
+        encoding="utf-8",
+    )
+    fake = FakeAws(applied=True)
+    for command in ("plan", "render-taskdef", "check", "check-manifest"):
+        code = wiring.main(
+            [command, "--params", str(params)], transport_factory=lambda: fake.transport
+        )
+        captured = capsys.readouterr()
+        assert code == 2
+        assert captured.out == ""
+        assert f"blocked: parameter_invalid:{WORKER_FLAG}" in captured.err
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("world,rollback", WORKER_WORLDS)
+def test_false_renders_and_checks_byte_for_byte_as_before(
+    world: str, rollback: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for command, golden in (
+        ("render-taskdef", GOLDEN_RENDER_SHA256),
+        ("check", GOLDEN_CHECK_SHA256),
+    ):
+        code, out, err = _worker_cli(
+            command, world, rollback, "false", tmp_path, capsys
+        )
+        assert code == 0, err
+        assert wiring.hashlib.sha256(out.encode("utf-8")).hexdigest() == golden[world]
+
+
+@pytest.mark.parametrize("world,rollback", WORKER_WORLDS)
+def test_true_renders_the_same_request_but_for_the_one_value(
+    world: str, rollback: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, off, err = _worker_cli(
+        "render-taskdef", world, rollback, "false", tmp_path, capsys
+    )
+    assert code == 0, err
+    code, on, err = _worker_cli(
+        "render-taskdef", world, rollback, "true", tmp_path, capsys
+    )
+    assert code == 0, err
+    changed = [
+        (before, after)
+        for before, after in zip(off.splitlines(), on.splitlines(), strict=True)
+        if before != after
+    ]
+    assert [(a.strip(), b.strip()) for a, b in changed] == [
+        ('"value": "false"', '"value": "true"')
+    ]
+    request_off, request_on = json.loads(off), json.loads(on)
+    environment = evidence._container_map(request_on)["app"]["environment"]
+    # Same position as before: after the source names, the D3 names sorted.
+    assert [row["name"] for row in environment][-4:] == sorted(wiring.ADDED_ENVIRONMENT)
+    assert environment[-1] == {"name": WORKER_FLAG, "value": "true"}
+    environment[-1]["value"] = "false"
+    assert request_on == request_off
+
+
+@pytest.mark.parametrize("rollback", [8, 9])
+def test_plan_keeps_revision_9_compliant_while_the_flag_is_false(
+    rollback: int,
+) -> None:
+    plan, rendered = _bridge_plan("false", rollback=rollback)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "compliant"
+    assert step["state"] == "compliant"
+    assert f"registered_and_deployed:{NEXT_ARN}" in step["compliant"]
+    assert step["changes"] == [] and step["blocks"] == []
+    assert plan["would_change"] == []
+    assert plan["parameters"][WORKER_FLAG] == "false"
+    assert evidence._env_map(evidence._container_map(rendered)["app"])[WORKER_FLAG] == (
+        "false"
+    )
+
+
+@pytest.mark.parametrize("rollback", [8, 9])
+def test_plan_with_true_on_revision_9_reports_a_new_revision(rollback: int) -> None:
+    plan, rendered = _bridge_plan("true", rollback=rollback)
+    assert rendered is not None
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "ready"
+    assert step["state"] == "would_change"
+    assert step["blocks"] == []
+    assert plan["would_change"] == ["task_definition_revision:register_task_definition"]
+    assert step["changes"] == [
+        {
+            "action": "register_task_definition",
+            "family": "neurostack-staging-app",
+            "derived_from": SOURCE_ARN,
+            "replaces": NEXT_ARN,
+            "worker_flag": {"name": WORKER_FLAG, "from": "false", "to": "true"},
+            "request_sha256": wiring._sha256(rendered),
+            "service_changes": "none (service_deployment is a separate gate)",
+        }
+    ]
+    assert plan["parameters"][WORKER_FLAG] == "true"
+    assert wiring.renderable(plan, rendered) is rendered
+    assert evidence._env_map(evidence._container_map(rendered)["app"])[WORKER_FLAG] == (
+        "true"
+    )
+
+
+@pytest.mark.parametrize("rollback", [8, 9])
+def test_a_registered_true_revision_is_reported_until_and_after_it_serves(
+    rollback: int,
+) -> None:
+    fake = _bridge_world("false")
+    _plan_result, rendered = _bridge_plan("true", rollback=rollback, fake=fake)
+    _put_app_revision(
+        fake, REVISION_10_ARN, _registered_as(REVISION_10_ARN, rendered), latest=True
+    )
+    fake.calls.clear()
+    plan, _rendered = _bridge_plan("true", rollback=rollback, fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert f"registered_not_deployed:{REVISION_10_ARN}" in step["compliant"]
+    assert step["info"]["registered_revision_changes_worker_flag"] == {
+        "serving": NEXT_ARN,
+        "from": "false",
+        "to": "true",
+    }
+    # The serving revision 9 is read exactly once (as the rollback target, or
+    # as the serving revision when the rollback target is 8).
+    nine = {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]}
+    assert [call[2] for call in fake.calls].count(nine) == 1
+    _serve(fake, REVISION_10_ARN)
+    plan, _rendered = _bridge_plan("true", rollback=rollback, fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "compliant"
+    assert f"registered_and_deployed:{REVISION_10_ARN}" in step["compliant"]
+    # Turning the worker off again is also a reviewed new revision.
+    plan, rendered_off = _bridge_plan("false", rollback=rollback, fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "ready"
+    assert [change["worker_flag"] for change in step["changes"]] == [
+        {"name": WORKER_FLAG, "from": "true", "to": "false"}
+    ]
+    assert step["changes"][0]["replaces"] == REVISION_10_ARN
+    assert evidence._env_map(evidence._container_map(rendered_off)["app"])[
+        WORKER_FLAG
+    ] == ("false")
+
+
+REVISION_11_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":11"
+
+
+def _stuck_world(
+    serving: str, serving_flag: str, newest: str, newest_flag: str
+) -> FakeAws:
+    """The service on ``serving``; the newest registered revision is ``newest``;
+    revision 9 (the rollback target) is the 'false' bridge rendering."""
+
+    fake = FakeAws(applied=True)
+    for arn, flag, latest in (
+        (NEXT_ARN, "false", False),
+        (serving, serving_flag, False),
+        (newest, newest_flag, True),
+    ):
+        rendered = _worker_rendering(flag, app_image_override=OVERRIDE_IMAGE)
+        _put_app_revision(fake, arn, _registered_as(arn, rendered), latest=latest)
+    _serve(fake, serving)
+    return fake
+
+
+# (serving, its flag, newest registered, its flag, parameter): the flag
+# revision abandoned or rolled back with the parameter back to 'false', and
+# the repository's 'false' rendering registered after the worker was on.
+STUCK_STATES = [
+    (NEXT_ARN, "false", REVISION_10_ARN, "true", "false"),
+    (REVISION_10_ARN, "true", REVISION_11_ARN, "false", "true"),
+]
+
+
+@pytest.mark.parametrize("rollback", [8, 9])
+@pytest.mark.parametrize("serving,serving_flag,newest,newest_flag,flag", STUCK_STATES)
+def test_a_newest_revision_differing_only_in_the_flag_blocks_under_its_own_name(
+    serving: str,
+    serving_flag: str,
+    newest: str,
+    newest_flag: str,
+    flag: str,
+    rollback: int,
+) -> None:
+    fake = _stuck_world(serving, serving_flag, newest, newest_flag)
+    plan, _rendered = _bridge_plan(flag, rollback=rollback, fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert step["state"] == "blocked"
+    assert step["blocks"] == [f"newest_revision_differs_only_in_worker_flag:{newest}"]
+    assert step["changes"] == []
+    assert not any(item.startswith("registered_") for item in step["compliant"])
+    assert step["info"]["newest_revision_worker_flag"] == {
+        "newest": newest,
+        "newest_value": newest_flag,
+        "rendered_value": flag,
+        "serving": serving,
+    }
+    # Facts only: the planner never performs or names a deregistration.
+    assert "deregister" not in json.dumps(plan).lower()
+
+
+def test_render_taskdef_refuses_the_stuck_state_with_its_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _stuck_world(NEXT_ARN, "false", REVISION_10_ARN, "true")
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump(_worker_manifest(9)), encoding="utf-8")
+    raw = _parameters(**{WORKER_FLAG: "false"})
+    raw["parameters"]["app_image_override"] = OVERRIDE_IMAGE
+    params = tmp_path / "params.yaml"
+    params.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    args = [
+        "--params",
+        str(params),
+        "--readback-file",
+        str(fake.snapshot(tmp_path / "readback.json")),
+        "--manifest",
+        str(manifest),
+    ]
+    for command in ("render-taskdef", "check"):
+        code, out, err = _run([command, *args], capsys)
+        assert code == 2 and out == ""
+        assert (
+            "blocked: plan_blocked:"
+            f"newest_revision_differs_only_in_worker_flag:{REVISION_10_ARN}" in err
+        )
+
+
+def test_a_drifted_serving_revision_keeps_the_generic_block() -> None:
+    fake = _stuck_world(NEXT_ARN, "false", REVISION_10_ARN, "true")
+    drifted = fake.get(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]},
+    )
+    REVISION_9_DRIFTS["another_value_too"](drifted)
+    plan, _rendered = _bridge_plan("false", fake=fake)
+    assert _step(plan, "task_definition_revision")["blocks"] == [
+        f"service_not_on_rollback_target:{NEXT_ARN}"
+    ]
+
+
+@pytest.mark.parametrize("rollback", [8, 9])
+def test_a_newest_revision_equal_to_the_serving_one_is_never_registered_green(
+    rollback: int,
+) -> None:
+    """Serving 9 'false', newest 10 'false', parameter 'true': the 'true'
+    rendering is not registered, so nothing is 'registered, not deployed'."""
+
+    fake = _stuck_world(NEXT_ARN, "false", REVISION_10_ARN, "false")
+    plan, _rendered = _bridge_plan("true", rollback=rollback, fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert f"registered_not_deployed:{REVISION_10_ARN}" not in step["compliant"]
+    assert "registered_revision_changes_worker_flag" not in step["info"]
+    assert step["blocks"] == [
+        f"newest_revision_differs_only_in_worker_flag:{REVISION_10_ARN}"
+    ]
+
+
+def test_a_readback_file_without_the_serving_revision_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Service on 10, newest 11, rollback target 9: the serving revision 10 is
+    read too, and a readback file without that read fails with its name."""
+
+    fake = _stuck_world(REVISION_10_ARN, "true", REVISION_11_ARN, "false")
+    del fake.responses[
+        wiring._read_key(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
+        )
+    ]
+    transport = wiring.snapshot_transport(fake.snapshot(tmp_path / "readback.json"))
+    with pytest.raises(
+        wiring.WiringError, match="^readback_missing:ecs.DescribeTaskDefinition$"
+    ):
+        wiring.collect_readback(
+            wiring.ReadOnlyAws(transport),
+            _validated(**{WORKER_FLAG: "true"}, app_image_override=OVERRIDE_IMAGE),
+            pins=_worker_pins(9),
+        )
+    manifest = tmp_path / "manifest.yaml"
+    manifest.write_text(yaml.safe_dump(_worker_manifest(9)), encoding="utf-8")
+    code, out, err = _run(
+        [
+            "plan",
+            "--params",
+            str(_write_params(tmp_path, **{WORKER_FLAG: "true"})),
+            "--readback-file",
+            str(tmp_path / "readback.json"),
+            "--manifest",
+            str(manifest),
+        ],
+        capsys,
+    )
+    assert code == 2 and out == ""
+    assert err.strip() == "blocked: readback_missing:ecs.DescribeTaskDefinition"
+
+
+def _drift(row_name: str, value: Any) -> Callable[[dict[str, Any]], None]:
+    def mutate(response: dict[str, Any]) -> None:
+        app = evidence._container_map(response["taskDefinition"])["app"]
+        for row in app["environment"]:
+            if row["name"] == row_name:
+                row["value"] = value
+
+    return mutate
+
+
+REVISION_9_DRIFTS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "another_value_too": _drift("ASAAS_WEBHOOK_URL", "https://other.example/x"),
+    "flag_unreviewed": _drift(WORKER_FLAG, "yes"),
+    "flag_upper_case": _drift(WORKER_FLAG, "FALSE"),
+    "flag_missing": lambda r: evidence._container_map(r["taskDefinition"])["app"][
+        "environment"
+    ].pop(),
+    "flag_duplicated": lambda r: evidence._container_map(r["taskDefinition"])["app"][
+        "environment"
+    ].append({"name": WORKER_FLAG, "value": "true"}),
+    "image": lambda r: evidence._container_map(r["taskDefinition"])["app"].__setitem__(
+        "image", LIVE_IMAGE
+    ),
+    "tags": lambda r: r.__setitem__(
+        "tags", [{"key": "ManagedBy", "value": "terraform"}]
+    ),
+    "secret": lambda r: evidence._container_map(r["taskDefinition"])["app"][
+        "secrets"
+    ].append({"name": "EXTRA", "valueFrom": SECRET_PREFIX + "extra-AbC123"}),
+    "otel": lambda r: evidence._container_map(r["taskDefinition"])["otel"].__setitem__(
+        "image", "public.ecr.aws/aws-observability/aws-otel-collector:x"
+    ),
+    "cpu": lambda r: r["taskDefinition"].__setitem__("cpu", "2048"),
+}
+
+
+@pytest.mark.parametrize("drift", sorted(REVISION_9_DRIFTS))
+def test_only_a_worker_flag_difference_becomes_a_new_revision(drift: str) -> None:
+    fake = FakeAws(applied=True)
+    revision_9 = _registered_as(
+        NEXT_ARN, _worker_rendering("false", app_image_override=OVERRIDE_IMAGE)
+    )
+    REVISION_9_DRIFTS[drift](revision_9)
+    _put_app_revision(fake, NEXT_ARN, revision_9, latest=True)
+    _serve(fake, NEXT_ARN)
+    plan, _rendered = _bridge_plan("true", fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert step["changes"] == []
+    assert f"service_not_on_rollback_target:{NEXT_ARN}" in step["blocks"]
+    # Serving that drifted revision 9 while the true rendering is registered
+    # as revision 10 is not "registered, not deployed" either.
+    rendered = _worker_rendering("true", app_image_override=OVERRIDE_IMAGE)
+    _put_app_revision(
+        fake, REVISION_10_ARN, _registered_as(REVISION_10_ARN, rendered), latest=True
+    )
+    plan, _rendered = _bridge_plan("true", fake=fake)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert not any(item.startswith("registered_") for item in step["compliant"])
+
+
+def test_worker_flag_change_is_exactly_one_reviewed_value_flip() -> None:
+    off = _worker_rendering("false", app_image_override=OVERRIDE_IMAGE)
+    on = _worker_rendering("true", app_image_override=OVERRIDE_IMAGE)
+    assert wiring.worker_flag_change(_registered_as(NEXT_ARN, off), on) == (
+        "false",
+        "true",
+    )
+    assert wiring.worker_flag_change(_registered_as(NEXT_ARN, on), off) == (
+        "true",
+        "false",
+    )
+    assert wiring.worker_flag_change(_registered_as(NEXT_ARN, off), off) is None
+    bogus = copy.deepcopy(on)
+    evidence._container_map(bogus)["app"]["environment"][-1]["value"] = "TRUE"
+    assert wiring.worker_flag_change(_registered_as(NEXT_ARN, off), bogus) is None
+    assert wiring.worker_flag_change(_registered_as(NEXT_ARN, bogus), off) is None
+    assert wiring.worker_flag_change({"taskDefinition": "x"}, on) is None
+
+
+@pytest.mark.parametrize("value", ["yes", "TRUE", " true", True])
+def test_render_refuses_an_unreviewed_flag_even_when_called_directly(
+    value: Any,
+) -> None:
+    parameters = _validated()
+    parameters[WORKER_FLAG] = value
+    with pytest.raises(wiring.WiringError, match=f":{WORKER_FLAG}$"):
+        wiring.render_task_definition(
+            _task_definition(),
+            secret_arns={
+                "ASAAS_API_KEY": API_KEY_ARN,
+                "ASAAS_WEBHOOK_TOKEN": WEBHOOK_TOKEN_ARN,
+                "BILLING_OBSERVABILITY_SMOKE_TOKEN": SMOKE_ARN,
+            },
+            parameters=parameters,
+            pins=_worker_pins(8),
+        )
+
+
+def test_check_passes_with_false_and_true_and_only_the_digest_moves(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    results = {}
+    for flag in ("false", "true"):
+        code, out, err = _worker_cli("check", "bridge", 8, flag, tmp_path, capsys)
+        assert code == 0, err
+        results[flag] = json.loads(out)
+        assert results[flag]["status"] == "pass"
+        assert results[flag]["structural_status"] == "pass"
+        assert results[flag]["group5_deploy_path_status"] == "pass"
+    assert {
+        key for key in results["false"] if results["false"][key] != results["true"][key]
+    } == {"rendered_request_sha256"}
+    assert all(row["result"] == "pass" for row in results["true"]["validators"])
+
+
+def test_the_protected_path_gates_read_the_same_for_false_and_true() -> None:
+    plans = {flag: _bridge_plan(flag)[0] for flag in ("false", "true")}
+    gates = {
+        flag: _step(plan, "signed_image_build_and_attestation")
+        for flag, plan in plans.items()
+    }
+    assert plans["false"]["gate_blocks"] == plans["true"]["gate_blocks"]
+    # Path B (8 -> image + wiring in one protected deploy) was never chosen and
+    # is reported with either value; residual 5 stays fixed with either value.
+    assert gates["true"]["blocks"] == ["F1_path_b_runtime_fingerprint_changes"]
+    for gate in gates.values():
+        assert gate["info"]["protected_replacement_keeps_runtime_fingerprint"] is True
+        assert gate["info"]["d3_environment_values_fingerprinted"] is True
+    # The flag value is part of the runtime fingerprint: the protected deploy
+    # binds the value of the revision it starts from.
+    assert (
+        gates["false"]["info"]["runtime_fingerprint_candidate"]
+        != gates["true"]["info"]["runtime_fingerprint_candidate"]
+    )
+    assert (
+        gates["false"]["info"]["runtime_fingerprint_rollback_target"]
+        == gates["true"]["info"]["runtime_fingerprint_rollback_target"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m["task_definition"]["app_environment_added"].__setitem__(
+            WORKER_FLAG, {"value": "false"}
+        ),
+        lambda m: m["task_definition"]["app_environment_added"].__setitem__(
+            WORKER_FLAG, {"value": "true"}
+        ),
+        lambda m: m["task_definition"]["app_environment_added"].__setitem__(
+            WORKER_FLAG, {"parameter": "ASAAS_WEBHOOK_URL"}
+        ),
+        lambda m: m["parameters"]["required"].pop(WORKER_FLAG),
+        lambda m: m["parameters"]["required"][WORKER_FLAG].__setitem__(
+            "validator", "any_string"
+        ),
+        lambda m: m["parameters"]["optional"].__setitem__(
+            WORKER_FLAG, m["parameters"]["required"].pop(WORKER_FLAG)
+        ),
+    ],
+)
+def test_manifest_validator_pins_the_worker_flag_to_its_parameter(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    mutate(manifest)
+    with pytest.raises(wiring.WiringError, match="^manifest_"):
+        wiring.validate_manifest(manifest)
+
+
+def test_check_manifest_accepts_the_reviewed_files(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, out, err = _run(["check-manifest", "--params", str(PARAMS)], capsys)
+    assert code == 0, err
+    assert json.loads(out)["status"] == "valid"
