@@ -67,23 +67,15 @@ target:
     - payments.staging.api.neurostack.global
 
 # Where a failed service deployment goes back to. Code reads this field (never
-# a constant). Revision 8 stays the target while the bridge revision 9 is under
-# observation; revision 8 runs code that reads columns migration 036 drops, so
-# the re-pin below is a reviewed edit of this field made after revision 9 has
-# served and its observation period closed, and before migration 036 runs.
+# a constant). Re-pinned from revision 8 to the bridge revision 9 (the D3
+# rendering on the bridge image pinned by digest) once revision 9 had served,
+# been verified and its observation period had closed, and before migration
+# 036: revision 8 runs code that reads columns 036 drops. This is the final
+# pin of the planner (no further re-pin is allowed by it); this edit merges
+# only after the observation period closed (about 2026-10-23 18:30 UTC).
 rollback_target:
-  revision: 8
-  effective_after: initial_d3_planning_2026_10_18
-  repin:
-    revision: 9
-    effective_after: bridge_revision_9_serving_verified_and_observation_closed
-    before: migration_036
-    why: >-
-      Revision 8 (image of 2026-10-14) reads legacy columns that migration 036
-      drops, so after 036 a rollback to it would fail at runtime. Revision 9,
-      the D3 rendering on the bridge image pinned by digest, is the first
-      revision safe after 036. Re-pinning earlier would leave no safe way back
-      while revision 9 is still under observation.
+  revision: 9
+  effective_after: bridge_revision_9_serving_verified_and_observation_closed
 
 secrets:
   kms_key_arn: arn:aws:kms:us-east-1:388460142431:key/90eff49a-c2bf-4836-834f-d5666294d956

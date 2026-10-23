@@ -705,19 +705,37 @@ MIGRATIONS_LOG = hook.LogTarget(
 )
 
 
-def repinned_manifest(tmp_path: Path) -> Path:
-    """The manifest after the reviewed re-pin of rollback_target to revision 9."""
+# The live bridge revision 9 the reviewed manifest re-pinned the rollback
+# target to (read back 2026-10-22), and its app image digest.
+LIVE_REVISION_9 = SERVICE_TD_9
+LIVE_REVISION_9_IMAGE = (
+    f"{REGISTRY}/neurostack-staging@sha256:"
+    "18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24"
+)
+
+
+def initial_manifest(tmp_path: Path) -> Path:
+    """The manifest as it read before the re-pin: revision 8 with its note.
+
+    The reviewed manifest itself is re-pinned to revision 9 (no ``repin``
+    block), so every 036 and 037 plan below reads it through the default.
+    """
 
     text = MANIFEST.read_text(encoding="utf-8")
     start = text.index("rollback_target:\n")
     end = text.index("\nsecrets:\n")
-    repinned = (
+    initial = (
         "rollback_target:\n"
-        "  revision: 9\n"
-        "  effective_after: bridge_revision_9_serving_verified_and_observation_closed\n"
+        "  revision: 8\n"
+        "  effective_after: initial_d3_planning_2026_10_18\n"
+        "  repin:\n"
+        "    revision: 9\n"
+        "    effective_after: bridge_revision_9_serving_verified_and_observation_closed\n"
+        "    before: migration_036\n"
+        "    why: Revision 8 reads legacy columns that migration 036 drops.\n"
     )
-    path = tmp_path / "manifest-repinned.yaml"
-    path.write_text(text[:start] + repinned + text[end:], encoding="utf-8")
+    path = tmp_path / "manifest-initial.yaml"
+    path.write_text(text[:start] + initial + text[end:], encoding="utf-8")
     return path
 
 
@@ -728,8 +746,6 @@ def plan(
     now: datetime = NOW_DT,
     manifest: Path | None = None,
 ) -> dict[str, Any]:
-    if manifest is None and world.window.rollback_target_revision is not None:
-        manifest = repinned_manifest(tmp_path)
     document, _context = mw.evaluate_plan(
         world.readback(tmp_path, "plan.json"),
         world.context(),
@@ -740,14 +756,8 @@ def plan(
 
 
 def render_run(world: World, tmp_path: Path, *, attempt: int = 1) -> dict[str, Any]:
-    manifest = (
-        repinned_manifest(tmp_path) if world.window.rollback_target_revision else None
-    )
     run = mw.run_context_for(
-        world.readback(tmp_path, "render.json"),
-        world.context(),
-        now=NOW_DT,
-        manifest=manifest,
+        world.readback(tmp_path, "render.json"), world.context(), now=NOW_DT
     )
     return mw.build_run_task_request(
         world.window,
@@ -1702,10 +1712,74 @@ def test_036_and_037_refuse_a_rollback_target_not_repinned(
     window: str, tmp_path: Path
 ) -> None:
     world = ready_world(tmp_path, window)
-    blocks = _blocks(
-        world, tmp_path, manifest=MANIFEST
-    )  # still revision 8 with its re-pin
+    # The manifest as it read before the re-pin: revision 8 with its note.
+    blocks = _blocks(world, tmp_path, manifest=initial_manifest(tmp_path))
     assert "rollback_target_not_repinned" in blocks
+
+
+def test_the_reviewed_manifest_is_re_pinned_to_revision_9() -> None:
+    raw = wiring.load_yaml(MANIFEST)
+    assert raw["rollback_target"] == {
+        "revision": 9,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+    }
+    pins = wiring.manifest_pins(wiring.validate_manifest(raw))
+    assert pins.rollback_revision == mw.WINDOW_036.rollback_target_revision
+    assert pins.rollback_revision == mw.WINDOW_037.rollback_target_revision
+    assert pins.rollback_repin_before is None
+    assert pins.rollback_task_definition_arn == LIVE_REVISION_9
+
+
+@pytest.mark.parametrize("window", ["036", "037"])
+def test_036_and_037_accept_the_live_revision_9_by_digest(
+    window: str, tmp_path: Path
+) -> None:
+    """The reviewed manifest, read by default: revision 9 ACTIVE by digest.
+
+    The service runs a later revision with the image containing the window's
+    migration; the rollback target is the live bridge revision 9.
+    """
+
+    world = ready_world(tmp_path, window)
+    later = TD_PREFIX + "neurostack-staging-app:10"
+    world.service_td = later
+    world.put(
+        "ecs", "DescribeServices", mw.describe_services_request(), _service(later)
+    )
+    world.put(
+        "ecs",
+        "DescribeTasks",
+        mw.describe_tasks_request(SERVICE_TASKS),
+        {
+            "tasks": [_running_task(arn, later, world.digest) for arn in SERVICE_TASKS],
+            "failures": [],
+        },
+    )
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(later),
+        _app_definition(later, BRIDGE_IMAGE),
+    )
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(LIVE_REVISION_9),
+        _app_definition(LIVE_REVISION_9, LIVE_REVISION_9_IMAGE),
+    )
+    document = plan(world, tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert document["manifest"] == {"rollback_target_revision": 9}
+    assert "rollback_target_repinned" in document["checks"]
+    assert "rollback_target_revision_active_digest_pinned" in document["checks"]
+    tagged = LIVE_REVISION_9_IMAGE.split("@", 1)[0] + ":" + OLD_TAG
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(LIVE_REVISION_9),
+        _app_definition(LIVE_REVISION_9, tagged),
+    )
+    assert "rollback_target_revision_unusable" in _blocks(world, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -1732,9 +1806,9 @@ def test_036_refuses_an_invalid_manifest(tmp_path: Path) -> None:
     world = ready_world(tmp_path, "036")
     broken = tmp_path / "broken.yaml"
     broken.write_text(
-        repinned_manifest(tmp_path)
-        .read_text(encoding="utf-8")
-        .replace("`alembic upgrade 036`", "`alembic upgrade head`"),
+        MANIFEST.read_text(encoding="utf-8").replace(
+            "`alembic upgrade 036`", "`alembic upgrade head`"
+        ),
         encoding="utf-8",
     )
     assert "manifest_invalid" in _blocks(world, tmp_path, manifest=broken)
@@ -1824,11 +1898,7 @@ def test_plan_cli_exit_codes_and_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     world = ready_world(tmp_path)
-    manifest = repinned_manifest(tmp_path)
-    code, out, err = run_cli(
-        ["plan", *world.args(tmp_path), "--manifest", str(manifest)],
-        capsys,
-    )
+    code, out, err = run_cli(["plan", *world.args(tmp_path)], capsys)
     assert code == 0, err
     assert json.loads(out)["status"] == "ready"
     world.put(
@@ -1837,10 +1907,7 @@ def test_plan_cli_exit_codes_and_output(
         mw.list_family_tasks_request(mw.MIGRATIONS_FAMILY),
         {"taskArns": [RUN_TASK]},
     )
-    code, out, _err = run_cli(
-        ["plan", *world.args(tmp_path), "--manifest", str(manifest)],
-        capsys,
-    )
+    code, out, _err = run_cli(["plan", *world.args(tmp_path)], capsys)
     assert code == 2
     assert "migrations_task_running" in json.loads(out)["blocks"]
 
@@ -2012,13 +2079,10 @@ def test_render_run_task_refuses_unless_plan_is_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = World()
-    manifest = repinned_manifest(tmp_path)
     code, out, err = run_cli(
         [
             "render-run-task",
             *world.args(tmp_path),
-            "--manifest",
-            str(manifest),
         ],
         capsys,
     )
@@ -2029,8 +2093,6 @@ def test_render_run_task_refuses_unless_plan_is_ready(
         [
             "render-run-task",
             *world.args(tmp_path),
-            "--manifest",
-            str(manifest),
         ],
         capsys,
     )
@@ -2043,8 +2105,6 @@ def test_render_run_task_refuses_unless_plan_is_ready(
         [
             "render-run-task",
             *world.args(tmp_path),
-            "--manifest",
-            str(manifest),
         ],
         capsys,
     )
@@ -2277,6 +2337,67 @@ def test_read_plan_refuses_an_unusable_read_family(
     )
     assert context is None and document["status"] == "blocked"
     assert reason in document["blocks"]
+
+
+def _read_plan_for(world: World, tmp_path: Path, container: dict[str, Any]) -> Any:
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(READ_TD),
+        _one_container_definition(READ_TD, "neurostack-staging-consulta", container),
+    )
+    return mw.evaluate_read_plan(
+        world.readback(tmp_path), world.context(), "pre", now=NOW_DT
+    )
+
+
+def test_the_live_read_family_revision_26_is_refused(tmp_path: Path) -> None:
+    """consulta:26 (2026-10-20): Alpine, ``sh -c`` with psql, the app role
+    through APP_URL. The live plan-pre-read of 2026-10-22 blocked it."""
+
+    container = _read_container(
+        image="public.ecr.aws/docker/library/alpine:3.20",
+        entryPoint=["sh", "-c"],
+        command=['psql "$APP_URL" -c "select 1"'],
+        secrets=[{"name": "APP_URL", "valueFrom": APP_DB_ARN}],
+    )
+    document, context = _read_plan_for(World("035"), tmp_path, container)
+    assert context is None and document["status"] == "blocked"
+    for reason in (
+        "read_container_entry_point_unexpected",
+        "read_database_secret_mismatch",
+        "read_image_not_an_application_image",
+    ):
+        assert reason in document["blocks"], reason
+
+
+@pytest.mark.parametrize("window", ["035", "036"])
+def test_the_live_read_family_revision_28_satisfies_the_contract(
+    window: str, tmp_path: Path
+) -> None:
+    """consulta:28 (2026-10-22): the bridge image by digest, no entry point,
+    the app DATABASE_URL secret and a harmless baked command. Its image need
+    not be the deployed or the migrations image: any image of the registry."""
+
+    container = _read_container(
+        image=LIVE_REVISION_9_IMAGE,
+        command=[
+            "python",
+            "-c",
+            "raise SystemExit('read revision: a command override is required')",
+        ],
+    )
+    world = World(window)
+    assert LIVE_REVISION_9_IMAGE not in (BRIDGE_IMAGE, OLD_IMAGE)
+    document, context = _read_plan_for(world, tmp_path, container)
+    assert context is not None and document["status"] == "ready", document["blocks"]
+    for check in (
+        "read_container_has_no_entry_point",
+        "read_database_secret_is_the_app_role",
+        "read_image_in_registry",
+        "read_family_names_no_migration_tool",
+    ):
+        assert check in document["checks"], check
 
 
 def test_the_037_readback_never_runs_as_the_application_role(tmp_path: Path) -> None:
@@ -3249,15 +3370,13 @@ def test_snapshot_requests_name_the_window_and_carry_no_tags(
     window: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     world = World(window)
-    manifest = ["--manifest", str(repinned_manifest(tmp_path))]
-    extra = manifest if world.window.rollback_target_revision else []
     code, out, err = run_cli(
-        ["plan-snapshot", *_snapshot_args(world, tmp_path), *extra], capsys
+        ["plan-snapshot", *_snapshot_args(world, tmp_path)], capsys
     )
     assert code == 0, (out, err)
     assert json.loads(out)["status"] == "ready"
     code, out, err = run_cli(
-        ["render-snapshot-requests", *_snapshot_args(world, tmp_path), *extra],
+        ["render-snapshot-requests", *_snapshot_args(world, tmp_path)],
         capsys,
     )
     assert code == 0, err
@@ -3329,11 +3448,7 @@ def test_the_snapshot_step_cross_checks_the_deploy_state(
 ) -> None:
     world = World("036")
     mutate(world)
-    args = [
-        *_snapshot_args(world, tmp_path),
-        "--manifest",
-        str(repinned_manifest(tmp_path)),
-    ]
+    args = _snapshot_args(world, tmp_path)
     code, out, err = run_cli(["plan-snapshot", *args], capsys)
     assert code == 2 and reason in json.loads(out)["blocks"]
     code, out, err = run_cli(["render-snapshot-requests", *args], capsys)
@@ -3344,11 +3459,7 @@ def test_the_snapshot_step_refuses_after_a_pre_read(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     world = ready_world(tmp_path, "036")
-    args = [
-        *_snapshot_args(world, tmp_path),
-        "--manifest",
-        str(repinned_manifest(tmp_path)),
-    ]
+    args = _snapshot_args(world, tmp_path)
     code, out, _err = run_cli(["plan-snapshot", *args], capsys)
     assert code == 2
     assert "pre_read_recorded_before_the_snapshot" in json.loads(out)["blocks"]
@@ -3586,8 +3697,7 @@ def test_script_runs_standalone_without_repository_on_the_path(tmp_path: Path) -
     # standalone (manifest read through the planner) and refuses on freshness
     # unless the system clock happens to sit inside the window.
     world = ready_world(tmp_path, "036")
-    manifest = repinned_manifest(tmp_path)
-    plan_run = run("plan", *world.args(tmp_path), "--manifest", str(manifest))
+    plan_run = run("plan", *world.args(tmp_path))
     document = json.loads(plan_run.stdout)
     assert plan_run.returncode == (0 if document["status"] == "ready" else 2)
     assert document["window"] == "036"
