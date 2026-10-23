@@ -29,6 +29,7 @@ MANIFEST = ROOT / "infra/production/asaas-production-wiring.yaml"
 PLANNER = ROOT / "scripts/asaas_production_wiring.py"
 WINDOW_TOOL = ROOT / "scripts/asaas_migration_window.py"
 RUNBOOK = ROOT / "docs/runbooks/asaas-deployment.md"
+ROLLBACK_RUNBOOK = ROOT / "docs/runbooks/asaas-rollback.md"
 CONFIGURATION = ROOT / "docs/configuration.md"
 README = ROOT / "README.md"
 VPS_RUNBOOK = ROOT / "docs/api-provider-settings-rollout.md"
@@ -334,3 +335,243 @@ def test_runbook_states_the_review_fixes_and_the_accepted_residual_risks() -> No
     ):
         assert phrase in text, phrase
     assert "never names the migration tool" not in text
+
+
+def test_runbook_records_the_live_read_family_revision() -> None:
+    text = " ".join(_text(RUNBOOK).split())
+    for phrase in (
+        "**`neurostack-staging-consulta:28`**",
+        "`neurostack-staging-consulta:26`",
+        "`read_container_entry_point_unexpected`, `read_database_secret_mismatch`"
+        " and `read_image_not_an_application_image`",
+        "no `entryPoint`, `DATABASE_URL` from the secret"
+        " `neurostack/staging/database-url` (application role)",
+        "`python -c \"raise SystemExit('read revision: a command override is"
+        " required')\"`",
+        "with stream prefix `consulta`",
+        "`ManagedBy=manual`, cpu 512 and memory 1024",
+        "The family's numbering skips `:27`, a deregistered revision",
+        "a new application image does **not** require re-registering the read"
+        " family",
+        '--read-task-definition "$READ_TD" # neurostack-staging-consulta:28',
+    ):
+        assert phrase in text, phrase
+    assert windows.READ_FAMILY == "neurostack-staging-consulta"
+    assert windows.APP_DATABASE_SECRET == "neurostack/staging/database-url"
+    assert "**Not verified live.**" not in text
+
+
+def test_runbook_separates_what_the_live_run_verified() -> None:
+    verified = " ".join(
+        _section(
+            _text(RUNBOOK),
+            "**Verified live on 2026-10-22**",
+            r"^\*\*Still not verified live\.\*\*",
+        ).split()
+    )
+    for phrase in (
+        "`rds:CreateDBSnapshot` and `rds:DescribeDBSnapshots`",
+        "`SnapshotCreateTime` is an aware timestamp string",
+        "`creating` -> `available`",
+        "`clientToken`, `platformVersion` `LATEST` and `enableECSManagedTags` false",
+        "both from this tool and from the deploy hook",
+        '`{"containerOverrides": [{"name": ...}], ...}`',
+        "(`read_ok`)",
+        "`neurostack-staging-consulta:28`",
+        "an empty page can carry a different token",
+    ):
+        assert phrase in verified, phrase
+    still = " ".join(
+        _section(
+            _text(RUNBOOK), "**Still not verified live.**", r"^\*\*Residual risks"
+        ).split()
+    )
+    for phrase in (
+        "Whether ECS honours the same `clientToken` for a re-sent RunTask",
+        "the enforcement of `--attempt`",
+        "the formal `verify-post-read` of this tool and the deploy hook's"
+        " `verify-result` on a real run",
+        "(`55P03`, `40P01`, `55000`)",
+        "PostgreSQL 17",
+    ):
+        assert phrase in still, phrase
+    text = " ".join(_text(RUNBOOK).split())
+    assert "not yet verified live" not in text
+
+
+def test_runbook_state_section_is_the_live_run_of_2026_10_22() -> None:
+    raw = _text(RUNBOOK)
+    assert "## Current state (2026-10-17)" not in raw
+    state = " ".join(
+        _section(raw, "## State after the live run of 2026-10-22\n", r"^## ").split()
+    )
+    for phrase in (
+        "`alembic_version` reads `035`",
+        "`4063e8a0555049ada6e4cd0880b436c5`",
+        "Pre-read task `98bfa0e6382d4e1590c9751d234475a3`",
+        "post-read task `223a1daf9eb14d508c047cb7e0a63e2a`",
+        "(task `8593671855574617b5267cbacfdfa081`)",
+        "`verify-result` (`applied`)",
+        "`pre-033-035-2026-10-22`",
+        "`neurostack-staging-app:9`, deployment `COMPLETED`",
+        "sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24",
+        "sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e",
+        "verdict `ready`, action `created`, one provider write",
+        "A second, foreign webhook exists in the ASAAS account; it was not touched",
+        "`neurostack-staging-consulta:28` registered",
+        "billing rollout `disabled`; `BILLING_FACT_WORKER_ENABLED` `false`",
+        "**Not applied:** migrations 036 and 037.",
+    ):
+        assert phrase in state, phrase
+
+
+def test_rollback_runbook_states_both_rollback_target_phases() -> None:
+    text = " ".join(_text(ROLLBACK_RUNBOOK).split())
+    for phrase in (
+        "**Until the re-pin is merged: revision 8**",
+        "**After the re-pin is merged: revision 9**",
+        "about **2026-10-23 18:30 UTC**",
+        "**Revision 8 is unsafe after migration 036**: it reads columns 036 drops",
+        "--task-definition neurostack-staging-app:R",
+        "`8` only until the re-pin is merged, `9` after it, and never `8` once"
+        " migration 036 has run",
+    ):
+        assert phrase in text, phrase
+    assert "Today it is `neurostack-staging-app:8`" not in text
+    assert "--task-definition neurostack-staging-app:8" not in text
+
+
+def test_runbook_states_the_snapshot_order_and_the_freshness_rule() -> None:
+    text = " ".join(_text(RUNBOOK).split())
+    for phrase in (
+        "**Snapshot order.** `plan-snapshot` runs, and exits 0, **before**"
+        " `CreateDBSnapshot` is sent",
+        "On 2026-10-22 (window `035`) `CreateDBSnapshot` was sent first, by"
+        " mistake, and the `plan-snapshot` run afterwards passed",
+        "**before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then"
+        " send `CreateDBSnapshot`",
+        f"(`pre_read_max_age_seconds` {windows.PRE_READ_MAX_AGE_SECONDS})",
+        f"(`snapshot_max_age_seconds` {windows.SNAPSHOT_MAX_AGE_SECONDS})",
+        "the run must follow the pre-read within 15 minutes and the snapshot"
+        " within 60",
+        "Prepare everything that does not age before asking for the owner's go",
+        "run the read's `plan-*` or `plan` again; it, not a comparison by eye, is"
+        " the judge",
+        "ECR `lastRecordedPullTime`, a task's `version`, the ECS service `events`",
+        "Any other difference between the old and the new response is"
+        " unexplained: stop and report (the safe default), never guess.",
+        "Never keep or re-date a readback past its freshness window.",
+    ):
+        assert phrase in text, phrase
+    assert windows.PRE_READ_MAX_AGE_SECONDS == 15 * 60
+    assert windows.SNAPSHOT_MAX_AGE_SECONDS == 60 * 60
+
+
+def test_runbook_states_the_live_log_paging_rule() -> None:
+    text = " ".join(_text(RUNBOOK).split())
+    for phrase in (
+        "**Log pages, as read live (2026-10-22, window `035`).**",
+        "until a response returns exactly the token that was sent: only that"
+        " repetition is the end of the stream",
+        "an **empty page can carry a different `nextForwardToken`**: an empty page"
+        " is not the end, send the next one",
+    ):
+        assert phrase in text, phrase
+
+
+def test_runbook_states_the_re_pin_merge_condition() -> None:
+    text = " ".join(_text(RUNBOOK).split())
+    for phrase in (
+        "**Merge condition of the re-pin.** The manifest edit above merges only"
+        " after revision 9's 24 h observation period has closed, about"
+        " **2026-10-23 18:30 UTC**",
+        "and before migration 036",
+        "**History.** The rollback target was re-pinned from revision 8 to"
+        " revision 9 on the date the re-pin merged; revision 8 was the target"
+        " until then.",
+        "arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9",
+        "neurostack-staging@sha256:"
+        "18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24",
+    ):
+        assert phrase in text, phrase
+    assert "about 2026-10-23 18:30 UTC" in " ".join(_text(MANIFEST).split())
+    # Text that lands on main only after the merge never describes the branch
+    # or the pre-merge state as current.
+    for stale in (
+        "prepared on branch",
+        "chore/asaas-repin-and-live-chain-docs",
+        "Until the merge, `main` reads revision 8",
+    ):
+        assert stale not in text, stale
+
+
+def test_runbook_keeps_the_standing_guidance_undated() -> None:
+    raw = _text(RUNBOOK)
+    assert raw.index("## State after the live run of 2026-10-22\n") < raw.index(
+        "## Standing guidance\n"
+    )
+    standing = " ".join(_section(raw, "## Standing guidance\n", r"^## ").split())
+    for phrase in (
+        "The ECS service `neurostack-staging-app` serves production traffic. Any"
+        " change to it is production-impacting.",
+        "Verify both from the server readback"
+        " (`GET /v1/admin/billing/rollout/readback`,",
+        "never from UI state or environment overrides.",
+        "The commercial credit top-up is deferred and stays unavailable.",
+        "`general` opens only after a delivered, deployed credit consumer exists",
+        "no transition to `canary_allowlist` or `general` is planned.",
+    ):
+        assert phrase in standing, phrase
+    assert "2026-10-18: D3 step 1" not in raw
+
+
+def test_the_read_family_contract_is_not_stated_stricter_than_the_code() -> None:
+    """The tools accept any application image of the registry and any log
+    group matching the name pattern; neither text may claim more."""
+
+    runbook = " ".join(_text(RUNBOOK).split())
+    comment = " ".join(
+        line.lstrip("# ")
+        for line in _text(WINDOW_TOOL).splitlines()
+        if line.startswith("#")
+    )
+    for text in (runbook, comment):
+        for stricter in (
+            "an image of the `neurostack-staging` repository",
+            "image of this registry's neurostack-staging repository",
+            "neurostack-staging repository (tag or digest)",
+            "awslogs (log group /ecs/neurostack-staging/",
+            "log group must be",
+        ):
+            assert stricter not in text, stricter
+    assert "an application image of this registry, by tag or digest" in runbook
+    assert "checked only against a name pattern" in runbook
+    assert "not a requirement of the tools" in runbook
+    assert "an application image of this registry (tag or digest)" in comment
+    assert "match the name patterns only" in comment
+    assert windows._REGISTRY_IMAGE.fullmatch(
+        f"{windows.ECR_REGISTRY}/some-other-repository:anything"
+    )
+    assert windows.hook._LOG_GROUP.fullmatch("/ecs/unrelated/group")
+
+
+def test_the_state_section_does_not_claim_formal_post_read_verification() -> None:
+    raw = _text(RUNBOOK)
+    state = " ".join(
+        _section(raw, "## State after the live run of 2026-10-22\n", r"^## ").split()
+    )
+    assert (
+        "were read from the raw task logs; the formal `verify-post-read` and the"
+        " deploy hook's `verify-result` were **not** run on them" in state
+    )
+    caveat_free = state.replace(
+        "the formal `verify-post-read` and the deploy hook's `verify-result` were"
+        " **not** run on them",
+        "",
+    )
+    for claim in (
+        "verify-post-read",
+        "verified by the deploy hook's",
+        "hook's `verify-result`",
+    ):
+        assert claim not in caveat_free, claim

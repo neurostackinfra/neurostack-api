@@ -96,9 +96,14 @@ ECR_REGISTRY = hook.ECR_REGISTRY
 MIGRATIONS_FAMILY = "neurostack-staging-migrations"
 MIGRATIONS_SOURCE_REVISION = 3
 MIGRATIONS_DATABASE_SECRET = "neurostack/staging/database-url-migrations"
-# The read family the orchestrator ran a SELECT-only query on (2026-10-20,
-# revision 26): the application role (secret database-url), log group
-# /ecs/neurostack-staging/migrations, stream consulta/consulta/<task id>.
+# The read family of the application-role reads. Contract (checked by
+# _read_target): one essential container, no entry point, DATABASE_URL only
+# as the secret database-url (application role), an application image of
+# this registry (tag or digest), a baked command that never names the
+# migration tool, and awslogs in this region with a log group and stream
+# prefix that match the name patterns only. The live revision is the one the
+# operator registers and passes as --read-task-definition (revision 28 on
+# 2026-10-22).
 READ_FAMILY = "neurostack-staging-consulta"
 APP_DATABASE_SECRET = "neurostack/staging/database-url"
 # The production database (staging discovery of 2026-10-10; not read by this
