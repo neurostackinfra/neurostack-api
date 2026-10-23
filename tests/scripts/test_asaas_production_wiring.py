@@ -719,6 +719,40 @@ def _pins(manifest: dict[str, Any] | None = None) -> Any:
     )
 
 
+# The rollback target as the manifest held it from the D3 planning of
+# 2026-10-18 until its re-pin to revision 9 (the planner still accepts it).
+INITIAL_ROLLBACK_TARGET: dict[str, Any] = {
+    "revision": 8,
+    "effective_after": "initial_d3_planning_2026_10_18",
+    "repin": {
+        "revision": 9,
+        "effective_after": (
+            "bridge_revision_9_serving_verified_and_observation_closed"
+        ),
+        "before": "migration_036",
+        "why": "Revision 8 reads legacy columns that migration 036 drops.",
+    },
+}
+
+
+def _initial_manifest() -> dict[str, Any]:
+    """The reviewed manifest with the rollback target it held before the re-pin."""
+
+    manifest: dict[str, Any] = wiring.load_yaml(MANIFEST)
+    manifest["rollback_target"] = copy.deepcopy(INITIAL_ROLLBACK_TARGET)
+    return manifest
+
+
+def _initial_pins() -> Any:
+    return _pins(_initial_manifest())
+
+
+def _initial_manifest_file(tmp_path: Path) -> Path:
+    path = tmp_path / "manifest-initial.yaml"
+    path.write_text(yaml.safe_dump(_initial_manifest()), encoding="utf-8")
+    return path
+
+
 def _plan(
     fake: FakeAws,
     *,
@@ -727,7 +761,11 @@ def _plan(
     **changes: Any,
 ) -> tuple[dict[str, Any], Any]:
     parameters = _validated(**changes)
-    pins = pins if pins is not None else _pins()
+    # The fixture world is the D3 world of 2026-10-18 (the service on revision
+    # 8, revision 9 not yet registered), planned against the manifest of that
+    # time: rollback_target 8 with its re-pin note. The reviewed manifest is
+    # re-pinned to 9 since; the T2 tests below plan it against revision 9.
+    pins = pins if pins is not None else _initial_pins()
     aws = wiring.ReadOnlyAws(fake.transport)
     readback = wiring.collect_readback(aws, parameters, pins=pins)
     return wiring.build_plan(
@@ -1428,8 +1466,8 @@ def test_image_override_must_be_a_digest_that_exists_in_ecr() -> None:
             _validated(app_image_override=invalid)
 
 
-def test_rollback_target_is_revision_8() -> None:
-    """The manifest field reads 8 until its documented re-pin to 9."""
+def test_initial_d3_world_rollback_target_was_revision_8() -> None:
+    """The manifest of the D3 world read 8 until its documented re-pin to 9."""
 
     plan, _rendered = _plan(FakeAws(applied=True))
     assert plan["target"]["rollback_target"] == SOURCE_ARN
@@ -1790,7 +1828,10 @@ def test_unknown_parameter_is_rejected() -> None:
 
 def test_manifest_and_template_validate() -> None:
     manifest, parameters, digests = wiring.load_inputs(MANIFEST, PARAMS)
-    assert manifest["rollback_target"]["revision"] == 8
+    assert manifest["rollback_target"] == {
+        "revision": 9,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+    }
     assert "rollback_task_definition_revision" not in manifest["target"]
     assert parameters is not None
     assert set(digests) == {"manifest_sha256", "template_sha256", "parameters_sha256"}
@@ -1853,7 +1894,14 @@ def test_cli_plan_render_and_check_from_a_readback_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
-    args = ["--params", str(PARAMS), "--readback-file", str(snapshot)]
+    args = [
+        "--params",
+        str(PARAMS),
+        "--readback-file",
+        str(snapshot),
+        "--manifest",
+        str(_initial_manifest_file(tmp_path)),
+    ]
     code, out, err = _run(["plan", *args], capsys)
     assert code == 0, err
     plan = json.loads(out)
@@ -1882,7 +1930,15 @@ def test_render_refuses_before_the_secret_access_stack_exists(
 ) -> None:
     snapshot = FakeAws().snapshot(tmp_path / "readback.json")
     code, out, err = _run(
-        ["render-taskdef", "--params", str(PARAMS), "--readback-file", str(snapshot)],
+        [
+            "render-taskdef",
+            "--params",
+            str(PARAMS),
+            "--readback-file",
+            str(snapshot),
+            "--manifest",
+            str(_initial_manifest_file(tmp_path)),
+        ],
         capsys,
     )
     assert code == 2
@@ -1891,14 +1947,14 @@ def test_render_refuses_before_the_secret_access_stack_exists(
     assert "blocked: plan_blocked:applied_record_but_stack_absent" in err
     parameters = _validated()
     readback = wiring.collect_readback(
-        wiring.ReadOnlyAws(FakeAws().transport), parameters, pins=_pins()
+        wiring.ReadOnlyAws(FakeAws().transport), parameters, pins=_initial_pins()
     )
     plan, rendered = wiring.build_plan(
         parameters,
         readback,
         {"template_sha256": "t" * 64},
         applied=None,
-        pins=_pins(),
+        pins=_initial_pins(),
     )
     assert plan["status"] == "ready"
     with pytest.raises(wiring.WiringError, match="secret_access_stack_not_compliant"):
@@ -2002,7 +2058,7 @@ def test_readback_file_missing_a_read_fails_closed(tmp_path: Path) -> None:
     transport = wiring.snapshot_transport(fake.snapshot(tmp_path / "readback.json"))
     with pytest.raises(wiring.WiringError, match="readback_missing:iam.GetRolePolicy"):
         wiring.collect_readback(
-            wiring.ReadOnlyAws(transport), _validated(), pins=_pins()
+            wiring.ReadOnlyAws(transport), _validated(), pins=_initial_pins()
         )
 
 
@@ -2112,7 +2168,14 @@ def test_render_and_check_refuse_whenever_the_plan_is_blocked(
         "blocks"
     ]
     snapshot = fake.snapshot(tmp_path / "readback.json")
-    args = ["--params", str(PARAMS), "--readback-file", str(snapshot)]
+    args = [
+        "--params",
+        str(PARAMS),
+        "--readback-file",
+        str(snapshot),
+        "--manifest",
+        str(_initial_manifest_file(tmp_path)),
+    ]
     code, out, _err = _run(["plan", *args], capsys)
     assert code == 2
     assert json.loads(out)["status"] == "blocked"
@@ -2320,7 +2383,16 @@ def test_plan_prints_the_pinned_migrations_command(
 ) -> None:
     snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
     code, out, err = _run(
-        ["plan", "--params", str(PARAMS), "--readback-file", str(snapshot)], capsys
+        [
+            "plan",
+            "--params",
+            str(PARAMS),
+            "--readback-file",
+            str(snapshot),
+            "--manifest",
+            str(_initial_manifest_file(tmp_path)),
+        ],
+        capsys,
     )
     assert code == 0, err
     info = _step(json.loads(out), "migrations_033_035")["info"]
@@ -2655,35 +2727,41 @@ def test_manifest_validator_pins_the_managed_by_override(value: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _repinned_manifest() -> dict[str, Any]:
-    """The manifest as it reads after the documented re-pin step."""
+# The live bridge revision 9 (read back 2026-10-22): its app image by digest.
+LIVE_REVISION_9_IMAGE = (
+    f"{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/neurostack-staging@sha256:"
+    "18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24"
+)
 
-    manifest: dict[str, Any] = wiring.load_yaml(MANIFEST)
-    repin = manifest["rollback_target"].pop("repin")
-    manifest["rollback_target"] = {
-        "revision": repin["revision"],
-        "effective_after": repin["effective_after"],
+
+def test_rollback_target_is_re_pinned_to_revision_9_without_a_note() -> None:
+    """The reviewed manifest after the re-pin: revision 9, no ``repin`` block."""
+
+    raw = wiring.load_yaml(MANIFEST)
+    assert raw["rollback_target"] == {
+        "revision": 9,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
     }
-    return manifest
-
-
-def test_rollback_target_field_carries_the_repin_note() -> None:
-    manifest = wiring.validate_manifest(wiring.load_yaml(MANIFEST))
-    target = manifest["rollback_target"]
-    assert target["revision"] == 8
-    assert target["effective_after"] == wiring.ROLLBACK_EFFECTIVE_INITIAL
-    assert target["repin"]["revision"] == 9
-    assert target["repin"]["effective_after"] == wiring.ROLLBACK_EFFECTIVE_BRIDGE
-    assert target["repin"]["before"] == "migration_036"
-    assert "036" in target["repin"]["why"]
+    manifest = wiring.validate_manifest(raw)
+    assert "repin" not in manifest["rollback_target"]
     pins = _pins()
+    assert pins.rollback_revision == wiring.BRIDGE_REVISION == 9
+    assert pins.rollback_task_definition_arn == NEXT_ARN
+    assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_BRIDGE
+    assert pins.rollback_repin_before is None
+    # The D3 source stays revision 8: the re-pin moves only the rollback target.
+    assert manifest["task_definition"]["source_revision"] == 8
+
+
+def test_the_manifest_before_the_re_pin_still_validates() -> None:
+    pins = _initial_pins()
     assert pins.rollback_revision == 8
     assert pins.rollback_task_definition_arn == SOURCE_ARN
     assert pins.rollback_repin_before == "migration_036"
 
 
 def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
-    pins = _pins(_repinned_manifest())
+    pins = _pins()
     assert pins.rollback_revision == 9
     assert pins.rollback_repin_before is None
     fake = FakeAws(applied=True)
@@ -2713,6 +2791,7 @@ def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
     assert plan["target"]["rollback_target"] == NEXT_ARN
     deployment = _step(plan, "service_deployment")
     assert deployment["info"]["rollback_target"] == NEXT_ARN
+    assert deployment["info"]["rollback_target_must_repin_before"] is None
     assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
     # The D3 source stays revision 8: revision 9 is still derived from it.
     assert plan["task_definition_diff"]["source_task_definition_arn"] == SOURCE_ARN
@@ -2727,28 +2806,33 @@ def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
 @pytest.mark.parametrize(
     "changes,reason",
     [
+        ({}, None),
         ({"status": "INACTIVE"}, "rollback_target_revision_unusable"),
         ({"image": LIVE_IMAGE}, "rollback_target_revision_unusable"),
     ],
 )
 def test_repinned_rollback_target_must_be_active_and_digest_pinned(
-    changes: dict[str, Any], reason: str
+    changes: dict[str, Any], reason: str | None
 ) -> None:
-    pins = _pins(_repinned_manifest())
     fake = FakeAws(applied=True)
-    target = _task_definition(NEXT_ARN, image=OVERRIDE_IMAGE)
+    target = _task_definition(
+        NEXT_ARN, image=changes.get("image", LIVE_REVISION_9_IMAGE)
+    )
     if "status" in changes:
         target["taskDefinition"]["status"] = changes["status"]
-    if "image" in changes:
-        target = _task_definition(NEXT_ARN, image=changes["image"])
     fake.put(
         "ecs",
         "DescribeTaskDefinition",
         {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]},
         target,
     )
-    plan, _rendered = _plan(fake, pins=pins)
-    assert reason in _step(plan, "service_deployment")["blocks"]
+    plan, _rendered = _plan(fake, pins=_pins())
+    deployment = _step(plan, "service_deployment")
+    if reason is None:
+        assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
+        assert deployment["info"]["rollback_target_image_pinned_by_digest"] is True
+    else:
+        assert reason in deployment["blocks"]
 
 
 def _set_rollback(**values: Any) -> Callable[[dict[str, Any]], None]:
@@ -2759,18 +2843,15 @@ def _set_rollback(**values: Any) -> Callable[[dict[str, Any]], None]:
     "mutate",
     [
         _set_rollback(revision=7),
+        _set_rollback(revision=8),
         _set_rollback(revision=10),
         _set_rollback(revision=True),
-        _set_rollback(revision="8"),
+        _set_rollback(revision="9"),
         _set_rollback(effective_after="whenever"),
-        lambda m: m["rollback_target"].pop("repin"),
-        lambda m: m["rollback_target"]["repin"].__setitem__("before", "migration_037"),
-        lambda m: m["rollback_target"]["repin"].__setitem__("revision", 10),
-        lambda m: m["rollback_target"]["repin"].__setitem__("why", ""),
-        lambda m: m["rollback_target"]["repin"].__setitem__(
-            "effective_after", wiring.ROLLBACK_EFFECTIVE_INITIAL
-        ),
+        _set_rollback(effective_after=wiring.ROLLBACK_EFFECTIVE_INITIAL),
+        _set_rollback(repin=copy.deepcopy(INITIAL_ROLLBACK_TARGET["repin"])),
         lambda m: m["rollback_target"].__setitem__("note", "x"),
+        lambda m: m["rollback_target"].pop("effective_after"),
         lambda m: m.pop("rollback_target"),
     ],
 )
@@ -2780,6 +2861,29 @@ def test_manifest_validator_rejects_an_invalid_rollback_target(
     manifest = wiring.load_yaml(MANIFEST)
     mutate(manifest)
     with pytest.raises(wiring.WiringError):
+        wiring.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _set_rollback(effective_after="whenever"),
+        lambda m: m["rollback_target"].pop("repin"),
+        lambda m: m["rollback_target"]["repin"].__setitem__("before", "migration_037"),
+        lambda m: m["rollback_target"]["repin"].__setitem__("revision", 10),
+        lambda m: m["rollback_target"]["repin"].__setitem__("why", ""),
+        lambda m: m["rollback_target"]["repin"].__setitem__(
+            "effective_after", wiring.ROLLBACK_EFFECTIVE_INITIAL
+        ),
+    ],
+)
+def test_manifest_validator_rejected_an_invalid_initial_rollback_target(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    manifest = _initial_manifest()
+    wiring.validate_manifest(copy.deepcopy(manifest))
+    mutate(manifest)
+    with pytest.raises(wiring.WiringError, match="manifest_rollback_target_invalid"):
         wiring.validate_manifest(manifest)
 
 
@@ -2797,7 +2901,7 @@ def test_manifest_validator_rejects_an_invalid_rollback_target(
 def test_a_repinned_rollback_target_cannot_be_repinned_again(
     mutate: Callable[[dict[str, Any]], None],
 ) -> None:
-    manifest = _repinned_manifest()
+    manifest = wiring.load_yaml(MANIFEST)
     wiring.validate_manifest(copy.deepcopy(manifest))
     mutate(manifest)
     with pytest.raises(wiring.WiringError, match="manifest_rollback_target_invalid"):
@@ -3655,7 +3759,16 @@ def test_plan_reports_every_window_step_from_the_table(
 ) -> None:
     snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
     code, out, err = _run(
-        ["plan", "--params", str(PARAMS), "--readback-file", str(snapshot)], capsys
+        [
+            "plan",
+            "--params",
+            str(PARAMS),
+            "--readback-file",
+            str(snapshot),
+            "--manifest",
+            str(_initial_manifest_file(tmp_path)),
+        ],
+        capsys,
     )
     assert code == 0, err
     plan = json.loads(out)

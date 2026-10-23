@@ -6,7 +6,35 @@
 > target, and its own approved operation. This document describes the current
 > state and the preconditions; it is not a permission.
 
-## Current state (2026-10-17)
+## State after the live run of 2026-10-22
+
+Verified facts of that run only. Caveat: `alembic_version` `035` after the
+run (the post-read) and the webhook verdict were read from the raw task
+logs; the formal `verify-post-read` and the deploy hook's `verify-result`
+were **not** run on them.
+
+- **Migrations 033-035 applied.** `alembic_version` reads `035`; the
+  window `035` migration task `4063e8a0555049ada6e4cd0880b436c5` was
+  verified by the window tooling's `verify-result` (`applied`). Pre-read
+  task `98bfa0e6382d4e1590c9751d234475a3`, post-read task
+  `223a1daf9eb14d508c047cb7e0a63e2a`. Snapshot taken before the run:
+  `pre-033-035-2026-10-22`.
+- **Application revision 9 serving.** `neurostack-staging-app:9`, deployment
+  `COMPLETED`, app image the bridge digest
+  `sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24`,
+  otel pinned by digest
+  `sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e`.
+- **Webhook registered by the deploy hook** (task
+  `8593671855574617b5267cbacfdfa081`): verdict `ready`, action `created`,
+  one provider write. A second, foreign webhook exists in the
+  ASAAS account; it was not touched.
+- **Read family revision:** `neurostack-staging-consulta:28` registered (see
+  [Migration windows: the run tooling](#migration-windows-the-run-tooling)).
+- **Still off:** billing rollout `disabled`; `BILLING_FACT_WORKER_ENABLED`
+  `false`.
+- **Not applied:** migrations 036 and 037.
+
+## Standing guidance
 
 - The ECS service `neurostack-staging-app` serves production traffic. Any
   change to it is production-impacting. Image rollout for it follows
@@ -17,10 +45,6 @@
   `ENVIRONMENT=staging`, which is how the production-serving service is
   configured), never from UI state or environment overrides.
 - The commercial credit top-up is deferred and stays unavailable.
-- 2026-10-18: D3 step 1 (the secret access stack) is applied. The rest of
-  the Group 9 D3/D4 production wiring is prepared but not applied. The service
-  still runs `neurostack-staging-app:8`, which carries no ASAAS secret or URL.
-  See [Production wiring (Group 9 D3/D4)](#production-wiring-group-9-d3d4).
 - The product owner decided that `general` opens only after a delivered,
   deployed credit consumer exists (`neurostack-credit-system`). Today paying
   for a plan records the subscription and an outbox fact, but no code grants
@@ -382,9 +406,10 @@ subcommands are `scripts/asaas_migration_window.py --window 036`, see
    alone proves nothing here: under `ENVIRONMENT=staging` it does not probe
    the database. `plan` checks it again right before the run: every service
    task on the expected revision and on the image digest of the window's
-   migrations revision, and no task still stopping. The rollback target is
-   re-pinned to revision 9 before this window (gate 6); `plan` refuses
-   otherwise.
+   migrations revision, and no task still stopping. The rollback target must
+   read revision 9 with no pending re-pin before this window (gate 6; the
+   re-pin is merged only after revision 9's observation period closed, about
+   2026-10-23 18:30 UTC); `plan` refuses otherwise.
 2. **RDS snapshot** (owner decision 2026-10-19 b): take a manual snapshot
    named `pre-036-<date>` of the production database and wait until its
    status is `available` before going on (`render-snapshot-requests`).
@@ -821,10 +846,10 @@ reads run on, is a spelling backstop, not the guarantee.
 
 - Application-role reads (windows `035` and `036` before the run, every
   window after it) run on the read family `neurostack-staging-consulta` (its
-  `DATABASE_URL` secret must be `neurostack/staging/database-url`; the family
-  the orchestrator used for the SELECT-only query of 2026-10-20) with the
+  `DATABASE_URL` secret must be `neurostack/staging/database-url`) with the
   program as the one container override (under 7680 of the 8192 characters
-  ECS allows). Their SQL is row counts and the revision read: no ownership
+  ECS allows). The revision to use is `neurostack-staging-consulta:28`
+  (below). Their SQL is row counts and the revision read: no ownership
   or privilege check, so the application role answers them as the migration
   would (reproduced on PostgreSQL 16 in the T8 capture). Dropping the
   override there would start the family's own baked command, so that
@@ -832,6 +857,42 @@ reads run on, is a spelling backstop, not the guarantee.
   migration tool: `plan-pre-read`, `plan-post-read`, `verify-*-read` and
   `plan` refuse the read family's revision otherwise
   (`read_family_names_the_migration_tool`).
+- **The read family revision, verified live on 2026-10-22.** The revision
+  the orchestrator had used for the SELECT-only query of 2026-10-20,
+  `neurostack-staging-consulta:26` (an Alpine image running `sh -c` with
+  `psql`, the application role through an `APP_URL` variable), does **not**
+  satisfy the contract: `plan-pre-read` blocked it with
+  `read_container_entry_point_unexpected`, `read_database_secret_mismatch`
+  and `read_image_not_an_application_image`. The revision registered on
+  2026-10-22, used for window `035`'s pre-read and post-read that day and
+  the one to use for window `036`'s pre-read and post-read, is
+  **`neurostack-staging-consulta:28`**: the bridge image by
+  the same digest as revision 9 (`neurostack-staging@sha256:18358ce7…`), no
+  `entryPoint`, `DATABASE_URL` from the secret
+  `neurostack/staging/database-url` (application role), the harmless baked
+  command
+  `python -c "raise SystemExit('read revision: a command override is required')"`
+  (a RunTask that loses its override exits nonzero without touching the
+  database), the execution role `neurostack-staging-ecs-execution`, `awslogs` to
+  `/ecs/neurostack-staging/migrations` with stream prefix `consulta`,
+  `ManagedBy=manual`, cpu 512 and memory 1024. The family's numbering
+  skips `:27`, a deregistered revision; never use `:26` or `:27`.
+- **The read family on the next image (E7).** What `plan-pre-read`,
+  `plan-post-read` and `plan` require of the read family's image is only
+  that it is an application image of this registry, by tag or digest
+  (`read_image_not_an_application_image` otherwise); its `awslogs` group
+  and stream prefix are checked only against a name pattern. They do not
+  compare the image with the deployed image or the migrations revision's
+  image, and they do not look it up in ECR. That `:28` runs the bridge
+  image of the `neurostack-staging` repository and logs to
+  `/ecs/neurostack-staging/migrations` is what the operator registered on
+  2026-10-22, not a requirement of the tools. So a new
+  application image does **not** require re-registering the read family:
+  `:28` stays valid while its bridge digest stays in ECR (a removed digest
+  would make the read task fail to start). Re-register it on a newer
+  digest only when the bridge digest is to be removed, or when the read
+  program needs something the bridge image lacks, with the same container
+  contract as `:28`.
 - Window `037`'s readback needs the migration role (only it gets eleven
   `ok`). It runs on the window's **read revision**: a separate
   `neurostack-staging-migrations` revision rendered by `render-migrations-taskdef
@@ -868,7 +929,7 @@ args=(--window "$W"                                   # 035, 036 or 037: the own
       --readback-file "$workdir/window-readback.json"
       --service-task-definition "$SERVICE_TD"         # the revision the service runs
       --migrations-task-definition "$MIGRATIONS_TD"   # registered for this window (> :3)
-      --read-task-definition "$READ_TD"               # neurostack-staging-consulta:<n>
+      --read-task-definition "$READ_TD"               # neurostack-staging-consulta:28
       --snapshot-id "$SNAPSHOT_ID")                   # printed by render-snapshot-requests
 # window 037 only (required there, refused for 035 and 036):
 args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read revision
@@ -881,11 +942,44 @@ status `incomplete`: send them, record the responses, run them again):
 | Phase | Plan step (035 / 036 / 037) | Subcommands, in order | Done when |
 |---|---|---|---|
 | register | S10 / S20 / S23 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
-| snapshot | S11 / S20 / S23 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target); `render-snapshot-requests`; send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
+| snapshot | S11 / S20 / S23 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
 | pre-read | S12 / S21 / S24 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
 | run | S12 / S21 / S24 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
 | verify | S13 / S22 / S24 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
 | post-read | S13 / S22 / S24 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" |
+
+**Snapshot order.** `plan-snapshot` runs, and exits 0, **before**
+`CreateDBSnapshot` is sent: it is the check that the deploy state allows
+this window's snapshot at all, and `render-snapshot-requests` prints the
+request to send. On 2026-10-22 (window `035`) `CreateDBSnapshot` was sent
+first, by mistake, and the `plan-snapshot` run afterwards passed; a later
+pass does not make the order optional (a blocked `plan-snapshot` after the
+fact would leave a snapshot taken for a window that must not run).
+
+**Freshness, in practice.** Every window is judged against the system
+clock: the plan reads within 10 minutes of `captured_at_utc`, the pre-read
+stopped within 15 minutes (`pre_read_max_age_seconds` 900) and the snapshot
+created within 60 minutes (`snapshot_max_age_seconds` 3600) when `plan`
+runs. So the run must follow the pre-read within 15 minutes and the
+snapshot within 60. Practical rule:
+
+1. Prepare everything that does not age before asking for the owner's go:
+   the window's revisions registered, the readback file laid out, the plan
+   reads and the RunTask parameters ready to send.
+2. After the go: snapshot (after `plan-snapshot`), pre-read, then `plan`,
+   `render-run-task` and the RunTask, without pausing between them.
+3. When a step is late, refresh the reads instead of reusing them: re-send
+   each read, record the new responses and the new `captured_at_utc`, and
+   run the read's `plan-*` or `plan` again; it, not a comparison by eye, is
+   the judge. Some fields legitimately change between two reads: ECR
+   `lastRecordedPullTime`, a task's `version`, the ECS service `events`
+   (which the planners ignore and the operator may drop from the record),
+   and the timestamps of freshly started tasks. Any other difference
+   between the old and the new response is unexplained: stop and report
+   (the safe default), never guess. Never keep or re-date a readback past
+   its freshness window. A pre-read older than 15 minutes is
+   taken again (a new attempt); a snapshot older than 60 minutes falls
+   under the same-day limitation below.
 
 The S labels in this table are the ones this tooling uses (the window
 table's `plan_steps`, printed by `windows`). They map the S1-S24 plan of
@@ -961,10 +1055,10 @@ container override (the program); window `037`'s pre-read on its read
 revision carries none. Both use `startedBy`
 `neurostack-migration-read-<W>-pre` or `-post`. Live evidence (2026-10-20) covers cluster, task definition,
 `FARGATE`, count, `startedBy`, `enableExecuteCommand`, the network block and
-a command override; `clientToken`, `platformVersion` and
-`enableECSManagedTags` are documented RunTask parameters the deploy hook
-renders too, not yet verified live: on any `InvalidParameterException`, stop
-and report the exact message (do not edit the request, do not retry).
+a command override; on 2026-10-22 ECS also accepted `clientToken`,
+`platformVersion` `LATEST` and `enableECSManagedTags` false. On any
+`InvalidParameterException`, stop and report the exact message (do not edit
+the request, do not retry).
 
 **`verify-result`** reads the task's container exit code and every log page
 of `<awslogs-stream-prefix>/<container>/<task id>` (pages followed through
@@ -989,6 +1083,19 @@ with no traceback and no SQLSTATE marker. Exit 3 `in_progress` (poll:
 The single SQLAlchemy line `(Background on this error at: https://sqlalche.me/e/<n>/<code>)`
 is the only URL the exposure scan tolerates; the captured failures above
 (T8, PostgreSQL 16) print it after every database error.
+
+**Log pages, as read live (2026-10-22, window `035`).** The read and
+migration tasks' log requests are `logs:GetLogEvents` with
+`logGroupName` the revision's `awslogs-group` (on 2026-10-22,
+`/ecs/neurostack-staging/migrations`), `logStreamName`
+`<awslogs-stream-prefix>/<container>/<task id>` (`consulta/...` for the read
+family), `startFromHead: true` and `limit` 500, exactly as
+`render-verify-reads` prints them. Keep sending pages, each with `nextToken`
+set to the previous response's `nextForwardToken`, until a response returns
+exactly the token that was sent: only that repetition is the end of the
+stream. The first page is never the end (it was sent without a token), and
+an **empty page can carry a different `nextForwardToken`**: an empty page is
+not the end, send the next one. Record every page, empty ones included.
 
 **Time bounds.** The tool cannot stop a task. The migration watch is 900 s
 from the task's `createdAt` (Fargate start 180 s + Alembic 300 s + stop
@@ -1016,15 +1123,33 @@ lost the same way is simply read again with a new attempt
 a task with the read's `startedBy` runs, and `plan` while any task of the
 read family runs. Never start a second migration while the first may run.
 
-**Not verified live.** The RDS snapshot request and response shapes
-(`SnapshotCreateTime` is recorded as an aware timestamp string), whether ECS
-honours `clientToken` for a re-sent RunTask and for how long, the delivery
-latency of the task logs, the consulta family's container definition
-(`plan-pre-read` checks it: one container, no entry point, the application
-`DATABASE_URL` secret, an application image of this registry, `awslogs`),
-and whether the application role may read `alembic_version` and the counted
-tables in production (a `permission denied` read is `read_failed` with
-SQLSTATE `42501`: stop).
+**Verified live on 2026-10-22** (window `035` and the deploy hook):
+
+- The `rds:CreateDBSnapshot` and `rds:DescribeDBSnapshots` request and
+  response shapes: `SnapshotCreateTime` is an aware timestamp string, and
+  `Status` goes `creating` -> `available`.
+- ECS accepted RunTask with `clientToken`, `platformVersion` `LATEST` and
+  `enableECSManagedTags` false, both from this tool and from the deploy
+  hook.
+- `ecs:DescribeTasks` reports `overrides` as
+  `{"containerOverrides": [{"name": ...}], ...}` (the container name only)
+  for a task started without an override, and with the `command` for a read
+  task.
+- The application role can read `alembic_version` and the counted tables
+  (`read_ok`).
+- The consulta family contract, with `neurostack-staging-consulta:28` (see
+  the read family revision above).
+- Task log delivery lagged a few seconds; paging must follow
+  `nextForwardToken` until the token sent comes back (an empty page can
+  carry a different token; see "Log pages" above).
+
+**Still not verified live.** Whether ECS honours the same `clientToken` for
+a re-sent RunTask, and for how long; the enforcement of `--attempt`; the
+formal `verify-post-read` of this tool and the deploy hook's `verify-result`
+on a real run (on 2026-10-22 those two checks were made from the raw logs);
+the behaviour of a failed migration live (`55P03`, `40P01`, `55000`); and
+PostgreSQL 17. A `permission denied` read is still `read_failed` with
+SQLSTATE `42501`: stop.
 
 **Residual risks, accepted.** `--manifest` (on `plan`, `render-run-task`,
 `plan-snapshot`, `render-snapshot-requests`) points the rollback-target check
@@ -1071,8 +1196,10 @@ window `037`'s SELECT-only readback program on the same image, roles and
 secret, as a separate revision.
 
 - The service rollback target is the manifest field `rollback_target`
-  (revision 8 today). Every code path reads it from there; it moves to
-  revision 9 only through its documented re-pin (gate 6). The D3 source
+  (revision 9 since its documented re-pin, gate 6, merged only after
+  revision 9's observation period closed, about 2026-10-23 18:30 UTC;
+  revision 8 before). Every code path reads it from there; revision 9 is
+  the last pin the planner allows. The D3 source
   revision (`task_definition.source_revision`, 8) is a separate, fixed value:
   revision 9 stays derived from it.
 - Two gate blocks are facts computed at plan time, not pinned states.
@@ -1368,6 +1495,20 @@ own explicit owner approval and is never performed from the manifest.
    through the planner and refuses until it is revision 9 with no pending
    re-pin (`rollback_target_not_repinned`) and revision 9 is `ACTIVE` on an
    image pinned by digest.
+
+   **Merge condition of the re-pin.** The manifest edit above merges only
+   after revision 9's 24 h observation period has closed, about
+   **2026-10-23 18:30 UTC**, with revision 9 still serving and verified at
+   that time, and before migration 036. Merging earlier would remove the
+   only safe way back during the observation (revision 8) from every code
+   path that reads the field.
+
+   **History.** The rollback target was re-pinned from revision 8 to
+   revision 9 on the date the re-pin merged; revision 8 was the target
+   until then. Revision 9 is
+   `arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9`,
+   app image
+   `388460142431.dkr.ecr.us-east-1.amazonaws.com/neurostack-staging@sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24`.
 
    What the current image does with the D3 names (not verified for the image
    itself): it was pushed on 2026-10-14, and commit `55651b58` on
@@ -1711,11 +1852,11 @@ render a request that carries the key, and a recorded RunTask that carries it
 is `run_task_request_propagate_tags_present`. The top-level key set is pinned
 by the hook and its tests. A request with only `cluster`, `taskDefinition`,
 `launchType`, `count`, `startedBy`, `enableExecuteCommand`,
-`networkConfiguration` and `overrides` was accepted live; `clientToken`,
-`platformVersion` and `enableECSManagedTags` are documented RunTask parameters
-not yet verified live in this request. The first real registration run is that
-check: on any `InvalidParameterException` from RunTask, stop (do not edit the
-request, do not retry) and report the exact error message. Single flight is the `ListTasks` precondition plus
+`networkConfiguration` and `overrides` was accepted live, and on 2026-10-22
+the first real registration run also had `clientToken`, `platformVersion`
+`LATEST` and `enableECSManagedTags` false accepted. On any
+`InvalidParameterException` from RunTask, stop (do not edit the request, do
+not retry) and report the exact error message. Single flight is the `ListTasks` precondition plus
 that token; two operators planning at the same instant can still both start
 a task (the window between the listing and the RunTask), in which case the
 command itself reports `ambiguous` and deletes nothing.

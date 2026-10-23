@@ -219,12 +219,12 @@ STARTED_BY = "neurostack-asaas-webhook-reconcile"
 # false, networkConfiguration.awsvpcConfiguration {subnets, securityGroups,
 # assignPublicIp DISABLED} and overrides.containerOverrides [{name, command}]
 # was accepted. clientToken, enableECSManagedTags and platformVersion (FARGATE
-# only, copied from the service) are documented RunTask parameters but are
-# UNVERIFIED LIVE in this request: the first real registration run is the
-# check, and on InvalidParameterException the operator stops and reports the
-# exact message (runbook). ``propagateTags`` is omitted on purpose: the live
-# RunTask API rejects ``NONE`` ("Invalid value for propagateTags") although the
-# botocore model lists it; omitting the parameter means no propagation.
+# only, copied from the service) were accepted live by ECS on 2026-10-22, in
+# the first real registration run; on InvalidParameterException the operator
+# stops and reports the exact message (runbook). ``propagateTags`` is omitted
+# on purpose: the live RunTask API rejects ``NONE`` ("Invalid value for
+# propagateTags") although the botocore model lists it; omitting the parameter
+# means no propagation.
 RUN_TASK_REQUIRED_KEYS = frozenset(
     {
         "cluster",

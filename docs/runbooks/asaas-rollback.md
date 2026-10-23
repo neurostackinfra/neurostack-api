@@ -75,19 +75,32 @@ after.
 
 The rollback target is the manifest field `rollback_target`
 (`infra/production/asaas-production-wiring.yaml`), which `plan` reports as
-`rollback_target`. Today it is `neurostack-staging-app:8`
-(`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
-the revision the service ran when the wiring was prepared. It is re-pinned to
-revision 9 (the D3 revision on the bridge image) once revision 9 has served
-and its observation period closed, and before migration 036: revision 8 reads
-columns 036 drops, so after 036 roll back to revision 9, never to 8. Read the
-revision below as the field's current value. A failed post-deploy webhook
+`rollback_target`. It has two phases:
+
+1. **Until the re-pin is merged: revision 8**
+   (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
+   the revision the service ran when the wiring was prepared. This phase
+   covers revision 9's 24 h observation period.
+2. **After the re-pin is merged: revision 9**
+   (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9`,
+   the D3 revision on the bridge image
+   `neurostack-staging@sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24`).
+   **Merge condition:** the re-pin (manifest field to `revision: 9`, no
+   `repin` block) merges only after revision 9's observation period has
+   closed, about **2026-10-23 18:30 UTC**, with revision 9 still serving and
+   verified, and before migration 036.
+
+**Revision 8 is unsafe after migration 036**: it reads columns 036 drops, so
+once 036 has run, roll back to revision 9, never to 8. Read "revision R"
+below as the field's current value: revision 8 in phase 1, revision 9 in
+phase 2 (check with `plan`, `rollback_target`). A failed post-deploy webhook
 registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a reason to roll
 back.
 
 - **Before the service deployment gate**, nothing needs rolling back. The
-  stack and the extra task definition revision are inert while the service
-  runs revision 8. Optionally deregister the extra revision.
+  stack and the extra task definition revision were inert while the service
+  ran revision 8 (history: the service has run revision 9 since
+  2026-10-22).
 - **Automatic rollback.** The service has the deployment circuit breaker
   enabled with rollback (`resetOnHealthyTask`, threshold `BOUNDED_PERCENT`
   50), minimum healthy 100 % and maximum 200 % (read back 2026-10-18). New
@@ -97,17 +110,21 @@ back.
   read a referenced secret, the API key fails settings validation, or
   `/health` never passes. The exact failed-task count that trips the breaker
   is computed by ECS from that setting and was not verified here. Read back
-  the service afterwards: one PRIMARY deployment on revision 8, `COMPLETED`.
+  the service afterwards: one PRIMARY deployment on the last completed
+  revision, `COMPLETED`.
 - **Manual rollback (separately approved; it is a deployment).**
 
   ```bash
   aws ecs update-service --region us-east-1 --cluster neurostack-staging \
-    --service neurostack-staging-app --task-definition neurostack-staging-app:8
+    --service neurostack-staging-app --task-definition neurostack-staging-app:R
   aws ecs wait services-stable --region us-east-1 --cluster neurostack-staging \
     --services neurostack-staging-app
   ```
 
-  **Verify:** `plan` shows `current_task_definition` on revision 8, the target
+  `R` is the rollback target: `8` only until the re-pin is merged, `9` after
+  it, and never `8` once migration 036 has run.
+
+  **Verify:** `plan` shows `current_task_definition` on revision R, the target
   group is healthy, `GET /ready` returns 200 on every task, and
   `GET /v1/admin/billing/rollout/readback` is still `disabled`.
 - **IAM and secret.** The stack `neurostack-asaas-production-wiring` (applied
@@ -122,10 +139,10 @@ back.
   deletion separately, with its own approval, if wanted. Never edit
   `segredos-e-logs` as part of a rollback.
 - **Provider webhook.** If the D4 registration already ran, ASAAS keeps
-  delivering to `/v1/billing/webhook/asaas`. Revision 8 has no
-  `ASAAS_WEBHOOK_TOKEN`; the current receiver answers such deliveries with
-  503 before reading the body (the behaviour of the revision 8 image was not
-  verified). ASAAS may then interrupt the webhook queue and email
+  delivering to `/v1/billing/webhook/asaas`. Revision 8 (the phase 1
+  target) has no `ASAAS_WEBHOOK_TOKEN` (revision 9 carries it); the current
+  receiver answers such deliveries with 503 before reading the body (the
+  behaviour of the revision 8 image was not verified). ASAAS may then interrupt the webhook queue and email
   `ASAAS_WEBHOOK_NOTIFICATION_EMAIL`.
   After a later re-deploy, the readback reports `interrupted` until the
   webhook is reconciled. The automatic `reconcile` that runs after each deploy
