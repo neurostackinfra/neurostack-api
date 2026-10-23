@@ -159,12 +159,47 @@ usa o modo multiprocess do `prometheus_client` e a imagem roda 4 workers
 uvicorn, então cada scrape lê o contador de um processo diferente e `rate()`
 veria resets falsos. O contador serve para diagnóstico, não para alerta.
 
-Release: este grupo muda o digest de `config/prometheus_rules.yml` (e do
+Release: este grupo mudou o digest de `config/prometheus_rules.yml` (e do
 espelho byte-idêntico `src/config/prometheus_rules.yml`) de `5ff2ae8d…` para
-`e3714701…`. Implantar um build com essas regras exige reemitir
-`BILLING_PROMETHEUS_RULES_DIGEST` e o acknowledgement do receiver. A limpeza de
-alertas do Group 10 vai rotacionar o digest de novo, então os dois devem sair
-no mesmo deploy, com uma única reemissão.
+`e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad`. A
+limpeza de alertas do Group 10 (E7) mudou de novo: removeu o alerta morto de
+intervenção manual da migração legada e as duas métricas da migração que
+nada alimentava, e renomeou o alerta de readback para `BillingReadbackBacklog`
+(mesma expressão sobre `neurostack_billing_readback_backlog`). O digest atual
+é `7464018bfa2d496dddbef2184ffd1a842804c33f614ce90d878fc1eaeeb267f0`; o pin
+`_RULES_SHA256` de `tests/test_billing_migration_surface_removed.py` muda
+junto com este parágrafo.
+
+Como a rotação funciona hoje:
+
+- O digest é o SHA-256 dos bytes de `config/prometheus_rules.yml` **dentro da
+  imagem**. O backend o recalcula ao gravar cada receipt de readiness do
+  rollout e de novo na transição para `general`, então um receipt gravado com
+  o digest anterior não vincula mais: grave os receipts de readiness depois
+  que a imagem nova estiver no ar.
+- `BILLING_PROMETHEUS_RULES_DIGEST` só é ligada no
+  `docker-compose.production.yml`: ali a API confere contra ela o arquivo de
+  regras montado do checkout (`./config/prometheus_rules.yml`, o mesmo que o
+  Prometheus do overlay avalia), junto com o acknowledgement do receiver.
+  Reemitir a variável e o acknowledgement vale só para esse overlay, e o
+  checkout precisa estar no commit da imagem.
+- As task definitions da AWS não definem a variável e não avaliam as regras:
+  lá a rotação é só a imagem nova.
+
+Ordem do E7 na AWS (o worker implantado é pré-requisito da rotação: código
+implantado **e** `BILLING_FACT_WORKER_ENABLED=true`, decisão do owner de
+2026-10-22; passos completos no runbook `docs/runbooks/asaas-deployment.md`,
+"Open follow-ups recorded by E6"):
+
+1. **Primeiro a flag, numa mudança própria.** O código do worker já está na
+   imagem ponte, então `BILLING_FACT_WORKER_ENABLED=true` sai antes, na
+   imagem ponte, como mudança revisada e deploy próprios (revisão nova
+   `ManagedBy=manual` renderizada pelo planner a partir do manifesto de
+   wiring, que hoje fixa a flag em `false`).
+2. **Observar.** O worker subiu em cada task, o last-tick avança e o outbox
+   está vazio.
+3. **Depois, a imagem do E7, nunca na mesma revisão.** Só então a imagem do
+   E7 é construída, publicada e implantada, numa revisão posterior.
 
 ## Primeiro acesso: bootstrap do super_admin
 

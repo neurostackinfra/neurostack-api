@@ -285,19 +285,9 @@ BILLING_SUMMARY_CHECKOUT_UNAVAILABLE_TOTAL = Counter(
     "neurostack_billing_summary_checkout_unavailable_total",
     "Billing summaries whose advisory checkout availability read failed",
 )
-# Group 5 control-plane metrics intentionally expose only bounded state/action
-# names.  Migration, subscription, receipt, actor, provider and deployment
-# identities never enter Prometheus labels.
-BILLING_MIGRATION_OPERATIONS_TOTAL = Counter(
-    "neurostack_billing_migration_operations_total",
-    "Local billing migration actions by bounded operation and outcome",
-    ["operation", "outcome"],
-)
-BILLING_MIGRATION_BACKLOG = Gauge(
-    "neurostack_billing_migration_backlog",
-    "Current billing migration backlog by bounded saga state",
-    ["state"],
-)
+# Group 5 control-plane metrics intentionally expose only bounded role,
+# direction and outcome names.  Subscription, receipt, actor, provider and
+# deployment identities never enter Prometheus labels.
 BILLING_OPERATION_RECEIPTS_TOTAL = Counter(
     "neurostack_billing_operation_receipts_total",
     "Signed billing operation receipts by role and bounded outcome",

@@ -193,26 +193,6 @@ _ENDPOINT = LabelPolicy(
     normalizer="route_template",
     fallback="/{unmatched}",
 )
-_BILLING_MIGRATION_OPERATION = _enum(
-    "roster_import",
-    "cancel_begin",
-    "cancel_reconcile",
-    "recreate_pending",
-    "recreate_reserve",
-    "recreate_reopen",
-    "checkout_recovery",
-    "provider_flip",
-    "manual_intervention",
-)
-_BILLING_MIGRATION_STATE = _enum(
-    "pending",
-    "in_progress",
-    "legacy_cancel_pending",
-    "legacy_cancelled",
-    "recreate_pending",
-    "migrated",
-    "manual_intervention",
-)
 _BILLING_OPERATION_ROLE = _enum("deployer", "approver", "reviewer", "unknown")
 _BILLING_OPERATION_OUTCOME = _enum("accepted", "rejected", "consumed")
 _BILLING_TOPUP_DIRECTION = _enum("enable", "disable")
@@ -484,16 +464,9 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
         ),
         "neurostack_billing_webhook_config_ready": _NONE,
         "neurostack_billing_summary_checkout_unavailable": _NONE,
-        # Group 5 migration control plane.  The vocabulary remains closed so
-        # no migration, actor, provider, subscription, receipt or deployment
-        # identity can enter Prometheus.
-        "neurostack_billing_migration_operations": _contract(
-            operation=_BILLING_MIGRATION_OPERATION,
-            outcome=_BILLING_OPERATION_OUTCOME,
-        ),
-        "neurostack_billing_migration_backlog": _contract(
-            state=_BILLING_MIGRATION_STATE
-        ),
+        # Group 5 billing control plane.  The vocabulary remains closed so no
+        # actor, provider, subscription, receipt or deployment identity can
+        # enter Prometheus.
         "neurostack_billing_operation_receipts": _contract(
             role=_BILLING_OPERATION_ROLE,
             outcome=_BILLING_OPERATION_OUTCOME,

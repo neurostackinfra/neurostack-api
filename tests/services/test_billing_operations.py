@@ -696,6 +696,10 @@ def test_runbook_documents_exactly_the_readiness_digest_field_list() -> None:
 def test_readiness_content_digest_is_rederived_by_hand_from_the_documented_list() -> (
     None
 ):
+    # ``rule_digest`` is opaque 64-hex material here, like the other two
+    # digests: this test pins the serializer, not the rules file, so it must
+    # not track rules rotations (tests/test_billing_migration_surface_removed.py
+    # pins the current rules digest; billing_rollout recomputes it at runtime).
     values: dict[str, object] = {
         "app_digest": "0123456789abcdef" * 4,
         "bundle_digest": "fedcba9876543210" * 4,
@@ -705,7 +709,7 @@ def test_readiness_content_digest_is_rederived_by_hand_from_the_documented_list(
         "provider_receipt_id": "00000000-0000-4000-8000-00000000000c",
         "receipt_kind": "provisioning",
         "rollout_revision": 12,
-        "rule_digest": "e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad",
+        "rule_digest": "89abcdef01234567" * 4,
     }
     assert tuple(values) == _DOCUMENTED_READINESS_FIELDS
     # The exact bytes, written out once so a serializer change cannot hide.
@@ -718,7 +722,7 @@ def test_readiness_content_digest_is_rederived_by_hand_from_the_documented_list(
         '"provider_receipt_id":"00000000-0000-4000-8000-00000000000c",'
         '"receipt_kind":"provisioning",'
         '"rollout_revision":12,'
-        '"rule_digest":"e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad"}'
+        '"rule_digest":"' + "89abcdef01234567" * 4 + '"}'
     )
 
     assert _readiness_content_digest(
@@ -728,7 +732,7 @@ def test_readiness_content_digest_is_rederived_by_hand_from_the_documented_list(
         operation_id=UUID("00000000-0000-4000-8000-00000000000a"),
         operation_receipt_id=UUID("00000000-0000-4000-8000-00000000000b"),
         provider_receipt_id=UUID("00000000-0000-4000-8000-00000000000c"),
-        rule_digest="e37147012adaf5e847f6f6171e15443d268f8e51acde261ae728c1265f447dad",
+        rule_digest="89abcdef01234567" * 4,
         bundle_digest="fedcba9876543210" * 4,
         app_digest="0123456789abcdef" * 4,
     ) == _hand_digest(values)

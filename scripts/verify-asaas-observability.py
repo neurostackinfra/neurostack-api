@@ -23,17 +23,16 @@ ALERTMANAGER = ROOT / "config" / "alertmanager" / "alertmanager.yml"
 PROMETHEUS = ROOT / "config" / "prometheus.yml"
 METRICS = ROOT / "src" / "observability" / "metrics.py"
 REQUIRED_ALERTS = {
-    "BillingMigrationManualIntervention",
-    "BillingMigrationReadbackBacklog",
+    "BillingReadbackBacklog",
     "BillingOperationReceiptRejected",
     "BillingTopupCapabilityRevoked",
     "BillingFactDeliveryStale",
     "BillingFactDeliveryBlocked",
     "BillingFactWorkerStalled",
 }
+# Every metric a required alert reads, so no required alert can go dead.
 REQUIRED_METRICS = {
-    "neurostack_billing_migration_operations_total",
-    "neurostack_billing_migration_backlog",
+    "neurostack_billing_readback_backlog",
     "neurostack_billing_operation_receipts_total",
     "neurostack_billing_topup_capability_transitions_total",
     "neurostack_billing_fact_backlog",
@@ -48,6 +47,10 @@ FORBIDDEN_LABEL_WORDS = {
     "receipt",
     "secret",
 }
+# The identity scan covers metrics.py from the first billing control-plane
+# instrument (operation receipts, then top-up capability and the
+# billing.fact.v1 worker families) to the end of the module.
+BILLING_LABEL_SCAN_ANCHOR = "BILLING_OPERATION_RECEIPTS_TOTAL = Counter("
 _FORBIDDEN_ACK_KEYS = {
     "address",
     "customer",
@@ -62,6 +65,13 @@ _FORBIDDEN_ACK_KEYS = {
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _billing_label_scan_section(metrics_text: str) -> str | None:
+    """Return the block the identity scan reads, or None without its anchor."""
+
+    start = metrics_text.find(BILLING_LABEL_SCAN_ANCHOR)
+    return None if start < 0 else metrics_text[start:]
 
 
 def _non_loopback_https(value: object) -> bool:
@@ -334,8 +344,10 @@ def verify(
     metrics_text = METRICS.read_text(encoding="utf-8")
     if not all(metric in metrics_text for metric in REQUIRED_METRICS):
         errors.append("billing Prometheus metric parity is incomplete")
-    billing_section = metrics_text.split("BILLING_MIGRATION_OPERATIONS_TOTAL", 1)[-1]
-    if any(f'"{word}"' in billing_section.lower() for word in FORBIDDEN_LABEL_WORDS):
+    billing_section = _billing_label_scan_section(metrics_text)
+    if billing_section is None:
+        errors.append("billing metric label scan anchor is missing")
+    elif any(f'"{word}"' in billing_section.lower() for word in FORBIDDEN_LABEL_WORDS):
         errors.append("billing metric labels may contain an identity or secret")
     return errors
 

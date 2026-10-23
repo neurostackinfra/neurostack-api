@@ -97,7 +97,7 @@ binding precondition before a transport may be wired.
 
 ## Card captures, funds receipts and payment drift
 
-`BillingMigrationReadbackBacklog` (`sum(neurostack_billing_readback_backlog) > 0`)
+`BillingReadbackBacklog` (`sum(neurostack_billing_readback_backlog) > 0`)
 also routes here: an exact-ID payment readback that does not converge.
 
 **Rule since 2026-10-18 (owner decision).** A card `PAYMENT_CONFIRMED`
