@@ -728,16 +728,49 @@ restored guards refuse what they refused.
 
 ### Open follow-ups recorded by E6
 
-- **E7 (alerts and digest):** remove the dead alert
-  `BillingMigrationManualIntervention`, rename `BillingMigrationReadbackBacklog`
-  (it reads a live metric), and retire the metrics
-  `neurostack_billing_migration_operations`/`_backlog` with their label
-  dimensions in `src/observability/metric_dimensions.py`
-  (`_BILLING_MIGRATION_OPERATION`, which still lists `roster_import`, and
-  `_BILLING_MIGRATION_STATE`), plus the names in
-  `scripts/verify-asaas-observability.py`, in the same coordinated digest
-  rotation. E6 left them: the metric is still registered and the rules
-  digest must not move here.
+- **E7-A (alerts and digest), done in code:** the dead manual-intervention
+  alert, the two never-emitted legacy migration metric families and their
+  label dimensions (the last metric vocabulary that listed `roster_import`)
+  are gone from both rules copies, `src/observability/metrics.py`,
+  `src/observability/metric_dimensions.py` and
+  `scripts/verify-asaas-observability.py`; the readback-backlog alert is now
+  `BillingReadbackBacklog`, same expression. Known gap, not fixed here: its
+  metric is written only by `reconcile_backlog`, which no production code
+  calls (only tests do), so the alert cannot fire until a caller is wired;
+  recorded in the wish as MEDIUM-D. One rules digest rotation, to
+  `7464018bfa2d496dddbef2184ffd1a842804c33f614ce90d878fc1eaeeb267f0` (the
+  previous value and how the rotation works: `docs/configuration.md`, billing
+  fact worker "Release"). Remaining live steps, in this order, none done by
+  this change. The wish makes a deployed worker the prerequisite of the
+  rotation, and "deployed" means code deployed **and**
+  `BILLING_FACT_WORKER_ENABLED=true` on the service (owner decision,
+  2026-10-22):
+  1. **Worker flag first, its own change.** The worker code is already in the
+     bridge image, so the flag is turned on first, on the bridge image, as its
+     own reviewed change and its own deploy: a new `neurostack-staging-app`
+     revision tagged `ManagedBy=manual`, rendered by the planner from the
+     wiring manifest and registered by the operator. Today the planner and the
+     manifest pin the flag to `false` (`ADDED_ENVIRONMENT` in
+     `scripts/asaas_production_wiring.py`, `app_environment_added` in
+     `infra/production/asaas-production-wiring.yaml`), so that reviewed change
+     moves the pin to `true` first. Evidence: `DescribeTaskDefinition` of the
+     active revision shows `BILLING_FACT_WORKER_ENABLED=true`.
+  2. **Observe the worker.** Before any E7 build: every task logs `billing
+     fact worker started`,
+     `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
+     advancing, and the outbox is empty (`neurostack_billing_fact_backlog` is
+     `0` for every condition).
+  3. **E7 image after, never in the same revision.** Only then is the E7 image
+     built, pushed and deployed, in a later revision of its own; the flag
+     change and the E7 image never share a revision or a deploy. In AWS this
+     deploy is the whole rotation: the new image carries the new rules.
+     Readiness receipts bind the digest of the rules file inside the image,
+     so record them only after the E7 image is live; one recorded against the
+     previous digest no longer verifies.
+  4. **Receiver acknowledgement (Compose only).** Re-issuing
+     `BILLING_PROMETHEUS_RULES_DIGEST` and the receiver acknowledgement
+     applies to the Compose production overlay only; the AWS task definitions
+     neither set the digest nor evaluate the rules.
 - **E8 / A8 (CI), done:** `tests/integration/test_migration_036_postgres.py`,
   `tests/integration/test_migration_037_postgres.py` and
   `tests/integration/test_migration_window_read_postgres.py` are in

@@ -246,24 +246,13 @@ groups:
           summary: "Baixa confiança nas classificações de intent"
           description: "Confiança média de classificação está em {{ $value | printf \"%.2f\" }}"
 
-  # Billing migration / rollout control plane.  Labels in these expressions
+  # Billing readback / rollout control plane.  Labels in these expressions
   # are closed technical vocabularies; no customer, actor, receipt, provider
   # or deployment identity is allowed into Prometheus.
   - name: neurostack_billing_operations
     interval: 30s
     rules:
-      - alert: BillingMigrationManualIntervention
-        expr: neurostack_billing_migration_backlog{state="manual_intervention"} > 0
-        for: 1m
-        labels:
-          severity: critical
-          team: backend
-        annotations:
-          summary: "Billing migration requires manual intervention"
-          description: "At least one migration is blocked in the manual lane"
-          runbook_url: "https://docs.neurostack.io/runbooks/asaas-billing-incident"
-
-      - alert: BillingMigrationReadbackBacklog
+      - alert: BillingReadbackBacklog
         expr: sum(neurostack_billing_readback_backlog) > 0
         for: 10m
         labels:

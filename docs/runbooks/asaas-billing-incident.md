@@ -12,10 +12,9 @@ is open.
 3. Call `/v1/admin/billing/rollout/incident-disable`. It can only transition
    to `disabled`; the current rollout revision prevents a stale receipt from
    overwriting later containment.
-4. Review `BillingMigrationManualIntervention`,
-   `BillingMigrationReadbackBacklog`, and
-   `BillingOperationReceiptRejected`. Resolve every exact-ID readback before
-   considering a new rollout operation.
+4. Review `BillingReadbackBacklog` and `BillingOperationReceiptRejected`.
+   Resolve every exact-ID readback before considering a new rollout
+   operation.
 5. For a top-up health or revocation event, call only
    `/v1/admin/billing/topup-capability/disable` with reason `health` or
    `revocation`. No other endpoint may turn top-up off.
