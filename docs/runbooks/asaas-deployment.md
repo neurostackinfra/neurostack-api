@@ -774,12 +774,12 @@ restored guards refuse what they refused.
      bridge image, so the flag is turned on first, on the bridge image, as its
      own reviewed change and its own deploy: a new `neurostack-staging-app`
      revision tagged `ManagedBy=manual`, rendered by the planner from the
-     wiring manifest and registered by the operator. Today the planner and the
-     manifest pin the flag to `false` (`ADDED_ENVIRONMENT` in
-     `scripts/asaas_production_wiring.py`, `app_environment_added` in
-     `infra/production/asaas-production-wiring.yaml`), so that reviewed change
-     moves the pin to `true` first. Evidence: `DescribeTaskDefinition` of the
-     active revision shows `BILLING_FACT_WORKER_ENABLED=true`.
+     reviewed parameter `BILLING_FACT_WORKER_ENABLED` (`'false'` in the
+     repository) and registered by the operator. The procedure, from the
+     reviewed PR that sets the parameter to `'true'` to the deploy, is
+     [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled).
+     Evidence: `DescribeTaskDefinition` of the active revision shows
+     `BILLING_FACT_WORKER_ENABLED=true`; then step 2.
   2. **Observe the worker.** Before any E7 build: every task logs `billing
      fact worker started`,
      `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
@@ -1209,6 +1209,9 @@ The reviewed artifacts are:
   `ASAAS_WEBHOOK_URL=https://staging.api.neurostack.global/v1/billing/webhook/asaas`
   and `ASAAS_WEBHOOK_NOTIFICATION_EMAIL=neurostack.infra@gmail.com`. To change
   one at apply time, edit this file, have it reviewed, and run `plan` again.
+  It also holds `BILLING_FACT_WORKER_ENABLED`, the outbox worker flag:
+  exactly `'false'` (the repository value) or `'true'`, see
+  [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled).
 - `scripts/asaas_production_wiring.py`: the read-only planner.
 
 ### The read-only planner
@@ -1315,7 +1318,8 @@ secret, as a separate revision.
    - secrets, as `valueFrom` ARN references: `ASAAS_API_KEY`,
      `ASAAS_WEBHOOK_TOKEN`, `BILLING_OBSERVABILITY_SMOKE_TOKEN`;
    - environment: `ASAAS_WEBHOOK_URL`, `ASAAS_CHECKOUT_RETURN_URL`,
-     `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and `BILLING_FACT_WORKER_ENABLED=false`.
+     `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and `BILLING_FACT_WORKER_ENABLED`
+     (the reviewed parameter; `false` for revision 9 and in the repository).
 
    It never carries a name with a forbidden prefix (the legacy payment
    provider, or `APPCONFIG_`) and never sets `SPA_ENABLED` or `SPA_DIST_DIR`.
@@ -1327,6 +1331,110 @@ secret, as a separate revision.
    fails with `financial_egress_disabled` before any provider POST. No
    AppConfig application exists in the account (read back 2026-10-18). This is
    the only supported initial state.
+
+### The outbox worker flag (`BILLING_FACT_WORKER_ENABLED`)
+
+The task definition renders `BILLING_FACT_WORKER_ENABLED` from the reviewed
+parameter of the same name in
+`infra/production/asaas-production-wiring.params.yaml`. It is exactly the
+quoted string `'false'` or `'true'`. A YAML boolean (`true`, `yes`, `on`),
+any other spelling, surrounding whitespace or a missing value fails the plan
+before any AWS read (`parameter_invalid:` or
+`parameter_missing:BILLING_FACT_WORKER_ENABLED`). The repository keeps
+`'false'`, pinned by `test_the_repository_keeps_the_outbox_worker_off` (the
+only test that pins the value), so merging the wiring changes nothing live:
+with `'false'` the rendering is byte for byte what it was when the value was
+a constant. Against the live state, `plan` reports revision 9
+`registered_and_deployed` only when `app_image_override` is set to revision
+9's image (the bridge digest `sha256:18358ce7…`), as when revision 9 was
+rendered. With the repository's `null` the rendering keeps revision 8's
+tagged image, and `plan` blocks on the live state, as it did before this
+parameter existed.
+
+What turning it on does: one asyncio loop per API worker process (2 tasks ×
+4 workers = 8 loops). Each tick (30 s) takes a PostgreSQL advisory lock and
+runs the reconcile and escalation reads/updates on `billing_fact_deliveries`
+and `billing_outbox_events`, publishes nothing (`transport=None`) and sets
+three gauges. It adds no AWS call, permission, secret or egress. With the
+rollout `disabled` and no billing fact it is a no-op apart from those reads;
+once any billing fact exists nothing consumes it, and
+`BillingFactDeliveryStale` fires after 900 s
+([asaas-billing-reconciliation.md](./asaas-billing-reconciliation.md)).
+
+**Turning it on is a committed, reviewed PR, never a local edit** (owner
+decision 2026-10-22: the flag first, on the bridge image, as its own change
+and its own deploy, before the E7 image). That PR changes only the parameter
+line to `'true'` and, deliberately, the pin test above, so the change is
+auditable and merged. After it merges, `plan` run from `main` with the
+repository file is the source of truth for the flag. `app_image_override`
+stays what it is today: an apply-time input the operator sets to the bridge
+digest revision 9 runs (the repository keeps `null`). The planner reads it
+only from the `--params` file, so the operator plans from a local copy of
+`main`'s file with that one field changed; the copy's `parameters_sha256`
+therefore differs from `main`'s, and the echoed flag value in the plan is the
+evidence of what was planned. The image does not
+change in this revision, and the E7 image is never part of it: the E7 image
+comes in a later revision of its own (E7-A follow-up step 3). Turning the
+worker off again is the same kind of PR, back to `'false'`, and the same
+steps.
+
+1. **PR.** Set `BILLING_FACT_WORKER_ENABLED: 'true'` and update
+   `test_the_repository_keeps_the_outbox_worker_off`; review and merge.
+2. **Plan, render, check** from `main`, with the repository file plus the
+   apply-time `app_image_override`. `plan` exits 0 with `status: ready` and
+   `task_definition_revision: would_change`. Its change is
+   `register_task_definition` with `replaces: <revision 9 ARN>` and
+   `worker_flag: {from: 'false', to: 'true'}`. It is reported only when the
+   serving revision differs from the rendering in that value alone; any
+   other difference blocks (`service_not_on_rollback_target:<ARN>`). Then
+   `render-taskdef` and `check` as in step 2 of the ordered procedure. With
+   `'true'`, `check` passes the same validators as with `'false'`. Only
+   `rendered_request_sha256` changes, and in `plan` only the image gate's
+   `runtime_fingerprint_candidate` (the value is fingerprinted).
+3. **Register** the rendering as revision 10 (`ManagedBy=manual`, by the
+   operator). `plan` then reports `status: compliant`, with
+   `registered_not_deployed:<revision 10 ARN>` and
+   `registered_revision_changes_worker_flag` naming revision 9. The worker is
+   **not** on yet: the service still runs revision 9 until step 4. When the
+   service runs a revision that is neither the D3 source, the rollback target
+   nor the newest, `plan` reads that revision too: a `--readback-file` must
+   then contain `ecs:DescribeTaskDefinition` of
+   `neurostack-staging-app:<serving revision>` with `"include": ["TAGS"]`, or
+   `plan` fails with `readback_missing:ecs.DescribeTaskDefinition`.
+4. **Deploy** revision 10: the `service_deployment` gate (separate owner
+   approval). Afterwards `plan` reports `registered_and_deployed:<revision 10
+   ARN>`, and the post-deploy hook accepts the revision: it refuses any flag
+   value other than `false` or `true` (`billing_fact_worker_flag_unreviewed`).
+5. **Observe** the worker, E7-A follow-up step 2 in
+   [Open follow-ups recorded by E6](#open-follow-ups-recorded-by-e6): every
+   task logs `billing fact worker started`,
+   `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
+   advancing, and `neurostack_billing_fact_backlog` is `0` for every
+   condition.
+6. **Regenerate the protected template from revision 10** before the E7
+   image (F1, "Regenerating the protected template from the deployed D3
+   revision"). The template fingerprints every D3 value, so the protected
+   path refuses a template captured from revision 9 (`false`) against a
+   serving revision with `true` (`base_task_environment_changed`).
+
+A service rollback to the rollback target (revision 9, which carries
+`false`) turns the worker off and leaves revision 10 the newest. While the
+parameter stays `'true'`, `plan` reports it `registered_not_deployed`; once a
+PR sets the parameter back to `'false'`, the state below applies.
+
+**Newest revision differing only in the flag (blocks, never green).** When
+the service runs the rendering, or differs from it in the flag alone, but the
+newest registered revision differs from the rendering in the flag alone,
+`plan` blocks with `newest_revision_differs_only_in_worker_flag:<newest ARN>`
+(`info.newest_revision_worker_flag` gives the values), and `render-taskdef`
+and `check` refuse. Typical causes: revision 10 registered and then
+abandoned; the service rolled back to revision 9 and the parameter set back
+to `'false'`; or the `'false'` rendering registered while the worker is on.
+Recovery is an owner decision, carried out by the operator and never by these
+tools: either
+deregister that unwanted newest revision (owner approval required), or, when
+its flag value is the one wanted, make the parameter say the same through the
+PR of step 1 and deploy it (step 4). Then run `plan` again.
 
 ### Ordered procedure
 
@@ -1560,7 +1668,8 @@ own explicit owner approval and is never performed from the manifest.
    otherwise with backoff from 30 s up to 300 s. This is not gated by
    financial egress, by design. Checkout creation stays closed (rollout
    `disabled`, financial egress closed, webhook not ready). The outbox worker
-   stays off.
+   stays off while the revision carries `BILLING_FACT_WORKER_ENABLED=false`
+   (see [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled)).
 
    Startup preconditions the owner checks without printing any value:
    - the API key secret is a plain string in the production key namespace

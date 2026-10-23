@@ -80,6 +80,16 @@ O worker **não tem transporte e não entrega nada hoje**: nenhum consumidor de
 créditos existe, a produção passa `transport=None` e a apresentação está
 bloqueada por uma guarda de código (ver "Apresentação bloqueada" abaixo).
 
+No serviço ECS de produção o valor vem do parâmetro revisado
+`BILLING_FACT_WORKER_ENABLED` em
+`infra/production/asaas-production-wiring.params.yaml`: exatamente a string
+`'false'` (o valor do repositório) ou `'true'`; qualquer outra grafia, um
+booleano YAML ou a ausência bloqueia o plano. Ligar (ou desligar) o worker é
+um PR revisado e mergeado que muda essa linha e o teste que fixa o valor
+(`test_the_repository_keeps_the_outbox_worker_off`), seguido de uma nova
+revisão da task definition (`docs/runbooks/asaas-deployment.md`, "The outbox
+worker flag").
+
 | Variável | Padrão | Limites | Efeito |
 |---|---:|---|---|
 | `BILLING_FACT_WORKER_ENABLED` | `false` | booleano | Liga um loop por processo da API (no ECS: 2 tasks × 4 workers = 8 loops). |
@@ -194,8 +204,9 @@ implantado **e** `BILLING_FACT_WORKER_ENABLED=true`, decisão do owner de
 1. **Primeiro a flag, numa mudança própria.** O código do worker já está na
    imagem ponte, então `BILLING_FACT_WORKER_ENABLED=true` sai antes, na
    imagem ponte, como mudança revisada e deploy próprios (revisão nova
-   `ManagedBy=manual` renderizada pelo planner a partir do manifesto de
-   wiring, que hoje fixa a flag em `false`).
+   `ManagedBy=manual` renderizada pelo planner a partir do parâmetro revisado
+   `BILLING_FACT_WORKER_ENABLED`, `'false'` no repositório; o procedimento é
+   "The outbox worker flag" no runbook).
 2. **Observar.** O worker subiu em cada task, o last-tick avança e o outbox
    está vazio.
 3. **Depois, a imagem do E7, nunca na mesma revisão.** Só então a imagem do

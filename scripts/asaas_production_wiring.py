@@ -172,8 +172,21 @@ SMOKE_TOKEN_ENV = "BILLING_OBSERVABILITY_SMOKE_TOKEN"
 RETURN_URL_PARAMETER = "ASAAS_CHECKOUT_RETURN_URL"
 WEBHOOK_URL_PARAMETER = "ASAAS_WEBHOOK_URL"
 EMAIL_PARAMETER = "ASAAS_WEBHOOK_NOTIFICATION_EMAIL"
+# The billing.fact.v1 outbox worker (one loop per API process). The reviewed
+# parameter is rendered as the environment value itself, so it is exactly the
+# string "false" or "true": a YAML boolean, another spelling or surrounding
+# whitespace is refused. The repository keeps "false"; turning the worker on
+# (or off again) is a reviewed PR to the parameters file, rendered as a new
+# revision (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
+WORKER_FLAG_PARAMETER = "BILLING_FACT_WORKER_ENABLED"
+WORKER_FLAG_VALUES = ("false", "true")
 IMAGE_PARAMETER = "app_image_override"
-REQUIRED_PARAMETERS = (RETURN_URL_PARAMETER, WEBHOOK_URL_PARAMETER, EMAIL_PARAMETER)
+REQUIRED_PARAMETERS = (
+    RETURN_URL_PARAMETER,
+    WEBHOOK_URL_PARAMETER,
+    EMAIL_PARAMETER,
+    WORKER_FLAG_PARAMETER,
+)
 RETURN_PATH = "/billing"
 WEBHOOK_PATH = "/v1/billing/webhook/asaas"
 # environment name -> ("parameter", parameter name) | ("value", literal)
@@ -181,7 +194,7 @@ ADDED_ENVIRONMENT: dict[str, tuple[str, str]] = {
     "ASAAS_WEBHOOK_URL": ("parameter", WEBHOOK_URL_PARAMETER),
     "ASAAS_CHECKOUT_RETURN_URL": ("parameter", RETURN_URL_PARAMETER),
     "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": ("parameter", EMAIL_PARAMETER),
-    "BILLING_FACT_WORKER_ENABLED": ("value", "false"),
+    "BILLING_FACT_WORKER_ENABLED": ("parameter", WORKER_FLAG_PARAMETER),
 }
 ADDED_SECRETS = tuple(row[0] for row in SECRET_REFERENCES)
 FORBIDDEN_NAME_PREFIXES = ("ABACATEPAY_", "APPCONFIG_")
@@ -615,6 +628,7 @@ def _expected_parameters_section() -> dict[str, Any]:
                 "path": WEBHOOK_PATH,
             },
             EMAIL_PARAMETER: {"validator": "operator_email", "path": None},
+            WORKER_FLAG_PARAMETER: {"validator": "exact_false_or_true", "path": None},
         },
         "optional": {
             IMAGE_PARAMETER: {"validator": "ecr_image_digest_reference", "path": None}
@@ -942,6 +956,14 @@ def validate_parameters(raw: Any) -> dict[str, Any]:
     allowed = set(REQUIRED_PARAMETERS) | {IMAGE_PARAMETER}
     unknown = sorted(set(values) - allowed)
     _require(not unknown, f"parameter_unknown:{','.join(unknown)}")
+    # A YAML boolean (true, yes, on, True...) or a number is a present but
+    # invalid flag, never a missing one: the reviewed value is the quoted
+    # environment string itself.
+    flag = values.get(WORKER_FLAG_PARAMETER)
+    _require(
+        flag is None or isinstance(flag, str),
+        f"parameter_invalid:{WORKER_FLAG_PARAMETER}",
+    )
     output: dict[str, Any] = {}
     for name in REQUIRED_PARAMETERS:
         value = values.get(name)
@@ -969,6 +991,10 @@ def validate_parameters(raw: Any) -> dict[str, Any]:
         and len(email) <= 254
         and _OPERATOR_EMAIL.fullmatch(email) is not None,
         f"parameter_invalid:{EMAIL_PARAMETER}",
+    )
+    _require(
+        output[WORKER_FLAG_PARAMETER] in WORKER_FLAG_VALUES,
+        f"parameter_invalid:{WORKER_FLAG_PARAMETER}",
     )
     image = values.get(IMAGE_PARAMETER)
     _require(
@@ -1371,7 +1397,48 @@ def collect_readback(
         if zone_id is not None
         else None
     )
+    # The revision the service runs, read only when no other read holds it
+    # (source, rollback target, latest): a newer revision registered from the
+    # rendering is reported registered but not deployed only when the serving
+    # revision differs from it in the worker flag alone (worker_flag_change).
+    serving = _serving_revision(readback["service"])
+    readback["serving_task_definition"] = (
+        aws.call(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": f"{TASK_FAMILY}:{serving}", "include": ["TAGS"]},
+        )
+        if serving is not None
+        and serving not in {D3_SOURCE_REVISION, pins.rollback_revision}
+        and task_definition_arn(TASK_FAMILY, serving)
+        != _task_definition_arn_of(readback["latest_task_definition"])
+        else None
+    )
     return readback
+
+
+_APP_REVISION_ARN = re.compile(
+    rf"^arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/"
+    rf"{re.escape(TASK_FAMILY)}:(?P<revision>[1-9][0-9]{{0,8}})$"
+)
+
+
+def _serving_revision(response: Any) -> int | None:
+    """The app revision number the service runs, or None when unreadable."""
+
+    services = response.get("services") if isinstance(response, dict) else None
+    if not (isinstance(services, list) and len(services) == 1):
+        return None
+    current = (
+        services[0].get("taskDefinition") if isinstance(services[0], dict) else None
+    )
+    match = _APP_REVISION_ARN.fullmatch(current) if isinstance(current, str) else None
+    return int(match.group("revision")) if match else None
+
+
+def _task_definition_arn_of(response: Any) -> Any:
+    definition = response.get("taskDefinition") if isinstance(response, dict) else None
+    return definition.get("taskDefinitionArn") if isinstance(definition, dict) else None
 
 
 def _source_app_container(response: Any) -> dict[str, Any] | None:
@@ -1546,6 +1613,10 @@ def render_task_definition(
         kind, reference = ADDED_ENVIRONMENT[name]
         value = parameters[reference] if kind == "parameter" else reference
         _require(isinstance(value, str) and value != "", f"parameter_missing:{name}")
+        _require(
+            reference != WORKER_FLAG_PARAMETER or value in WORKER_FLAG_VALUES,
+            f"parameter_invalid:{reference}",
+        )
         environment.append({"name": name, "value": value})
     app["environment"] = environment
     secrets = list(app.get("secrets", []))
@@ -2717,6 +2788,39 @@ def _plan_task_definition(
             )
         except WiringError:
             latest_matches = False
+    # The service already runs a registered D3 revision that differs from the
+    # rendering in the worker flag alone: a new revision is needed (worker on,
+    # or off again), and once registered it is reported like the D3 one.
+    flag_change = (
+        worker_flag_change(latest_response, rendered)
+        if isinstance(current, str)
+        and current == latest_arn
+        and current != D3_SOURCE_TASK_DEFINITION_ARN
+        and not latest_matches
+        else None
+    )
+    serving_flag_change = (
+        worker_flag_change(_serving_response(readback, current, pins), rendered)
+        if isinstance(current, str)
+        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
+        and latest_matches
+        else None
+    )
+    # Stuck, never green: the service runs the rendering (or differs from it in
+    # the worker flag alone) while the newest registered revision differs from
+    # the rendering in the worker flag alone, e.g. a flag revision registered
+    # and then abandoned or rolled back. Reported under its own name; what to
+    # do with that newest revision is an owner decision (runbook).
+    newest_flag_change = (
+        worker_flag_change(latest_response, rendered)
+        if isinstance(current, str)
+        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
+        and not latest_matches
+        and _same_but_for_worker_flag(
+            _serving_response(readback, current, pins), rendered
+        )
+        else None
+    )
     if current == D3_SOURCE_TASK_DEFINITION_ARN:
         if latest_arn == D3_SOURCE_TASK_DEFINITION_ARN:
             step.changes.append(
@@ -2734,9 +2838,102 @@ def _plan_task_definition(
             step.blocks.append(f"newer_revision_differs_from_rendering:{latest_arn}")
     elif isinstance(current, str) and current == latest_arn and latest_matches:
         step.compliant.append(f"registered_and_deployed:{latest_arn}")
+    elif flag_change is not None:
+        step.changes.append(
+            {
+                "action": "register_task_definition",
+                "family": TASK_FAMILY,
+                "derived_from": D3_SOURCE_TASK_DEFINITION_ARN,
+                "replaces": current,
+                "worker_flag": {
+                    "name": WORKER_FLAG_PARAMETER,
+                    "from": flag_change[0],
+                    "to": flag_change[1],
+                },
+                "request_sha256": diff["rendered_request_sha256"],
+                "service_changes": "none (service_deployment is a separate gate)",
+            }
+        )
+    elif serving_flag_change is not None:
+        step.compliant.append(f"registered_not_deployed:{latest_arn}")
+        step.info["registered_revision_changes_worker_flag"] = {
+            "serving": current,
+            "from": serving_flag_change[0],
+            "to": serving_flag_change[1],
+        }
+    elif newest_flag_change is not None:
+        step.blocks.append(f"newest_revision_differs_only_in_worker_flag:{latest_arn}")
+        step.info["newest_revision_worker_flag"] = {
+            "newest": latest_arn,
+            "newest_value": newest_flag_change[0],
+            "rendered_value": newest_flag_change[1],
+            "serving": current,
+        }
     else:
         step.blocks.append(f"service_not_on_rollback_target:{current}")
     return rendered, diff, rendered
+
+
+def _same_but_for_worker_flag(response: Any, rendered: dict[str, Any]) -> bool:
+    """Whether a registered revision equals the rendering, flag value aside."""
+
+    try:
+        same = _comparable(_request_from_response(response)) == _comparable(rendered)
+    except WiringError:
+        return False
+    return same or worker_flag_change(response, rendered) is not None
+
+
+def _serving_response(
+    readback: dict[str, Any], current: str, pins: ManifestPins
+) -> Any:
+    """The DescribeTaskDefinition readback of the revision the service runs."""
+
+    if current == pins.rollback_task_definition_arn:
+        return readback.get("rollback_task_definition")
+    return readback.get("serving_task_definition")
+
+
+def worker_flag_change(
+    registered_response: Any, rendered: dict[str, Any]
+) -> tuple[str, str] | None:
+    """(registered value, rendered value) of a worker-flag-only difference.
+
+    A registered revision differs from the rendering in the worker flag alone
+    when both carry it exactly once with a reviewed value ("false" or "true"),
+    the two values differ, and with the rendered value put in its place the
+    revision compares equal to the rendering (every other field, name, value,
+    secret reference, image and tag). Anything else is None.
+    """
+
+    try:
+        registered = _request_from_response(registered_response)
+        registered_app = evidence._container_map(registered)[APP_CONTAINER]
+        rendered_env = evidence._env_map(
+            evidence._container_map(rendered)[APP_CONTAINER]
+        )
+        evidence._env_map(registered_app)
+    except (WiringError, evidence.EvidenceError):
+        return None
+    rows = [
+        row
+        for row in registered_app.get("environment", [])
+        if row.get("name") == WORKER_FLAG_PARAMETER
+    ]
+    to_value = rendered_env.get(WORKER_FLAG_PARAMETER)
+    if len(rows) != 1:
+        return None
+    from_value = rows[0]["value"]
+    if not (
+        from_value in WORKER_FLAG_VALUES
+        and to_value in WORKER_FLAG_VALUES
+        and from_value != to_value
+    ):
+        return None
+    rows[0]["value"] = to_value
+    if _comparable(registered) != _comparable(rendered):
+        return None
+    return str(from_value), str(to_value)
 
 
 def _plan_protected_path_integrity(

@@ -2324,3 +2324,43 @@ def test_other_secrets_still_hash_the_whole_reference(variant: str) -> None:
         {"name": "SECRET_KEY", "valueFrom": f"{_OTHER_SECRET_ARN}:key::{VERSION_ID}"},
     ]
     assert _fingerprint(None, other_secrets=changed) != _GOLDEN_NO_DATABASE_URL
+
+
+def test_either_reviewed_worker_flag_passes_and_its_value_is_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E7-B0: the outbox worker flag may be 'false' or 'true' (a reviewed
+    parameter of the D3 planner). The protected path accepts either value and
+    binds it like every D3 value: a template captured from a 'false' revision
+    refuses a serving 'true' revision, so after the flip the template must be
+    regenerated from the serving revision before a protected deploy."""
+
+    flag = "BILLING_FACT_WORKER_ENABLED"
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    templates = {}
+    for value in ("false", "true"):
+        template = _set_env(_d3_template(signer), flag, value)
+        templates[value] = validate_task_definition_template(template)
+        assert templates[value]["base_environment_sha256"][flag] == _sha(value)
+    serving_true = _set_env(_d3_snapshot(), flag, "true")
+    _validate_d3_snapshot(
+        copy.deepcopy(serving_true),
+        expected_base=templates["true"]["base_environment_sha256"],
+    )
+    with pytest.raises(RolloutError, match="^base_task_environment_changed$"):
+        _validate_d3_snapshot(
+            serving_true, expected_base=templates["false"]["base_environment_sha256"]
+        )
+    before = _validate_d3_snapshot(_set_env(_d3_snapshot(), flag, "true"))
+    after = _validate_d3_snapshot(
+        _set_env(_d3_snapshot(phase="after"), flag, "true"), phase="after"
+    )
+    compare_rollout_readbacks(before, after, expected_digest=DIGEST)
+    flipped = _validate_d3_snapshot(
+        _set_env(_d3_snapshot(phase="after"), flag, "false"), phase="after"
+    )
+    with pytest.raises(
+        RolloutError, match="readback_runtime_fingerprint_sha256_changed"
+    ):
+        compare_rollout_readbacks(before, flipped, expected_digest=DIGEST)
