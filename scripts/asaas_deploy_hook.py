@@ -77,6 +77,12 @@ TASK_FAMILY = rollout.TASK_FAMILY
 APP_CONTAINER = rollout.APP_CONTAINER
 OTEL_CONTAINER = "otel"
 ECR_REGISTRY = rollout.ECR_REGISTRY
+# The D3 outbox worker flag and its only reviewed values (the parameter
+# BILLING_FACT_WORKER_ENABLED of scripts/asaas_production_wiring.py, which this
+# pure tool must not import; a test pins the two equal). A deployed revision
+# may carry either value; any other value was never rendered by the planner.
+WORKER_FLAG = "BILLING_FACT_WORKER_ENABLED"
+WORKER_FLAG_VALUES = ("false", "true")
 
 # ---------------------------------------------------------------------------
 # The registration command's result contract (src/ops/asaas_webhook.py, T1,
@@ -864,6 +870,17 @@ def _task_definition_view(
         and rollout.D3_SECRET_NAMES <= _names(app, "secrets"),
         "task_definition_has_webhook_wiring",
         "task_definition_missing_webhook_wiring",
+    )
+    environment = app.get("environment")
+    flag_values = [
+        row.get("value")
+        for row in (environment if isinstance(environment, list) else [])
+        if isinstance(row, dict) and row.get("name") == WORKER_FLAG
+    ]
+    checks.check(
+        len(flag_values) == 1 and flag_values[0] in WORKER_FLAG_VALUES,
+        "billing_fact_worker_flag_reviewed",
+        "billing_fact_worker_flag_unreviewed",
     )
     log_configuration = app.get("logConfiguration")
     options = (

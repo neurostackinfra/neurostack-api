@@ -3054,3 +3054,79 @@ def test_render_run_task_rechecks_freshness_itself(
     code, out, err = run(["render-run-task", *_args(World(), tmp_path)], capsys)
     assert code == 2 and out == ""
     assert "readback_stale" in err
+
+
+# ---------------------------------------------------------------------------
+# E7-B0: the outbox worker flag is a reviewed parameter ('false' or 'true')
+# ---------------------------------------------------------------------------
+
+
+def _with_worker_flag(*rows: dict[str, Any]) -> dict[str, Any]:
+    environment = [
+        row
+        for row in _app_container()["environment"]
+        if row["name"] != hook.WORKER_FLAG
+    ]
+    return _definition_with(environment=[*environment, *rows])
+
+
+@pytest.mark.parametrize("value", ["false", "true"])
+def test_plan_accepts_a_deployed_revision_with_either_reviewed_worker_flag(
+    value: str, tmp_path: Path
+) -> None:
+    world = World()
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": EXPECTED_ARN},
+        _with_worker_flag({"name": hook.WORKER_FLAG, "value": value}),
+    )
+    document = plan(world, tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert "billing_fact_worker_flag_reviewed" in document["checks"]
+    assert "task_definition_has_webhook_wiring" in document["checks"]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"name": "BILLING_FACT_WORKER_ENABLED", "value": value}]
+        for value in ("yes", "True", "TRUE", "1", "on", "", " true", "false\n")
+    ]
+    + [
+        [{"name": "BILLING_FACT_WORKER_ENABLED"}],
+        [{"name": "BILLING_FACT_WORKER_ENABLED", "value": ["true"]}],
+        [{"name": "BILLING_FACT_WORKER_ENABLED", "value": True}],
+        [
+            {"name": "BILLING_FACT_WORKER_ENABLED", "value": "false"},
+            {"name": "BILLING_FACT_WORKER_ENABLED", "value": "true"},
+        ],
+        [],
+    ],
+)
+def test_plan_refuses_a_worker_flag_the_planner_never_renders(
+    rows: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    world = World()
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": EXPECTED_ARN},
+        _with_worker_flag(*rows),
+    )
+    document = plan(world, tmp_path)
+    assert document["status"] == "blocked"
+    assert "billing_fact_worker_flag_unreviewed" in document["blocks"]
+    assert "billing_fact_worker_flag_reviewed" not in document["checks"]
+
+
+def test_the_hook_worker_flag_is_the_planner_parameter() -> None:
+    from scripts import asaas_production_wiring as wiring
+
+    assert hook.WORKER_FLAG == wiring.WORKER_FLAG_PARAMETER
+    assert hook.WORKER_FLAG_VALUES == wiring.WORKER_FLAG_VALUES == ("false", "true")
+    assert hook.WORKER_FLAG in rollout.D3_ENVIRONMENT_NAMES
+    assert wiring.ADDED_ENVIRONMENT[hook.WORKER_FLAG] == (
+        "parameter",
+        wiring.WORKER_FLAG_PARAMETER,
+    )
