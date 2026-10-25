@@ -4320,6 +4320,10 @@ def test_the_repository_turns_the_outbox_worker_on() -> None:
 
 WORKER_FLAG_RUNBOOK = ROOT / "docs/runbooks/asaas-deployment.md"
 WORKER_FLAG_CONFIGURATION = ROOT / "docs/configuration.md"
+WORKER_FLAG_ROLLBACK = ROOT / "docs/runbooks/asaas-rollback.md"
+# The runbook's state section (operator-recorded live evidence); the same
+# heading as STATE_HEADING in test_production_migration_window.py.
+RUNBOOK_STATE_HEADING = "## State after the live runs of 2026-10-22 to 2026-10-25\n"
 # Statements of the repository value from before E7-B1; none may come back
 # while the repository says 'true'.
 RETIRED_WORKER_FLAG_STATEMENTS = (
@@ -4339,38 +4343,113 @@ RETIRED_WORKER_FLAG_STATEMENTS = (
     "`'false'` no repositório",
     "the only test that pins the value",
     "pinned by one test",
+    # Untrue since the worker runs: its maintenance pass calls the reconciler
+    # every 30 s (only the publisher has no runtime caller).
+    "and reconciler have no runtime caller",
 )
-# Claims that the worker already runs in production; none holds until the
-# next revision is deployed and observed.
-WORKER_ON_IN_PRODUCTION_CLAIMS = (
-    "the worker is on in production",
-    "the worker is already on",
-    "the worker is now on",
-    "the flag is on in production",
-    "the flag is already on",
-    "worker runs in production",
-    "o worker está ligado em produção",
-    "o worker já está ligado",
-    "a flag já está ligada",
-    "a flag está ligada em produção",
+# The worker is on in production since revision 10 (deployment completed
+# 2026-10-25 01:51Z, operator-recorded) and revision 11 carries the flag too.
+# The docs must say so where the live state is recorded...
+WORKER_ON_IN_PRODUCTION_FACTS = {
+    "runbook state section": (
+        "The worker is on in production since revision 10 (2026-10-25 01:51Z),"
+        " and revision 11 carries the flag too."
+    ),
+    "configuration.md": "**O worker está ligado em produção desde a revisão 10**",
+}
+# ...and no statement that it is off, or not yet on a registered revision,
+# may come back (compared lowercased).
+WORKER_OFF_IN_PRODUCTION_CLAIMS = (
+    "the worker is not yet on",
+    "the worker is still off",
+    "nothing here claims the flag is on",
+    "nothing here claims the worker is on",
+    "no registered revision carries `true` yet",
+    "o worker ainda não está ligado",
+    "ainda em nenhuma revisão registrada",
+)
+# The same claims with words in between ("the outbox worker is still off in
+# production", "a flag do worker segue desligada em produção"): the worker or
+# the flag, then off, then production, within one sentence.
+_OFF_IN_PRODUCTION = re.compile(
+    r"\b(?:worker|flag)\b[^.;\n]{0,40}"
+    r"\b(?:off|not on|not enabled|not yet on|disabled|desligad[oa]"
+    r"|não está ligad[oa]|não ligad[oa]|ainda não)\b"
+    r"[^.;\n]{0,40}\b(?:in production|em produção)",
+    re.IGNORECASE,
 )
 
 
-_NEGATED_CLAIM = re.compile(r"\b(?:not|never|claims?|não|nunca|nem)\b[^.;]{0,12}$")
-
-
-def _unnegated_claims(text: str, claims: tuple[str, ...]) -> list[str]:
-    """Each claim occurrence not negated just before it (``nothing here claims
-    the flag is on`` is the truth, ``the flag is on`` is not)."""
-
-    found = []
-    for claim in claims:
-        for match in re.finditer(re.escape(claim), text):
-            if not _NEGATED_CLAIM.search(
-                text[max(0, match.start() - 40) : match.start()]
-            ):
-                found.append(claim)
+def _worker_off_claims(text: str) -> list[str]:
+    lowered = text.lower()
+    found = [claim for claim in WORKER_OFF_IN_PRODUCTION_CLAIMS if claim in lowered]
+    found.extend(match.group(0) for match in _OFF_IN_PRODUCTION.finditer(text))
     return found
+
+
+def _runbook_state_section() -> str:
+    raw = WORKER_FLAG_RUNBOOK.read_text(encoding="utf-8")
+    start = raw.index(RUNBOOK_STATE_HEADING)
+    end = raw.index("\n## ", start + len(RUNBOOK_STATE_HEADING))
+    return raw[start:end]
+
+
+@pytest.mark.parametrize(
+    ("wording", "claims_off"),
+    [
+        pytest.param("The worker is still off in production.", True, id="plain"),
+        pytest.param(
+            "The outbox worker is still off in production.", True, id="interposed"
+        ),
+        pytest.param(
+            "The billing fact worker is not enabled in production yet.",
+            True,
+            id="not-enabled",
+        ),
+        pytest.param(
+            "The worker flag is disabled in production.", True, id="flag-disabled"
+        ),
+        pytest.param(
+            "o worker do outbox está desligado em produção.", True, id="pt-off"
+        ),
+        pytest.param(
+            "A flag do worker ainda não está ligada em produção.",
+            True,
+            id="pt-not-yet",
+        ),
+        pytest.param(
+            "No registered revision carries `true` yet.", True, id="not-registered"
+        ),
+        # The true statements and the procedure wording stay allowed.
+        pytest.param(
+            "The worker is on in production since revision 10 (2026-10-25"
+            " 01:51Z), and revision 11 carries the flag too.",
+            False,
+            id="true-en",
+        ),
+        pytest.param(
+            "**O worker está ligado em produção desde a revisão 10**",
+            False,
+            id="true-pt",
+        ),
+        pytest.param(
+            "`worker_flag: {from: 'true', to: 'false'}` (turning the worker off"
+            " again, a new revision).",
+            False,
+            id="turn-off-procedure",
+        ),
+        pytest.param(
+            "A rollback to revision 9 would also turn the worker off. Revision 11"
+            " serves in production now.",
+            False,
+            id="rollback-consequence",
+        ),
+    ],
+)
+def test_the_worker_off_scan_catches_variants_and_spares_the_truth(
+    wording: str, claims_off: bool
+) -> None:
+    assert bool(_worker_off_claims(" ".join(wording.split()))) is claims_off
 
 
 def _flat(path: Path) -> str:
@@ -4388,26 +4467,44 @@ def _in_order(text: str, steps: list[str]) -> None:
 
 
 def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
-    """The docs follow the pin: the repository says 'true', revision 10 with
-    'true' was registered and deployed on 2026-10-25, and the steps are in
-    order. The PR that turns the worker off again changes this test with the
-    pin test."""
+    """The docs follow the pin and the live state: the repository says 'true',
+    revision 10 with 'true' was registered and deployed on 2026-10-25, the
+    worker is on in production since then (revision 11 keeps the flag), and
+    the steps are in order. The PR that turns the worker off again changes
+    this test with the pin test."""
 
     assert wiring.validate_parameters(wiring.load_yaml(PARAMS))[WORKER_FLAG] == "true"
     for path in (
         WORKER_FLAG_RUNBOOK,
         WORKER_FLAG_CONFIGURATION,
+        WORKER_FLAG_ROLLBACK,
         PARAMS,
         MANIFEST,
         ROOT / "scripts/asaas_production_wiring.py",
     ):
         text = _flat(path)
-        lowered = text.lower()
         for retired in RETIRED_WORKER_FLAG_STATEMENTS:
             assert retired not in text, (path.name, retired)
-        assert (
-            _unnegated_claims(lowered, WORKER_ON_IN_PRODUCTION_CLAIMS) == []
-        ), path.name
+        assert _worker_off_claims(text) == [], path.name
+
+    state = " ".join(_runbook_state_section().split())
+    assert WORKER_ON_IN_PRODUCTION_FACTS["runbook state section"] in state
+    assert WORKER_ON_IN_PRODUCTION_FACTS["configuration.md"] in _flat(
+        WORKER_FLAG_CONFIGURATION
+    )
+    # On, but still publishing nothing: no transport, no consumer. The
+    # reconciler does run (src/services/billing_fact_worker.py, _maintain).
+    assert (
+        "**Outbox publication is not scheduled yet.** This still holds with"
+        " `BILLING_FACT_WORKER_ENABLED=true` (revisions 10 and 11): the worker"
+        " runs with `transport=None` and logs `consumer=absent`, so it publishes"
+        " nothing. The publisher has no runtime caller; it runs only with a"
+        " transport. The reconciler does run, in the worker's maintenance pass"
+        " every 30 s. Facts stay `pending` with no attempt counted, and a fact"
+        " still unacknowledged after 900 s gets an `ack overdue` alert row and"
+        " the WARN `billing fact acknowledgement overdue`. Nothing in ECS"
+        " evaluates the alert rules" in _flat(WORKER_FLAG_RUNBOOK)
+    )
 
     runbook = _flat(WORKER_FLAG_RUNBOOK)
     section = _between(
@@ -4423,12 +4520,20 @@ def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
         " 2026-10-25** (deployment completed 01:51Z, 8 `billing fact worker"
         " started` lines, no tick failure)",
         "ECS assigns the number at registration (expected `:10`)",
-        # Today's result against the live state (revision 10 serving).
-        "Today, against the live state (revision 10 serving) with the override"
-        " set to the bridge digest, `'true'` reports `status: compliant` with"
+        # The result while revision 10 served, and since revision 11 serves.
+        "While revision 10 served (2026-10-25 01:51Z to 15:04Z), against the"
+        " live state (revision 10 serving) with the override set to the bridge"
+        " digest, `'true'` reports `status: compliant` with"
         " `registered_and_deployed:<revision 10 ARN>`, and `'false'` reports"
         " `status: ready` with one change, `replaces: <revision 10 ARN>` and"
         " `worker_flag: {from: 'true', to: 'false'}`",
+        "Since revision 11 serves, the override that matches the live state is"
+        " the E7b digest, and `plan` reports"
+        " `registered_and_deployed:<revision 11 ARN>`",
+        # The override's value today, and the bridge wording as history.
+        "Today that is the E7b digest revision 11 runs; at the time of E7-B1 it"
+        " was the bridge digest revision 9 ran, and the bridge wording in this"
+        " procedure is historical.",
         "Steps 2 to 4 were done on 2026-10-25: revision 10, with the flag"
         " `true`, was registered and deployed (deployment completed 01:51Z, 8"
         " `billing fact worker started` lines, no tick failure).",
@@ -4475,16 +4580,29 @@ def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
         ],
     )
 
-    # E7-A follow-up: the flag first, observed, then the E7 image; step 1
-    # never claims the flag revision is registered or deployed.
+    # E7-A follow-up: the flag first, observed, then the E7 image. Each step
+    # records its operator-recorded completion (revision 10 carries 'true'
+    # since 2026-10-25 01:51Z, its observation closed at 12:42Z, revision 11
+    # serves since 15:04Z); the pre-deploy wording is retired.
     follow_up = _between(
         runbook, "1. **Worker flag first, its own change.**", "4. **Receiver"
     )
     flag_step = _between(
         follow_up, "1. **Worker flag first", "2. **Observe the worker.**"
     )
-    assert "no registered revision carries `true` yet" in flag_step
-    assert "registered and deployed" not in flag_step
+    assert "no registered revision carries `true` yet" not in flag_step
+    assert "revision 10 was the first to carry `true`" in flag_step
+    assert (
+        "Done: revision 10 has carried `true` since its deployment completed on"
+        " 2026-10-25 01:51Z (operator record)." in flag_step
+    )
+    assert (
+        "Done: the observation of revision 10 closed at 2026-10-25T12:42Z" in follow_up
+    )
+    assert (
+        "Done: revision 11, on the E7b image, has served since 2026-10-25 15:04Z"
+        in follow_up
+    )
     _in_order(
         follow_up,
         [
@@ -4505,7 +4623,12 @@ def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
     for phrase in (
         "`'true'` (o valor do repositório desde o PR revisado E7-B1, que ligou o"
         " parâmetro do repositório)",
-        "**o worker ainda não está ligado em produção**",
+        WORKER_ON_IN_PRODUCTION_FACTS["configuration.md"],
+        "(deploy concluído em 2026-10-25 01:51Z, evidência registrada pelo"
+        " operador), e a revisão 11, no ar desde 2026-10-25 15:04Z, também leva"
+        " `true`; as revisões 8 e 9 levam `false`.",
+        "Todos os passos abaixo foram feitos em 2026-10-25; ficam descritos como"
+        " procedimento.",
         "`test_the_repository_turns_the_outbox_worker_on`",
     ):
         assert phrase in section, phrase
@@ -4531,8 +4654,16 @@ def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
     flag_step = _between(
         order, "1. **Primeiro a flag, numa mudança própria.**", "2. **Observar.**"
     )
-    assert "ainda em nenhuma revisão registrada" in flag_step
-    assert "registrada e implantada" not in flag_step
+    assert "a revisão 10 foi a primeira a levá-lo" in flag_step
+    assert (
+        "Feito: a revisão 10 leva `true` desde o fim do seu deploy, em"
+        " 2026-10-25 01:51Z (evidência do operador)." in flag_step
+    )
+    assert "Feito: a observação da revisão 10 fechou em 2026-10-25T12:42Z" in order
+    assert (
+        "Feito: a revisão 11, na imagem E7b, está no ar desde 2026-10-25 15:04Z"
+        in order
+    )
     _in_order(
         order,
         [
@@ -6018,9 +6149,10 @@ def test_the_runbook_documents_the_image_bump() -> None:
     for text in (runbook, rollback_doc):
         assert "2026-10-25 07:51 UTC" in text
         assert "manifest marker `closed_at` before the merge" in text
-    # The new digest is an apply-time input: only tests name it.
+    # The new digest is an apply-time input: no procedure, parameter, manifest
+    # or tool names it. Since revision 11 serves (2026-10-25), the runbook's
+    # state section records it as operator evidence, and only there.
     for path in (
-        WORKER_FLAG_RUNBOOK,
         WORKER_FLAG_CONFIGURATION,
         ROOT / "docs/runbooks/asaas-rollback.md",
         PARAMS,
@@ -6029,4 +6161,8 @@ def test_the_runbook_documents_the_image_bump() -> None:
         ROOT / "scripts/asaas_migration_window.py",
     ):
         assert NEW_DIGEST[7:] not in path.read_text(encoding="utf-8"), path.name
+    raw_runbook = WORKER_FLAG_RUNBOOK.read_text(encoding="utf-8")
+    state = _runbook_state_section()
+    assert NEW_DIGEST in state
+    assert NEW_DIGEST[7:] not in raw_runbook.replace(state, "")
     assert "\n  app_image_override: null\n" in PARAMS.read_text(encoding="utf-8")

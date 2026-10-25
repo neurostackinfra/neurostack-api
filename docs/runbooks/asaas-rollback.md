@@ -10,23 +10,41 @@ Rollback is application-only. Never downgrade the schema as part of a
 rollback, and never infer a financial outcome from a browser return, a
 redirect or a UI state.
 
-Once migration 036 is applied, no image built before Group 10 E5 can run
-(its ORM reads the dropped `roster_revision`/`migration_id` columns), so roll
-back only to an image that contains E5. Downgrading 036 is a separate owner
-decision, refused while any subscription or readiness row exists; see
-"Migration 036" in [`asaas-deployment.md`](./asaas-deployment.md).
-
-Once migration 037 is applied, roll back only to an image that contains
-Group 10 E6. The E5 image still maps the dropped legacy tables: its ORM
-deletion of a builder (`DELETE /v1/admin/builders/{id}`) fails with
-`relation "billing_migrations" does not exist` and rolls back; its other
-paths do not touch them. Running the E5 image again needs the 037 downgrade
-first, a separate owner decision; see "Migration 037" in
+Migration 036 was applied in production on 2026-10-24 (operator record), so
+no image built before Group 10 E5 can run (its ORM reads the dropped
+`roster_revision`/`migration_id` columns): roll back only to an image that
+contains E5. See "Migration 036" in
 [`asaas-deployment.md`](./asaas-deployment.md).
 
-## Current state (2026-10-17)
+Migration 037 was applied in production on 2026-10-24 (operator record), so
+roll back only to an image that contains Group 10 E6. The E5 image still
+maps the dropped legacy tables: its ORM deletion of a builder
+(`DELETE /v1/admin/builders/{id}`) fails with
+`relation "billing_migrations" does not exist` and rolls back; its other
+paths do not touch them. See "Migration 037" in
+[`asaas-deployment.md`](./asaas-deployment.md). Revision 10, the rollback
+target, meets this rule (operator evidence, recorded in the wish): its image,
+the bridge digest `sha256:18358ce7…` that revisions 9 and 10 run, was built
+from commit `67b9b51c`, the merge of #126, which contains migration 037 and
+the E6 code.
 
-Billing rollout is `disabled` and `topup_commercial_enabled=false`. While it
+The schema is forward-only. After 037 the only way back for the database is
+a restore from a snapshot (`pre-037-2026-10-24`, `pre-036-2026-10-24` or
+`pre-033-035-2026-10-22`), each restore its own owner decision; never an
+Alembic downgrade and never revision 8.
+
+## Current state (2026-10-25)
+
+Operator-recorded evidence, not derivable from this repository (details in
+the state section of [`asaas-deployment.md`](./asaas-deployment.md)): the
+service `neurostack-staging-app` serves revision 11 (the image bump of
+revision 10, deployed 2026-10-25 15:04Z, `COMPLETED` 15:06:57Z),
+`BILLING_FACT_WORKER_ENABLED=true`, `alembic_version` `037` (the post-read
+of window `037`, 2026-10-24; not read again since revision 11 was
+deployed), and the rollback target is revision 10.
+
+Billing rollout is `disabled` (all four rows in the post-read of window
+`037`, 2026-10-24) and `topup_commercial_enabled=false`. While it
 stays `disabled`, a rollback of the application does not need a billing
 containment step; verify the state from
 `GET /v1/admin/billing/rollout/readback` (answers only under
@@ -75,47 +93,54 @@ after.
 
 The rollback target is the manifest field `rollback_target`
 (`infra/production/asaas-production-wiring.yaml`), which `plan` reports as
-`rollback_target`. It has three phases:
+`rollback_target`. It went through three phases, each move a reviewed
+manifest change; both re-pins are merged, and the field reads revision 10
+(dates are operator-recorded evidence):
 
-1. **Until the re-pin is merged: revision 8**
+1. **Revision 8, until the first re-pin merged**
    (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
    the revision the service ran when the wiring was prepared. This phase
-   covers revision 9's 24 h observation period.
-2. **After the re-pin is merged: revision 9**
+   covered revision 9's 24 h observation period (revision 9 served from
+   2026-10-22 18:31 UTC).
+2. **Revision 9, from the first re-pin to the second**
    (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9`,
    the D3 revision on the bridge image
    `neurostack-staging@sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24`).
-   **Merge condition:** the re-pin (manifest field to `revision: 9`, no
-   `repin` block) merges only after revision 9's observation period has
-   closed, about **2026-10-23 18:30 UTC**, with revision 9 still serving and
-   verified, and before migration 036.
-3. **After the second re-pin is merged: revision 10**
+   The re-pin (manifest field to `revision: 9`, no `repin` block) merged
+   after revision 9's observation period had closed, about
+   **2026-10-23 18:30 UTC**, with revision 9 still serving and verified, and
+   before migration 036. Windows `036` and `037` ran on 2026-10-24 with this
+   target.
+3. **Revision 10, since the second re-pin**
    (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:10`,
    revision 9 with `BILLING_FACT_WORKER_ENABLED=true` on the same bridge
-   image). **Merge condition:** the second re-pin (manifest field to
-   `revision: 10`, no `repin` block) merges only after revision 10 has
-   served, been verified and the observation of the worker has closed: 6
-   hours after its deployment completed (2026-10-25 01:51 UTC), so at
-   **2026-10-25 07:51 UTC**, with the actual closing time recorded by the
-   orchestrator in the manifest marker `closed_at` before the merge
+   image, deployment completed 2026-10-25 01:51 UTC). The second re-pin (manifest field
+   to `revision: 10`, no `repin` block) merged in PR #133 after revision 10
+   had served, been verified and the observation of the worker had closed.
+   The earliest close was 6 hours after its deployment completed, so
+   2026-10-25 07:51 UTC; the observation closed at 2026-10-25T12:42Z, the
+   actual closing time the orchestrator recorded in the manifest marker
+   `closed_at` before the merge
    ([`asaas-deployment.md`](./asaas-deployment.md), "Merge condition of the
-   re-pin (9 to 10)"), and before the image bump (revision 11, a new app image digest) is deployed:
-   a rollback to revision 9 would also turn the worker off. Once revision 11
-   serves, the way back is revision 10
+   re-pin (9 to 10)"). The re-pin merged before the image bump (revision 11,
+   a new app image digest) was deployed, at 2026-10-25 15:04 UTC: a rollback
+   to revision 9 would also turn the worker off. Revision 11 serves now, and
+   the way back is revision 10
    ([`asaas-deployment.md`](./asaas-deployment.md), "The image bump").
 
-**Revision 8 is unsafe after migration 036**: it reads columns 036 drops, so
-once 036 has run, roll back to the field's revision (10 since the second
-re-pin), never to 8. Read "revision R" below as the field's current value:
-revision 8 in phase 1, revision 9 in phase 2, revision 10 in phase 3 (check
-with `plan`, `rollback_target`). A failed post-deploy webhook
-registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a reason to roll
-back.
+**Revision 8 is unsafe after migration 036**: it reads columns 036 drops,
+and 036 ran on 2026-10-24, so roll back to the field's revision (10 since
+the second re-pin), never to 8. Read "revision R" below as the field's
+current value, revision 10 (check with `plan`, `rollback_target`); it was
+revision 8 in phase 1 and revision 9 in phase 2. A failed post-deploy
+webhook registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a
+reason to roll back.
 
-- **Before the service deployment gate**, nothing needs rolling back. The
+- **Before the service deployment gate**, nothing needed rolling back. The
   stack and the extra task definition revision were inert while the service
-  ran revision 8 (history: the service has run revision 9 since
-  2026-10-22).
+  ran revision 8 (history: the service ran revision 9 from 2026-10-22
+  18:31 UTC, revision 10 from 2026-10-25 01:51 UTC, and has run revision 11
+  since 2026-10-25 15:04 UTC).
 - **Automatic rollback.** The service has the deployment circuit breaker
   enabled with rollback (`resetOnHealthyTask`, threshold `BOUNDED_PERCENT`
   50), minimum healthy 100 % and maximum 200 % (read back 2026-10-18). New
@@ -136,9 +161,9 @@ back.
     --services neurostack-staging-app
   ```
 
-  `R` is the rollback target: `8` only until the re-pin is merged, `9` after
-  it, `10` after the second re-pin, and never `8` once migration 036 has
-  run.
+  `R` is the rollback target, `10` since the second re-pin (it was `8` until
+  the first re-pin merged and `9` until the second); never `8`, because
+  migration 036 has run.
 
   **Verify:** `plan` shows `current_task_definition` on revision R, the target
   group is healthy, `GET /ready` returns 200 on every task, and
@@ -155,8 +180,8 @@ back.
   deletion separately, with its own approval, if wanted. Never edit
   `segredos-e-logs` as part of a rollback.
 - **Provider webhook.** If the D4 registration already ran, ASAAS keeps
-  delivering to `/v1/billing/webhook/asaas`. Revision 8 (the phase 1
-  target) has no `ASAAS_WEBHOOK_TOKEN` (revision 9 carries it); the current
+  delivering to `/v1/billing/webhook/asaas`. Revision 8 (the former phase 1
+  target, no longer a valid target) has no `ASAAS_WEBHOOK_TOKEN` (revision 9 carries it); the current
   receiver answers such deliveries with 503 before reading the body (the
   behaviour of the revision 8 image was not verified). ASAAS may then interrupt the webhook queue and email
   `ASAAS_WEBHOOK_NOTIFICATION_EMAIL`.
