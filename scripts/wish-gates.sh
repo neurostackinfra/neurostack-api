@@ -931,7 +931,8 @@ asaas_release_candidate_postgres_suites() (
         tests/integration/test_billing_producer_handoff_postgres.py \
         tests/integration/test_migration_036_postgres.py \
         tests/integration/test_migration_037_postgres.py \
-        tests/integration/test_migration_window_read_postgres.py -v || {
+        tests/integration/test_migration_window_read_postgres.py \
+        tests/integration/test_rollout_readback_postgres.py -v || {
         echo "release-candidate PostgreSQL suites failed" >&2
         return 1
     }

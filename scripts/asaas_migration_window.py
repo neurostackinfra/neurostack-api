@@ -45,6 +45,11 @@ always the system clock (no ``--now``).
                               ``alembic_version`` read back after the run; it
                               must be exactly the window's ``after``.
 
+``scripts/asaas_rollout_readback.py`` reuses the read machinery (program,
+read family contract, RunTask hardening, log reader, exposure scan, output
+guard) for the one read outside the windows, the post-deploy rollout
+readback.
+
 The only requests it renders are ``ecs:RunTask``, ``DescribeTasks``,
 ``ListTasks``, ``DescribeServices``, ``DescribeTaskDefinition``,
 ``logs:GetLogEvents``, ``rds:CreateDBSnapshot``, ``DescribeDBSnapshots`` and
@@ -1446,7 +1451,16 @@ def _read_target(
                 "read_revision_image_differs",
             )
         return read_target
-    arn = context.read_task_definition
+    return read_family_target(reads, context.read_task_definition, checks)
+
+
+def read_family_target(
+    reads: _Reads, arn: str, checks: hook._Checks
+) -> TaskTarget | None:
+    """The read family revision ``arn`` under the application-role read
+    contract (also the post-deploy rollout readback's, in
+    ``scripts/asaas_rollout_readback.py``)."""
+
     definition = _definition(
         reads.get(
             "ecs", "DescribeTaskDefinition", describe_task_definition_request(arn)
@@ -1672,10 +1686,17 @@ except BaseException as e:
 sys.exit(x)
 """
 _READ_HEADER = re.compile(
-    r"^S='(?P<schema>[a-z_.0-9]+)';W='(?P<window>[0-9]{3})';P='(?P<phase>pre|post)';"
+    r"^S='(?P<schema>[a-z_.0-9]+)';W='(?P<window>[0-9]{3})';"
+    r"P='(?P<phase>pre|post|rollout)';"
     r"H='(?P<sha>[0-9a-f]{64})';D='(?P<payload>[A-Za-z0-9+/=]+)';"
     r"T=(?P<connect>[0-9]+);L=\"(?P<settings>[^\"\n]+)\"\n"
 )
+# The one read outside the windows: the post-deploy rollout readback
+# (scripts/asaas_rollout_readback.py), the same program on the read family,
+# labelled with the window whose schema it reads and a phase of its own. A
+# program labelled ``rollout`` is recognized only with this window.
+ROLLOUT_READ_WINDOW = "037"
+ROLLOUT_READ_PHASE = "rollout"
 
 
 # The revision read: every read reports what the alembic_version table holds.
@@ -1775,6 +1796,10 @@ def normalized_read_command(command: Any) -> list[str] | None:
         or program[match.end() :] != _READ_PROGRAM_BODY
         or match.group("schema") != READ_LINE_SCHEMA
         or match.group("window") not in WINDOWS
+        or (
+            match.group("phase") == ROLLOUT_READ_PHASE
+            and match.group("window") != ROLLOUT_READ_WINDOW
+        )
         or match.group("connect") != str(READ_CONNECT_TIMEOUT_SECONDS)
         or match.group("settings") != _read_settings()
     ):
@@ -2294,10 +2319,15 @@ def _safe_text(value: Any) -> str | None:
     return value
 
 
-def judge_read(
+def judge_read_envelope(
     lines: _ReadLines, window: MigrationWindow, spec: ReadSpec
-) -> tuple[list[str], dict[str, Any]]:
-    """(reasons, report) for one read's lines; no reasons means the read is ok."""
+) -> tuple[list[str], dict[str, Any], bool]:
+    """(reasons, report, rows_judgeable) for everything but the rows: the
+    exposure scan, foreign and malformed lines, the sequence, the end line,
+    the begin line (labels and payload digest), the row count and the
+    revision. ``rows_judgeable`` is False without an end line or when the
+    read failed. Shared by ``judge_read`` and the post-deploy rollout
+    readback (``scripts/asaas_rollout_readback.py``)."""
 
     reasons: list[str] = []
     report: dict[str, Any] = {"alembic_version": lines.version, "rows": None}
@@ -2317,7 +2347,7 @@ def judge_read(
     end = lines.end
     if end is None:
         fail("read_end_missing")
-        return reasons, report
+        return reasons, report, False
     if end["status"] != "ok":
         error_class = end.get("error_class")
         sqlstate = end.get("sqlstate")
@@ -2333,7 +2363,7 @@ def judge_read(
             else None
         )
         fail("read_failed")
-        return reasons, report
+        return reasons, report, False
     began = lines.began
     if not (
         isinstance(began, dict)
@@ -2350,6 +2380,22 @@ def judge_read(
             fail("post_read_version_is_before_nothing_applied")
         else:
             fail("read_alembic_version_mismatch")
+    return reasons, report, True
+
+
+def judge_read(
+    lines: _ReadLines, window: MigrationWindow, spec: ReadSpec
+) -> tuple[list[str], dict[str, Any]]:
+    """(reasons, report) for one read's lines; no reasons means the read is ok."""
+
+    reasons, report, rows_judgeable = judge_read_envelope(lines, window, spec)
+    if not rows_judgeable:
+        return reasons, report
+
+    def fail(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
     rows = lines.rows
     if spec.rule == RULE_VERSION_ONLY:
         if rows:
