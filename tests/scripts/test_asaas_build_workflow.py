@@ -1844,7 +1844,6 @@ def _approval_gate_fixture(now: datetime, *, omit_bypass_api_field: bool = False
         "EXPECTED_APPROVAL_EVIDENCE_SHA256": json.loads(comment)["evidence_sha256"],
         "EXPECTED_UI_CHECKED_AT_UTC": json.loads(comment)["checked_at_utc"],
         "EXPECTED_GROUP2_BUNDLE_SHA256": json.loads(comment)["group2_bundle_sha256"],
-        "EXPECTED_GROUP2_BUNDLE_SHA256": json.loads(comment)["group2_bundle_sha256"],
         **backend_trust_env,
     }
 
@@ -2060,8 +2059,6 @@ def test_environment_approval_requires_run_bound_independent_admin_and_readback(
         ),
         "manifest_ref": build_comment["manifest_ref"],
         "manifest_sha256": hashlib.sha256(build_manifest).hexdigest(),
-        "group2_bundle_ref": build_comment["group2_bundle_ref"],
-        "group2_bundle_sha256": build_comment["group2_bundle_sha256"],
         "group2_bundle_ref": build_comment["group2_bundle_ref"],
         "group2_bundle_sha256": build_comment["group2_bundle_sha256"],
         "group2_snapshot_sha256": verifier._validate_group2_bundle(
@@ -2583,10 +2580,6 @@ def test_approval_observation_is_named_separately_from_human_check_time():
     now = datetime(2026, 10, 16, 5, 0, 0, tzinfo=timezone.utc)
     verifier, env, api, get_json, get_collection, get_evidence, now = (
         _approval_gate_fixture(now)
-    )
-    approvals_path = (
-        "https://api.github.com/repos/neurostackinfra/neurostack-api/actions/runs/"
-        "7123456789/approvals"
     )
     evidence = verifier.verify_environment_approval(
         env,

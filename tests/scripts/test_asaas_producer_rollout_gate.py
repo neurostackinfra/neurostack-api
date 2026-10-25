@@ -14,8 +14,8 @@ from scripts.asaas_oidc_ui_freshness import validate_ui_evidence_freshness
 from scripts.asaas_producer_rollout_gate import (
     DEPLOY_ROLE_VARIABLE,
     GateError,
-    _validate_ui_approval_comment,
     _require_distinct_ui_approval_screenshots,
+    _validate_ui_approval_comment,
     validate_canonical_registration_comment,
     validate_deploy_role_environment_variable,
     validate_deployment_history,
@@ -25,9 +25,7 @@ from scripts.asaas_producer_rollout_gate import (
 
 REPOSITORY = "neurostackinfra/neurostack-api"
 WORKFLOW = ".github/workflows/asaas-producer-image-deploy.yml"
-DEPLOY_ROLE_ARN = (
-    rollout_gate.PINNED_DEPLOY_ROLE_ARN
-)
+DEPLOY_ROLE_ARN = rollout_gate.PINNED_DEPLOY_ROLE_ARN
 
 
 @pytest.mark.parametrize(
