@@ -365,6 +365,7 @@ _RELEASE_CANDIDATE_POSTGRES_SUITES = (
     "tests/integration/test_migration_036_postgres.py",
     "tests/integration/test_migration_037_postgres.py",
     "tests/integration/test_migration_window_read_postgres.py",
+    "tests/integration/test_rollout_readback_postgres.py",
 )
 _POSTGRES_SUITES_CALL = (
     "poetry run pytest -p no:cacheprovider -rs "

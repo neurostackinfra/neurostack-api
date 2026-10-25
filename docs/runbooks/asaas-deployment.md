@@ -1203,6 +1203,187 @@ migration task reach the same database: the read family's and the
 migrations family's `DATABASE_URL` secrets are different names, and the
 tool only checks that each names its own secret.
 
+## Post-deploy rollout readback
+
+The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one
+SELECT-only read of the production database **after the final deploy**.
+`scripts/asaas_rollout_readback.py` runs it at any time after the migration
+windows, outside them: no migrations task, no snapshot, none of a window's
+ordering rules. It is a production read: run it on the owner's instruction
+for that read. Like the window tooling it is pure (it never calls AWS); the
+orchestrator sends every request with its own tools and records the
+responses.
+
+**What it reuses, unchanged.** The window tooling's read program (see "Read
+tasks" above: `python -c <program>`, the session with
+`default_transaction_read_only=on`, one `REPEATABLE READ, READ ONLY`
+transaction that is never committed, `lock_timeout` 3 s, `statement_timeout`
+60 s, the SQL carried gzip+base64 and checked against its SHA-256 inside the
+task, one JSON line per result), the read family contract of
+`neurostack-staging-consulta:28` (application role), the RunTask hardening,
+the log reader, the exposure scan and the output guard. The program carries
+the labels window `037`, phase `rollout` (the window tool recognizes that
+pair, and only it, as a read program besides the windows' own).
+
+**What it reads** (`scripts/asaas_rollout_readback.sql`, verbatim in the
+program): `alembic_version`, which must be exactly `037`, and one row per
+fact, `check_name`, `subject`, `value`. `verify` requires exactly this
+table of 25 rows (4 + 4 + 4 + 10 + 3), no row missing, none added or
+repeated. Rows are judged by `check_name` and `subject`, so their order is
+not significant: a reordered read is accepted by design (the SQL orders them
+for reading only); the program's line numbering must still have no gap.
+
+| `check_name` | `subject` | `value` |
+|---|---|---|
+| `rollout state` | each of `development`, `production`, `staging`, `test` | `disabled` |
+| `rollout topup_commercial_enabled` | the same four environments | `false` |
+| `legacy table` | each of the four tables migration 037 drops | `absent` |
+| `legacy function` | each of the ten functions migration 037 drops (exact signatures) | `absent` |
+| `billing_subscriptions rows` | (empty) | `0` |
+| `billing_checkout_sessions rows` | (empty) | `0` |
+| `row level security on read tables` | (empty) | `0` |
+
+The last row counts `billing_rollout_control`, `billing_subscriptions` and
+`billing_checkout_sessions` with row-level security enabled or forced: under
+RLS the application role could see fewer rows than exist (the PostgreSQL 16
+captures of the fixture show both cases: no rollout row at all, and a
+checkout count of `0` that only the RLS row contradicts). The legacy names
+are migration 037's `DROPPED_TABLES` and `DROPPED_FUNCTIONS` (a test keeps
+them equal); `to_regclass` and `to_regprocedure` only look a name up. Every
+table it reads, the application role read live (`billing_checkout_sessions`
+and `billing_subscriptions` in window `035`'s pre-read of 2026-10-22,
+`billing_rollout_control` then and on 2026-10-23).
+
+**What it proves, and what not.** The state **at the moment of the read**:
+the revision, the four rollout rows, the absence of the legacy objects and
+two empty billing tables. It does **not** show the history: it reads no
+rollout revision and no `billing_rollout_receipts` row, so it cannot show
+that no transition to `canary_allowlist` or `general` ever happened; the
+`verdict` line says so.
+
+**Files**, in a private directory, one set per run:
+
+| File | Content |
+|------|---------|
+| `rollout-readback.json` | schema `asaas_rollout_readback_file.v1`: `schema_version`, `account_id` `388460142431`, `region` `us-east-1`, `captured_at_utc` (aware ISO 8601, the time of the latest reads), `reads` (`service`, `operation`, `params`, `response`, one per exact request; an AWS error is `{"__error_code__": "<Code>"}`) and, once sent, `read` (`params`, `response` of its RunTask). Only `DescribeServices`, `DescribeTaskDefinition`, `ListTasks`, `DescribeTasks` and `GetLogEvents` responses are accepted. |
+| `rollout-readback-plan.json`, `rollout-readback-task.json`, `rollout-readback-result.json` | outputs of `plan`, `render` and `verify` |
+
+```bash
+tool=scripts/asaas_rollout_readback.py
+workdir="$(mktemp -d)" && chmod 700 "$workdir"; umask 077
+args=(--readback-file "$workdir/rollout-readback.json"
+      --service-task-definition arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:11
+      --read-task-definition arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-consulta:28)
+poetry run python "$tool" plan "${args[@]}" > "$workdir/rollout-readback-plan.json"     # 0 ready
+poetry run python "$tool" render "${args[@]}" > "$workdir/rollout-readback-task.json"   # the RunTask
+poetry run python "$tool" verify "${args[@]}" > "$workdir/rollout-readback-result.json" # 0, 3 or 4
+```
+
+Each option is given at most once, and there is no `--now`. `plan` and
+`render` judge freshness against the system clock; `verify` does not read
+the clock at all: it judges every time from the recorded reads'
+`captured_at_utc` and the task's own timestamps. `--service-task-definition`
+is the revision the service must be serving (`:11` after the final deploy
+of 2026-10-25); the verdict names it. Running the three commands in
+sequence before the RunTask is sent is harmless: the tool itself sends
+nothing (it only prints the request), `render` prints nothing and exits 2
+unless the plan is `ready`, and `verify` exits 2 (`read_not_recorded`)
+until `read` is in the file.
+
+**Sequence** (stop on any divergence and report):
+
+1. Send these five reads and record each response, with `captured_at_utc`:
+   `ecs:DescribeServices` `{"cluster": "neurostack-staging", "services": ["neurostack-staging-app"]}`;
+   `ecs:DescribeTaskDefinition` `{"taskDefinition": "<consulta:28 ARN>"}`;
+   `ecs:ListTasks` `{"cluster": "neurostack-staging", "startedBy": "neurostack-rollout-readback"}`,
+   `{"cluster": "neurostack-staging", "family": "neurostack-staging-consulta"}` and
+   `{"cluster": "neurostack-staging", "family": "neurostack-staging-migrations"}`.
+2. `plan`: exit 0, `ready`. Status `incomplete` lists the reads still
+   missing as `next_requests` (send, record, run again); `blocked` lists the
+   reasons: stop. It requires the reads captured within the last 10 minutes
+   (60 s of clock skew forward); the service with exactly one deployment,
+   `PRIMARY`, `COMPLETED`, on `--service-task-definition`, with its
+   `createdAt`, `runningCount == desiredCount > 0`, nothing pending, Fargate,
+   private awsvpc; the read family revision under the read contract (the
+   same checks and names as the windows' read plans: `ACTIVE`, Fargate,
+   awsvpc, one essential container without entry point, `DATABASE_URL` only
+   as the `neurostack/staging/database-url` secret, `awslogs`, an
+   application image of this registry, no mention of the migration tool);
+   no task with `startedBy` `neurostack-rollout-readback`, of the read family
+   or of the migrations family running; no `read` recorded in the file.
+3. `render`: prints the `ecs:RunTask` request. Send it exactly as printed and
+   record the request and its response as `read`. It is `cluster`
+   `neurostack-staging`, `taskDefinition` the read family revision, `count`
+   1, `launchType` `FARGATE`, the service's subnets and security groups with
+   `assignPublicIp` `DISABLED`, the service's `platformVersion`, `startedBy`
+   `neurostack-rollout-readback`, `enableExecuteCommand` and
+   `enableECSManagedTags` false, exactly one container override (the
+   program as the `consulta` container's `command`), no `propagateTags`, and
+   a `clientToken` `rollout-readback-<32 hex>` derived from `--attempt`, the
+   UTC day and the request. On any `InvalidParameterException`, stop and
+   report the exact message.
+4. `verify`: exit 3 `in_progress` lists `next_requests` (`DescribeTasks`
+   of the task, then `GetLogEvents` pages of
+   `/ecs/neurostack-staging/migrations`, stream
+   `consulta/consulta/<task id>`, followed through `nextForwardToken` until
+   a response returns the token that was sent). Send them, **replace** an
+   earlier response of the same request (the file holds one per request),
+   update `captured_at_utc`, run `verify` again, every 15 s. Before the
+   final `verify` (once the task stopped and every log page is recorded),
+   send `ecs:DescribeServices` and `ecs:DescribeTaskDefinition` again
+   (the same two requests as in step 1), replace their responses and update
+   `captured_at_utc`: the verdict's "service on `:11`, deployment
+   `COMPLETED`" then rests on reads taken after the task, not only on the
+   plan's. Exit 0 `verified`: record the printed `verdict` line. Exit 4
+   `ROLLOUT_READBACK_STOPPED`: report the `reasons` and stop.
+
+**What `verify` checks.** The service and read family reads still pass the
+plan's checks (`read_context_unusable` otherwise); the recorded RunTask is
+exactly one `render` prints (for an attempt from 1 to 20, on the task's UTC
+day or the day before); the described task has the read family revision,
+`startedBy` `neurostack-rollout-readback` and no override but the program
+(a different payload digest is `read_task_command_mismatch`); it was created
+after the service's deployment started, at most 3600 s before the latest
+recorded reads and at most 60 s (clock skew) after them
+(`read_task_not_recent`: an older task handed back for a reused token is
+not this read); a task still running after 600 s is
+`read_watch_deadline_exceeded`; container exit 0; every log page; the
+program's lines exactly `begin` (window `037`, phase `rollout`, the payload
+digest), `version`, the rows and `end`, with no foreign or malformed line
+(`read_log_foreign_line`, `read_line_malformed`, `read_sequence_broken`,
+`read_end_missing`, `read_row_count_mismatch`); a URL, `user@host`, an IPv4
+address, an AWS host, a password or token anywhere in the log is
+`read_log_exposure_suspected` and is never echoed; and the table above
+(`rollout_state_not_disabled:<environment>`,
+`topup_commercial_enabled_not_false:<environment>`,
+`legacy_table_present:<name>`, `legacy_function_present:<name>`,
+`billing_subscriptions_not_empty`, `billing_checkout_sessions_not_empty`,
+`row_level_security_on_read_tables`, `read_fact_missing:...`,
+`read_checks_mismatch` for a row missing, added, repeated or of another
+shape, and
+`read_alembic_version_mismatch` for any revision but `037`). A database
+error is `read_failed` with its class and SQLSTATE only (`42501` is a
+missing privilege).
+
+**Retry.** A read that stopped, or a RunTask that failed, is taken again
+with a new file and `render --attempt <n+1>` (the same day) or attempt 1
+(another day): each is a new `clientToken`. While a readback task may run,
+`plan` stays blocked (`readback_task_running`).
+
+**Not yet run in production.** Its first run is the readback the criterion
+waits for. The SQL and the program were run on PostgreSQL 16 as a
+non-superuser application role
+(`tests/fixtures/asaas_rollout_readback/read_runs.json`: at 036, at 037,
+with row-level security on `billing_rollout_control` and on
+`billing_checkout_sessions`, with one row opened to `general`); the server
+log of that capture shows each read session running only `BEGIN ISOLATION
+LEVEL REPEATABLE READ READ ONLY`, the `SET LOCAL` settings, the two SELECTs
+and `ROLLBACK`. `tests/integration/test_rollout_readback_postgres.py`, in
+the release-candidate PostgreSQL suites CI runs
+(`asaas_release_candidate_postgres_suites`), migrates a fresh database to
+036 and 037 and runs the program as the superuser and as a throwaway
+non-superuser login role (row-level security is not bypassed for it).
+
 ## Production wiring (Group 9 D3/D4)
 
 The reviewed artifacts are:

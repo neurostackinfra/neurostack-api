@@ -25,6 +25,7 @@ _RELEASE_CANDIDATE_POSTGRES_SUITES = (
     "tests/integration/test_migration_036_postgres.py",
     "tests/integration/test_migration_037_postgres.py",
     "tests/integration/test_migration_window_read_postgres.py",
+    "tests/integration/test_rollout_readback_postgres.py",
 )
 _PRODUCTION_COMPOSE = _ROOT / "docker-compose.production.yml"
 _LOG_STEP = "Enable the server log the trigger characterization audits"
