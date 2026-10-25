@@ -85,7 +85,7 @@ target:
 # before the merge, in the exact form `# closed_at: YYYY-MM-DDTHH:MMZ` (UTC,
 # at or after 2026-10-25T07:51Z) (docs/runbooks/asaas-deployment.md, "Merge
 # condition of the re-pin (9 to 10)").
-# closed_at: <filled in at merge>
+# closed_at: 2026-10-25T12:42Z
 # Revision 10 is the final pin of the planner (no further re-pin is allowed
 # by it).
 rollback_target:
