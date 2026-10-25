@@ -86,9 +86,12 @@ No serviço ECS de produção o valor vem do parâmetro revisado
 `'true'` (o valor do repositório desde o PR revisado E7-B1, que ligou o
 parâmetro do repositório) ou `'false'`; qualquer outra grafia, um booleano
 YAML ou a ausência bloqueia o plano. O padrão `false` da tabela abaixo é o
-da aplicação, não o do parâmetro. O merge desse PR não liga nada sozinho:
-**o worker ainda não está ligado em produção**, e as revisões 8 e 9 levam
-`false`. Depois do merge, na ordem: `plan` a partir de `main` com
+da aplicação, não o do parâmetro. O merge desse PR não ligou nada sozinho.
+**O worker está ligado em produção desde a revisão 10** (deploy concluído em
+2026-10-25 01:51Z, evidência registrada pelo operador), e a revisão 11, no ar
+desde 2026-10-25 15:04Z, também leva `true`; as revisões 8 e 9 levam
+`false`. Todos os passos abaixo foram feitos em 2026-10-25; ficam descritos
+como procedimento. Depois do merge, na ordem: `plan` a partir de `main` com
 `app_image_override` definido (entrada de aplicação, o digest da imagem
 ponte da revisão 9) propõe a próxima revisão (esperada `:10`; o número é
 atribuído pelo ECS), flag `false` para `true`, na imagem ponte; o operador a
@@ -223,15 +226,19 @@ implantado **e** `BILLING_FACT_WORKER_ENABLED=true`, decisão do owner de
    imagem ponte, então `BILLING_FACT_WORKER_ENABLED=true` sai antes, na
    imagem ponte, como mudança revisada e deploy próprios (revisão nova
    `ManagedBy=manual` renderizada pelo planner a partir do parâmetro revisado
-   `BILLING_FACT_WORKER_ENABLED`, `'true'` no repositório desde o E7-B1,
-   ainda em nenhuma revisão registrada; o procedimento é
-   "The outbox worker flag" no runbook).
+   `BILLING_FACT_WORKER_ENABLED`, `'true'` no repositório desde o E7-B1; a
+   revisão 10 foi a primeira a levá-lo; o procedimento é
+   "The outbox worker flag" no runbook). Feito: a revisão 10 leva `true`
+   desde o fim do seu deploy, em 2026-10-25 01:51Z (evidência do operador).
 2. **Observar.** O worker subiu em cada processo da API (8 linhas
    `billing fact worker started`), o last-tick avança e o outbox está vazio.
+   Feito: a observação da revisão 10 fechou em 2026-10-25T12:42Z (marcador
+   `closed_at` do manifesto).
 3. **Depois, a imagem do E7, nunca na mesma revisão.** Só então a imagem do
    E7 é construída, publicada e implantada, numa revisão posterior (o
    procedimento é "The image bump" no runbook: só o digest da imagem do `app`
-   muda em relação à revisão servida).
+   muda em relação à revisão servida). Feito: a revisão 11, na imagem E7b,
+   está no ar desde 2026-10-25 15:04Z (evidência do operador).
 
 ## Primeiro acesso: bootstrap do super_admin
 

@@ -6,33 +6,79 @@
 > target, and its own approved operation. This document describes the current
 > state and the preconditions; it is not a permission.
 
-## State after the live run of 2026-10-22
+## State after the live runs of 2026-10-22 to 2026-10-25
 
-Verified facts of that run only. Caveat: `alembic_version` `035` after the
-run (the post-read) and the webhook verdict were read from the raw task
-logs; the formal `verify-post-read` and the deploy hook's `verify-result`
-were **not** run on them.
+Operator-recorded evidence of those runs; none of it can be derived from
+this repository, and each item says when it was read. The database facts
+(`alembic_version`, the legacy objects, the rollout rows) are from the
+post-read of window `037` on 2026-10-24 and have not been read again since
+revisions 10 and 11 were deployed; the service, task definition and hook
+facts were read back on 2026-10-25. Caveat for the run of 2026-10-22:
+`alembic_version` `035` after the run (the post-read) and the webhook
+verdict were read from the raw task logs; the formal `verify-post-read` and
+the deploy hook's `verify-result` were **not** run on them. The same holds
+for windows `036` and `037` and for the hook's runs on revisions 10 and 11:
+the formal `verify-result` and `verify-post-read` were **not** run on them
+either; the operator read the raw task logs, and the owner accepted that raw
+evidence on 2026-10-25.
 
-- **Migrations 033-035 applied.** `alembic_version` reads `035`; the
-  window `035` migration task `4063e8a0555049ada6e4cd0880b436c5` was
-  verified by the window tooling's `verify-result` (`applied`). Pre-read
-  task `98bfa0e6382d4e1590c9751d234475a3`, post-read task
+- **Migrations 033-035 applied (2026-10-22).** `alembic_version` read `035`
+  after that run; the window `035` migration task
+  `4063e8a0555049ada6e4cd0880b436c5` was verified by the window tooling's
+  `verify-result` (`applied`). Pre-read task
+  `98bfa0e6382d4e1590c9751d234475a3`, post-read task
   `223a1daf9eb14d508c047cb7e0a63e2a`. Snapshot taken before the run:
   `pre-033-035-2026-10-22`.
-- **Application revision 9 serving.** `neurostack-staging-app:9`, deployment
-  `COMPLETED`, app image the bridge digest
+- **Migration 036 applied (2026-10-24).** Window `036` migration task
+  `2f23754d…` (ID prefix; the full ID is in the operator's record), upgrade
+  line `035 -> 036`. Snapshot taken before the run: `pre-036-2026-10-24`.
+- **Migration 037 applied (2026-10-24).** Window `037` migration task
+  `4d8b009e…` (ID prefix), upgrade line `036 -> 037`. `alembic_version` read
+  `037` in that window's post-read (2026-10-24), and the legacy AbacatePay
+  tables and functions are dropped (none left in that post-read). Snapshot
+  taken before the run: `pre-037-2026-10-24`. Windows `036` and `037` both
+  ran with the rollback target at revision 9 (the manifest's history notes
+  on `migrations_036` and `migrations_037`).
+- **The schema is forward-only.** After 037 the only way back for the
+  database is a restore from one of the three snapshots above, each its own
+  owner decision; never an Alembic downgrade (the downgrade sections below
+  describe what the code supports, not a production path), and never
+  revision 8, which reads columns 036 dropped.
+- **Application revision 11 serving.** `neurostack-staging-app:11`, the
+  [image bump](#the-image-bump-app_image_override) of revision 10: app image
+  the E7b digest
+  `sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159`,
+  deployed 2026-10-25 15:04Z, deployment `COMPLETED` 15:06:57Z,
+  `BILLING_FACT_WORKER_ENABLED` `true`. The worker is on in production since
+  revision 10 (2026-10-25 01:51Z), and revision 11 carries the flag too.
+- **Earlier revisions.** Revision 10 (the bridge image,
+  `BILLING_FACT_WORKER_ENABLED` `true`) served from 2026-10-25 01:51Z to
+  15:04Z. Revision 9 served from 2026-10-22 18:31Z to 2026-10-25 01:51Z:
+  `neurostack-staging-app:9`, deployment `COMPLETED`, app image the bridge
+  digest
   `sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24`,
   otel pinned by digest
-  `sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e`.
+  `sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e`,
+  `BILLING_FACT_WORKER_ENABLED` `false`.
+- **Rollback target: revision 10.** Both re-pins of the manifest field
+  `rollback_target` are merged: 8 to 9 after revision 9's 24 h observation,
+  and 9 to 10 in PR #133 after revision 10's observation (minimum 6 h)
+  closed at 2026-10-25T12:42Z, after about 11 h clean (the manifest marker
+  `closed_at`). Revision 8 is no
+  longer a way back after migration 036. See
+  [`asaas-rollback.md`](./asaas-rollback.md).
 - **Webhook registered by the deploy hook** (task
-  `8593671855574617b5267cbacfdfa081`): verdict `ready`, action `created`,
-  one provider write. A second, foreign webhook exists in the
-  ASAAS account; it was not touched.
+  `8593671855574617b5267cbacfdfa081`, on revision 9): verdict `ready`, action
+  `created`, one provider write. The hook ran again on revisions 10 and 11
+  and reported `action: none` both times. A second, foreign webhook exists in
+  the ASAAS account; it was not touched.
 - **Read family revision:** `neurostack-staging-consulta:28` registered (see
   [Migration windows: the run tooling](#migration-windows-the-run-tooling)).
-- **Still off:** billing rollout `disabled`; `BILLING_FACT_WORKER_ENABLED`
-  `false`.
-- **Not applied:** migrations 036 and 037.
+- **Still off:** billing rollout `disabled` (all four
+  `billing_rollout_control` rows `disabled` in the post-read of window
+  `037`, 2026-10-24; not read again since revision 11 was deployed);
+  financial egress closed (the task definition carries no
+  `APPCONFIG_ENABLED`).
 
 ## Standing guidance
 
@@ -131,10 +177,10 @@ with a new revision, each step its own approved operation:
 
 The table column
 `billing_rollout_readiness_receipts.roster_revision` and its
-`CHECK (roster_revision >= 0)` stay until migration 036 (phase E5, written,
-not applied in production; see
+`CHECK (roster_revision >= 0)` stayed until migration 036 (phase E5, applied
+in production on 2026-10-24 by operator record; see
 [Migration 036](#migration-036-decouple-from-the-legacy-roster-group-10-e5))
-drops them. Images built from E3 up to E4 write the constant `0` and never
+dropped them. Images built from E3 up to E4 write the constant `0` and never
 read the column, so a stored value is not evidence; images from E5 on no
 longer map it. Migration 036 refuses to run while any unexpired readiness
 receipt exists. Readiness and every rollout transition take the per-environment
@@ -158,9 +204,15 @@ active subscriptions.
   produces receipt signatures or drives the quorum end to end. Until the new
   tooling ships and is reviewed, there is no supported operator path for a
   rollout transition.
-- **Outbox publication is not scheduled yet.** The billing outbox publisher
-  and reconciler have no runtime caller; facts would stay `pending` without
-  bounded retry or alerting.
+- **Outbox publication is not scheduled yet.** This still holds with
+  `BILLING_FACT_WORKER_ENABLED=true` (revisions 10 and 11): the worker runs
+  with `transport=None` and logs `consumer=absent`, so it publishes nothing.
+  The publisher has no runtime caller; it runs only with a transport. The
+  reconciler does run, in the worker's maintenance pass every 30 s. Facts
+  stay `pending` with no attempt counted, and a fact still unacknowledged
+  after 900 s gets an `ack overdue` alert row and the WARN
+  `billing fact acknowledgement overdue`. Nothing in ECS evaluates the alert
+  rules (see [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled)).
 
 ## Preconditions before any future transition request
 
@@ -269,9 +321,10 @@ These are prerequisites to check, not steps to execute now:
 
 ## Migration 036: decouple from the legacy roster (Group 10 E5)
 
-Written and tested on disposable PostgreSQL 16 only; **not applied in
-production**. Running it needs its own explicit owner instruction, after
-033-035 are applied and verified. Window `036` of
+Written and tested on disposable PostgreSQL 16; **applied in production on
+2026-10-24** (operator record, see the state section at the top). Running it
+needed its own explicit owner instruction, after 033-035 were applied and
+verified. Window `036` of
 `scripts/asaas_migration_window.py` runs it, and only that window (see
 "Windows, not a moving pin" below and
 [Migration windows: the run tooling](#migration-windows-the-run-tooling)).
@@ -429,6 +482,11 @@ Never run 036 under an earlier image.
 
 ### Rollback (downgrade 036 -> 035)
 
+In production this is not a way back any more: since 037 was applied on
+2026-10-24 the schema is forward-only, and the only way back is a restore
+from a snapshot (see the state section at the top). What follows describes
+what the code supports.
+
 The downgrade is real and restores the 035 columns, constraints, functions
 and trigger from `alembic/frozen/036_downgrade_restores_035.json`. That DDL
 was extracted from a fresh 035 database by `scripts/alembic_frozen_ddl.py`,
@@ -447,9 +505,8 @@ restored columns are appended, so their physical position differs.
   could remove them only as a superuser with
   `session_replication_role = replica`, deleting across outbox, facts,
   transactions, effects, projections, cycles and checkouts, which is not an
-  operation this runbook allows. The downgrade is usable today only because
-  production held zero such rows (read-only count, 2026-10-17); re-read them
-  before relying on it.
+  operation this runbook allows. Before 036 ran, the downgrade was usable
+  only because production held zero such rows (read-only count, 2026-10-17).
 - It takes the same 5-second lock timeout as the upgrade: `55P03` means
   nothing changed (see "Lock wait").
 - Checkout rows need no invented value: they come back with
@@ -476,9 +533,10 @@ bootstrap, not the production windows.
 
 ## Migration 037: drop the legacy saga and roster objects (Group 10 E6)
 
-Written and tested on disposable PostgreSQL 16 only; **not applied in
-production**. Running it needs its own explicit owner instruction, after 036
-is applied and verified (036 before 037, owner condition of 2026-10-17).
+Written and tested on disposable PostgreSQL 16; **applied in production on
+2026-10-24**, after 036 (operator record, see the state section at the top).
+Running it needed its own explicit owner instruction, after 036 was applied
+and verified (036 before 037, owner condition of 2026-10-17).
 Window `037` of `scripts/asaas_migration_window.py` runs it, and only that
 window (see "Windows, not a moving pin" above).
 
@@ -724,6 +782,11 @@ subcommands are `scripts/asaas_migration_window.py --window 037`, see
 
 ### Rollback (downgrade 037 -> 036)
 
+In production this is not a way back: since 037 was applied on 2026-10-24
+the schema is forward-only, and the only way back is a restore from a
+snapshot (`pre-037-2026-10-24` for the 036 schema; see the state section at
+the top). What follows describes what the code supports.
+
 The downgrade is real. It restores the 036 objects from
 `alembic/frozen/037_downgrade_restores_036.json`: the four tables (empty)
 with their columns in the original order, the ten functions, the
@@ -749,8 +812,12 @@ restored guards refuse what they refused.
 - **Rollback target.** After 037 the previous release image cannot use the
   removed objects: only its builder deletion is affected (above), but roll
   back the application only to an image of this release; running the E5
-  image again needs the downgrade to 036 first, which is a separate owner
-  decision.
+  image again needs the 036 schema back, which in production is a snapshot
+  restore (`pre-037-2026-10-24`), a separate owner decision, never this
+  downgrade. Revision 10, the production rollback target, meets the rule
+  (operator evidence, recorded in the wish): its bridge image
+  `sha256:18358ce7…` was built from commit `67b9b51c`, the merge of #126,
+  which contains migration 037 and the E6 code.
 
 ### Open follow-ups recorded by E6
 
@@ -777,8 +844,9 @@ restored guards refuse what they refused.
      revision tagged `ManagedBy=manual`, rendered by the planner from the
      reviewed parameter `BILLING_FACT_WORKER_ENABLED` (`'true'` in the
      repository since the reviewed PR that turned the repository parameter
-     on, E7-B1; no registered revision carries `true` yet) and registered by
-     the operator. The procedure, from the reviewed PR that sets the
+     on, E7-B1; revision 10 was the first to carry `true`) and registered by
+     the operator. Done: revision 10 has carried `true` since its deployment
+     completed on 2026-10-25 01:51Z (operator record). The procedure, from the reviewed PR that sets the
      parameter to `'true'` to the deploy, is
      [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled).
      Evidence: `DescribeTaskDefinition` of the active revision shows
@@ -787,13 +855,15 @@ restored guards refuse what they refused.
      `billing fact worker started` (8 lines, 4 per task × 2 tasks),
      `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
      advancing, and the outbox is empty (`neurostack_billing_fact_backlog` is
-     `0` for every condition).
+     `0` for every condition). Done: the observation of revision 10 closed at
+     2026-10-25T12:42Z (the manifest marker `closed_at`).
   3. **E7 image after, never in the same revision.** Only then is the E7 image
      built, pushed and deployed, in a later revision of its own; the flag
      change and the E7 image never share a revision or a deploy. The
      procedure is [The image bump](#the-image-bump-app_image_override). In
      AWS this deploy is the whole rotation: the new image carries the new
-     rules.
+     rules. Done: revision 11, on the E7b image, has served since
+     2026-10-25 15:04Z (operator record).
      Readiness receipts bind the digest of the rules file inside the image,
      so record them only after the E7 image is live; one recorded against the
      previous digest no longer verifies.
@@ -1422,15 +1492,15 @@ window `037`'s SELECT-only readback program on the same image, roles and
 secret, as a separate revision.
 
 - The service rollback target is the manifest field `rollback_target`
-  (revision 10 since its second documented re-pin, 9 to 10, which merges
-  only after revision 10 has served, been verified and its observation has
-  closed, 6 hours after its deployment completed, so at 2026-10-25
-  07:51 UTC, with the actual closing time recorded by the orchestrator in
-  the manifest marker `closed_at` before the merge ("Merge condition of the
-  re-pin (9 to 10)"), and before the image bump; revision 9 since the first,
-  gate 6, merged only
-  after revision 9's observation period closed, about 2026-10-23 18:30 UTC;
-  revision 8 before). Every code path reads it from there; revision 10 is
+  (revision 10 since its second documented re-pin, 9 to 10, merged in
+  PR #133 after revision 10 had served, been verified and its observation
+  had closed: no earlier than 6 hours after its deployment completed, so at
+  2026-10-25 07:51 UTC, and in fact at 2026-10-25T12:42Z, the actual closing
+  time recorded by the orchestrator in the manifest marker `closed_at`
+  before the merge ("Merge condition of the re-pin (9 to 10)"), and before
+  the image bump was deployed; revision 9 since the first, gate 6, merged
+  only after revision 9's observation period closed, about 2026-10-23
+  18:30 UTC; revision 8 before). Every code path reads it from there; revision 10 is
   the last pin the planner allows. The D3 source
   revision (`task_definition.source_revision`, 8) is a separate, fixed value:
   revisions 9 and 10 stay derived from it.
@@ -1516,8 +1586,8 @@ secret, as a separate revision.
    - environment: `ASAAS_WEBHOOK_URL`, `ASAAS_CHECKOUT_RETURN_URL`,
      `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and `BILLING_FACT_WORKER_ENABLED`
      (the reviewed parameter; `false` for revision 9, `'true'` in the
-     repository since E7-B1, rendered as the next revision, expected `:10`,
-     by the flag procedure below).
+     repository since E7-B1, rendered as revision 10 by the flag procedure
+     below and kept by revision 11, the image bump).
 
    It never carries a name with a forbidden prefix (the legacy payment
    provider, or `APPCONFIG_`) and never sets `SPA_ENABLED` or `SPA_DIST_DIR`.
@@ -1557,15 +1627,19 @@ tick failure). "Revision 10" below is that next revision of
 (revision 9 serving) with the repository's `'true'`, `plan` proposed the
 next revision (`:10`, step 2) when `app_image_override` was set to revision
 9's image (the bridge digest `sha256:18358ce7…`); with `'false'` it reported
-revision 9 `registered_and_deployed`. Today, against the live state
-(revision 10 serving) with the override set to the bridge digest, `'true'`
+revision 9 `registered_and_deployed`. While revision 10 served
+(2026-10-25 01:51Z to 15:04Z), against the live state (revision 10 serving)
+with the override set to the bridge digest, `'true'`
 reports `status: compliant` with `registered_and_deployed:<revision 10 ARN>`,
 and `'false'` reports `status: ready` with one change,
 `replaces: <revision 10 ARN>` and
 `worker_flag: {from: 'true', to: 'false'}` (turning the worker off again, a
-new revision). With the repository's `null` the rendering keeps revision
-8's tagged image, and `plan` blocks on the live state, as it did before this
-parameter existed.
+new revision). Since revision 11 serves, the override that matches the live
+state is the E7b digest, and `plan` reports
+`registered_and_deployed:<revision 11 ARN>`
+([the image bump](#the-image-bump-app_image_override), step 6). With the
+repository's `null` the rendering keeps revision 8's tagged image, and
+`plan` blocks on the live state, as it did before this parameter existed.
 
 What turning it on does (`src/services/billing_fact_worker.py`,
 `src/services/billing_outbox.py`): one asyncio loop per API worker process
@@ -1599,8 +1673,10 @@ the manifest, `docs/configuration.md`), so the change is auditable and
 merged.
 After it merges, `plan` run from `main` with the repository file is the
 source of truth for the flag. `app_image_override`
-stays what it is today: an apply-time input the operator sets to the bridge
-digest revision 9 runs (the repository keeps `null`). The planner reads it
+stays an apply-time input that the operator sets to the digest the serving
+revision runs (the repository keeps `null`). Today that is the E7b digest
+revision 11 runs; at the time of E7-B1 it was the bridge digest revision 9
+ran, and the bridge wording in this procedure is historical. The planner reads it
 only from the `--params` file, so the operator plans from a local copy of
 `main`'s file with that one field changed; the copy's `parameters_sha256`
 therefore differs from `main`'s, and the echoed flag value in the plan is the
@@ -1617,9 +1693,10 @@ steps.
    Done by E7-B1. Steps 2 to 4 were done on 2026-10-25: revision 10, with
    the flag `true`, was registered and deployed (deployment completed
    01:51Z, 8 `billing fact worker started` lines, no tick failure). Its
-   observation (step 5) closes six hours after that, at 07:51Z ("Merge
-   condition of the re-pin (9 to 10)" in the ordered procedure); step 6 was
-   done the same day.
+   observation (step 5) could close no earlier than six hours after that,
+   at 07:51Z, and closed at 12:42Z, the time in the manifest marker
+   `closed_at` ("Merge condition of the re-pin (9 to 10)" in the ordered
+   procedure); step 6 was done the same day.
 2. **Plan, render, check** from `main`, with the repository file plus the
    apply-time `app_image_override` (the bridge digest revision 9 runs).
    Against the live state (revision 9 serving `false`) it proposes the next
@@ -2111,6 +2188,12 @@ own explicit owner approval and is never performed from the manifest.
    2026-10-25T07:51Z; the field name `effective_after` stays). Merging
    earlier would make revision 10 the only way back before its observation
    has shown it safe.
+
+   **History (9 to 10).** The observation of revision 10 closed at
+   2026-10-25T12:42Z, recorded as `closed_at: 2026-10-25T12:42Z` in the
+   manifest; the re-pin merged in PR #133, and the image bump (revision 11)
+   was deployed afterwards, at 2026-10-25 15:04Z. Revision 10 has been the
+   rollback target since that merge.
 
    The checks, over the whole period (`$DEPLOY_START_MS` as in step 5 of the
    flag procedure, `$CLOSE_MS` the closing time in epoch milliseconds):
@@ -2771,10 +2854,12 @@ and a new binary to the image supply chain.
   image bump revision once it has served; images older than the E5 release
   cannot delete a builder after migration 037, see "Rollback target" under
   migration 037. Operator evidence, not checked from this repository: the
-  bridge image was built from commit `67b9b51c` (digest
+  bridge image was built from commit `67b9b51c`, the merge of #126, which
+  contains migration 037 and the E6 code (digest
   `sha256:18358ce7…`, recorded in the wish), migration 037 was applied on
-  2026-10-24, and revisions 9 and 10, on that image, have served on the
-  037 schema since then according to the operator's readbacks)
+  2026-10-24, revisions 9 and 10, on that image, served on the 037 schema
+  after that, and revision 11, on the E7b image, has served since
+  2026-10-25 15:04Z, according to the operator's readbacks)
   is a reviewed change to `ROLLBACK_TARGET_PINS` in the planner, to the
   manifest field and to `rollback_target_revision` of windows `036` and
   `037` in `scripts/asaas_migration_window.py`.
@@ -2919,11 +3004,10 @@ poetry run python scripts/production_image_smoke.py --expected-head <head of the
 ```
 
 `--expected-head` is the head of the migrations CONTAINED in the image, that
-is of `alembic/versions` in the checkout being built: `035` on `main` today,
-`036` once PR #121 (migration 036) is merged. It is not the production
+is of `alembic/versions` in the checkout being built: `037` on `main` today
+(migrations 036 and 037 are merged). It is not the production
 migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
-checked offline as `032:035` whatever the image's head is. Whichever of this
-change and PR #121 lands second only changes the number given here.
+checked offline as `032:035` whatever the image's head is.
 
 It runs `docker buildx build --platform linux/amd64 --load --target production`
 on the working tree (no push, no registry login) with `VCS_REF` set to the git
@@ -2949,8 +3033,8 @@ tkinter); no file or directory under `/app` or site-packages is
 world-writable; every top-level import under `src/` resolves; both KMS
 signer factories build their clients (no KMS call); `alembic heads` prints
 exactly one line, `<expected head> (head)`, the head of the migrations in
-the image given with `--expected-head` (`035` on `main` today, `036` once
-PR #121 is merged); `/app/spa/index.html` exists; and `alembic upgrade
+the image given with `--expected-head` (`037` on `main` today);
+`/app/spa/index.html` exists; and `alembic upgrade
 032:035 --sql` emits the production migration window, which stays `032:035`
 whatever the image's head, as one transaction. The window
 starts at `032` because migration `017` reads rows, which offline mode cannot
