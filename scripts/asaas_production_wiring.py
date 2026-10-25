@@ -175,9 +175,10 @@ EMAIL_PARAMETER = "ASAAS_WEBHOOK_NOTIFICATION_EMAIL"
 # The billing.fact.v1 outbox worker (one loop per API process). The reviewed
 # parameter is rendered as the environment value itself, so it is exactly the
 # string "false" or "true": a YAML boolean, another spelling or surrounding
-# whitespace is refused. The repository keeps "false"; turning the worker on
-# (or off again) is a reviewed PR to the parameters file, rendered as a new
-# revision (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
+# whitespace is refused. The repository says "true" since the reviewed PR
+# E7-B1; turning the worker on or off is a reviewed PR to the parameters
+# file, rendered as a new revision (docs/runbooks/asaas-deployment.md, "The
+# outbox worker flag").
 WORKER_FLAG_PARAMETER = "BILLING_FACT_WORKER_ENABLED"
 WORKER_FLAG_VALUES = ("false", "true")
 IMAGE_PARAMETER = "app_image_override"

@@ -1255,7 +1255,7 @@ def test_rendering_keeps_app_and_otel_and_adds_exactly_the_d3_names() -> None:
         wiring.ADDED_SECRETS
     )
     # The reviewed parameter, rendered as is; its repository value is pinned
-    # once, by test_the_repository_keeps_the_outbox_worker_off.
+    # once, by test_the_repository_turns_the_outbox_worker_on.
     assert app_env["BILLING_FACT_WORKER_ENABLED"] == (
         _validated()["BILLING_FACT_WORKER_ENABLED"]
     )
@@ -1711,7 +1711,7 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         "ASAAS_WEBHOOK_URL": "https://staging.api.neurostack.global/v1/billing/webhook/asaas",
         "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": "neurostack.infra@gmail.com",
         # Present and valid here; its repository value is pinned once, by
-        # test_the_repository_keeps_the_outbox_worker_off.
+        # test_the_repository_turns_the_outbox_worker_on.
         "BILLING_FACT_WORKER_ENABLED": values["BILLING_FACT_WORKER_ENABLED"],
         "app_image_override": None,
     }
@@ -4083,7 +4083,7 @@ def test_the_same_window_and_purpose_on_another_image_is_never_reused(
 
 
 # ---------------------------------------------------------------------------
-# E7-B0: the outbox worker flag is a reviewed parameter ('false' by default)
+# E7-B0: the outbox worker flag is a reviewed parameter ('true' since E7-B1)
 # ---------------------------------------------------------------------------
 
 WORKER_FLAG = "BILLING_FACT_WORKER_ENABLED"
@@ -4231,27 +4231,30 @@ def _worker_cli(
     )
 
 
-def test_the_repository_keeps_the_outbox_worker_off() -> None:
-    """An accidental merge can never enable the worker: the default is 'false'.
+def test_the_repository_turns_the_outbox_worker_on() -> None:
+    """The repository value is 'true', set deliberately by a reviewed PR.
 
-    The only test that pins the repository value. Turning the worker on (or
-    off again) is a committed, reviewed PR that changes the parameters line
-    and this test deliberately (docs/runbooks/asaas-deployment.md, "The outbox
-    worker flag"); nothing else in the suites depends on the value.
+    E7-B1, the committed, reviewed PR that turned the repository parameter on
+    (owner decision 2026-10-22: the flag first, on the bridge image, then the
+    E7 image in a later revision of its own), changed the parameters line and
+    the tests that pin it together: this one (the parameter and its
+    rendering), test_the_docs_state_that_the_repository_turns_the_worker_on
+    (the docs) and test_the_repository_parameters_propose_the_next_revision
+    (the planner on the repository file). Turning it off again is the same
+    kind of PR, back to 'false', and changes those tests with it
+    (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
     """
 
-    assert "\n  BILLING_FACT_WORKER_ENABLED: 'false'\n" in PARAMS.read_text(
-        encoding="utf-8"
-    )
-    assert wiring.validate_parameters(wiring.load_yaml(PARAMS))[WORKER_FLAG] == (
-        "false"
-    )
+    text = PARAMS.read_text(encoding="utf-8")
+    assert "\n  BILLING_FACT_WORKER_ENABLED: 'true'\n" in text
+    assert "\n  BILLING_FACT_WORKER_ENABLED: 'false'\n" not in text
+    assert wiring.validate_parameters(wiring.load_yaml(PARAMS))[WORKER_FLAG] == "true"
     _manifest, parameters, _digests = wiring.load_inputs(MANIFEST, PARAMS)
-    assert parameters is not None and parameters[WORKER_FLAG] == "false"
+    assert parameters is not None and parameters[WORKER_FLAG] == "true"
     _plan_result, rendered = _plan(FakeAws(applied=True), pins=_worker_pins(8))
     assert rendered is not None
     app = evidence._container_map(rendered)["app"]
-    assert evidence._env_map(app)[WORKER_FLAG] == "false"
+    assert evidence._env_map(app)[WORKER_FLAG] == "true"
     manifest = wiring.load_yaml(MANIFEST)
     assert manifest["task_definition"]["app_environment_added"][WORKER_FLAG] == {
         "parameter": WORKER_FLAG
@@ -4260,6 +4263,298 @@ def test_the_repository_keeps_the_outbox_worker_off() -> None:
         "validator": "exact_false_or_true",
         "path": None,
     }
+
+
+WORKER_FLAG_RUNBOOK = ROOT / "docs/runbooks/asaas-deployment.md"
+WORKER_FLAG_CONFIGURATION = ROOT / "docs/configuration.md"
+# Statements of the repository value from before E7-B1; none may come back
+# while the repository says 'true'.
+RETIRED_WORKER_FLAG_STATEMENTS = (
+    "keeps_the_outbox_worker_off",
+    "The repository keeps `'false'`",
+    "the repository keeps 'false'",
+    "The repository keeps 'false'",
+    'The repository keeps "false"',
+    "`'false'` (the repository value)",
+    "`'false'` in the repository",
+    "'false' in the repository",
+    "`false` for revision 9 and in the repository",
+    "`'false'` (o valor do repositório)",
+    "`'false'` no repositório",
+    "the only test that pins the value",
+    "pinned by one test",
+)
+# Claims that the worker already runs in production; none holds until the
+# next revision is deployed and observed.
+WORKER_ON_IN_PRODUCTION_CLAIMS = (
+    "the worker is on in production",
+    "the worker is already on",
+    "the worker is now on",
+    "the flag is on in production",
+    "the flag is already on",
+    "worker runs in production",
+    "o worker está ligado em produção",
+    "o worker já está ligado",
+    "a flag já está ligada",
+    "a flag está ligada em produção",
+)
+
+
+_NEGATED_CLAIM = re.compile(r"\b(?:not|never|claims?|não|nunca|nem)\b[^.;]{0,12}$")
+
+
+def _unnegated_claims(text: str, claims: tuple[str, ...]) -> list[str]:
+    """Each claim occurrence not negated just before it (``nothing here claims
+    the flag is on`` is the truth, ``the flag is on`` is not)."""
+
+    found = []
+    for claim in claims:
+        for match in re.finditer(re.escape(claim), text):
+            if not _NEGATED_CLAIM.search(
+                text[max(0, match.start() - 40) : match.start()]
+            ):
+                found.append(claim)
+    return found
+
+
+def _flat(path: Path) -> str:
+    return " ".join(path.read_text(encoding="utf-8").split())
+
+
+def _between(text: str, start: str, end: str) -> str:
+    begin = text.index(start)
+    return text[begin : text.index(end, begin + len(start))]
+
+
+def _in_order(text: str, steps: list[str]) -> None:
+    positions = [text.index(step) for step in steps]
+    assert positions == sorted(positions), steps
+
+
+def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
+    """The docs follow the pin: the repository says 'true', production does not
+    yet, and the next steps are in order. The PR that turns the worker off
+    again changes this test with the pin test."""
+
+    assert wiring.validate_parameters(wiring.load_yaml(PARAMS))[WORKER_FLAG] == "true"
+    for path in (
+        WORKER_FLAG_RUNBOOK,
+        WORKER_FLAG_CONFIGURATION,
+        PARAMS,
+        MANIFEST,
+        ROOT / "scripts/asaas_production_wiring.py",
+    ):
+        text = _flat(path)
+        lowered = text.lower()
+        for retired in RETIRED_WORKER_FLAG_STATEMENTS:
+            assert retired not in text, (path.name, retired)
+        assert (
+            _unnegated_claims(lowered, WORKER_ON_IN_PRODUCTION_CLAIMS) == []
+        ), path.name
+
+    runbook = _flat(WORKER_FLAG_RUNBOOK)
+    section = _between(
+        runbook,
+        "### The outbox worker flag (`BILLING_FACT_WORKER_ENABLED`)",
+        "### Ordered procedure",
+    )
+    for phrase in (
+        "**The repository says `'true'` since E7-B1**, the reviewed PR that"
+        " turned the repository parameter on deliberately.",
+        "`test_the_repository_turns_the_outbox_worker_on`",
+        "**the worker is not on in production**",
+        "ECS assigns the number at registration (expected `:10`)",
+        "steps 2 to 6 are not done, and nothing here claims the flag is on in"
+        " production",
+        "The image does not change in this revision, and the E7 image is never"
+        " part of it: the E7 image comes in a later revision of its own",
+        "Recovery is an owner decision, carried out by the operator and never by"
+        " these tools",
+        # What a pass reads and writes (src/services/billing_fact_worker.py).
+        "`billing_payment_effects` (provider `asaas`), `billing_outbox`,"
+        " `billing_fact_deliveries`, `billing_fact_handoffs`, `billing_fact_acks`"
+        " and `billing_fact_reconciliation_alerts`. It can write:",
+        "With those tables empty it writes nothing.",
+        "so up to 8 passes run per 30 s",
+        "`BillingFactDeliveryStale` does not fire there",
+    ):
+        assert phrase in section, phrase
+    assert "billing_outbox_events" not in section
+    _in_order(
+        section,
+        [
+            "1. **PR.**",
+            "2. **Plan, render, check**",
+            "proposes the next revision (expected `:10`), flag `false` to `true`,"
+            " on the same bridge image",
+            "3. **Register** the rendering as revision 10 (`ManagedBy=manual`",
+            "4. **Deploy** revision 10: the `service_deployment` gate (separate"
+            " owner approval)",
+            "5. **Observe**",
+            "8 lines from the revision 10 tasks, 4 per task × 2 tasks, not one per"
+            " task",
+            "--log-group-name /ecs/neurostack-staging/app",
+            "--filter-pattern '\"billing fact worker started\"'",
+            "`'\"billing fact acknowledgement overdue\"'` (the WARN) returns no"
+            " event",
+            "`neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps"
+            " advancing",
+            "a payment effect with no outbox row does not show in it",
+            "FROM billing_payment_effects WHERE provider = 'asaas'",
+            "FROM billing_outbox)",
+            "FROM billing_fact_deliveries)",
+            "The counts are the same before and after.",
+            "6. **Regenerate the protected template from revision 10** before the"
+            " E7 image",
+        ],
+    )
+
+    # E7-A follow-up: the flag first, observed, then the E7 image; step 1
+    # never claims the flag revision is registered or deployed.
+    follow_up = _between(
+        runbook, "1. **Worker flag first, its own change.**", "4. **Receiver"
+    )
+    flag_step = _between(
+        follow_up, "1. **Worker flag first", "2. **Observe the worker.**"
+    )
+    assert "no registered revision carries `true` yet" in flag_step
+    assert "registered and deployed" not in flag_step
+    _in_order(
+        follow_up,
+        [
+            "1. **Worker flag first, its own change.** The worker code is already"
+            " in the bridge image, so the flag is turned on first, on the bridge"
+            " image, as its own reviewed change and its own deploy",
+            "2. **Observe the worker.** Before any E7 build:",
+            "`billing fact worker started` (8 lines, 4 per task × 2 tasks)",
+            "3. **E7 image after, never in the same revision.**",
+            "the flag change and the E7 image never share a revision or a deploy",
+        ],
+    )
+
+    configuration = _flat(WORKER_FLAG_CONFIGURATION)
+    section = _between(
+        configuration, "## Worker do outbox `billing.fact.v1`", "| Variável |"
+    )
+    for phrase in (
+        "`'true'` (o valor do repositório desde o PR revisado E7-B1, que ligou o"
+        " parâmetro do repositório)",
+        "**o worker ainda não está ligado em produção**",
+        "`test_the_repository_turns_the_outbox_worker_on`",
+    ):
+        assert phrase in section, phrase
+    _in_order(
+        section,
+        [
+            "propõe a próxima revisão (esperada `:10`; o número é atribuído pelo"
+            " ECS), flag `false` para `true`, na imagem ponte",
+            "o operador a registra (`ManagedBy=manual`)",
+            "o deploy tem aprovação própria",
+            "8 linhas no log group `/ecs/neurostack-staging/app`, 4 por task × 2"
+            " tasks",
+            "`neurostack_billing_fact_worker_last_tick_timestamp_seconds` avança,"
+            " mas o `/metrics` é por processo",
+            "nenhum WARN `billing fact acknowledgement overdue`",
+            "`billing_payment_effects` com `provider = 'asaas'`",
+            "iguais antes e depois do deploy",
+            "regenerar o template protegido a partir dessa revisão antes da imagem"
+            " do E7",
+        ],
+    )
+    order = _between(configuration, "Ordem do E7 na AWS", "## Primeiro acesso")
+    flag_step = _between(
+        order, "1. **Primeiro a flag, numa mudança própria.**", "2. **Observar.**"
+    )
+    assert "ainda em nenhuma revisão registrada" in flag_step
+    assert "registrada e implantada" not in flag_step
+    _in_order(
+        order,
+        [
+            "1. **Primeiro a flag, numa mudança própria.** O código do worker já"
+            " está na imagem ponte, então `BILLING_FACT_WORKER_ENABLED=true` sai"
+            " antes, na imagem ponte",
+            "2. **Observar.**",
+            "3. **Depois, a imagem do E7, nunca na mesma revisão.**",
+        ],
+    )
+
+
+def _repository_params_copy(directory: Path, flag: str | None) -> Path:
+    """The operator's local copy of the repository file: app_image_override set
+    to the bridge digest. ``flag=None`` keeps the repository's flag line as it
+    is; a value rewrites it (the control run only)."""
+
+    text = PARAMS.read_text(encoding="utf-8")
+    image = re.compile(r"^  app_image_override: null$", re.MULTILINE)
+    line = re.compile(rf"^  {WORKER_FLAG}: '(?:false|true)'$", re.MULTILINE)
+    assert len(image.findall(text)) == 1 and len(line.findall(text)) == 1
+    text = image.sub(f"  app_image_override: {OVERRIDE_IMAGE}", text)
+    if flag is not None:
+        text = line.sub(f"  {WORKER_FLAG}: '{flag}'", text)
+    path = directory / f"params-{flag or 'repository'}.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_repository_parameters_propose_the_next_revision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The repository file as it is (only the apply-time image set) and the
+    reviewed manifest, against the fixture of the live bridge state (revision 9
+    serving 'false'): plan proposes one new revision that flips the flag alone,
+    render-taskdef differs from the 'false' control rendering in that one
+    value, and check passes. Fails when the repository value is not 'true'."""
+
+    snapshot = _bridge_world().snapshot(tmp_path / "readback.json")
+    outputs: dict[str, dict[str, str]] = {}
+    for flag in ("true", "false"):
+        # The 'true' run reads the repository's own flag line; only the
+        # 'false' control run rewrites it.
+        params = _repository_params_copy(tmp_path, None if flag == "true" else flag)
+        outputs[flag] = {}
+        for command in ("plan", "render-taskdef", "check"):
+            code, out, err = _run(
+                [
+                    command,
+                    "--params",
+                    str(params),
+                    "--readback-file",
+                    str(snapshot),
+                    "--manifest",
+                    str(MANIFEST),
+                ],
+                capsys,
+            )
+            assert code == 0, (flag, command, err)
+            outputs[flag][command] = out
+
+    plan = json.loads(outputs["true"]["plan"])
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "ready"
+    assert plan["parameters"][WORKER_FLAG] == "true"
+    assert step["state"] == "would_change" and step["blocks"] == []
+    [change] = step["changes"]
+    assert change["action"] == "register_task_definition"
+    assert change["replaces"] == NEXT_ARN
+    assert change["worker_flag"] == {"name": WORKER_FLAG, "from": "false", "to": "true"}
+    assert change["request_sha256"] == wiring._sha256(
+        json.loads(outputs["true"]["render-taskdef"])
+    )
+    assert json.loads(outputs["false"]["plan"])["status"] == "compliant"
+
+    off, on = outputs["false"]["render-taskdef"], outputs["true"]["render-taskdef"]
+    changed = [
+        (before.strip(), after.strip())
+        for before, after in zip(off.splitlines(), on.splitlines(), strict=True)
+        if before != after
+    ]
+    assert changed == [('"value": "false"', '"value": "true"')]
+    app = evidence._container_map(json.loads(on))["app"]
+    assert evidence._env_map(app)[WORKER_FLAG] == "true"
+    assert (
+        json.loads(outputs["true"]["check"])["rendered_request_sha256"]
+        != json.loads(outputs["false"]["check"])["rendered_request_sha256"]
+    )
 
 
 @pytest.mark.parametrize("value", ["false", "true"])
