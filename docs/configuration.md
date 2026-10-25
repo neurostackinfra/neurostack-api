@@ -229,7 +229,9 @@ implantado **e** `BILLING_FACT_WORKER_ENABLED=true`, decisão do owner de
 2. **Observar.** O worker subiu em cada processo da API (8 linhas
    `billing fact worker started`), o last-tick avança e o outbox está vazio.
 3. **Depois, a imagem do E7, nunca na mesma revisão.** Só então a imagem do
-   E7 é construída, publicada e implantada, numa revisão posterior.
+   E7 é construída, publicada e implantada, numa revisão posterior (o
+   procedimento é "The image bump" no runbook: só o digest da imagem do `app`
+   muda em relação à revisão servida).
 
 ## Primeiro acesso: bootstrap do super_admin
 

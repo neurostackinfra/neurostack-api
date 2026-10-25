@@ -32,7 +32,8 @@ context:
     - Resolve every secret ARN, random suffix included, from DescribeSecret at plan time.
     - Derive the new revision from the D3 source revision (task_definition.source_revision); change only the names listed under task_definition, the otel image (task_definition.otel_image, a digest) and the tags in task_definition.tag_overrides.
     - BILLING_FACT_WORKER_ENABLED renders its reviewed parameter exactly ('false' or 'true'; the repository value lives in the parameters file and is pinned by tests/scripts/test_asaas_production_wiring.py). A revision that only flips it (worker on, or off again) is its own reviewed parameters edit and owner approval; plan reports it as a register_task_definition change carrying worker_flag.
-    - The service rollback target is the field rollback_target; code paths read it from here and it moves only through its documented re-pin.
+    - A revision that only moves the app image to another digest of the same repository (the image bump, from the apply-time parameter app_image_override) is its own owner approval; plan reports it as a register_task_definition change carrying app_image. An image and a worker flag change never share a revision.
+    - The service rollback target is the field rollback_target; code paths read it from here and it moves only through its documented re-pins (8 to 9, then 9 to 10).
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
     - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names.
     - Keep financial_egress_enabled closed; opening it is a separate, unwritten follow-up.
@@ -68,15 +69,28 @@ target:
     - payments.staging.api.neurostack.global
 
 # Where a failed service deployment goes back to. Code reads this field (never
-# a constant). Re-pinned from revision 8 to the bridge revision 9 (the D3
+# a constant). First re-pinned from revision 8 to the bridge revision 9 (the D3
 # rendering on the bridge image pinned by digest) once revision 9 had served,
 # been verified and its observation period had closed, and before migration
-# 036: revision 8 runs code that reads columns 036 drops. This is the final
-# pin of the planner (no further re-pin is allowed by it); this edit merges
-# only after the observation period closed (about 2026-10-23 18:30 UTC).
+# 036: revision 8 runs code that reads columns 036 drops (that edit merged
+# only after the observation period closed, about 2026-10-23 18:30 UTC).
+# Then re-pinned from revision 9 to the worker-flag revision 10 (revision 9
+# with BILLING_FACT_WORKER_ENABLED 'true', same bridge image) once revision 10
+# had served, been verified and the observation of the worker had closed, and
+# before the image bump that starts from revision 10 is deployed: a rollback
+# to revision 9 would also turn the worker off. This edit merges only after
+# that observation closes, 6 hours after revision 10's deployment completed
+# (2026-10-25 01:51 UTC), so at 2026-10-25 07:51 UTC; the orchestrator makes
+# the final check then and records the actual closing time on the next line
+# before the merge, in the exact form `# closed_at: YYYY-MM-DDTHH:MMZ` (UTC,
+# at or after 2026-10-25T07:51Z) (docs/runbooks/asaas-deployment.md, "Merge
+# condition of the re-pin (9 to 10)").
+# closed_at: 2026-10-25T12:42Z
+# Revision 10 is the final pin of the planner (no further re-pin is allowed
+# by it).
 rollback_target:
-  revision: 9
-  effective_after: bridge_revision_9_serving_verified_and_observation_closed
+  revision: 10
+  effective_after: worker_flag_revision_10_serving_verified_and_observation_closed
 
 secrets:
   kms_key_arn: arn:aws:kms:us-east-1:388460142431:key/90eff49a-c2bf-4836-834f-d5666294d956
@@ -239,6 +253,7 @@ steps:
       - Every required parameter is present and valid; both hosts resolve to the ALB and are covered by its certificate.
       - plan runs immediately before rendering, exits 0 and reports no block; render-taskdef refuses otherwise.
       - BILLING_FACT_WORKER_ENABLED is the reviewed parameter. The D3 approval of 2026-10-18 covered the value 'false'; while the service runs a registered D3 revision, a rendering that differs from it in that value alone (plan change worker_flag, replaces the serving revision) needs its own owner approval.
+      - While the service runs a registered D3 revision, a rendering that differs from it in the app image digest alone, both pinned by digest in the same repository (plan change app_image, replaces the serving revision), needs its own owner approval; any other difference blocks.
     change: >-
       Register one new revision of the family with the request printed by
       render-taskdef. Registering does not change the service.
@@ -352,7 +367,8 @@ steps:
     preconditions:
       - Window 035 applied and verified first; read back the exact revision with the window's SELECT-only pre-read and continue only if alembic_version == 035.
       - The image containing 036 is deployed and running on every service task, by digest (an earlier image cannot read the 036 schema); the window's migrations revision carries that same digest.
-      - rollback_target re-pinned to revision 9 (reviewed manifest edit) and revision 9 ACTIVE, because revision 8 reads columns 036 drops.
+      # History: window 036 actually ran with rollback_target revision 9; the requirement of 10 applies to any later use of the tooling.
+      - rollback_target re-pinned to revision 10 with no pending re-pin (reviewed manifest edits, 8 to 9 then 9 to 10) and revision 10 ACTIVE, because revision 8 reads columns 036 drops and revision 9 carries BILLING_FACT_WORKER_ENABLED false (a rollback to it would also turn the worker off), so revision 10 is the only safe way back.
       - Manual RDS snapshot pre-036-<date> available and recent; the preflight of scripts/migration_036_preflight.sql reads every count 0 right before the run.
     change: register the window's neurostack-staging-migrations revision with render-migrations-taskdef --window 036 --purpose migrate (the deployed image digest, the command baked to exactly `alembic upgrade 036`) and run it once through scripts/asaas_migration_window.py --window 036 (plan, render-run-task, verify-result), with no command override and no propagateTags
     verification:
@@ -366,7 +382,8 @@ steps:
     preconditions:
       - Window 036 applied and verified first; the window's pre-read runs scripts/migration_037_readback.sql as the migration role, on the window's dedicated read revision, and must read eleven ok, the first being alembic_version == 036.
       - The image containing 037 is deployed and running on every service task, by digest; the window's migrations revision carries that same digest.
-      - rollback_target stays revision 9 and revision 9 is ACTIVE.
+      # History: window 037 actually ran with rollback_target revision 9; the requirement of 10 applies to any later use of the tooling.
+      - rollback_target stays revision 10 and revision 10 is ACTIVE.
       - Manual RDS snapshot pre-037-<date> available and recent before the run.
     change: register two separate neurostack-staging-migrations revisions on the deployed image digest, the read revision with render-migrations-taskdef --window 037 --purpose read (its command baked to the SELECT-only readback program, which never invokes the migration tool and only reads the alembic_version table) and the migrate revision with render-migrations-taskdef --window 037 --purpose migrate (the command baked to exactly `alembic upgrade 037`); run the read revision for the pre-read and the migrate revision once through scripts/asaas_migration_window.py --window 037 (plan, render-run-task, verify-result), with no command override and no propagateTags
     verification:

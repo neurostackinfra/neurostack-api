@@ -407,9 +407,10 @@ subcommands are `scripts/asaas_migration_window.py --window 036`, see
    the database. `plan` checks it again right before the run: every service
    task on the expected revision and on the image digest of the window's
    migrations revision, and no task still stopping. The rollback target must
-   read revision 9 with no pending re-pin before this window (gate 6; the
-   re-pin is merged only after revision 9's observation period closed, about
-   2026-10-23 18:30 UTC); `plan` refuses otherwise.
+   read revision 10 with no pending re-pin before this window (gate 6: the
+   re-pin from 8 to 9 merged only after revision 9's observation period
+   closed, about 2026-10-23 18:30 UTC, and the one from 9 to 10 before the
+   image bump); `plan` refuses otherwise.
 2. **RDS snapshot** (owner decision 2026-10-19 b): take a manual snapshot
    named `pre-036-<date>` of the production database and wait until its
    status is `available` before going on (`render-snapshot-requests`).
@@ -789,8 +790,10 @@ restored guards refuse what they refused.
      `0` for every condition).
   3. **E7 image after, never in the same revision.** Only then is the E7 image
      built, pushed and deployed, in a later revision of its own; the flag
-     change and the E7 image never share a revision or a deploy. In AWS this
-     deploy is the whole rotation: the new image carries the new rules.
+     change and the E7 image never share a revision or a deploy. The
+     procedure is [The image bump](#the-image-bump-app_image_override). In
+     AWS this deploy is the whole rotation: the new image carries the new
+     rules.
      Readiness receipts bind the digest of the rules file inside the image,
      so record them only after the E7 image is live; one recorded against the
      previous digest no longer verifies.
@@ -828,8 +831,12 @@ migrations revision from it.
 | Window | Manifest step | Plan steps | Baked command | `alembic_version` before, after | Snapshot | SELECT-only readback before the run | Image prerequisite |
 |---|---|---|---|---|---|---|---|
 | `035` | `migrations_033_035` | S10-S13 | `alembic upgrade 035` | `032`, `035` | `pre-033-035-<date>` | `scripts/migration_033_035_zero_reads.sql`, application role | the migrations revision carries the bridge image by digest (in ECR); every service task runs its own revision's image (revision 8 may still serve, by tag) |
-| `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 9, `ACTIVE` |
-| `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 9, `ACTIVE` |
+| `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 10, `ACTIVE` |
+| `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 10, `ACTIVE` |
+
+History: windows `036` and `037` actually ran with `rollback_target`
+revision 9; the requirement of revision 10 in the table applies to any later
+use of the tooling.
 
 After the run every window reads back `alembic_version` as the application
 role; it must be exactly the window's "after" (window `037` also reads
@@ -1050,7 +1057,7 @@ the snapshot `$SNAPSHOT_ID` of `neurostack-staging-db`, manual, `postgres`,
 `available`, created within the last 60 minutes and named for its creation
 date (or the day before); no task of the migrations family, of the
 window's `startedBy` or of the read family running; for 036 and 037 the
-manifest's `rollback_target` revision 9 with no pending re-pin and revision 9
+manifest's `rollback_target` revision 10 with no pending re-pin and revision 10
 `ACTIVE` on an image by digest; for 037 the read revision (baked readback,
 no mention of the migration tool, same image as the migrate revision) and the
 migrate revision never swapped; the recorded pre-read verified `read_ok`,
@@ -1234,12 +1241,18 @@ window `037`'s SELECT-only readback program on the same image, roles and
 secret, as a separate revision.
 
 - The service rollback target is the manifest field `rollback_target`
-  (revision 9 since its documented re-pin, gate 6, merged only after
-  revision 9's observation period closed, about 2026-10-23 18:30 UTC;
-  revision 8 before). Every code path reads it from there; revision 9 is
+  (revision 10 since its second documented re-pin, 9 to 10, which merges
+  only after revision 10 has served, been verified and its observation has
+  closed, 6 hours after its deployment completed, so at 2026-10-25
+  07:51 UTC, with the actual closing time recorded by the orchestrator in
+  the manifest marker `closed_at` before the merge ("Merge condition of the
+  re-pin (9 to 10)"), and before the image bump; revision 9 since the first,
+  gate 6, merged only
+  after revision 9's observation period closed, about 2026-10-23 18:30 UTC;
+  revision 8 before). Every code path reads it from there; revision 10 is
   the last pin the planner allows. The D3 source
   revision (`task_definition.source_revision`, 8) is a separate, fixed value:
-  revision 9 stays derived from it.
+  revisions 9 and 10 stay derived from it.
 - Two gate blocks are facts computed at plan time, not pinned states.
   `F1_residual_5_database_url_fingerprint` (F1 residual 5; it replaced the
   id `F1_group5_deploy_validator_allowlist`, whose check passes since F1
@@ -1352,18 +1365,26 @@ parameter and its rendering, and
 statements of it; the off PR changes both, and the live-state test
 `test_the_repository_parameters_propose_the_next_revision` too. Until E7-B1 the repository kept
 `'false'`, and with `'false'` the rendering is byte for byte what it was
-when the value was a constant. Merging the PR changes nothing live by
-itself: **the worker is not on in production** until the next revision is
-registered and deployed (steps 2 to 4 below); revisions 8 and 9 carry
-`false`. "Revision 10" below is that next revision of
+when the value was a constant. Merging the PR changed nothing live by
+itself: the worker started only when the next revision was registered and
+deployed (steps 2 to 4 below); revisions 8 and 9 carry `false`. **Revision
+10, with the flag `true`, was registered and deployed on 2026-10-25**
+(deployment completed 01:51Z, 8 `billing fact worker started` lines, no
+tick failure). "Revision 10" below is that next revision of
 `neurostack-staging-app`: ECS assigns the number at registration (expected
-`:10`). Against the live state with the repository's `'true'`, `plan`
-proposes the next revision (expected `:10`, step 2) when
-`app_image_override` is set to revision 9's image (the bridge digest
-`sha256:18358ce7…`); with `'false'` it reports revision 9
-`registered_and_deployed`, as when revision 9 was rendered. With the
-repository's `null` the rendering keeps revision 8's tagged image, and
-`plan` blocks on the live state, as it did before this parameter existed.
+`:10`). Before revision 10 was registered, against the live state then
+(revision 9 serving) with the repository's `'true'`, `plan` proposed the
+next revision (`:10`, step 2) when `app_image_override` was set to revision
+9's image (the bridge digest `sha256:18358ce7…`); with `'false'` it reported
+revision 9 `registered_and_deployed`. Today, against the live state
+(revision 10 serving) with the override set to the bridge digest, `'true'`
+reports `status: compliant` with `registered_and_deployed:<revision 10 ARN>`,
+and `'false'` reports `status: ready` with one change,
+`replaces: <revision 10 ARN>` and
+`worker_flag: {from: 'true', to: 'false'}` (turning the worker off again, a
+new revision). With the repository's `null` the rendering keeps revision
+8's tagged image, and `plan` blocks on the live state, as it did before this
+parameter existed.
 
 What turning it on does (`src/services/billing_fact_worker.py`,
 `src/services/billing_outbox.py`): one asyncio loop per API worker process
@@ -1412,8 +1433,12 @@ steps.
    (now `test_the_repository_turns_the_outbox_worker_on`, the docs test and
    `test_the_repository_parameters_propose_the_next_revision`); review and
    merge.
-   Done by E7-B1 once that PR merges; steps 2 to 6 are not done, and nothing
-   here claims the flag is on in production.
+   Done by E7-B1. Steps 2 to 4 were done on 2026-10-25: revision 10, with
+   the flag `true`, was registered and deployed (deployment completed
+   01:51Z, 8 `billing fact worker started` lines, no tick failure). Its
+   observation (step 5) closes six hours after that, at 07:51Z ("Merge
+   condition of the re-pin (9 to 10)" in the ordered procedure); step 6 was
+   done the same day.
 2. **Plan, render, check** from `main`, with the repository file plus the
    apply-time `app_image_override` (the bridge digest revision 9 runs).
    Against the live state (revision 9 serving `false`) it proposes the next
@@ -1424,7 +1449,9 @@ steps.
    `register_task_definition` with `replaces: <revision 9 ARN>` and
    `worker_flag: {from: 'false', to: 'true'}`. It is reported only when the
    serving revision differs from the rendering in that value alone; any
-   other difference blocks (`service_not_on_rollback_target:<ARN>`). Then
+   other difference blocks (`service_not_on_rollback_target:<ARN>`), except
+   the app image digest alone, which is
+   [the image bump](#the-image-bump-app_image_override). Then
    `render-taskdef` and `check` as in step 2 of the ordered procedure. With
    `'true'`, `check` passes the same validators as with `'false'`. Only
    `rendered_request_sha256` changes, and in `plan` only the image gate's
@@ -1494,10 +1521,11 @@ steps.
    path refuses a template captured from revision 9 (`false`) against a
    serving revision with `true` (`base_task_environment_changed`).
 
-A service rollback to the rollback target (revision 9, which carries
-`false`) turns the worker off and leaves revision 10 the newest. While the
-parameter stays `'true'`, `plan` reports it `registered_not_deployed`; once a
-PR sets the parameter back to `'false'`, the state below applies.
+A service rollback from revision 10 to revision 9 (which carries `false`;
+the rollback target until the re-pin to 10) turns the worker off and leaves
+revision 10 the newest. While the parameter stays `'true'`, `plan` reports
+it `registered_not_deployed`; once a PR sets the parameter back to
+`'false'`, the state below applies.
 
 **Newest revision differing only in the flag (blocks, never green).** When
 the service runs the rendering, or differs from it in the flag alone, but the
@@ -1512,6 +1540,138 @@ tools: either
 deregister that unwanted newest revision (owner approval required), or, when
 its flag value is the one wanted, make the parameter say the same through the
 PR of step 1 and deploy it (step 4). Then run `plan` again.
+
+### The image bump (`app_image_override`)
+
+The image bump moves the service to a new application image and changes
+nothing else: one new `neurostack-staging-app` revision that is the serving
+revision with only the `app` image digest changed. Use it for the next image
+built from `main` (for example the E7 image, step 3 of the E7-A follow-ups in
+[Open follow-ups recorded by E6](#open-follow-ups-recorded-by-e6)) once the
+service runs a registered D3 revision on an image pinned by digest (revision
+10: the bridge image, `BILLING_FACT_WORKER_ENABLED=true`) and the rollback
+target is re-pinned to that revision ("Re-pinning the rollback target (9 to
+10)", step 6 of the ordered procedure). Like Path A it is registered and
+deployed by the operator outside the protected deploy path. It never carries
+a worker flag change: the flag and an image never share a revision or a
+deploy (owner decision 2026-10-22).
+
+Step 6 of the flag procedure (regenerate the protected template from
+revision 10 before the E7 image) applies only to a deploy through the
+protected path. The manual image bump below is outside that path, so it does
+not depend on that step. The template was regenerated from revision 10 on
+2026-10-25; once revision 11 serves, it must be regenerated again, from
+revision 11, before any later protected deploy.
+
+`plan` proposes it only when the service runs the newest registered
+revision and that revision equals the rendering except for the app image:
+both images pinned by digest (`<repository>@sha256:<digest>`, no tag) in the
+same repository, two different digests, and every other field equal (every
+environment name and value, the worker flag included, every secret
+reference, the otel digest, the roles, the sizing and the tags). Any other
+difference blocks (`service_not_on_rollback_target:<ARN>`): an image by tag,
+an image in another repository, a malformed digest, and a rendering that
+changes the image and the flag together. That reason names the serving
+revision (revision 10 here) and does not say which fields differ; it is the
+same in two cases: (a) revision 10 serves and is also the newest, and the
+rendering differs from it in more than the image digest; (b) revision 10
+serves, a newer revision is registered, and that newer revision differs
+from the rendering in both the image and the flag. The flag code behaves the
+same. Compare the rendering with the serving revision to find the fields.
+`app_image_override` stays `null`
+in the repository: as for the flag, the operator plans from a local copy of
+`main`'s parameters file with that one field set to the new digest, so the
+copy's `parameters_sha256` differs from `main`'s and the echoed
+`app_image_override` in the plan is the evidence of what was planned.
+"Revision 11" below is that new revision: ECS assigns the number at
+registration (expected `:11`).
+
+1. **Build and smoke.** Build the image from a clone on the Linux filesystem
+   and run the [image smoke](#image-smoke-local-before-the-signed-build).
+   Continue only if every check passes.
+2. **Push by image ID.** Tag the smoked image ID and push that tag to
+   `neurostack-staging` (tags are immutable there); never rebuild for the
+   push, or the pushed image is not the one that was checked.
+3. **Verify the digest and the scan.** `aws ecr describe-images` of the
+   pushed tag returns exactly one image, and its digest is the one to deploy.
+   The ECR image scan of that digest (`aws ecr
+   describe-image-scan-findings`) has completed and its findings are
+   reviewed before going on.
+4. **Plan, render, check, register.** `plan` with the local copy
+   (`app_image_override:
+   388460142431.dkr.ecr.us-east-1.amazonaws.com/neurostack-staging@sha256:<new digest>`)
+   exits 0 with `status: ready` and `task_definition_revision: would_change`.
+   Its change is `register_task_definition` with
+   `replaces: <revision 10 ARN>`,
+   `app_image: {repository, from: <bridge digest>, to: <new digest>}`, no
+   `worker_flag`, and
+   `service_changes: none (service_deployment is a separate gate)`. Then
+   `render-taskdef` and `check` as in step 2 of the ordered procedure; the
+   rendered request differs from revision 10 in the `app` image line alone
+   (review it), and `check` passes. Register it as revision 11
+   (`ManagedBy=manual`, by the operator). `plan` then reports
+   `status: compliant`, `registered_not_deployed:<revision 11 ARN>` and
+   `registered_revision_changes_app_image` naming revision 10 and both
+   digests. Registering changes nothing in the service. In this step and
+   the next ones, unless the manifest pins revision 10 with no pending
+   re-pin, `plan` also reports the gate block
+   `rollback_target_not_repinned_before_image_bump` on `service_deployment`
+   (in `gate_blocks`; the plan `status` stays `ready` or `compliant`): do
+   not deploy while it is reported.
+5. **Database read, before the deploy.** The read-only database read of
+   step 5 of the flag procedure ("Database, read-only, before the deploy and
+   after": the SELECT-only counts as the application role, its own
+   approval), taken before the deploy below; keep its counts.
+6. **Deploy** revision 11: the `service_deployment` gate (separate owner
+   approval),
+   `aws ecs update-service --cluster neurostack-staging --service neurostack-staging-app --task-definition <revision 11 ARN>`.
+   Deploy only when `plan` does not report
+   `rollback_target_not_repinned_before_image_bump`. Afterwards `plan`
+   reports `registered_and_deployed:<revision 11 ARN>`, and
+   `rollback_target` stays revision 10. Once revision 11 serves, the gate is
+   reported only while the manifest pins revision 9 (whose bridge digest it
+   compares with the serving image); with revision 8 pinned there is no
+   digest to compare with and no gate, a state the documented order never
+   produces (8 is re-pinned to 9 before migration 036, long before the image
+   bump).
+7. **Post-deploy hook.** Once the deployment is `COMPLETED`, run the
+   [post-deploy webhook registration hook](#post-deploy-webhook-registration-hook)
+   (`reconcile` on the deployed revision). Its failure is the alert
+   `DEPLOYED_WEBHOOK_PENDING`: the deployment stays.
+8. **Observe.** The verification of step 6 of the ordered procedure (every
+   task RUNNING on revision 11, target group healthy, `GET /ready` 200 on
+   every task, rollout readback still `disabled`), and the worker checks of
+   step 5 of the flag procedure, now from the revision 11 tasks (8
+   `billing fact worker started` lines, no tick failure, no WARN). Take the
+   database read again after the deploy and compare it with the read of
+   step 5: the counts are the same before and after, and a new alert row,
+   or more ASAAS payment effects than outbox rows, is a finding to report.
+
+**Rollback** is the service back to revision 10, the rollback target:
+`aws ecs update-service ... --task-definition <revision 10 ARN>` (or the
+deployment circuit breaker, automatically), as in
+[`asaas-rollback.md`](./asaas-rollback.md). No revision is registered for
+it, and revision 11 stays the newest: while the override still names the new
+digest, `plan` reports revision 11 `registered_not_deployed` again. Setting
+the override back to the bridge digest while revision 11 still serves is not
+a rollback: `plan` then proposes a new revision (expected `:12`) that
+replaces revision 11 and is identical to revision 10 (`app_image` from the
+new digest to the bridge digest). Do not register it; the documented
+rollback is the service update to revision 10.
+
+**Newest revision differing only in the image (blocks, never green).** When
+the service runs the rendering, or differs from it in the app image alone,
+but the newest registered revision differs from the rendering in the app
+image alone, `plan` blocks with
+`newest_revision_differs_only_in_app_image:<newest ARN>`
+(`info.newest_revision_app_image` gives the repository and both digests),
+and `render-taskdef` and `check` refuse. Typical causes: revision 11
+registered and then abandoned, or the service rolled back to revision 10 and
+the override set back to the bridge digest. Recovery is an owner decision,
+carried out by the operator and never by these tools, as for the flag:
+either deregister that unwanted newest revision (owner approval required),
+or, when its image is the one wanted, set the override to its digest and
+deploy it (step 6). Then run `plan` again.
 
 ### Ordered procedure
 
@@ -1712,7 +1872,8 @@ own explicit owner approval and is never performed from the manifest.
    `036` and `037` (`scripts/asaas_migration_window.py`) reads the same field
    through the planner and refuses until it is revision 9 with no pending
    re-pin (`rollback_target_not_repinned`) and revision 9 is `ACTIVE` on an
-   image pinned by digest.
+   image pinned by digest; since the second re-pin below they require
+   revision 10 instead, likewise.
 
    **Merge condition of the re-pin.** The manifest edit above merges only
    after revision 9's 24 h observation period has closed, about
@@ -1727,6 +1888,85 @@ own explicit owner approval and is never performed from the manifest.
    `arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:9`,
    app image
    `388460142431.dkr.ecr.us-east-1.amazonaws.com/neurostack-staging@sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24`.
+
+   **Re-pinning the rollback target (9 to 10).** Revision 9 carries
+   `BILLING_FACT_WORKER_ENABLED=false`, so once revision 10 (the
+   [worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled)
+   revision) serves, rolling back to 9 would also turn the worker off. Once
+   revision 10 has served, been verified and the observation of the worker
+   (step 5 of the flag procedure) has closed, and **before** the
+   [image bump](#the-image-bump-app_image_override) is deployed, edit the
+   manifest field to `revision: 10`,
+   `effective_after: worker_flag_revision_10_serving_verified_and_observation_closed`,
+   with no `repin` block (a reviewed change; the planner refuses any other
+   value and allows no pin after 10, and 8 to 10 is not a move). Revision 9
+   then validates only with its `repin` note naming revision 10
+   (`before: app_image_bump_deployment`, a `why` naming
+   `BILLING_FACT_WORKER_ENABLED`). `plan` reports `rollback_target` =
+   revision 10 and checks it as above; unless the manifest pins revision 10
+   with no pending re-pin, it reports the gate block
+   `rollback_target_not_repinned_before_image_bump` on `service_deployment`
+   for a proposed or registered image bump, and for a serving one when
+   revision 9 is pinned (an image other than revision 9's bridge digest).
+   With revision 8 pinned a serving image bump is not detected: revision 8
+   runs a tag, with no digest to compare with, and the documented order
+   never produces that state. Revision 10 is
+   `arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:10`,
+   revision 9 with the flag `true` on the same bridge image digest.
+
+   **Merge condition of the re-pin (9 to 10).** The manifest edit above
+   merges only after revision 10's observation has closed: **6 hours after
+   its deployment completed (2026-10-25 01:51 UTC), so at 2026-10-25
+   07:51 UTC**, and before the image bump is deployed. The observation closes
+   only if, over the whole period, the revision 10 tasks logged 8
+   `billing fact worker started` lines and no `billing fact worker tick
+   failed`, no `billing fact acknowledgement overdue` and no ERROR line, and
+   the service stayed 2/2 healthy with no task restart, no 5xx and no
+   unhealthy target. The orchestrator makes the final check at 07:51 UTC and
+   records it, with the actual closing time, in the marker
+   `closed_at: <filled in at merge>` of the manifest comment on
+   `rollback_target` before the merge, replacing the placeholder in the
+   exact form `# closed_at: YYYY-MM-DDTHH:MMZ` (UTC, at or after
+   2026-10-25T07:51Z; the field name `effective_after` stays). Merging
+   earlier would make revision 10 the only way back before its observation
+   has shown it safe.
+
+   The checks, over the whole period (`$DEPLOY_START_MS` as in step 5 of the
+   flag procedure, `$CLOSE_MS` the closing time in epoch milliseconds):
+
+   ```bash
+   for pattern in '"billing fact worker started"' \
+                  '"billing fact worker tick failed"' \
+                  '"billing fact acknowledgement overdue"' \
+                  'ERROR'; do
+     aws logs filter-log-events --region us-east-1 \
+       --log-group-name /ecs/neurostack-staging/app \
+       --start-time "$DEPLOY_START_MS" --end-time "$CLOSE_MS" \
+       --filter-pattern "$pattern"
+   done
+   ```
+
+   Expected: 8 events for the first pattern, none for the other three. 5xx
+   and unhealthy targets come from the ALB metrics of the service's target
+   group (`AWS/ApplicationELB`, dimensions `TargetGroup` and `LoadBalancer`
+   as `DescribeTargetGroups` gives them):
+
+   ```bash
+   for metric in HTTPCode_Target_5XX_Count UnHealthyHostCount; do
+     aws cloudwatch get-metric-statistics --region us-east-1 \
+       --namespace AWS/ApplicationELB --metric-name "$metric" \
+       --dimensions Name=TargetGroup,Value="$TG_DIMENSION" \
+                    Name=LoadBalancer,Value="$LB_DIMENSION" \
+       --start-time 2026-10-25T01:51:00Z --end-time "$CLOSE_ISO" \
+       --period 300 --statistics Sum Maximum
+   done
+   ```
+
+   Expected: `Sum` 0 for every period of `HTTPCode_Target_5XX_Count` and
+   `Maximum` 0 for every period of `UnHealthyHostCount`. No task restart:
+   `aws ecs describe-services` shows `runningCount` 2 on revision 10 with
+   no task-stopped or task-started event in `events` after the deployment
+   completed.
 
    What the current image does with the D3 names (not verified for the image
    itself): it was pushed on 2026-10-14, and commit `55651b58` on
@@ -2339,12 +2579,24 @@ and a new binary to the image supply chain.
 - **Re-pinning after later deployments.** The manifest and the planner pin
   revision 8 as the D3 source (`task_definition.source_revision`, fixed). The
   rollback target is the separate manifest field `rollback_target`, which the
-  planner reads; its only allowed move is 8 to 9 (gate 6). Once a revision
-  other than 8 or the D3 rendering serves (for example after the
-  signed-image gate), `plan` reports `service_not_on_rollback_target:<ARN>`
-  for the D3 step (the reason ID is historical: it names the D3 source). A
-  later re-pin is a reviewed change to `ROLLBACK_TARGET_PINS` in the planner
-  and to the manifest field.
+  planner reads; its only allowed moves are 8 to 9 (gate 6) and then 9 to 10
+  (before the image bump), and 10 is the last pin. From a serving registered
+  D3 revision, `plan` proposes a new revision only for the worker flag alone
+  or for the app image digest alone
+  ([the image bump](#the-image-bump-app_image_override)). When any other
+  revision serves (for example after the signed-image gate), `plan` reports
+  `service_not_on_rollback_target:<ARN>` for the D3 step (the reason ID is
+  historical: it names the D3 source). A later re-pin (for example to the
+  image bump revision once it has served; images older than the E5 release
+  cannot delete a builder after migration 037, see "Rollback target" under
+  migration 037. Operator evidence, not checked from this repository: the
+  bridge image was built from commit `67b9b51c` (digest
+  `sha256:18358ce7…`, recorded in the wish), migration 037 was applied on
+  2026-10-24, and revisions 9 and 10, on that image, have served on the
+  037 schema since then according to the operator's readbacks)
+  is a reviewed change to `ROLLBACK_TARGET_PINS` in the planner, to the
+  manifest field and to `rollback_target_revision` of windows `036` and
+  `037` in `scripts/asaas_migration_window.py`.
 - **Terraform drift (owner or infra question).** The execution role and the
   task definition family were tagged `ManagedBy=terraform`. Owner approval A4
   (2026-10-19) moves the two ECS roles to `ManagedBy=manual`. Every new

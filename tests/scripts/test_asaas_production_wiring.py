@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+import datetime
 import json
 import os
 import re
@@ -763,8 +764,9 @@ def _plan(
     parameters = _validated(**changes)
     # The fixture world is the D3 world of 2026-10-18 (the service on revision
     # 8, revision 9 not yet registered), planned against the manifest of that
-    # time: rollback_target 8 with its re-pin note. The reviewed manifest is
-    # re-pinned to 9 since; the T2 tests below plan it against revision 9.
+    # time: rollback_target 8 with its re-pin note. The reviewed manifest has
+    # been re-pinned since (8 to 9, then 9 to 10); the tests below that plan
+    # the later states pass the pins they need (_worker_pins).
     pins = pins if pins is not None else _initial_pins()
     aws = wiring.ReadOnlyAws(fake.transport)
     readback = wiring.collect_readback(aws, parameters, pins=pins)
@@ -1836,8 +1838,8 @@ def test_unknown_parameter_is_rejected() -> None:
 def test_manifest_and_template_validate() -> None:
     manifest, parameters, digests = wiring.load_inputs(MANIFEST, PARAMS)
     assert manifest["rollback_target"] == {
-        "revision": 9,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+        "revision": 10,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
     }
     assert "rollback_task_definition_revision" not in manifest["target"]
     assert parameters is not None
@@ -2730,7 +2732,8 @@ def test_manifest_validator_pins_the_managed_by_override(value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T2: the rollback target is a manifest field, re-pinned 8 -> 9 before 036
+# T2: the rollback target is a manifest field, re-pinned 8 -> 9 before 036,
+# then 9 -> 10 before the image bump is deployed
 # ---------------------------------------------------------------------------
 
 
@@ -2741,23 +2744,55 @@ LIVE_REVISION_9_IMAGE = (
 )
 
 
-def test_rollback_target_is_re_pinned_to_revision_9_without_a_note() -> None:
-    """The reviewed manifest after the re-pin: revision 9, no ``repin`` block."""
+def test_rollback_target_is_re_pinned_to_revision_10_without_a_note() -> None:
+    """The reviewed manifest after the second re-pin: revision 10, no note."""
 
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 9,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+        "revision": 10,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
     }
+    assert wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG == (
+        "worker_flag_revision_10_serving_verified_and_observation_closed"
+    )
     manifest = wiring.validate_manifest(raw)
     assert "repin" not in manifest["rollback_target"]
     pins = _pins()
+    assert pins.rollback_revision == wiring.WORKER_FLAG_REVISION == 10
+    assert pins.rollback_task_definition_arn == REVISION_10_ARN
+    assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG
+    assert pins.rollback_repin_before is None
+    # The D3 source stays revision 8: the re-pins move only the rollback target.
+    assert manifest["task_definition"]["source_revision"] == 8
+    # The pins form one chain, 8 -> 9 -> 10, and 10 is the last.
+    assert wiring.ROLLBACK_TARGET_PINS == {
+        8: (
+            wiring.ROLLBACK_EFFECTIVE_INITIAL,
+            (9, wiring.ROLLBACK_EFFECTIVE_BRIDGE, "migration_036"),
+        ),
+        9: (
+            wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+            (10, wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG, "app_image_bump_deployment"),
+        ),
+        10: (wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG, None),
+    }
+
+
+def test_revision_9_is_a_pin_with_its_pending_re_pin_to_10() -> None:
+    """Revision 9 still validates, but only with its note naming 10."""
+
+    pins = _worker_pins(9)
     assert pins.rollback_revision == wiring.BRIDGE_REVISION == 9
     assert pins.rollback_task_definition_arn == NEXT_ARN
     assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_BRIDGE
-    assert pins.rollback_repin_before is None
-    # The D3 source stays revision 8: the re-pin moves only the rollback target.
-    assert manifest["task_definition"]["source_revision"] == 8
+    assert pins.rollback_repin_before == "app_image_bump_deployment"
+    manifest = wiring.load_yaml(MANIFEST)
+    manifest["rollback_target"] = {
+        "revision": 9,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+    }
+    with pytest.raises(wiring.WiringError, match="manifest_rollback_target_invalid"):
+        wiring.validate_manifest(manifest)
 
 
 def test_the_manifest_before_the_re_pin_still_validates() -> None:
@@ -2768,9 +2803,9 @@ def test_the_manifest_before_the_re_pin_still_validates() -> None:
 
 
 def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
-    pins = _pins()
+    pins = _worker_pins(9)
     assert pins.rollback_revision == 9
-    assert pins.rollback_repin_before is None
+    assert pins.rollback_repin_before == "app_image_bump_deployment"
     fake = FakeAws(applied=True)
     _plan_result, rendered = _plan(fake, app_image_override=OVERRIDE_IMAGE)
     assert rendered is not None
@@ -2798,7 +2833,9 @@ def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
     assert plan["target"]["rollback_target"] == NEXT_ARN
     deployment = _step(plan, "service_deployment")
     assert deployment["info"]["rollback_target"] == NEXT_ARN
-    assert deployment["info"]["rollback_target_must_repin_before"] is None
+    assert deployment["info"]["rollback_target_must_repin_before"] == (
+        "app_image_bump_deployment"
+    )
     assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
     # The D3 source stays revision 8: revision 9 is still derived from it.
     assert plan["task_definition_diff"]["source_task_definition_arn"] == SOURCE_ARN
@@ -2823,17 +2860,18 @@ def test_repinned_rollback_target_must_be_active_and_digest_pinned(
 ) -> None:
     fake = FakeAws(applied=True)
     target = _task_definition(
-        NEXT_ARN, image=changes.get("image", LIVE_REVISION_9_IMAGE)
+        REVISION_10_ARN, image=changes.get("image", LIVE_REVISION_9_IMAGE)
     )
     if "status" in changes:
         target["taskDefinition"]["status"] = changes["status"]
     fake.put(
         "ecs",
         "DescribeTaskDefinition",
-        {"taskDefinition": "neurostack-staging-app:9", "include": ["TAGS"]},
+        {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
         target,
     )
     plan, _rendered = _plan(fake, pins=_pins())
+    assert plan["target"]["rollback_target"] == REVISION_10_ARN
     deployment = _step(plan, "service_deployment")
     if reason is None:
         assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
@@ -2851,7 +2889,8 @@ def _set_rollback(**values: Any) -> Callable[[dict[str, Any]], None]:
     [
         _set_rollback(revision=7),
         _set_rollback(revision=8),
-        _set_rollback(revision=10),
+        _set_rollback(revision=9),
+        _set_rollback(revision=11),
         _set_rollback(revision=True),
         _set_rollback(revision="9"),
         _set_rollback(effective_after="whenever"),
@@ -4088,8 +4127,9 @@ def test_the_same_window_and_purpose_on_another_image_is_never_reused(
 
 WORKER_FLAG = "BILLING_FACT_WORKER_ENABLED"
 REVISION_10_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":10"
-# Both rollback targets the manifest may hold, set explicitly: these tests do
-# not depend on which one the reviewed manifest carries.
+# Every rollback target the manifest may hold, set explicitly: these tests do
+# not depend on which one the reviewed manifest carries. Revision 9 names its
+# pending re-pin to 10 (before the image bump is deployed).
 WORKER_ROLLBACK_TARGETS: dict[int, dict[str, Any]] = {
     8: {
         "revision": 8,
@@ -4101,7 +4141,20 @@ WORKER_ROLLBACK_TARGETS: dict[int, dict[str, Any]] = {
             "why": "Revision 8 reads legacy columns that migration 036 drops.",
         },
     },
-    9: {"revision": 9, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
+    9: {
+        "revision": 9,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+        "repin": {
+            "revision": 10,
+            "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
+            "before": "app_image_bump_deployment",
+            "why": (
+                "Revision 9 carries BILLING_FACT_WORKER_ENABLED 'false': a"
+                " rollback to it from the image bump would turn the worker off."
+            ),
+        },
+    },
+    10: {"revision": 10, "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG},
 }
 # stdout of render-taskdef and check BEFORE the flag became a parameter (the
 # literal 'false', main a42754cd), in the D3 world (service on 8) and in the
@@ -4270,6 +4323,9 @@ WORKER_FLAG_CONFIGURATION = ROOT / "docs/configuration.md"
 # Statements of the repository value from before E7-B1; none may come back
 # while the repository says 'true'.
 RETIRED_WORKER_FLAG_STATEMENTS = (
+    # Untrue since revision 10 ('true') was deployed on 2026-10-25.
+    "the worker is not on in production",
+    "steps 2 to 6 are not done",
     "keeps_the_outbox_worker_off",
     "The repository keeps `'false'`",
     "the repository keeps 'false'",
@@ -4332,9 +4388,10 @@ def _in_order(text: str, steps: list[str]) -> None:
 
 
 def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
-    """The docs follow the pin: the repository says 'true', production does not
-    yet, and the next steps are in order. The PR that turns the worker off
-    again changes this test with the pin test."""
+    """The docs follow the pin: the repository says 'true', revision 10 with
+    'true' was registered and deployed on 2026-10-25, and the steps are in
+    order. The PR that turns the worker off again changes this test with the
+    pin test."""
 
     assert wiring.validate_parameters(wiring.load_yaml(PARAMS))[WORKER_FLAG] == "true"
     for path in (
@@ -4362,10 +4419,19 @@ def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
         "**The repository says `'true'` since E7-B1**, the reviewed PR that"
         " turned the repository parameter on deliberately.",
         "`test_the_repository_turns_the_outbox_worker_on`",
-        "**the worker is not on in production**",
+        "**Revision 10, with the flag `true`, was registered and deployed on"
+        " 2026-10-25** (deployment completed 01:51Z, 8 `billing fact worker"
+        " started` lines, no tick failure)",
         "ECS assigns the number at registration (expected `:10`)",
-        "steps 2 to 6 are not done, and nothing here claims the flag is on in"
-        " production",
+        # Today's result against the live state (revision 10 serving).
+        "Today, against the live state (revision 10 serving) with the override"
+        " set to the bridge digest, `'true'` reports `status: compliant` with"
+        " `registered_and_deployed:<revision 10 ARN>`, and `'false'` reports"
+        " `status: ready` with one change, `replaces: <revision 10 ARN>` and"
+        " `worker_flag: {from: 'true', to: 'false'}`",
+        "Steps 2 to 4 were done on 2026-10-25: revision 10, with the flag"
+        " `true`, was registered and deployed (deployment completed 01:51Z, 8"
+        " `billing fact worker started` lines, no tick failure).",
         "The image does not change in this revision, and the E7 image is never"
         " part of it: the E7 image comes in a later revision of its own",
         "Recovery is an owner decision, carried out by the operator and never by"
@@ -4499,13 +4565,18 @@ def _repository_params_copy(directory: Path, flag: str | None) -> Path:
 def test_the_repository_parameters_propose_the_next_revision(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The repository file as it is (only the apply-time image set) and the
-    reviewed manifest, against the fixture of the live bridge state (revision 9
-    serving 'false'): plan proposes one new revision that flips the flag alone,
-    render-taskdef differs from the 'false' control rendering in that one
-    value, and check passes. Fails when the repository value is not 'true'."""
+    """The repository file as it is (only the apply-time image set), against
+    the fixture of the bridge state before revision 10 was registered
+    (revision 9 serving 'false') and the manifest of that state (rollback
+    target 9, its re-pin to 10 pending): plan proposes one new revision that
+    flips the flag alone, render-taskdef differs from the 'false' control
+    rendering in that one value, and check passes. Fails when the repository
+    value is not 'true'. The image bump from revision 10 is
+    test_the_repository_parameters_propose_the_image_bump."""
 
     snapshot = _bridge_world().snapshot(tmp_path / "readback.json")
+    manifest = tmp_path / "manifest-bridge.yaml"
+    manifest.write_text(yaml.safe_dump(_worker_manifest(9)), encoding="utf-8")
     outputs: dict[str, dict[str, str]] = {}
     for flag in ("true", "false"):
         # The 'true' run reads the repository's own flag line; only the
@@ -4521,7 +4592,7 @@ def test_the_repository_parameters_propose_the_next_revision(
                     "--readback-file",
                     str(snapshot),
                     "--manifest",
-                    str(MANIFEST),
+                    str(manifest),
                 ],
                 capsys,
             )
@@ -5097,3 +5168,865 @@ def test_check_manifest_accepts_the_reviewed_files(
     code, out, err = _run(["check-manifest", "--params", str(PARAMS)], capsys)
     assert code == 0, err
     assert json.loads(out)["status"] == "valid"
+
+
+# ---------------------------------------------------------------------------
+# The image bump: a new app image digest from a serving registered D3 revision
+# ---------------------------------------------------------------------------
+
+REGISTRY = f"{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com"
+STAGING_REPOSITORY = f"{REGISTRY}/neurostack-staging"
+BRIDGE_DIGEST = (
+    "sha256:18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24"
+)
+# The next image, pushed by image ID to the same repository (owner readback).
+NEW_DIGEST = "sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159"
+BRIDGE_IMAGE = f"{STAGING_REPOSITORY}@{BRIDGE_DIGEST}"
+NEW_IMAGE = f"{STAGING_REPOSITORY}@{NEW_DIGEST}"
+OTHER_DIGEST = "sha256:" + "3" * 64
+OTHER_IMAGE = f"{STAGING_REPOSITORY}@{OTHER_DIGEST}"
+
+
+def _with_images(fake: FakeAws) -> FakeAws:
+    """ECR knows the bridge, the new and one other digest of neurostack-staging."""
+
+    for digest in (BRIDGE_DIGEST, NEW_DIGEST, OTHER_DIGEST):
+        fake.put(
+            "ecr",
+            "DescribeImages",
+            {
+                "repositoryName": "neurostack-staging",
+                "imageIds": [{"imageDigest": digest}],
+            },
+            {"imageDetails": [{"imageDigest": digest}]},
+        )
+    return fake
+
+
+def _image_rendering(image: str, flag: str = "true") -> dict[str, Any]:
+    """The rendering of the D3 world with ``image`` and the flag ``flag``."""
+
+    _plan_result, rendered = _plan(
+        _with_images(FakeAws(applied=True)),
+        pins=_worker_pins(8),
+        app_image_override=image,
+        **{WORKER_FLAG: flag},
+    )
+    assert rendered is not None
+    return rendered
+
+
+def _image_world(serving: str, *revisions: tuple[str, str, str]) -> FakeAws:
+    """The service on ``serving``; each (ARN, image, flag) registered from its
+    rendering, the last one the newest registered revision."""
+
+    fake = _with_images(FakeAws(applied=True))
+    for index, (arn, image, flag) in enumerate(revisions):
+        _put_app_revision(
+            fake,
+            arn,
+            _registered_as(arn, _image_rendering(image, flag)),
+            latest=index == len(revisions) - 1,
+        )
+    _serve(fake, serving)
+    return fake
+
+
+# Live since the flag deploy: revision 9 (bridge, 'false'), revision 10
+# (bridge, 'true') serving and the newest.
+FLAG_REVISIONS = (
+    (NEXT_ARN, BRIDGE_IMAGE, "false"),
+    (REVISION_10_ARN, BRIDGE_IMAGE, "true"),
+)
+REVISION_12_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":12"
+
+
+def _live_flag_world() -> FakeAws:
+    return _image_world(REVISION_10_ARN, *FLAG_REVISIONS)
+
+
+def _image_plan(
+    fake: FakeAws, *, image: str | None = NEW_IMAGE, flag: str = "true", rollback: int
+) -> tuple[dict[str, Any], Any]:
+    return _plan(
+        fake,
+        pins=_worker_pins(rollback),
+        app_image_override=image,
+        **{WORKER_FLAG: flag},
+    )
+
+
+def _image_change(image_from: str, image_to: str) -> dict[str, str]:
+    return {
+        "repository": STAGING_REPOSITORY,
+        "from": image_from.split("@", 1)[1],
+        "to": image_to.split("@", 1)[1],
+    }
+
+
+@pytest.mark.parametrize("rollback", [8, 9, 10])
+def test_plan_on_revision_10_with_a_new_digest_proposes_an_image_bump(
+    rollback: int,
+) -> None:
+    fake = _live_flag_world()
+    plan, rendered = _image_plan(fake, rollback=rollback)
+    assert rendered is not None
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "ready", plan["blocks"]
+    assert step["state"] == "would_change" and step["blocks"] == []
+    assert plan["would_change"] == ["task_definition_revision:register_task_definition"]
+    assert step["changes"] == [
+        {
+            "action": "register_task_definition",
+            "family": "neurostack-staging-app",
+            "derived_from": SOURCE_ARN,
+            "replaces": REVISION_10_ARN,
+            "app_image": _image_change(BRIDGE_IMAGE, NEW_IMAGE),
+            "request_sha256": wiring._sha256(rendered),
+            "service_changes": "none (service_deployment is a separate gate)",
+        }
+    ]
+    assert wiring.renderable(plan, rendered) is rendered
+    # The rendering is revision 10 with the app image changed, nothing else.
+    revision_10 = wiring._request_from_response(
+        fake.get(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
+        )
+    )
+    assert evidence._container_map(revision_10)["app"]["image"] == BRIDGE_IMAGE
+    evidence._container_map(revision_10)["app"]["image"] = NEW_IMAGE
+    assert revision_10 == rendered
+    assert evidence._env_map(evidence._container_map(rendered)["app"])[WORKER_FLAG] == (
+        "true"
+    )
+    # Deploying it before the re-pin to 10 would leave revision 9 (the worker
+    # off) or 8 as the way back: a gate block unless the manifest pins 10.
+    gate = "rollback_target_not_repinned_before_image_bump"
+    assert (gate in _step(plan, "service_deployment")["blocks"]) == (rollback != 10)
+
+
+@pytest.mark.parametrize("rollback", [8, 9, 10])
+def test_a_registered_image_bump_is_reported_until_and_after_it_serves(
+    rollback: int,
+) -> None:
+    fake = _image_world(
+        REVISION_10_ARN, *FLAG_REVISIONS, (REVISION_11_ARN, NEW_IMAGE, "true")
+    )
+    fake.calls.clear()
+    plan, _rendered = _image_plan(fake, rollback=rollback)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert step["changes"] == [] and step["blocks"] == []
+    assert f"registered_not_deployed:{REVISION_11_ARN}" in step["compliant"]
+    assert step["info"]["registered_revision_changes_app_image"] == {
+        "serving": REVISION_10_ARN,
+        **_image_change(BRIDGE_IMAGE, NEW_IMAGE),
+    }
+    assert "registered_revision_changes_worker_flag" not in step["info"]
+    # The serving revision 10 is read exactly once (as the rollback target, or
+    # as the serving revision when the rollback target is 8 or 9).
+    ten = {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]}
+    assert [call[2] for call in fake.calls].count(ten) == 1
+    gate = "rollback_target_not_repinned_before_image_bump"
+    assert (gate in _step(plan, "service_deployment")["blocks"]) == (rollback != 10)
+
+    _serve(fake, REVISION_11_ARN)
+    plan, _rendered = _image_plan(fake, rollback=rollback)
+    step = _step(plan, "task_definition_revision")
+    assert f"registered_and_deployed:{REVISION_11_ARN}" in step["compliant"]
+    deployment = _step(plan, "service_deployment")
+    if rollback == 9:
+        # Deployed while the manifest still pins 9 with its note: the way
+        # back would turn the worker off, so the deployment gate still blocks.
+        assert gate in deployment["blocks"]
+    elif rollback == 10:
+        assert plan["status"] == "compliant"
+        assert gate not in deployment["blocks"]
+    if rollback == 10:
+        # Once 11 serves, the way back is revision 10.
+        assert plan["target"]["rollback_target"] == REVISION_10_ARN
+        assert deployment["info"]["rollback_target"] == REVISION_10_ARN
+        assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
+
+    # Rolled back to revision 10 with the override unchanged: 11 is again
+    # registered, not deployed.
+    _serve(fake, REVISION_10_ARN)
+    plan, _rendered = _image_plan(fake, rollback=rollback)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "compliant"
+    assert f"registered_not_deployed:{REVISION_11_ARN}" in step["compliant"]
+
+
+def test_the_worker_flag_branches_still_work_from_revision_11() -> None:
+    """Rollback target 10, service on the image bump revision 11."""
+
+    fake = _image_world(
+        REVISION_11_ARN, *FLAG_REVISIONS, (REVISION_11_ARN, NEW_IMAGE, "true")
+    )
+    plan, rendered = _image_plan(fake, flag="false", rollback=10)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "ready", plan["blocks"]
+    [change] = step["changes"]
+    assert change["replaces"] == REVISION_11_ARN
+    assert change["worker_flag"] == {"name": WORKER_FLAG, "from": "true", "to": "false"}
+    assert "app_image" not in change
+    assert evidence._container_map(rendered)["app"]["image"] == NEW_IMAGE
+
+    # Registered as 12 while 11 serves: registered, not deployed (11 is read).
+    _put_app_revision(
+        fake, REVISION_12_ARN, _registered_as(REVISION_12_ARN, rendered), latest=True
+    )
+    fake.calls.clear()
+    plan, _rendered = _image_plan(fake, flag="false", rollback=10)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert f"registered_not_deployed:{REVISION_12_ARN}" in step["compliant"]
+    assert step["info"]["registered_revision_changes_worker_flag"] == {
+        "serving": REVISION_11_ARN,
+        "from": "true",
+        "to": "false",
+    }
+    eleven = {"taskDefinition": "neurostack-staging-app:11", "include": ["TAGS"]}
+    assert [call[2] for call in fake.calls].count(eleven) == 1
+
+    # The parameter back to 'true' with 12 abandoned: the flag's stuck state.
+    plan, _rendered = _image_plan(fake, flag="true", rollback=10)
+    assert _step(plan, "task_definition_revision")["blocks"] == [
+        f"newest_revision_differs_only_in_worker_flag:{REVISION_12_ARN}"
+    ]
+
+
+# (serving, newest registered (image, flag), rendered image): the image bump
+# abandoned or rolled back with the override set back to the bridge digest,
+# and an unwanted image registered while another one is rendered.
+IMAGE_STUCK_STATES = [
+    (REVISION_10_ARN, (NEW_IMAGE, "true"), BRIDGE_IMAGE),
+    (REVISION_10_ARN, (OTHER_IMAGE, "true"), NEW_IMAGE),
+]
+
+
+@pytest.mark.parametrize("rollback", [9, 10])
+@pytest.mark.parametrize("serving,newest,image", IMAGE_STUCK_STATES)
+def test_a_newest_revision_differing_only_in_the_image_blocks_under_its_own_name(
+    serving: str, newest: tuple[str, str], image: str, rollback: int
+) -> None:
+    fake = _image_world(serving, *FLAG_REVISIONS, (REVISION_11_ARN, *newest))
+    plan, _rendered = _image_plan(fake, image=image, rollback=rollback)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert step["blocks"] == [
+        f"newest_revision_differs_only_in_app_image:{REVISION_11_ARN}"
+    ]
+    assert step["changes"] == []
+    assert not any(item.startswith("registered_") for item in step["compliant"])
+    assert step["info"]["newest_revision_app_image"] == {
+        "newest": REVISION_11_ARN,
+        "repository": STAGING_REPOSITORY,
+        "newest_digest": newest[0].split("@", 1)[1],
+        "rendered_digest": image.split("@", 1)[1],
+        "serving": serving,
+    }
+    assert "deregister" not in json.dumps(plan).lower()
+
+
+def test_render_taskdef_refuses_the_image_stuck_state_with_its_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _image_world(
+        REVISION_10_ARN, *FLAG_REVISIONS, (REVISION_11_ARN, NEW_IMAGE, "true")
+    )
+    raw = _parameters(app_image_override=BRIDGE_IMAGE)
+    params = tmp_path / "params.yaml"
+    params.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    args = [
+        "--params",
+        str(params),
+        "--readback-file",
+        str(fake.snapshot(tmp_path / "readback.json")),
+        "--manifest",
+        str(MANIFEST),
+    ]
+    for command in ("render-taskdef", "check"):
+        code, out, err = _run([command, *args], capsys)
+        assert code == 2 and out == ""
+        assert (
+            "blocked: plan_blocked:"
+            f"newest_revision_differs_only_in_app_image:{REVISION_11_ARN}" in err
+        )
+
+
+def _app_of(response: dict[str, Any]) -> dict[str, Any]:
+    return evidence._container_map(response["taskDefinition"])["app"]
+
+
+# Anything on revision 10 besides its app image: never an image bump.
+IMAGE_BUMP_REFUSALS: dict[str, Callable[[dict[str, Any]], None]] = {
+    **REVISION_9_DRIFTS,
+    "image_in_another_repository": lambda r: _app_of(r).__setitem__(
+        "image", BRIDGE_IMAGE.replace("/neurostack-staging@", "/neurostack-other@")
+    ),
+    "image_by_tag_and_digest": lambda r: _app_of(r).__setitem__(
+        "image", BRIDGE_IMAGE.replace("@", ":bridge@")
+    ),
+    "image_digest_malformed": lambda r: _app_of(r).__setitem__(
+        "image", f"{STAGING_REPOSITORY}@sha256:{BRIDGE_DIGEST[7:].upper()}"
+    ),
+    "image_and_worker_flag_together": _drift(WORKER_FLAG, "false"),
+    "secret_reference": lambda r: _app_of(r)["secrets"][-1].__setitem__(
+        "valueFrom", SECRET_PREFIX + "billing-observability-smoke-token-ZzZ999"
+    ),
+    "task_role": lambda r: r["taskDefinition"].__setitem__(
+        "taskRoleArn", evidence.TASK_ROLE_ARN + "-other"
+    ),
+    "app_command": lambda r: _app_of(r).__setitem__("command", ["sh"]),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(IMAGE_BUMP_REFUSALS))
+def test_only_an_image_digest_difference_becomes_an_image_bump(refusal: str) -> None:
+    fake = _live_flag_world()
+    revision_10 = fake.get(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
+    )
+    IMAGE_BUMP_REFUSALS[refusal](revision_10)
+    _put_app_revision(fake, REVISION_10_ARN, revision_10, latest=True)
+    plan, _rendered = _image_plan(fake, rollback=10)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert step["changes"] == []
+    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_10_ARN}"]
+    assert "rollback_target_not_repinned_before_image_bump" not in (
+        _step(plan, "service_deployment")["blocks"]
+    )
+    # Serving that drifted revision 10 while the new rendering is registered
+    # as revision 11 is not "registered, not deployed" either.
+    _put_app_revision(
+        fake,
+        REVISION_11_ARN,
+        _registered_as(REVISION_11_ARN, _image_rendering(NEW_IMAGE)),
+        latest=True,
+    )
+    plan, _rendered = _image_plan(fake, rollback=10)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert not any(item.startswith("registered_") for item in step["compliant"])
+
+
+def test_a_rendering_by_tag_is_never_an_image_bump() -> None:
+    """Without app_image_override the rendering keeps revision 8's tag."""
+
+    plan, _rendered = _image_plan(_live_flag_world(), image=None, rollback=10)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert step["changes"] == []
+    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_10_ARN}"]
+
+
+def test_app_image_change_is_exactly_one_digest_move() -> None:
+    bridge = _image_rendering(BRIDGE_IMAGE)
+    new = _image_rendering(NEW_IMAGE)
+    assert wiring.app_image_change(_registered_as(REVISION_10_ARN, bridge), new) == (
+        BRIDGE_IMAGE,
+        NEW_IMAGE,
+    )
+    assert wiring.app_image_change(_registered_as(REVISION_11_ARN, new), bridge) == (
+        NEW_IMAGE,
+        BRIDGE_IMAGE,
+    )
+    assert wiring.app_image_change(_registered_as(REVISION_10_ARN, new), new) is None
+    flag_off = _image_rendering(NEW_IMAGE, "false")
+    assert (
+        wiring.app_image_change(_registered_as(REVISION_10_ARN, bridge), flag_off)
+        is None
+    )
+    tagged = copy.deepcopy(new)
+    evidence._container_map(tagged)["app"]["image"] = LIVE_IMAGE
+    assert (
+        wiring.app_image_change(_registered_as(REVISION_10_ARN, bridge), tagged) is None
+    )
+    assert wiring.app_image_change(_registered_as(REVISION_10_ARN, tagged), new) is None
+    other = copy.deepcopy(new)
+    evidence._container_map(other)["app"]["image"] = NEW_IMAGE.replace(
+        "/neurostack-staging@", "/neurostack-other@"
+    )
+    assert (
+        wiring.app_image_change(_registered_as(REVISION_10_ARN, bridge), other) is None
+    )
+    assert wiring.app_image_change({"taskDefinition": "x"}, new) is None
+
+
+@pytest.mark.parametrize(
+    "rendered_image",
+    [
+        NEW_IMAGE.replace("@", ":next@"),
+        f"{STAGING_REPOSITORY}@sha256:{NEW_DIGEST[7:].upper()}",
+    ],
+)
+def test_app_image_change_requires_a_rendered_digest_without_tag(
+    rendered_image: str,
+) -> None:
+    """The rendered side is validated like the registered one."""
+
+    bridge = _image_rendering(BRIDGE_IMAGE)
+    rendered = copy.deepcopy(bridge)
+    evidence._container_map(rendered)["app"]["image"] = rendered_image
+    assert (
+        wiring.app_image_change(_registered_as(REVISION_10_ARN, bridge), rendered)
+        is None
+    )
+
+
+def test_a_drifted_serving_revision_is_never_the_image_stuck_state() -> None:
+    """The newest revision differs from the rendering in the image alone, but
+    the serving revision 10 differs from it in more than the image: not the
+    stuck state, the service is off its known revisions."""
+
+    fake = _image_world(
+        REVISION_10_ARN, *FLAG_REVISIONS, (REVISION_11_ARN, NEW_IMAGE, "true")
+    )
+    revision_10 = fake.get(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
+    )
+    _app_of(revision_10)["command"] = ["sh"]
+    _put_app_revision(fake, REVISION_10_ARN, revision_10, latest=False)
+    plan, _rendered = _image_plan(fake, image=BRIDGE_IMAGE, rollback=10)
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "blocked"
+    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_10_ARN}"]
+    assert "newest_revision_app_image" not in step["info"]
+
+
+def test_only_rollback_target_10_without_a_note_clears_the_image_bump_gate() -> None:
+    """The validator never accepts revision 10 with a re-pin note; the gate
+    still requires the good state itself, not the validator."""
+
+    pins = dataclasses.replace(
+        _worker_pins(10), rollback_repin_before=wiring.ROLLBACK_REPIN_BEFORE_IMAGE_BUMP
+    )
+    plan, _rendered = _plan(
+        _live_flag_world(),
+        pins=pins,
+        app_image_override=NEW_IMAGE,
+        **{WORKER_FLAG: "true"},
+    )
+    assert "rollback_target_not_repinned_before_image_bump" in (
+        _step(plan, "service_deployment")["blocks"]
+    )
+
+
+def test_the_live_state_before_the_re_pin_never_reports_the_image_bump_gate() -> None:
+    """Revision 10 serves the bridge image, the manifest is still at 9 with its
+    note and the override is the bridge digest: no image bump, so no gate
+    (revision 10 and the rollback target 9 run the same image)."""
+
+    plan, _rendered = _image_plan(_live_flag_world(), image=BRIDGE_IMAGE, rollback=9)
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert (
+        f"registered_and_deployed:{REVISION_10_ARN}"
+        in _step(plan, "task_definition_revision")["compliant"]
+    )
+    gate = "rollback_target_not_repinned_before_image_bump"
+    assert gate not in _step(plan, "service_deployment")["blocks"]
+    assert gate not in [row["reason"] for row in plan["gate_blocks"]]
+
+
+@pytest.mark.parametrize("rollback", [9, 10])
+def test_a_serving_image_from_another_repository_is_gated_like_a_bump(
+    rollback: int,
+) -> None:
+    """Revision 11, registered and deployed outside the planner with an app
+    image in another repository: with rollback target 9 the gate blocks, with
+    10 it does not."""
+
+    digest = "sha256:" + "4" * 64
+    image = f"{REGISTRY}/neurostack-other@{digest}"
+    fake = _image_world(REVISION_10_ARN, *FLAG_REVISIONS)
+    fake.put(
+        "ecr",
+        "DescribeImages",
+        {"repositoryName": "neurostack-other", "imageIds": [{"imageDigest": digest}]},
+        {"imageDetails": [{"imageDigest": digest}]},
+    )
+    _plan_result, rendered = _image_plan(fake, image=image, rollback=rollback)
+    assert rendered is not None
+    _put_app_revision(
+        fake, REVISION_11_ARN, _registered_as(REVISION_11_ARN, rendered), latest=True
+    )
+    _serve(fake, REVISION_11_ARN)
+    plan, _rendered = _image_plan(fake, image=image, rollback=rollback)
+    assert (
+        f"registered_and_deployed:{REVISION_11_ARN}"
+        in _step(plan, "task_definition_revision")["compliant"]
+    )
+    gate = "rollback_target_not_repinned_before_image_bump"
+    assert (gate in _step(plan, "service_deployment")["blocks"]) == (rollback == 9)
+
+
+def test_a_flag_change_never_reports_the_image_bump_gate() -> None:
+    """The pending 9 -> 10 re-pin only gates an image bump's deploy."""
+
+    plan, _rendered = _bridge_plan("true", rollback=9)
+    assert plan["status"] == "ready"
+    assert "rollback_target_not_repinned_before_image_bump" not in (
+        _step(plan, "service_deployment")["blocks"]
+    )
+
+
+def test_the_rollback_target_may_be_re_pinned_from_9_to_10_only() -> None:
+    for revision in (8, 9, 10):
+        wiring.validate_manifest(_worker_manifest(revision))
+    flag = wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG
+    note_to_10 = copy.deepcopy(WORKER_ROLLBACK_TARGETS[9]["repin"])
+    invalid: list[dict[str, Any]] = [
+        # 10 is the last pin: no re-pin from it, no revision after it.
+        {**WORKER_ROLLBACK_TARGETS[10], "repin": {**note_to_10, "revision": 11}},
+        {"revision": 11, "effective_after": flag},
+        {"revision": 10, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
+        # No skipping: 8 re-pins to 9 only, 9 to 10 only.
+        {**WORKER_ROLLBACK_TARGETS[8], "repin": note_to_10},
+        {"revision": 8, "effective_after": flag},
+        {**WORKER_ROLLBACK_TARGETS[9], "repin": {**note_to_10, "revision": 11}},
+        # The 9 -> 10 note names its own step and the flag it protects.
+        {
+            **WORKER_ROLLBACK_TARGETS[9],
+            "repin": {**note_to_10, "before": "migration_036"},
+        },
+        {
+            **WORKER_ROLLBACK_TARGETS[9],
+            "repin": {**note_to_10, "why": "Revision 8 reads columns 036 drops."},
+        },
+        {
+            **WORKER_ROLLBACK_TARGETS[9],
+            "repin": {
+                **note_to_10,
+                "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+            },
+        },
+        {"revision": 9, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
+    ]
+    for target in invalid:
+        manifest = wiring.load_yaml(MANIFEST)
+        manifest["rollback_target"] = copy.deepcopy(target)
+        with pytest.raises(
+            wiring.WiringError, match="manifest_rollback_target_invalid"
+        ):
+            wiring.validate_manifest(manifest)
+
+
+def _repository_params_with_image(directory: Path, image: str) -> Path:
+    """The operator's local copy of the repository file with only
+    app_image_override set (the flag line is the repository's own)."""
+
+    text = PARAMS.read_text(encoding="utf-8")
+    line = re.compile(r"^  app_image_override: null$", re.MULTILINE)
+    assert len(line.findall(text)) == 1
+    path = directory / f"params-{image.rsplit(':', 1)[1][:12]}.yaml"
+    path.write_text(line.sub(f"  app_image_override: {image}", text), encoding="utf-8")
+    return path
+
+
+def test_the_repository_parameters_propose_the_image_bump(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The live state (revision 10 serving the bridge image with 'true', the
+    newest), the reviewed manifest (rollback target 10) and the repository
+    file with only the apply-time image set to the new digest: plan proposes
+    one new revision whose only difference from revision 10 is the app image,
+    render-taskdef prints it and check passes. With the bridge digest instead,
+    revision 10 is registered and deployed."""
+
+    fake = _live_flag_world()
+    snapshot = fake.snapshot(tmp_path / "readback.json")
+    outputs: dict[str, dict[str, str]] = {}
+    for image in (NEW_IMAGE, BRIDGE_IMAGE):
+        params = _repository_params_with_image(tmp_path, image)
+        outputs[image] = {}
+        for command in ("plan", "render-taskdef", "check"):
+            code, out, err = _run(
+                [
+                    command,
+                    "--params",
+                    str(params),
+                    "--readback-file",
+                    str(snapshot),
+                    "--manifest",
+                    str(MANIFEST),
+                ],
+                capsys,
+            )
+            assert code == 0, (image, command, err)
+            outputs[image][command] = out
+
+    plan = json.loads(outputs[NEW_IMAGE]["plan"])
+    step = _step(plan, "task_definition_revision")
+    assert plan["status"] == "ready"
+    assert plan["would_change"] == ["task_definition_revision:register_task_definition"]
+    assert plan["parameters"] == {
+        **plan["parameters"],
+        WORKER_FLAG: "true",
+        "app_image_override": NEW_IMAGE,
+    }
+    assert plan["target"]["rollback_target"] == REVISION_10_ARN
+    assert plan["target"]["current_task_definition"] == REVISION_10_ARN
+    assert step["state"] == "would_change" and step["blocks"] == []
+    [change] = step["changes"]
+    assert change["replaces"] == REVISION_10_ARN
+    assert change["app_image"] == {
+        "repository": STAGING_REPOSITORY,
+        "from": BRIDGE_DIGEST,
+        "to": NEW_DIGEST,
+    }
+    assert "worker_flag" not in change
+    assert change["service_changes"] == "none (service_deployment is a separate gate)"
+    rendered = json.loads(outputs[NEW_IMAGE]["render-taskdef"])
+    assert change["request_sha256"] == wiring._sha256(rendered)
+    deployment = _step(plan, "service_deployment")
+    assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
+    assert "rollback_target_not_repinned_before_image_bump" not in deployment["blocks"]
+
+    # The rendered request differs from revision 10 in the app image alone.
+    revision_10 = wiring._request_from_response(
+        fake.get(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
+        )
+    )
+    before = json.dumps(revision_10, indent=2, sort_keys=True).splitlines()
+    after = json.dumps(rendered, indent=2, sort_keys=True).splitlines()
+    assert [
+        (old.strip(), new.strip())
+        for old, new in zip(before, after, strict=True)
+        if old != new
+    ] == [(f'"image": "{BRIDGE_IMAGE}",', f'"image": "{NEW_IMAGE}",')]
+    check = json.loads(outputs[NEW_IMAGE]["check"])
+    assert check["status"] == "pass" and check["structural_status"] == "pass"
+    assert check["rendered_request_sha256"] == change["request_sha256"]
+
+    control = json.loads(outputs[BRIDGE_IMAGE]["plan"])
+    assert control["status"] == "compliant"
+    assert (
+        f"registered_and_deployed:{REVISION_10_ARN}"
+        in _step(control, "task_definition_revision")["compliant"]
+    )
+
+
+# Statements of the rollback target from before the 9 -> 10 re-pin; none may
+# come back while the manifest pins 10.
+RETIRED_ROLLBACK_STATEMENTS = (
+    "revision 9 is the last pin the planner allows",
+    "its only allowed move is 8 to 9",
+    "This is the final pin of the planner",
+    "rollback_target stays revision 9",
+    "re-pinned to revision 9, `ACTIVE`",
+    "`rollback_target` revision 9 with no pending re-pin",
+)
+
+
+# The observation of revision 10 closes 6 h after its deployment completed
+# (2026-10-25 01:51 UTC).
+REPIN_9_TO_10_EARLIEST_CLOSE = datetime.datetime(2026, 10, 25, 7, 51)
+
+
+def _closed_at_is_valid(value: str) -> bool:
+    """The manifest marker: the placeholder, or YYYY-MM-DDTHH:MMZ at or after
+    the earliest close."""
+
+    if value == "<filled in at merge>":
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z", value) is None:
+        return False
+    try:
+        closed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%MZ")
+    except ValueError:
+        return False
+    return closed >= REPIN_9_TO_10_EARLIEST_CLOSE
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ("<filled in at merge>", True),
+        ("2026-10-25T07:51Z", True),
+        ("2026-10-25T23:59Z", True),
+        ("2026-10-26T00:10Z", True),
+        ("2026-11-02T09:00Z", True),
+        ("2026-10-25T07:50Z", False),
+        ("2026-10-25T01:51Z", False),
+        ("2026-10-24T23:59Z", False),
+        ("2026-10-25T7:51Z", False),
+        ("2026-10-25T07:51", False),
+        ("2026-10-25 07:51Z", False),
+        ("2026-10-25T07:51:00Z", False),
+        ("2026-10-25T25:00Z", False),
+        ("<filled in later>", False),
+        ("", False),
+    ],
+)
+def test_the_closed_at_marker_accepts_only_a_close_at_or_after_07_51(
+    value: str, valid: bool
+) -> None:
+    assert _closed_at_is_valid(value) is valid
+
+
+def test_the_runbook_documents_the_image_bump() -> None:
+    runbook = _flat(WORKER_FLAG_RUNBOOK)
+    raw = WORKER_FLAG_RUNBOOK.read_text(encoding="utf-8")
+    assert "\n### The image bump (`app_image_override`)\n" in raw
+    assert (
+        raw.index("### The outbox worker flag")
+        < raw.index("### The image bump (`app_image_override`)")
+        < raw.index("### Ordered procedure")
+    )
+    assert "(#the-image-bump-app_image_override)" in runbook
+    section = _between(
+        runbook, "### The image bump (`app_image_override`)", "### Ordered procedure"
+    )
+    for phrase in (
+        "moves the service to a new application image and changes nothing else",
+        "It never carries a worker flag change: the flag and an image never share"
+        " a revision or a deploy (owner decision 2026-10-22)",
+        "Any other difference blocks (`service_not_on_rollback_target:<ARN>`): an"
+        " image by tag, an image in another repository, a malformed digest, and a"
+        " rendering that changes the image and the flag together.",
+        "`app_image_override` stays `null` in the repository",
+        "`replaces: <revision 10 ARN>`",
+        "`app_image: {repository, from: <bridge digest>, to: <new digest>}`, no"
+        " `worker_flag`",
+        "`registered_revision_changes_app_image` naming revision 10",
+        "`rollback_target` stays revision 10",
+        "**Rollback** is the service back to revision 10, the rollback target",
+        "No revision is registered for it",
+        "`newest_revision_differs_only_in_app_image:<newest ARN>`",
+        "Recovery is an owner decision, carried out by the operator and never by"
+        " these tools",
+        "`rollback_target_not_repinned_before_image_bump`",
+    ):
+        assert phrase in section, phrase
+    _in_order(
+        section,
+        [
+            "1. **Build and smoke.**",
+            "2. **Push by image ID.**",
+            "never rebuild for the push",
+            "3. **Verify the digest and the scan.**",
+            "describe-image-scan-findings",
+            "4. **Plan, render, check, register.**",
+            "Register it as revision 11 (`ManagedBy=manual`, by the operator)",
+            "5. **Database read, before the deploy.**",
+            "6. **Deploy** revision 11: the `service_deployment` gate (separate"
+            " owner approval)",
+            "7. **Post-deploy hook.**",
+            "8. **Observe.**",
+            "Take the database read again after the deploy and compare it with"
+            " the read of step 5",
+        ],
+    )
+    for phrase in (
+        # The template regeneration belongs to the protected path only.
+        "Step 6 of the flag procedure (regenerate the protected template from"
+        " revision 10 before the E7 image) applies only to a deploy through the"
+        " protected path. The manual image bump below is outside that path",
+        "The template was regenerated from revision 10 on 2026-10-25; once"
+        " revision 11 serves, it must be regenerated again, from revision 11,"
+        " before any later protected deploy.",
+        "or, when its image is the one wanted, set the override to its digest"
+        " and deploy it (step 6)",
+        "unless the manifest pins revision 10 with no pending re-pin, `plan` also"
+        " reports the gate block `rollback_target_not_repinned_before_image_bump`"
+        " on `service_deployment`",
+        "Deploy only when `plan` does not report"
+        " `rollback_target_not_repinned_before_image_bump`.",
+        "with revision 8 pinned there is no digest to compare with and no gate, a"
+        " state the documented order never produces",
+        "That reason names the serving revision (revision 10 here) and does not"
+        " say which fields differ",
+        "The flag code behaves the same.",
+        "Setting the override back to the bridge digest while revision 11 still"
+        " serves is not a rollback: `plan` then proposes a new revision (expected"
+        " `:12`) that replaces revision 11 and is identical to revision 10",
+    ):
+        assert phrase in section, phrase
+
+    repin = _between(
+        runbook,
+        "**Re-pinning the rollback target (9 to 10).**",
+        "What the current image does with the D3 names",
+    )
+    for phrase in (
+        f"`effective_after: {wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG}`",
+        f"(`before: {wiring.ROLLBACK_REPIN_BEFORE_IMAGE_BUMP}`",
+        "**before** the [image bump](#the-image-bump-app_image_override) is"
+        " deployed",
+        "allows no pin after 10, and 8 to 10 is not a move",
+        "**Merge condition of the re-pin (9 to 10).** The manifest edit above"
+        " merges only after revision 10's observation has closed: **6 hours after"
+        " its deployment completed (2026-10-25 01:51 UTC), so at 2026-10-25"
+        " 07:51 UTC**, and before the image bump is deployed.",
+        "8 `billing fact worker started` lines and no `billing fact worker tick"
+        " failed`, no `billing fact acknowledgement overdue` and no ERROR line,"
+        " and the service stayed 2/2 healthy with no task restart, no 5xx and no"
+        " unhealthy target.",
+        "The orchestrator makes the final check at 07:51 UTC and records it",
+        "and for a serving one when revision 9 is pinned",
+        "With revision 8 pinned a serving image bump is not detected",
+        '--filter-pattern "$pattern"',
+        "HTTPCode_Target_5XX_Count UnHealthyHostCount",
+    ):
+        assert phrase in repin, phrase
+    # The gate is stated in the steps, never in the stuck-state paragraph.
+    stuck = section[
+        section.index(
+            "**Newest revision differing only in the image (blocks, never green).**"
+        ) :
+    ]
+    assert "rollback_target_not_repinned_before_image_bump" not in stuck
+
+    # Comments read as prose: the markers that start each comment line go.
+    manifest_text = " ".join(
+        re.sub(r"^\s*#", "", line)
+        for line in MANIFEST.read_text(encoding="utf-8").splitlines()
+    )
+    manifest_text = " ".join(manifest_text.split())
+    for path, text in (
+        (WORKER_FLAG_RUNBOOK, runbook),
+        (MANIFEST, manifest_text),
+        (
+            ROOT / "docs/runbooks/asaas-rollback.md",
+            _flat(ROOT / "docs/runbooks/asaas-rollback.md"),
+        ),
+    ):
+        for retired in RETIRED_ROLLBACK_STATEMENTS:
+            assert retired not in text, (path.name, retired)
+    assert "Revision 10 is the final pin of the planner" in manifest_text
+    # The 9 -> 10 re-pin merges only after the 6 h observation closes; the
+    # orchestrator fills the actual closing time into this one marker before
+    # the merge (it is never invented here).
+    assert "so at 2026-10-25 07:51 UTC" in manifest_text
+    marker = re.compile(r"^# closed_at: (?P<value>.+)$", re.MULTILINE)
+    [value] = marker.findall(MANIFEST.read_text(encoding="utf-8"))
+    assert _closed_at_is_valid(value), value
+    for text in (manifest_text, runbook):
+        assert "closed_at: YYYY-MM-DDTHH:MMZ" in text
+    rollback_doc = _flat(ROOT / "docs/runbooks/asaas-rollback.md")
+    for text in (runbook, rollback_doc):
+        assert "2026-10-25 07:51 UTC" in text
+        assert "manifest marker `closed_at` before the merge" in text
+    # The new digest is an apply-time input: only tests name it.
+    for path in (
+        WORKER_FLAG_RUNBOOK,
+        WORKER_FLAG_CONFIGURATION,
+        ROOT / "docs/runbooks/asaas-rollback.md",
+        PARAMS,
+        MANIFEST,
+        SCRIPT,
+        ROOT / "scripts/asaas_migration_window.py",
+    ):
+        assert NEW_DIGEST[7:] not in path.read_text(encoding="utf-8"), path.name
+    assert "\n  app_image_override: null\n" in PARAMS.read_text(encoding="utf-8")

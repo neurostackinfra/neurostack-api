@@ -425,18 +425,24 @@ def test_runbook_state_section_is_the_live_run_of_2026_10_22() -> None:
         assert phrase in state, phrase
 
 
-def test_rollback_runbook_states_both_rollback_target_phases() -> None:
+def test_rollback_runbook_states_every_rollback_target_phase() -> None:
     text = " ".join(_text(ROLLBACK_RUNBOOK).split())
     for phrase in (
+        "It has three phases:",
         "**Until the re-pin is merged: revision 8**",
         "**After the re-pin is merged: revision 9**",
         "about **2026-10-23 18:30 UTC**",
+        "**After the second re-pin is merged: revision 10**",
+        "before the image bump (revision 11, a new app image digest) is deployed:"
+        " a rollback to revision 9 would also turn the worker off",
+        "Once revision 11 serves, the way back is revision 10",
         "**Revision 8 is unsafe after migration 036**: it reads columns 036 drops",
         "--task-definition neurostack-staging-app:R",
-        "`8` only until the re-pin is merged, `9` after it, and never `8` once"
-        " migration 036 has run",
+        "`8` only until the re-pin is merged, `9` after it, `10` after the second"
+        " re-pin, and never `8` once migration 036 has run",
     ):
         assert phrase in text, phrase
+    assert "It has two phases" not in text
     assert "Today it is `neurostack-staging-app:8`" not in text
     assert "--task-definition neurostack-staging-app:8" not in text
 

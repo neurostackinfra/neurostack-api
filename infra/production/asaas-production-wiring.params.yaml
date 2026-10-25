@@ -30,5 +30,8 @@ parameters:
   BILLING_FACT_WORKER_ENABLED: 'true'
   # null keeps the live app image reference exactly. A value must be an
   # immutable <account ECR repository URI>@sha256:<digest> that exists in ECR;
-  # building and attesting that image is a separate gate.
+  # building and attesting that image is a separate gate. It is an apply-time
+  # input: the operator plans from a local copy with it set. Another digest of
+  # the repository the service runs is the image bump
+  # (docs/runbooks/asaas-deployment.md, "The image bump").
   app_image_override: null
