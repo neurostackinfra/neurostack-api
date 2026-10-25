@@ -18,11 +18,16 @@ parameters:
   # The billing.fact.v1 outbox worker, rendered as the app environment value
   # BILLING_FACT_WORKER_ENABLED. Exactly the quoted string 'false' or 'true';
   # a YAML boolean (true, yes, on), any other spelling or a missing value fails
-  # the plan. The repository keeps 'false'. Turning the worker on (or off
-  # again) is a committed, reviewed PR that changes this line and the pin test
-  # test_the_repository_keeps_the_outbox_worker_off, then a new revision
-  # (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
-  BILLING_FACT_WORKER_ENABLED: 'false'
+  # the plan. The repository says 'true' since E7-B1, the reviewed PR that
+  # turned the repository parameter on deliberately (owner decision
+  # 2026-10-22: the flag first, on the bridge image, observed, then the E7
+  # image in a later revision of its own). Merging this line changes nothing live by itself: the new
+  # revision is planned, registered and deployed by the operator under its own
+  # approvals. Turning the worker off again is the same kind of PR: this line
+  # back to 'false' and the pin tests in
+  # tests/scripts/test_asaas_production_wiring.py changed with it, then a new
+  # revision (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
+  BILLING_FACT_WORKER_ENABLED: 'true'
   # null keeps the live app image reference exactly. A value must be an
   # immutable <account ECR repository URI>@sha256:<digest> that exists in ECR;
   # building and attesting that image is a separate gate.

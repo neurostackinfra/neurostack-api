@@ -774,14 +774,16 @@ restored guards refuse what they refused.
      bridge image, so the flag is turned on first, on the bridge image, as its
      own reviewed change and its own deploy: a new `neurostack-staging-app`
      revision tagged `ManagedBy=manual`, rendered by the planner from the
-     reviewed parameter `BILLING_FACT_WORKER_ENABLED` (`'false'` in the
-     repository) and registered by the operator. The procedure, from the
-     reviewed PR that sets the parameter to `'true'` to the deploy, is
+     reviewed parameter `BILLING_FACT_WORKER_ENABLED` (`'true'` in the
+     repository since the reviewed PR that turned the repository parameter
+     on, E7-B1; no registered revision carries `true` yet) and registered by
+     the operator. The procedure, from the reviewed PR that sets the
+     parameter to `'true'` to the deploy, is
      [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled).
      Evidence: `DescribeTaskDefinition` of the active revision shows
      `BILLING_FACT_WORKER_ENABLED=true`; then step 2.
-  2. **Observe the worker.** Before any E7 build: every task logs `billing
-     fact worker started`,
+  2. **Observe the worker.** Before any E7 build: every API process logs
+     `billing fact worker started` (8 lines, 4 per task × 2 tasks),
      `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
      advancing, and the outbox is empty (`neurostack_billing_fact_backlog` is
      `0` for every condition).
@@ -1210,7 +1212,7 @@ The reviewed artifacts are:
   and `ASAAS_WEBHOOK_NOTIFICATION_EMAIL=neurostack.infra@gmail.com`. To change
   one at apply time, edit this file, have it reviewed, and run `plan` again.
   It also holds `BILLING_FACT_WORKER_ENABLED`, the outbox worker flag:
-  exactly `'false'` (the repository value) or `'true'`, see
+  exactly `'true'` (the repository value since E7-B1) or `'false'`, see
   [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled).
 - `scripts/asaas_production_wiring.py`: the read-only planner.
 
@@ -1319,7 +1321,9 @@ secret, as a separate revision.
      `ASAAS_WEBHOOK_TOKEN`, `BILLING_OBSERVABILITY_SMOKE_TOKEN`;
    - environment: `ASAAS_WEBHOOK_URL`, `ASAAS_CHECKOUT_RETURN_URL`,
      `ASAAS_WEBHOOK_NOTIFICATION_EMAIL` and `BILLING_FACT_WORKER_ENABLED`
-     (the reviewed parameter; `false` for revision 9 and in the repository).
+     (the reviewed parameter; `false` for revision 9, `'true'` in the
+     repository since E7-B1, rendered as the next revision, expected `:10`,
+     by the flag procedure below).
 
    It never carries a name with a forbidden prefix (the legacy payment
    provider, or `APPCONFIG_`) and never sets `SPA_ENABLED` or `SPA_DIST_DIR`.
@@ -1340,33 +1344,59 @@ parameter of the same name in
 quoted string `'false'` or `'true'`. A YAML boolean (`true`, `yes`, `on`),
 any other spelling, surrounding whitespace or a missing value fails the plan
 before any AWS read (`parameter_invalid:` or
-`parameter_missing:BILLING_FACT_WORKER_ENABLED`). The repository keeps
-`'false'`, pinned by `test_the_repository_keeps_the_outbox_worker_off` (the
-only test that pins the value), so merging the wiring changes nothing live:
-with `'false'` the rendering is byte for byte what it was when the value was
-a constant. Against the live state, `plan` reports revision 9
-`registered_and_deployed` only when `app_image_override` is set to revision
-9's image (the bridge digest `sha256:18358ce7…`), as when revision 9 was
-rendered. With the repository's `null` the rendering keeps revision 8's
-tagged image, and `plan` blocks on the live state, as it did before this
-parameter existed.
+`parameter_missing:BILLING_FACT_WORKER_ENABLED`). **The repository says
+`'true'` since E7-B1**, the reviewed PR that turned the repository parameter
+on deliberately. `test_the_repository_turns_the_outbox_worker_on` pins the
+parameter and its rendering, and
+`test_the_docs_state_that_the_repository_turns_the_worker_on` pins these
+statements of it; the off PR changes both, and the live-state test
+`test_the_repository_parameters_propose_the_next_revision` too. Until E7-B1 the repository kept
+`'false'`, and with `'false'` the rendering is byte for byte what it was
+when the value was a constant. Merging the PR changes nothing live by
+itself: **the worker is not on in production** until the next revision is
+registered and deployed (steps 2 to 4 below); revisions 8 and 9 carry
+`false`. "Revision 10" below is that next revision of
+`neurostack-staging-app`: ECS assigns the number at registration (expected
+`:10`). Against the live state with the repository's `'true'`, `plan`
+proposes the next revision (expected `:10`, step 2) when
+`app_image_override` is set to revision 9's image (the bridge digest
+`sha256:18358ce7…`); with `'false'` it reports revision 9
+`registered_and_deployed`, as when revision 9 was rendered. With the
+repository's `null` the rendering keeps revision 8's tagged image, and
+`plan` blocks on the live state, as it did before this parameter existed.
 
-What turning it on does: one asyncio loop per API worker process (2 tasks ×
-4 workers = 8 loops). Each tick (30 s) takes a PostgreSQL advisory lock and
-runs the reconcile and escalation reads/updates on `billing_fact_deliveries`
-and `billing_outbox_events`, publishes nothing (`transport=None`) and sets
-three gauges. It adds no AWS call, permission, secret or egress. With the
-rollout `disabled` and no billing fact it is a no-op apart from those reads;
-once any billing fact exists nothing consumes it, and
-`BillingFactDeliveryStale` fires after 900 s
+What turning it on does (`src/services/billing_fact_worker.py`,
+`src/services/billing_outbox.py`): one asyncio loop per API worker process
+(2 tasks × 4 workers = 8 loops), with no consumer (`transport=None`), so it
+publishes nothing. Every 30 s each loop runs one maintenance pass in a
+transaction under `pg_try_advisory_xact_lock`. The lock only serializes
+passes that overlap (a loop that does not get it skips its pass), so up to
+8 passes run per 30 s. A pass reads `billing_payment_effects` (provider
+`asaas`), `billing_outbox`, `billing_fact_deliveries`,
+`billing_fact_handoffs`, `billing_fact_acks` and
+`billing_fact_reconciliation_alerts`. It can write: it inserts alert rows
+into `billing_fact_reconciliation_alerts` (`gap` for an ASAAS payment effect
+without an outbox row or a fact without lineage, `ack missing`, and
+`ack overdue` after 900 s), and it updates `billing_fact_deliveries.state`
+(to `acknowledged` or `blocked`) only when an ack exists. With those tables
+empty it writes nothing. Each loop then recomputes the backlog gauges from
+`billing_fact_deliveries` and stamps the last-tick gauge. It adds no AWS
+call, permission, secret or egress. Once any billing fact exists nothing
+consumes it, and in ECS nothing evaluates the alert rules (step 4 of the
+E7-A follow-ups), so `BillingFactDeliveryStale` does not fire there: what
+an operator sees is the `neurostack_billing_fact_backlog` gauge, the WARN
+log `billing fact acknowledgement overdue` and the stored alert rows
 ([asaas-billing-reconciliation.md](./asaas-billing-reconciliation.md)).
 
 **Turning it on is a committed, reviewed PR, never a local edit** (owner
 decision 2026-10-22: the flag first, on the bridge image, as its own change
-and its own deploy, before the E7 image). That PR changes only the parameter
-line to `'true'` and, deliberately, the pin test above, so the change is
-auditable and merged. After it merges, `plan` run from `main` with the
-repository file is the source of truth for the flag. `app_image_override`
+and its own deploy, before the E7 image). That PR (E7-B1) changes the
+parameter line to `'true'` and, deliberately, the pin tests above, plus the
+statements of the repository value (this section, the parameters comment,
+the manifest, `docs/configuration.md`), so the change is auditable and
+merged.
+After it merges, `plan` run from `main` with the repository file is the
+source of truth for the flag. `app_image_override`
 stays what it is today: an apply-time input the operator sets to the bridge
 digest revision 9 runs (the repository keeps `null`). The planner reads it
 only from the `--params` file, so the operator plans from a local copy of
@@ -1378,10 +1408,18 @@ comes in a later revision of its own (E7-A follow-up step 3). Turning the
 worker off again is the same kind of PR, back to `'false'`, and the same
 steps.
 
-1. **PR.** Set `BILLING_FACT_WORKER_ENABLED: 'true'` and update
-   `test_the_repository_keeps_the_outbox_worker_off`; review and merge.
+1. **PR.** Set `BILLING_FACT_WORKER_ENABLED: 'true'` and update the pin tests
+   (now `test_the_repository_turns_the_outbox_worker_on`, the docs test and
+   `test_the_repository_parameters_propose_the_next_revision`); review and
+   merge.
+   Done by E7-B1 once that PR merges; steps 2 to 6 are not done, and nothing
+   here claims the flag is on in production.
 2. **Plan, render, check** from `main`, with the repository file plus the
-   apply-time `app_image_override`. `plan` exits 0 with `status: ready` and
+   apply-time `app_image_override` (the bridge digest revision 9 runs).
+   Against the live state (revision 9 serving `false`) it proposes the next
+   revision (expected `:10`), flag `false` to `true`, on the same bridge
+   image. `plan` exits 0 with
+   `status: ready` and
    `task_definition_revision: would_change`. Its change is
    `register_task_definition` with `replaces: <revision 9 ARN>` and
    `worker_flag: {from: 'false', to: 'true'}`. It is reported only when the
@@ -1406,11 +1444,50 @@ steps.
    ARN>`, and the post-deploy hook accepts the revision: it refuses any flag
    value other than `false` or `true` (`billing_fact_worker_flag_unreviewed`).
 5. **Observe** the worker, E7-A follow-up step 2 in
-   [Open follow-ups recorded by E6](#open-follow-ups-recorded-by-e6): every
-   task logs `billing fact worker started`,
-   `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
-   advancing, and `neurostack_billing_fact_backlog` is `0` for every
-   condition.
+   [Open follow-ups recorded by E6](#open-follow-ups-recorded-by-e6):
+   - **8 loops started.** Every API process logs `billing fact worker
+     started` (`consumer=absent`): 8 lines from the revision 10 tasks, 4 per
+     task × 2 tasks, not one per task. Fewer means a process has no loop.
+
+     `$DEPLOY_START_MS` is the deployment's `createdAt` in epoch
+     milliseconds (from `DescribeServices`, taken when the deployment starts).
+
+     ```bash
+     aws logs filter-log-events --region us-east-1 \
+       --log-group-name /ecs/neurostack-staging/app \
+       --start-time "$DEPLOY_START_MS" \
+       --filter-pattern '"billing fact worker started"'
+     ```
+
+   - **No failure, no escalation.** The same filter with
+     `'"billing fact worker tick failed"'` and with
+     `'"billing fact acknowledgement overdue"'` (the WARN) returns no event.
+   - **Gauges, per process.** `/metrics` is not in multiprocess mode, so a
+     read reaches one of the 8 processes:
+     `neurostack_billing_fact_worker_last_tick_timestamp_seconds` keeps
+     advancing between reads only proves that the process reached ticks; the
+     8 log lines are the reliable proof that every loop started.
+     `neurostack_billing_fact_backlog` is a global count from
+     `billing_fact_deliveries`, `0` for every condition from any process,
+     but a payment effect with no outbox row does not show in it.
+   - **Database, read-only, before the deploy and after.** A SELECT-only read
+     as the application role (the read family `neurostack-staging-consulta:28`,
+     its own approval like any production read). The family's baked command
+     only exits: the read needs a command override carrying this SQL in the
+     read-program template of `scripts/asaas_migration_window.py`
+     (`program_for_payload`), its output goes to
+     `/ecs/neurostack-staging/migrations` (stream prefix `consulta`):
+
+     ```sql
+     SELECT (SELECT count(*) FROM billing_payment_effects WHERE provider = 'asaas') AS asaas_effects,
+            (SELECT count(*) FROM billing_outbox) AS outbox,
+            (SELECT count(*) FROM billing_fact_deliveries) AS deliveries,
+            (SELECT count(*) FROM billing_fact_reconciliation_alerts) AS alerts;
+     ```
+
+     The counts are the same before and after. A new alert row, or more ASAAS
+     payment effects than outbox rows, is a finding to report before the E7
+     image.
 6. **Regenerate the protected template from revision 10** before the E7
    image (F1, "Regenerating the protected template from the deployed D3
    revision"). The template fingerprints every D3 value, so the protected

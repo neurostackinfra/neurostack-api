@@ -83,10 +83,28 @@ bloqueada por uma guarda de código (ver "Apresentação bloqueada" abaixo).
 No serviço ECS de produção o valor vem do parâmetro revisado
 `BILLING_FACT_WORKER_ENABLED` em
 `infra/production/asaas-production-wiring.params.yaml`: exatamente a string
-`'false'` (o valor do repositório) ou `'true'`; qualquer outra grafia, um
-booleano YAML ou a ausência bloqueia o plano. Ligar (ou desligar) o worker é
-um PR revisado e mergeado que muda essa linha e o teste que fixa o valor
-(`test_the_repository_keeps_the_outbox_worker_off`), seguido de uma nova
+`'true'` (o valor do repositório desde o PR revisado E7-B1, que ligou o
+parâmetro do repositório) ou `'false'`; qualquer outra grafia, um booleano
+YAML ou a ausência bloqueia o plano. O padrão `false` da tabela abaixo é o
+da aplicação, não o do parâmetro. O merge desse PR não liga nada sozinho:
+**o worker ainda não está ligado em produção**, e as revisões 8 e 9 levam
+`false`. Depois do merge, na ordem: `plan` a partir de `main` com
+`app_image_override` definido (entrada de aplicação, o digest da imagem
+ponte da revisão 9) propõe a próxima revisão (esperada `:10`; o número é
+atribuído pelo ECS), flag `false` para `true`, na imagem ponte; o operador a
+registra (`ManagedBy=manual`); o deploy tem aprovação própria; observar
+(cada processo da API registra `billing fact worker started`, 8 linhas no
+log group `/ecs/neurostack-staging/app`, 4 por task × 2 tasks;
+`neurostack_billing_fact_worker_last_tick_timestamp_seconds` avança, mas o
+`/metrics` é por processo; nenhum WARN `billing fact acknowledgement
+overdue`; contagens só-leitura de `billing_payment_effects` com
+`provider = 'asaas'`, `billing_outbox`, `billing_fact_deliveries` e
+`billing_fact_reconciliation_alerts` iguais antes e depois do deploy); e
+regenerar o template protegido a partir dessa revisão antes da imagem do
+E7. Comandos e evidências: runbook, "The outbox worker flag", passo 5. Desligar o worker de novo é o mesmo tipo de PR, de volta a
+`'false'`, que muda essa linha e os testes que fixam o valor
+(`test_the_repository_turns_the_outbox_worker_on`, o teste de documentação e
+`test_the_repository_parameters_propose_the_next_revision`), seguido de uma nova
 revisão da task definition (`docs/runbooks/asaas-deployment.md`, "The outbox
 worker flag").
 
@@ -205,10 +223,11 @@ implantado **e** `BILLING_FACT_WORKER_ENABLED=true`, decisão do owner de
    imagem ponte, então `BILLING_FACT_WORKER_ENABLED=true` sai antes, na
    imagem ponte, como mudança revisada e deploy próprios (revisão nova
    `ManagedBy=manual` renderizada pelo planner a partir do parâmetro revisado
-   `BILLING_FACT_WORKER_ENABLED`, `'false'` no repositório; o procedimento é
+   `BILLING_FACT_WORKER_ENABLED`, `'true'` no repositório desde o E7-B1,
+   ainda em nenhuma revisão registrada; o procedimento é
    "The outbox worker flag" no runbook).
-2. **Observar.** O worker subiu em cada task, o last-tick avança e o outbox
-   está vazio.
+2. **Observar.** O worker subiu em cada processo da API (8 linhas
+   `billing fact worker started`), o last-tick avança e o outbox está vazio.
 3. **Depois, a imagem do E7, nunca na mesma revisão.** Só então a imagem do
    E7 é construída, publicada e implantada, numa revisão posterior.
 
