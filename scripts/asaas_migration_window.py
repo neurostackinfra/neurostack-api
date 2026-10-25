@@ -124,7 +124,9 @@ RULE_RELATIONS_GONE = "relations_gone"
 # 035: the service may still run the tagged revision 8 (expand-only window);
 # the migrations revision carries the bridge image. 036 and 037: the image
 # containing the migration runs on every service task and is the migrations
-# revision's image, by digest.
+# revision's image, by digest; the manifest's rollback_target is its last pin,
+# revision 10 (the planner's WORKER_FLAG_REVISION, re-pinned from 9 before the
+# image bump; a test pins the two equal), with no pending re-pin.
 IMAGE_RULE_BRIDGE = "migrations_revision_on_bridge_image"
 IMAGE_RULE_DEPLOYED = "service_runs_the_migrations_image"
 PHASES = ("register", "snapshot", "pre_read", "run", "verify", "post_read")
@@ -273,7 +275,7 @@ WINDOW_036 = MigrationWindow(
     command=("alembic", "upgrade", "036"),
     snapshot_prefix="pre-036-",
     image_rule=IMAGE_RULE_DEPLOYED,
-    rollback_target_revision=9,
+    rollback_target_revision=10,
     started_by="neurostack-migration-window-036",
     pre_read=ReadSpec(
         phase="pre",
@@ -309,7 +311,7 @@ WINDOW_037 = MigrationWindow(
     command=("alembic", "upgrade", "037"),
     snapshot_prefix="pre-037-",
     image_rule=IMAGE_RULE_DEPLOYED,
-    rollback_target_revision=9,
+    rollback_target_revision=10,
     started_by="neurostack-migration-window-037",
     # The runbook requires the migration role for this readback (as the
     # application role its privilege row answers for that role): it runs on

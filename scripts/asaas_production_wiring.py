@@ -16,7 +16,9 @@ only, its SELECT-only readback program run as the migration role (``read``);
 revision 3 is only read.
 The windows are the table of ``scripts/asaas_migration_window.py``, which also
 runs them. The service rollback target is the manifest field
-``rollback_target``.
+``rollback_target``. Once the service runs a registered D3 revision, a new
+revision is proposed only for one reviewed difference at a time: the worker
+flag alone, or the app image digest alone (the image bump).
 
 Every AWS request passes through :class:`ReadOnlyAws`, which allows only an
 exact list of Describe/Get/List operations and never ``GetSecretValue``;
@@ -75,27 +77,47 @@ def task_definition_arn(family: str, revision: int) -> str:
 
 
 # The revision the D3 wiring is derived from (task_definition.source_revision).
-# It is history, not the rollback target: revision 9 stays derived from it after
-# the rollback target moves.
+# It is history, not the rollback target: revisions 9 and 10 stay derived from
+# it after the rollback target moves.
 D3_SOURCE_REVISION = 8
 D3_SOURCE_TASK_DEFINITION_ARN = task_definition_arn(TASK_FAMILY, D3_SOURCE_REVISION)
-# The bridge-image D3 revision the rollback target is re-pinned to.
+# The bridge-image D3 revision the rollback target was first re-pinned to.
 BRIDGE_REVISION = 9
+# The worker-flag revision (revision 9 with BILLING_FACT_WORKER_ENABLED 'true',
+# same bridge image) the rollback target is re-pinned to next: the way back
+# from the image bump that starts from it.
+WORKER_FLAG_REVISION = 10
 # The service rollback target lives in the manifest (rollback_target); these
 # are the only pins it may hold and the documented step at which each one takes
-# effect. Revision 8 runs code that reads columns migration 036 drops, so the
-# re-pin to 9 must happen before 036, and only once revision 9 has served and
-# its observation period closed (until then 8 is the safe way back).
+# effect, in order (8, 9, 10; none is skipped). Revision 8 runs code that reads
+# columns migration 036 drops, so the re-pin to 9 must happen before 036, and
+# only once revision 9 has served and its observation period closed (until
+# then 8 is the safe way back). Revision 9 carries the worker flag 'false', so
+# a rollback to it from an image bump would also turn the worker off: the
+# re-pin to 10 must happen before the image bump is deployed, and only once
+# revision 10 has served, been verified and its observation closed.
 ROLLBACK_EFFECTIVE_INITIAL = "initial_d3_planning_2026_10_18"
 ROLLBACK_EFFECTIVE_BRIDGE = "bridge_revision_9_serving_verified_and_observation_closed"
+ROLLBACK_EFFECTIVE_WORKER_FLAG = (
+    "worker_flag_revision_10_serving_verified_and_observation_closed"
+)
 ROLLBACK_REPIN_BEFORE = "migration_036"
+ROLLBACK_REPIN_BEFORE_IMAGE_BUMP = "app_image_bump_deployment"
 # revision -> (effective_after, (next revision, its effective_after, before) | None)
 ROLLBACK_TARGET_PINS: dict[int, tuple[str, tuple[int, str, str] | None]] = {
     D3_SOURCE_REVISION: (
         ROLLBACK_EFFECTIVE_INITIAL,
         (BRIDGE_REVISION, ROLLBACK_EFFECTIVE_BRIDGE, ROLLBACK_REPIN_BEFORE),
     ),
-    BRIDGE_REVISION: (ROLLBACK_EFFECTIVE_BRIDGE, None),
+    BRIDGE_REVISION: (
+        ROLLBACK_EFFECTIVE_BRIDGE,
+        (
+            WORKER_FLAG_REVISION,
+            ROLLBACK_EFFECTIVE_WORKER_FLAG,
+            ROLLBACK_REPIN_BEFORE_IMAGE_BUMP,
+        ),
+    ),
+    WORKER_FLAG_REVISION: (ROLLBACK_EFFECTIVE_WORKER_FLAG, None),
 }
 # New revisions (app and migrations) carry ManagedBy=manual: owner approval A4
 # (2026-10-19) moved the two ECS roles to manual management; no code manages the
@@ -671,6 +693,14 @@ def _expected_migrations_section() -> dict[str, Any]:
     }
 
 
+# What the ``why`` of a pending re-pin must name, by its ``before`` step: the
+# reason the pin it leaves is unsafe from that step on.
+ROLLBACK_REPIN_WHY_NAMES: Mapping[str, str] = {
+    ROLLBACK_REPIN_BEFORE: "036",
+    ROLLBACK_REPIN_BEFORE_IMAGE_BUMP: WORKER_FLAG_PARAMETER,
+}
+
+
 def _validate_rollback_target(section: Any) -> None:
     """Only the pinned revisions, each with its documented effective step."""
 
@@ -695,7 +725,7 @@ def _validate_rollback_target(section: Any) -> None:
             and set(note) == {"revision", "effective_after", "before", "why"}
             and (note["revision"], note["effective_after"], note["before"]) == repin
             and isinstance(note["why"], str)
-            and "036" in note["why"],
+            and ROLLBACK_REPIN_WHY_NAMES[repin[2]] in note["why"],
             "manifest_rollback_target_invalid",
         )
 
@@ -1401,7 +1431,8 @@ def collect_readback(
     # The revision the service runs, read only when no other read holds it
     # (source, rollback target, latest): a newer revision registered from the
     # rendering is reported registered but not deployed only when the serving
-    # revision differs from it in the worker flag alone (worker_flag_change).
+    # revision differs from it in the worker flag alone (worker_flag_change)
+    # or in the app image digest alone (app_image_change).
     serving = _serving_revision(readback["service"])
     readback["serving_task_definition"] = (
         aws.call(
@@ -2822,6 +2853,42 @@ def _plan_task_definition(
         )
         else None
     )
+    # The image bump, composed the same way: the service runs a registered D3
+    # revision that differs from the rendering in the app image digest alone
+    # (both pinned by digest in the same repository, the worker flag equal).
+    # A rendering that changes the image and the worker flag together matches
+    # neither and blocks: the two never share a revision (owner decision
+    # 2026-10-22).
+    image_change = (
+        app_image_change(latest_response, rendered)
+        if isinstance(current, str)
+        and current == latest_arn
+        and current != D3_SOURCE_TASK_DEFINITION_ARN
+        and not latest_matches
+        else None
+    )
+    serving_image_change = (
+        app_image_change(_serving_response(readback, current, pins), rendered)
+        if isinstance(current, str)
+        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
+        and latest_matches
+        else None
+    )
+    # Stuck, never green, as for the flag: the service runs the rendering (or
+    # differs from it in the app image alone) while the newest registered
+    # revision differs from the rendering in the app image alone, e.g. an image
+    # bump registered and then abandoned, or rolled back with the override set
+    # back to the image the service runs.
+    newest_image_change = (
+        app_image_change(latest_response, rendered)
+        if isinstance(current, str)
+        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
+        and not latest_matches
+        and _same_but_for_app_image(
+            _serving_response(readback, current, pins), rendered
+        )
+        else None
+    )
     if current == D3_SOURCE_TASK_DEFINITION_ARN:
         if latest_arn == D3_SOURCE_TASK_DEFINITION_ARN:
             step.changes.append(
@@ -2855,6 +2922,18 @@ def _plan_task_definition(
                 "service_changes": "none (service_deployment is a separate gate)",
             }
         )
+    elif image_change is not None:
+        step.changes.append(
+            {
+                "action": "register_task_definition",
+                "family": TASK_FAMILY,
+                "derived_from": D3_SOURCE_TASK_DEFINITION_ARN,
+                "replaces": current,
+                "app_image": _image_change_info(image_change),
+                "request_sha256": diff["rendered_request_sha256"],
+                "service_changes": "none (service_deployment is a separate gate)",
+            }
+        )
     elif serving_flag_change is not None:
         step.compliant.append(f"registered_not_deployed:{latest_arn}")
         step.info["registered_revision_changes_worker_flag"] = {
@@ -2862,12 +2941,28 @@ def _plan_task_definition(
             "from": serving_flag_change[0],
             "to": serving_flag_change[1],
         }
+    elif serving_image_change is not None:
+        step.compliant.append(f"registered_not_deployed:{latest_arn}")
+        step.info["registered_revision_changes_app_image"] = {
+            "serving": current,
+            **_image_change_info(serving_image_change),
+        }
     elif newest_flag_change is not None:
         step.blocks.append(f"newest_revision_differs_only_in_worker_flag:{latest_arn}")
         step.info["newest_revision_worker_flag"] = {
             "newest": latest_arn,
             "newest_value": newest_flag_change[0],
             "rendered_value": newest_flag_change[1],
+            "serving": current,
+        }
+    elif newest_image_change is not None:
+        step.blocks.append(f"newest_revision_differs_only_in_app_image:{latest_arn}")
+        newest = _image_change_info(newest_image_change)
+        step.info["newest_revision_app_image"] = {
+            "newest": latest_arn,
+            "repository": newest["repository"],
+            "newest_digest": newest["from"],
+            "rendered_digest": newest["to"],
             "serving": current,
         }
     else:
@@ -2935,6 +3030,64 @@ def worker_flag_change(
     if _comparable(registered) != _comparable(rendered):
         return None
     return str(from_value), str(to_value)
+
+
+def _same_but_for_app_image(response: Any, rendered: dict[str, Any]) -> bool:
+    """Whether a registered revision equals the rendering, app image aside."""
+
+    try:
+        same = _comparable(_request_from_response(response)) == _comparable(rendered)
+    except WiringError:
+        return False
+    return same or app_image_change(response, rendered) is not None
+
+
+def app_image_change(
+    registered_response: Any, rendered: dict[str, Any]
+) -> tuple[str, str] | None:
+    """(registered image, rendered image) of an app-image-only difference.
+
+    A registered revision differs from the rendering in the app image alone
+    when both app images are pinned by digest, with no tag
+    (``<account ECR repository URI>@sha256:<digest>``), in the same repository,
+    the two digests differ, and with the rendered image put in its place the
+    revision compares equal to the rendering (every other field, name, value,
+    secret reference, the worker flag, the otel image, the roles and the tags).
+    Anything else is None.
+    """
+
+    try:
+        registered = _request_from_response(registered_response)
+        registered_app = evidence._container_map(registered)[APP_CONTAINER]
+        rendered_app = evidence._container_map(rendered)[APP_CONTAINER]
+    except (WiringError, evidence.EvidenceError):
+        return None
+    from_image = registered_app.get("image")
+    to_image = rendered_app.get("image")
+    if not (
+        isinstance(from_image, str)
+        and isinstance(to_image, str)
+        and _ECR_DIGEST_REFERENCE.fullmatch(from_image) is not None
+        and _ECR_DIGEST_REFERENCE.fullmatch(to_image) is not None
+        and from_image.split("@", 1)[0] == to_image.split("@", 1)[0]
+        and from_image != to_image
+    ):
+        return None
+    registered_app["image"] = to_image
+    if _comparable(registered) != _comparable(rendered):
+        return None
+    return from_image, to_image
+
+
+def _image_change_info(change: tuple[str, str]) -> dict[str, str]:
+    """The repository and the two digests of an ``app_image_change``."""
+
+    repository, from_digest = change[0].split("@", 1)
+    return {
+        "repository": repository,
+        "from": from_digest,
+        "to": change[1].split("@", 1)[1],
+    }
 
 
 def _plan_protected_path_integrity(
@@ -3084,6 +3237,42 @@ def _plan_rollback_target(
         deployment.blocks.append("rollback_target_revision_unusable")
 
 
+def _serving_image_moved_off_rollback_target(
+    readback: dict[str, Any], service: dict[str, Any] | None, pins: ManifestPins
+) -> bool:
+    """Whether the service runs an app image other than the rollback target's.
+
+    True when the rollback target's app image is pinned by digest and the
+    service runs another revision whose app image is any other reference
+    (another digest, another repository or a tag): an image change that
+    already serves. Revision 8, pinned by tag, has no digest to compare with
+    and never counts.
+    """
+
+    current = service.get("taskDefinition") if isinstance(service, dict) else None
+    if (
+        pins.rollback_revision == D3_SOURCE_REVISION
+        or not isinstance(current, str)
+        or current == pins.rollback_task_definition_arn
+    ):
+        return False
+    serving_response = (
+        readback.get("latest_task_definition")
+        if current == _task_definition_arn_of(readback.get("latest_task_definition"))
+        else readback.get("serving_task_definition")
+    )
+    target = (
+        _source_app_container(readback.get("rollback_task_definition")) or {}
+    ).get("image")
+    serving = (_source_app_container(serving_response) or {}).get("image")
+    return (
+        isinstance(target, str)
+        and isinstance(serving, str)
+        and _ECR_DIGEST_REFERENCE.fullmatch(target) is not None
+        and target != serving
+    )
+
+
 def _plan_gates(
     steps: dict[str, _Step],
     readback: dict[str, Any],
@@ -3140,6 +3329,22 @@ def _plan_gates(
 
     deployment = steps["service_deployment"]
     _plan_rollback_target(deployment, readback, pins)
+    # The re-pin to revision 10 is due before an image bump is deployed. Only
+    # rollback target 10 with no pending re-pin is the good state: with any
+    # other pin (9 with its note, or 8) a proposed, registered or serving
+    # image bump would leave a revision without the worker (or older code) as
+    # the way back.
+    revision = steps["task_definition_revision"]
+    repinned = (
+        pins.rollback_revision == WORKER_FLAG_REVISION
+        and pins.rollback_repin_before is None
+    )
+    if not repinned and (
+        any("app_image" in change for change in revision.changes)
+        or "registered_revision_changes_app_image" in revision.info
+        or _serving_image_moved_off_rollback_target(readback, service, pins)
+    ):
+        deployment.blocks.append("rollback_target_not_repinned_before_image_bump")
     config = (service or {}).get("deploymentConfiguration") or {}
     breaker = config.get("deploymentCircuitBreaker") or {}
     if (

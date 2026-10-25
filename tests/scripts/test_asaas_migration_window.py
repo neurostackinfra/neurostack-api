@@ -41,6 +41,7 @@ REGISTRY = f"{ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com"
 TD_PREFIX = f"arn:aws:ecs:us-east-1:{ACCOUNT}:task-definition/"
 SERVICE_TD_8 = TD_PREFIX + "neurostack-staging-app:8"
 SERVICE_TD_9 = TD_PREFIX + "neurostack-staging-app:9"
+SERVICE_TD_10 = TD_PREFIX + "neurostack-staging-app:10"
 MIGRATIONS_TD = {
     "035": TD_PREFIX + "neurostack-staging-migrations:4",
     "036": TD_PREFIX + "neurostack-staging-migrations:5",
@@ -318,7 +319,7 @@ class World:
         self.reads: dict[str, dict[str, Any]] = {}
         self.records: dict[str, dict[str, Any]] = {}
         self.captured_at = CAPTURED_PLAN
-        self.service_td = SERVICE_TD_8 if window == "035" else SERVICE_TD_9
+        self.service_td = SERVICE_TD_8 if window == "035" else SERVICE_TD_10
         self.migrations_td = MIGRATIONS_TD[window]
         self.snapshot_id = SNAPSHOT_ID[window]
         service_image = OLD_IMAGE if window == "035" else BRIDGE_IMAGE
@@ -705,20 +706,25 @@ MIGRATIONS_LOG = hook.LogTarget(
 )
 
 
-# The live bridge revision 9 the reviewed manifest re-pinned the rollback
-# target to (read back 2026-10-22), and its app image digest.
+# The live bridge revision 9 the reviewed manifest first re-pinned the
+# rollback target to (read back 2026-10-22), and its app image digest.
 LIVE_REVISION_9 = SERVICE_TD_9
 LIVE_REVISION_9_IMAGE = (
     f"{REGISTRY}/neurostack-staging@sha256:"
     "18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24"
 )
+# The worker-flag revision 10 it is re-pinned to since (revision 9 with the
+# worker flag 'true', on the same bridge image digest).
+LIVE_REVISION_10 = SERVICE_TD_10
+LIVE_REVISION_10_IMAGE = LIVE_REVISION_9_IMAGE
 
 
 def initial_manifest(tmp_path: Path) -> Path:
     """The manifest as it read before the re-pin: revision 8 with its note.
 
-    The reviewed manifest itself is re-pinned to revision 9 (no ``repin``
-    block), so every 036 and 037 plan below reads it through the default.
+    The reviewed manifest itself is re-pinned to revision 10 (8 to 9, then 9
+    to 10; no ``repin`` block), so every 036 and 037 plan below reads it
+    through the default.
     """
 
     text = MANIFEST.read_text(encoding="utf-8")
@@ -736,6 +742,28 @@ def initial_manifest(tmp_path: Path) -> Path:
     )
     path = tmp_path / "manifest-initial.yaml"
     path.write_text(text[:start] + initial + text[end:], encoding="utf-8")
+    return path
+
+
+def bridge_manifest(tmp_path: Path) -> Path:
+    """The manifest at revision 9 with its pending re-pin to revision 10."""
+
+    text = MANIFEST.read_text(encoding="utf-8")
+    start = text.index("rollback_target:\n")
+    end = text.index("\nsecrets:\n")
+    bridge = (
+        "rollback_target:\n"
+        "  revision: 9\n"
+        "  effective_after: bridge_revision_9_serving_verified_and_observation_closed\n"
+        "  repin:\n"
+        "    revision: 10\n"
+        "    effective_after: "
+        "worker_flag_revision_10_serving_verified_and_observation_closed\n"
+        "    before: app_image_bump_deployment\n"
+        "    why: Revision 9 carries BILLING_FACT_WORKER_ENABLED 'false'.\n"
+    )
+    path = tmp_path / "manifest-bridge.yaml"
+    path.write_text(text[:start] + bridge + text[end:], encoding="utf-8")
     return path
 
 
@@ -938,7 +966,7 @@ def test_each_window_pins_its_command_versions_snapshot_readback_and_steps(
     assert window.image_rule == (
         mw.IMAGE_RULE_BRIDGE if name == "035" else mw.IMAGE_RULE_DEPLOYED
     )
-    assert window.rollback_target_revision == (None if name == "035" else 9)
+    assert window.rollback_target_revision == (None if name == "035" else 10)
     assert (ROOT / sql).is_file()
 
 
@@ -1105,8 +1133,8 @@ def test_target_comes_from_the_hook_and_the_planner_shares_the_family() -> None:
     assert wiring.MIGRATIONS_TASK_SOURCE_REVISION == mw.MIGRATIONS_SOURCE_REVISION == 3
     assert wiring.MIGRATIONS_DATABASE_SECRET_NAME == mw.MIGRATIONS_DATABASE_SECRET
     assert wiring.MIGRATION_WINDOWS is mw.WINDOWS
-    assert wiring.BRIDGE_REVISION == mw.WINDOW_036.rollback_target_revision
-    assert wiring.BRIDGE_REVISION == mw.WINDOW_037.rollback_target_revision
+    assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_036.rollback_target_revision
+    assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_037.rollback_target_revision
 
 
 def test_policy_values_and_watch_budgets() -> None:
@@ -1712,36 +1740,40 @@ def test_036_and_037_refuse_a_rollback_target_not_repinned(
     window: str, tmp_path: Path
 ) -> None:
     world = ready_world(tmp_path, window)
-    # The manifest as it read before the re-pin: revision 8 with its note.
-    blocks = _blocks(world, tmp_path, manifest=initial_manifest(tmp_path))
-    assert "rollback_target_not_repinned" in blocks
+    # The manifest as it read before the first re-pin: revision 8 with its
+    # note, and before the second: revision 9 with its note (pending re-pin
+    # to revision 10 before the image bump).
+    for manifest in (initial_manifest(tmp_path), bridge_manifest(tmp_path)):
+        blocks = _blocks(world, tmp_path, manifest=manifest)
+        assert "rollback_target_not_repinned" in blocks
 
 
-def test_the_reviewed_manifest_is_re_pinned_to_revision_9() -> None:
+def test_the_reviewed_manifest_is_re_pinned_to_revision_10() -> None:
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 9,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE,
+        "revision": 10,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
     }
     pins = wiring.manifest_pins(wiring.validate_manifest(raw))
     assert pins.rollback_revision == mw.WINDOW_036.rollback_target_revision
     assert pins.rollback_revision == mw.WINDOW_037.rollback_target_revision
     assert pins.rollback_repin_before is None
-    assert pins.rollback_task_definition_arn == LIVE_REVISION_9
+    assert pins.rollback_task_definition_arn == LIVE_REVISION_10
 
 
 @pytest.mark.parametrize("window", ["036", "037"])
-def test_036_and_037_accept_the_live_revision_9_by_digest(
+def test_036_and_037_accept_the_live_revision_10_by_digest(
     window: str, tmp_path: Path
 ) -> None:
-    """The reviewed manifest, read by default: revision 9 ACTIVE by digest.
+    """The reviewed manifest, read by default: revision 10 ACTIVE by digest.
 
-    The service runs a later revision with the image containing the window's
-    migration; the rollback target is the live bridge revision 9.
+    The service runs a later revision (the image bump, revision 11) with the
+    image containing the window's migration; the rollback target is the live
+    worker-flag revision 10 on the bridge image.
     """
 
     world = ready_world(tmp_path, window)
-    later = TD_PREFIX + "neurostack-staging-app:10"
+    later = TD_PREFIX + "neurostack-staging-app:11"
     world.service_td = later
     world.put(
         "ecs", "DescribeServices", mw.describe_services_request(), _service(later)
@@ -1764,20 +1796,20 @@ def test_036_and_037_accept_the_live_revision_9_by_digest(
     world.put(
         "ecs",
         "DescribeTaskDefinition",
-        mw.describe_task_definition_request(LIVE_REVISION_9),
-        _app_definition(LIVE_REVISION_9, LIVE_REVISION_9_IMAGE),
+        mw.describe_task_definition_request(LIVE_REVISION_10),
+        _app_definition(LIVE_REVISION_10, LIVE_REVISION_10_IMAGE),
     )
     document = plan(world, tmp_path)
     assert document["status"] == "ready", document["blocks"]
-    assert document["manifest"] == {"rollback_target_revision": 9}
+    assert document["manifest"] == {"rollback_target_revision": 10}
     assert "rollback_target_repinned" in document["checks"]
     assert "rollback_target_revision_active_digest_pinned" in document["checks"]
-    tagged = LIVE_REVISION_9_IMAGE.split("@", 1)[0] + ":" + OLD_TAG
+    tagged = LIVE_REVISION_10_IMAGE.split("@", 1)[0] + ":" + OLD_TAG
     world.put(
         "ecs",
         "DescribeTaskDefinition",
-        mw.describe_task_definition_request(LIVE_REVISION_9),
-        _app_definition(LIVE_REVISION_9, tagged),
+        mw.describe_task_definition_request(LIVE_REVISION_10),
+        _app_definition(LIVE_REVISION_10, tagged),
     )
     assert "rollback_target_revision_unusable" in _blocks(world, tmp_path)
 
@@ -1789,15 +1821,15 @@ def test_036_and_037_accept_the_live_revision_9_by_digest(
         {"containerDefinitions": [{"name": "app", "image": OLD_IMAGE}]},
     ],
 )
-def test_036_refuses_an_unusable_revision_9(
+def test_036_refuses_an_unusable_revision_10(
     change: dict[str, Any], tmp_path: Path
 ) -> None:
     world = ready_world(tmp_path, "036")
     world.put(
         "ecs",
         "DescribeTaskDefinition",
-        mw.describe_task_definition_request(SERVICE_TD_9),
-        _app_definition(SERVICE_TD_9, BRIDGE_IMAGE, **change),
+        mw.describe_task_definition_request(SERVICE_TD_10),
+        _app_definition(SERVICE_TD_10, BRIDGE_IMAGE, **change),
     )
     assert "rollback_target_revision_unusable" in _blocks(world, tmp_path)
 

@@ -75,7 +75,7 @@ after.
 
 The rollback target is the manifest field `rollback_target`
 (`infra/production/asaas-production-wiring.yaml`), which `plan` reports as
-`rollback_target`. It has two phases:
+`rollback_target`. It has three phases:
 
 1. **Until the re-pin is merged: revision 8**
    (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
@@ -89,11 +89,26 @@ The rollback target is the manifest field `rollback_target`
    `repin` block) merges only after revision 9's observation period has
    closed, about **2026-10-23 18:30 UTC**, with revision 9 still serving and
    verified, and before migration 036.
+3. **After the second re-pin is merged: revision 10**
+   (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:10`,
+   revision 9 with `BILLING_FACT_WORKER_ENABLED=true` on the same bridge
+   image). **Merge condition:** the second re-pin (manifest field to
+   `revision: 10`, no `repin` block) merges only after revision 10 has
+   served, been verified and the observation of the worker has closed: 6
+   hours after its deployment completed (2026-10-25 01:51 UTC), so at
+   **2026-10-25 07:51 UTC**, with the actual closing time recorded by the
+   orchestrator in the manifest marker `closed_at` before the merge
+   ([`asaas-deployment.md`](./asaas-deployment.md), "Merge condition of the
+   re-pin (9 to 10)"), and before the image bump (revision 11, a new app image digest) is deployed:
+   a rollback to revision 9 would also turn the worker off. Once revision 11
+   serves, the way back is revision 10
+   ([`asaas-deployment.md`](./asaas-deployment.md), "The image bump").
 
 **Revision 8 is unsafe after migration 036**: it reads columns 036 drops, so
-once 036 has run, roll back to revision 9, never to 8. Read "revision R"
-below as the field's current value: revision 8 in phase 1, revision 9 in
-phase 2 (check with `plan`, `rollback_target`). A failed post-deploy webhook
+once 036 has run, roll back to the field's revision (10 since the second
+re-pin), never to 8. Read "revision R" below as the field's current value:
+revision 8 in phase 1, revision 9 in phase 2, revision 10 in phase 3 (check
+with `plan`, `rollback_target`). A failed post-deploy webhook
 registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a reason to roll
 back.
 
@@ -122,7 +137,8 @@ back.
   ```
 
   `R` is the rollback target: `8` only until the re-pin is merged, `9` after
-  it, and never `8` once migration 036 has run.
+  it, `10` after the second re-pin, and never `8` once migration 036 has
+  run.
 
   **Verify:** `plan` shows `current_task_definition` on revision R, the target
   group is healthy, `GET /ready` returns 200 on every task, and
