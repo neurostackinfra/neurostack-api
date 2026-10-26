@@ -76,6 +76,12 @@ _FORBIDDEN_LABEL_NAMES = frozenset(
         "prompt",
         "model",
         "rule_id",
+        # neurostack-credit-system: builder and subscription identities stay
+        # in structured logs (no existing family uses these label names).
+        "builder",
+        "builder_id",
+        "subscription",
+        "subscription_id",
     }
 )
 _GENERATED_LABELS = frozenset({"le", "quantile"})
@@ -487,6 +493,10 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
             outcome=_enum("completed", "deadline", "stopped", "failed")
         ),
         "neurostack_billing_fact_worker_last_tick_timestamp_seconds": _NONE,
+        # neurostack-credit-system (src/services/credit_switch.py): every
+        # ``neurostack_credit_*`` family is declared here, without identity
+        # labels.  The switch gauge is 0 whenever the switch is not effective.
+        "neurostack_credit_switch_effective": _NONE,
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(
             intent_category=_INTENT, funnel_stage=_FUNNEL_STAGE, mode=_FLOW_MODE

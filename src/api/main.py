@@ -71,6 +71,13 @@ from src.services.billing_fact_worker import (
     start_billing_fact_worker,
 )
 from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
+from src.services.credit_switch import (
+    CreditUnavailableError,
+    credit_unavailable_exception_handler,
+    refresh_credit_switch,
+    start_credit_switch_refresher,
+    stop_credit_switch,
+)
 
 # Configure logging on module load
 configure_logging()
@@ -178,10 +185,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from src.repositories import init_database
 
     await init_database()
+    # Credit dominance switch (neurostack-credit-system Group 1b): read once
+    # here, then refreshed in the background only when the config is on.  It
+    # fails closed and never raises; with the config off it reads nothing.
+    await refresh_credit_switch()
+    credit_switch_refresher: asyncio.Task[None] | None = None
     webhook_refresher = _start_webhook_readiness_refresher()
     fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
     try:
+        credit_switch_refresher = start_credit_switch_refresher()
         fact_worker = _start_billing_fact_worker()
         if settings.environment == "staging":
             redis_client = Redis.from_url(
@@ -193,6 +206,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis = redis_client
         yield
     finally:
+        # First, and it never raises: off (and the refresher cancelled) before
+        # anything else stops and before the pool closes.
+        await stop_credit_switch(credit_switch_refresher)
         if webhook_refresher is not None:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):
@@ -676,6 +692,12 @@ def create_app() -> FastAPI:
         privacy.public_router,
         prefix="/api/public",
         tags=["Privacy"],
+    )
+
+    # Credit surfaces (neurostack-credit-system Group 1b): a refusal raised by
+    # ``require_credit_switch`` answers 503 {"code": "credit_unavailable"}.
+    app.add_exception_handler(
+        CreditUnavailableError, credit_unavailable_exception_handler
     )
 
     # Override OpenAPI schema to include headers (after all routers are registered)

@@ -17,6 +17,12 @@ from src.config.logging import get_logger
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
 from src.repositories import get_db_session
+from src.services.credit_principal import (
+    credit_identity,
+    identity_from_tenant_context,
+    publish_credit_identity,
+)
+from src.services.credit_switch import capture_credit_switch
 
 logger = get_logger(__name__)
 _audit_logger = get_logger(f"{__name__}.audit")
@@ -69,6 +75,10 @@ class TenantIdentityMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            # Credit dominance switch, captured once per request at entry
+            # (neurostack-credit-system Group 1b).  Only request.state changes.
+            capture_credit_switch(scope)
         if scope["type"] != "http" or scope.get("method") != "POST":
             await self.app(scope, receive, send)
             return
@@ -110,7 +120,9 @@ class TenantIdentityMiddleware:
                 )
                 return
 
-        _state(scope)["canonical_tenant_id"] = tenant.tenant_id
+        state = _state(scope)
+        state["canonical_tenant_id"] = tenant.tenant_id
+        publish_credit_identity(state, identity_from_tenant_context(tenant))
         await self.app(scope, guarded_receive, send)
 
     async def _guard_meta(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -210,6 +222,7 @@ class TenantIdentityMiddleware:
         state["canonical_tenant_id"] = tenant_id
         state["meta_phone_number_id"] = phone_id
         state["meta_credentials"] = credentials
+        publish_credit_identity(state, credit_identity("meta", tenant_id))
         await self.app(scope, guarded_receive, send)
 
     async def _reject(
