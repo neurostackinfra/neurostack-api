@@ -459,6 +459,14 @@ class Settings(BaseSettings):
     billing_fact_worker_max_attempts: int = Field(default=10, ge=1, le=50)
     # A pending/awaiting_ack fact older than this raises the stale alert.
     billing_fact_worker_stale_after_seconds: int = Field(default=900, ge=60, le=86_400)
+    # Credit dominance switch (neurostack-credit-system Group 1b).  Off by
+    # default: every credit surface stays inert and no refresh task starts.
+    # When true it is EFFECTIVE only while alembic_version holds one row at
+    # or after the image's highest credit migration, read at start-up and
+    # every credit_switch_refresh_seconds; any read error keeps it off
+    # (src/services/credit_switch.py).  On is observational only.
+    credit_hot_path_enabled: bool = False
+    credit_switch_refresh_seconds: int = Field(default=60, ge=1, le=300)
 
     @field_validator("asaas_webhook_url")
     @classmethod

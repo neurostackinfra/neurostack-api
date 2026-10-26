@@ -1,0 +1,382 @@
+{
+  "schema_version": "credit_dominance_corpus.v1",
+  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none.",
+  "masked_fields": [
+    "event_id",
+    "timestamp",
+    "processed_at",
+    "processing_time_ms",
+    "stage_timings",
+    "created_at",
+    "updated_at",
+    "trace_id",
+    "request_id"
+  ],
+  "requests": [
+    {
+      "id": "events-api-key-scheduling",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "json": {
+        "tenant_id": "{api_tenant}",
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Olá, gostaria de agendar uma consulta",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-second-turn",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Pode ser na próxima terça de manhã?",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-jwt-panel-simulator",
+      "ingress": "jwt",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "jwt/jwt_tenant",
+      "json": {
+        "session_id": "{jwt_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Quais são os horários de atendimento?",
+          "channel": "web"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-cross-tenant-assertion",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "json": {
+        "tenant_id": "{jwt_tenant}",
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {"content": "Olá", "channel": "whatsapp"}
+      }
+    },
+    {
+      "id": "events-api-key-cross-tenant-session",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "json": {
+        "session_id": "{jwt_session}",
+        "event_type": "message.in",
+        "payload": {"content": "Olá", "channel": "whatsapp"}
+      }
+    },
+    {
+      "id": "events-unknown-api-key",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/unknown",
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {"content": "Olá", "channel": "whatsapp"}
+      }
+    },
+    {
+      "id": "events-invalid-jwt",
+      "ingress": "jwt",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "jwt_invalid",
+      "json": {
+        "session_id": "{jwt_session}",
+        "event_type": "message.in",
+        "payload": {"content": "Olá", "channel": "web"}
+      }
+    },
+    {
+      "id": "events-missing-credentials",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "none",
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {"content": "Olá", "channel": "whatsapp"}
+      }
+    },
+    {
+      "id": "events-invalid-payload",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "json": {"session_id": "{api_session}", "event_type": "message.in"}
+    },
+    {
+      "id": "zapi-text-message",
+      "ingress": "zapi",
+      "method": "POST",
+      "path": "/v1/webhook/zapi/{zapi_token}",
+      "auth": "none",
+      "json": {
+        "instanceId": "{zapi_instance}",
+        "phone": "5511900000101",
+        "messageId": "credit-dominance-zapi-1",
+        "fromMe": false,
+        "text": {"message": "Olá, quero marcar uma avaliação"},
+        "momment": 1761480000000,
+        "senderName": "Paciente Z"
+      }
+    },
+    {
+      "id": "zapi-duplicate-message",
+      "ingress": "zapi",
+      "method": "POST",
+      "path": "/v1/webhook/zapi/{zapi_token}",
+      "auth": "none",
+      "json": {
+        "instanceId": "{zapi_instance}",
+        "phone": "5511900000101",
+        "messageId": "credit-dominance-zapi-1",
+        "fromMe": false,
+        "text": {"message": "Olá, quero marcar uma avaliação"},
+        "momment": 1761480000000,
+        "senderName": "Paciente Z"
+      }
+    },
+    {
+      "id": "zapi-unknown-token",
+      "ingress": "zapi",
+      "method": "POST",
+      "path": "/v1/webhook/zapi/{unknown_zapi_token}",
+      "auth": "none",
+      "json": {"instanceId": "{zapi_instance}", "messageId": "credit-dominance-zapi-2"}
+    },
+    {
+      "id": "zapi-instance-mismatch",
+      "ingress": "zapi",
+      "method": "POST",
+      "path": "/v1/webhook/zapi/{zapi_token}",
+      "auth": "none",
+      "json": {"instanceId": "3Ecreditnope", "messageId": "credit-dominance-zapi-3"}
+    },
+    {
+      "id": "zapi-legacy-route",
+      "ingress": "zapi",
+      "method": "POST",
+      "path": "/v1/webhook/zapi",
+      "auth": "none",
+      "json": {"instanceId": "{zapi_instance}", "messageId": "credit-dominance-zapi-4"}
+    },
+    {
+      "id": "meta-text-message",
+      "ingress": "meta",
+      "method": "POST",
+      "path": "/v1/webhook/meta",
+      "auth": "meta/meta_tenant",
+      "json": {
+        "object": "whatsapp_business_account",
+        "entry": [
+          {
+            "id": "credit-dominance-waba",
+            "changes": [
+              {
+                "field": "messages",
+                "value": {
+                  "messaging_product": "whatsapp",
+                  "metadata": {
+                    "display_phone_number": "5511900000200",
+                    "phone_number_id": "{meta_phone}"
+                  },
+                  "contacts": [
+                    {"profile": {"name": "Paciente M"}, "wa_id": "5511900000201"}
+                  ],
+                  "messages": [
+                    {
+                      "from": "5511900000201",
+                      "id": "wamid.credit-dominance-meta-1",
+                      "timestamp": "1761480000",
+                      "text": {"body": "Olá, vocês atendem aos sábados?"},
+                      "type": "text"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "meta-status-only",
+      "ingress": "meta",
+      "method": "POST",
+      "path": "/v1/webhook/meta",
+      "auth": "meta/meta_tenant",
+      "json": {
+        "object": "whatsapp_business_account",
+        "entry": [
+          {
+            "id": "credit-dominance-waba",
+            "changes": [
+              {
+                "field": "messages",
+                "value": {
+                  "messaging_product": "whatsapp",
+                  "metadata": {"phone_number_id": "{meta_phone}"},
+                  "statuses": [
+                    {
+                      "id": "wamid.credit-dominance-meta-reply",
+                      "status": "delivered",
+                      "timestamp": "1761480001",
+                      "recipient_id": "5511900000201"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "meta-bad-signature",
+      "ingress": "meta",
+      "method": "POST",
+      "path": "/v1/webhook/meta",
+      "auth": "meta_bad_signature",
+      "json": {
+        "object": "whatsapp_business_account",
+        "entry": [
+          {
+            "id": "credit-dominance-waba",
+            "changes": [
+              {
+                "field": "messages",
+                "value": {
+                  "messaging_product": "whatsapp",
+                  "metadata": {"phone_number_id": "{meta_phone}"},
+                  "messages": [
+                    {
+                      "from": "5511900000201",
+                      "id": "wamid.credit-dominance-meta-2",
+                      "timestamp": "1761480002",
+                      "text": {"body": "Olá"},
+                      "type": "text"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "uazapi-text-message",
+      "ingress": "uazapi",
+      "method": "POST",
+      "path": "/v1/webhook/uazapi",
+      "auth": "none",
+      "json": {
+        "instanceName": "{uazapi_instance}",
+        "message": {
+          "messageid": "credit-dominance-uazapi-1",
+          "text": "Olá, qual o valor da consulta?",
+          "fromMe": false,
+          "type": "text",
+          "sender_pn": "5511900000301@s.whatsapp.net"
+        },
+        "chat": {"wa_chatid": "5511900000301@s.whatsapp.net"}
+      }
+    },
+    {
+      "id": "uazapi-unknown-instance",
+      "ingress": "uazapi",
+      "method": "POST",
+      "path": "/v1/webhook/uazapi",
+      "auth": "none",
+      "json": {
+        "instanceName": "credit-dominance-unknown",
+        "message": {
+          "messageid": "credit-dominance-uazapi-2",
+          "text": "Olá",
+          "fromMe": false,
+          "type": "text",
+          "sender_pn": "5511900000302@s.whatsapp.net"
+        },
+        "chat": {"wa_chatid": "5511900000302@s.whatsapp.net"}
+      }
+    },
+    {
+      "id": "evolution-text-message",
+      "ingress": "evolution",
+      "method": "POST",
+      "path": "/v1/webhook/evolution",
+      "auth": "none",
+      "json": {
+        "event": "messages.upsert",
+        "instance": "{evolution_instance}",
+        "data": {
+          "key": {
+            "remoteJid": "5511900000401@s.whatsapp.net",
+            "fromMe": false,
+            "id": "credit-dominance-evolution-1"
+          },
+          "message": {"conversation": "Olá, vocês aceitam convênio?"},
+          "pushName": "Paciente E"
+        }
+      }
+    },
+    {
+      "id": "evolution-unknown-instance",
+      "ingress": "evolution",
+      "method": "POST",
+      "path": "/v1/webhook/evolution",
+      "auth": "none",
+      "json": {
+        "event": "messages.upsert",
+        "instance": "credit-dominance-unknown",
+        "data": {
+          "key": {
+            "remoteJid": "5511900000402@s.whatsapp.net",
+            "fromMe": false,
+            "id": "credit-dominance-evolution-2"
+          },
+          "message": {"conversation": "Olá"},
+          "pushName": "Paciente E"
+        }
+      }
+    },
+    {
+      "id": "evolution-non-message-event",
+      "ingress": "evolution",
+      "method": "POST",
+      "path": "/v1/webhook/evolution",
+      "auth": "none",
+      "json": {
+        "event": "connection.update",
+        "instance": "{evolution_instance}",
+        "data": {"state": "open"}
+      }
+    }
+  ]
+}
