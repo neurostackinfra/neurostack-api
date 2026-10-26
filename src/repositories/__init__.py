@@ -13,6 +13,8 @@ from src.repositories.billing import (
     BillingTransitionRejected,
     billing_advisory_key,
 )
+from src.repositories.credit import CreditRepository
+from src.repositories.credit_fact_ack import CreditFactAckRepository
 from src.repositories.database import (
     close_database,
     get_db_engine,
@@ -37,6 +39,9 @@ __all__ = [
     "BillingTransitionRejected",
     "BillingCapabilityRejected",
     "billing_advisory_key",
+    # Credit (neurostack-credit-system)
+    "CreditRepository",
+    "CreditFactAckRepository",
     # Database
     "get_db_session",
     "get_db_session_dependency",
