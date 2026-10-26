@@ -95,10 +95,14 @@ def document() -> dict[str, Any]:
     return json.loads(FROZEN_037_PATH.read_bytes())
 
 
-def test_037_revises_036_and_is_the_single_head(migration: ModuleType) -> None:
+def test_037_revises_036_and_038_follows_it(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("037", "036")
-    assert current_head() == "037"
-    assert migration_revisions()[_MIGRATION.name] == ("037", "036")
+    revisions = migration_revisions()
+    assert revisions[_MIGRATION.name] == ("037", "036")
+    # neurostack-credit-system Group 1a: 038 (the additive credit schema) is
+    # the only child of 037.
+    assert [rev for rev, parent in revisions.values() if parent == "037"] == ["038"]
+    assert current_head() == "038"
 
 
 def test_scope_is_the_four_legacy_tables_and_their_ten_functions(

@@ -41,6 +41,22 @@ from src.models.builder import Builder
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.coupon import Coupon
+from src.models.credit import (
+    CreditAccount,
+    CreditCapabilityReadiness,
+    CreditDebt,
+    CreditDebtOrigin,
+    CreditDebtSettlement,
+    CreditEffect,
+    CreditEnforcementBinding,
+    CreditEnforcementState,
+    CreditIngressClaim,
+    CreditLedgerEntry,
+    CreditLot,
+    CreditObservationalEffect,
+    CreditResponseOutbox,
+)
+from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
 from src.models.demo_lead import DemoLead
 from src.models.event import Event
 from src.models.handoff import HandoffRecord
@@ -85,6 +101,22 @@ __all__ = [
     "BillingProducerV1BuildAttestation",
     "BillingProducerV1Receipt",
     "BillingProducerV1ActivePair",
+    # Credit Models (neurostack-credit-system, migration 038)
+    "CreditAccount",
+    "CreditEffect",
+    "CreditLot",
+    "CreditLedgerEntry",
+    "CreditDebt",
+    "CreditDebtOrigin",
+    "CreditDebtSettlement",
+    "CreditFactInbox",
+    "CreditRevisionGap",
+    "CreditCapabilityReadiness",
+    "CreditIngressClaim",
+    "CreditResponseOutbox",
+    "CreditEnforcementState",
+    "CreditEnforcementBinding",
+    "CreditObservationalEffect",
     # Core Models
     "Builder",
     "Coupon",

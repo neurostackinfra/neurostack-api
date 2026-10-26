@@ -253,7 +253,11 @@ MIGRATIONS_EXCLUDED: Mapping[str, str] = {
         "037: its own window (migrations_037), on its own explicit owner "
         "instruction after 036 is verified"
     ),
-    "037": "none: 037 is the last written revision",
+    "037": (
+        "038 (the additive credit schema, neurostack-credit-system): no "
+        "window yet; its ASAAS migration window is an entry condition of "
+        "that wish's Group 8"
+    ),
 }
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)
 _ALEMBIC_UPGRADE = re.compile(r"alembic\s+upgrade\s+([^\s`'\"),.;]+)", re.IGNORECASE)
