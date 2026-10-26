@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+
 import pytest
 from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, HTTPException
