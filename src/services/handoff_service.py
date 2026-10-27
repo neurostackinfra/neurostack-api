@@ -44,8 +44,10 @@ from src.handoff.sla import (
 from src.handoff.summarizer import ConversationSummarizer, get_summarizer
 from src.handoff.webhook import WebhookDispatcher, get_webhook_dispatcher
 from src.interaction_context import (
+    InteractionOrigin,
     ResolvedInteractionContext,
     require_interaction_context,
+    unknown_interaction_context,
 )
 from src.memory import event_store as event_store_module
 from src.memory.event_store import EventData, EventStore, EventType, HandoffEventData
@@ -395,14 +397,27 @@ class HandoffService:
         ``ResolvedInteractionContext`` for ``request``'s tenant and session is
         accepted: any other type raises ``TypeError`` and a tenant or session
         mismatch raises ``InteractionContextError``, both before any record,
-        event, webhook or log.
+        event, webhook or log. Without a context the call has no proof of
+        origin and takes the ``unknown`` factory.
+
+        Only the context's origin reaches ``handoff.request``, beside the
+        record's tenant and session. ``interaction_event_id`` stays in memory:
+        a synchronous handoff runs in pipeline phase 1, before the phase 2
+        bundle writes the ``message.in`` that ID reserves.
         """
-        if context is not None:
+        if context is None:
+            context = unknown_interaction_context(
+                effective_tenant_id=request.tenant_id,
+                session_id=request.session_id,
+                event_type=EventType.HANDOFF_REQUEST.value,
+            )
+        else:
             require_interaction_context(
                 context,
                 tenant_id=request.tenant_id,
                 session_id=request.session_id,
             )
+        origin = context.origin
         started_at = time.perf_counter()
         handoff_id = uuid4()
         summary = self._generate_summary(request)
@@ -452,7 +467,7 @@ class HandoffService:
                         "Failed to persist handoff in PostgreSQL"
                     ) from exc
 
-            await self._emit_handoff_request(record, summary)
+            await self._emit_handoff_request(record, summary, origin=origin)
             webhook_sent, webhook_status = await self._dispatch_creation_webhook(
                 record,
                 request,
@@ -579,7 +594,14 @@ class HandoffService:
         self,
         record: HandoffRecord,
         summary: ConversationSummary,
+        *,
+        origin: InteractionOrigin,
     ) -> None:
+        """Append ``handoff.request`` with the initiation origin only.
+
+        The emitter receives the origin, never the context, so the reserved
+        ``interaction_event_id`` cannot reach the event.
+        """
         try:
             event_store = await self._event_store_for_operation()
             if event_store is None:
@@ -594,6 +616,7 @@ class HandoffService:
                 tenant_id=record.tenant_id,
                 session_id=record.session_id,
                 event_type=EventType.HANDOFF_REQUEST.value,
+                interaction_origin=origin,
                 event_data=event_data.model_dump(),
                 event_metadata={"handoff_id": str(record.id)},
             )
@@ -1193,19 +1216,27 @@ class HandoffService:
         }.get(new_status)
         if event_type is None:
             return
-        event = EventData(
-            tenant_id=record.tenant_id,
-            session_id=record.session_id,
-            event_type=event_type.value,
-            event_data={
-                "handoff_id": str(record.id),
-                "old_status": old_status.value,
-                "new_status": new_status.value,
-                "assigned_to": record.assigned_to,
-            },
-            event_metadata={},
-        )
         try:
+            # A late transition has no live interaction: the record carries no
+            # origin and none is inferred from it, its channel or its metadata.
+            late_context = unknown_interaction_context(
+                effective_tenant_id=record.tenant_id,
+                session_id=record.session_id,
+                event_type=event_type.value,
+            )
+            event = EventData(
+                tenant_id=record.tenant_id,
+                session_id=record.session_id,
+                event_type=event_type.value,
+                interaction_origin=late_context.origin,
+                event_data={
+                    "handoff_id": str(record.id),
+                    "old_status": old_status.value,
+                    "new_status": new_status.value,
+                    "assigned_to": record.assigned_to,
+                },
+                event_metadata={},
+            )
             event_store = await self._event_store_for_operation()
             if event_store is None:
                 return
