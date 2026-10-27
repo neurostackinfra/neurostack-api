@@ -16,7 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.middleware.auth import TenantContext, get_tenant_context
+from src.api.middleware.auth import (
+    TenantContext,
+    get_tenant_context,
+    resolve_effective_tenant,
+)
 from src.api.middleware.tenant_identity import (
     audit_tenant_identity_mismatch,
     tenant_identity_mismatch_response,
@@ -29,11 +33,35 @@ from src.api.schemas.events import (
     EventResponse,
     EventType,
 )
+from src.interaction_context import (
+    build_interaction_context,
+    classify_interaction_origin,
+)
 from src.repositories import get_db_session_dependency
 from src.services import get_event_service
 from src.services.event_service import SessionNotFoundError
 
 router = APIRouter()
+
+# Server-managed provenance. A client may never send it in the public
+# ``EventRequest`` body, its ``payload`` or ``payload.metadata``.
+RESERVED_INTERACTION_ORIGIN_FIELD = "interaction_origin"
+INTERACTION_ORIGIN_SERVER_MANAGED = "interaction_origin_server_managed"
+
+
+def _client_sent_interaction_origin(raw_body: object) -> bool:
+    """True when the raw JSON body carries the reserved origin field."""
+    if not isinstance(raw_body, dict):
+        return False
+    if RESERVED_INTERACTION_ORIGIN_FIELD in raw_body:
+        return True
+    payload = raw_body.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    if RESERVED_INTERACTION_ORIGIN_FIELD in payload:
+        return True
+    metadata = payload.get("metadata")
+    return isinstance(metadata, dict) and RESERVED_INTERACTION_ORIGIN_FIELD in metadata
 
 
 # ============================================
@@ -77,12 +105,22 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
         },
     },
     403: {
-        "description": "Tenant identity assertion failed",
+        "description": (
+            "Tenant identity assertion failed, or the JWT role has no "
+            "operational policy (`caller_role_forbidden`)"
+        ),
         "content": {
             "application/json": {
-                "example": {
-                    "error": "tenant_identity_mismatch",
-                    "message": "Tenant identity does not match the authenticated request",
+                "examples": {
+                    "tenant_identity_mismatch": {
+                        "value": {
+                            "error": "tenant_identity_mismatch",
+                            "message": "Tenant identity does not match the authenticated request",
+                        }
+                    },
+                    "caller_role_forbidden": {
+                        "value": {"detail": {"code": "caller_role_forbidden"}}
+                    },
                 }
             }
         },
@@ -96,6 +134,53 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
                     "error": "not_found",
                     "message": "Session not found",
                 }
+            }
+        },
+    },
+    422: {
+        "description": (
+            "Invalid body, or a client-sent `interaction_origin` "
+            "(server-managed provenance)"
+        ),
+        "content": {
+            "application/json": {
+                "schema": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/HTTPValidationError"},
+                        {
+                            "type": "object",
+                            "required": ["detail"],
+                            "properties": {
+                                "detail": {
+                                    "type": "object",
+                                    "required": ["code"],
+                                    "properties": {
+                                        "code": {
+                                            "type": "string",
+                                            "enum": [INTERACTION_ORIGIN_SERVER_MANAGED],
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                    ]
+                },
+                "examples": {
+                    "validation_error": {
+                        "value": {
+                            "detail": [
+                                {
+                                    "loc": ["body", "event_type"],
+                                    "msg": "Field required",
+                                    "type": "missing",
+                                }
+                            ]
+                        }
+                    },
+                    INTERACTION_ORIGIN_SERVER_MANAGED: {
+                        "value": {"detail": {"code": INTERACTION_ORIGIN_SERVER_MANAGED}}
+                    },
+                },
             }
         },
     },
@@ -221,13 +306,33 @@ async def process_event(
 
     _logger = _get_logger(__name__)
 
+    # Fixed error order (#68 contract kept; the tenant assertion already ran in
+    # TenantIdentityMiddleware): JWT role allowlist (403 caller_role_forbidden,
+    # the rate-limit slot stays consumed) → reserved origin field (422) →
+    # session proved by the tenant-scoped lock (403 tenant_identity_mismatch).
+    effective_tenant_id = await resolve_effective_tenant(http_request, tenant, None, db)
+
+    if _client_sent_interaction_origin(await http_request.json()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": INTERACTION_ORIGIN_SERVER_MANAGED},
+        )
+
     # TenantIdentityMiddleware treated the optional payload value as an
     # assertion. Canonicalize the model before any service/store receives it.
     canonical_request = CanonicalEventRequest(
-        tenant_id=tenant.tenant_id,
+        tenant_id=effective_tenant_id,
         session_id=request.session_id,
         event_type=request.event_type,
         payload=request.payload,
+    )
+    # The interaction's single context: built once here, consumed only after
+    # run_pipeline's lock proves the session inside the tenant.
+    context = build_interaction_context(
+        effective_tenant_id=effective_tenant_id,
+        session_id=request.session_id,
+        origin=classify_interaction_origin(tenant),
+        event_type=request.event_type,
     )
 
     service = get_event_service()
@@ -236,7 +341,7 @@ async def process_event(
     # Any exception here rolls back the transaction so nothing is left dirty.
     try:
         result, clinic_config, message_history = await service.run_pipeline(
-            canonical_request, session=db
+            canonical_request, session=db, context=context
         )
     except SessionNotFoundError:
         await db.rollback()
@@ -291,7 +396,11 @@ async def process_event(
     # DB session is already committed/released; failures here are independent.
     try:
         return await service.finish_response(
-            canonical_request, result, clinic_config, message_history
+            canonical_request,
+            result,
+            clinic_config,
+            message_history,
+            context=context,
         )
     except HTTPException:
         raise

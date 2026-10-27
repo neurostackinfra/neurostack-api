@@ -43,6 +43,10 @@ from src.handoff.sla import (
 )
 from src.handoff.summarizer import ConversationSummarizer, get_summarizer
 from src.handoff.webhook import WebhookDispatcher, get_webhook_dispatcher
+from src.interaction_context import (
+    ResolvedInteractionContext,
+    require_interaction_context,
+)
 from src.memory import event_store as event_store_module
 from src.memory.event_store import EventData, EventStore, EventType, HandoffEventData
 from src.models.handoff import HandoffRecord
@@ -378,8 +382,27 @@ class HandoffService:
             return await event_store_module.get_event_store()
         return self.event_store
 
-    async def initiate_handoff(self, request: HandoffRequest) -> HandoffResponse:
-        """Commit the PostgreSQL source of truth before any public effects."""
+    async def initiate_handoff(
+        self,
+        request: HandoffRequest,
+        *,
+        context: ResolvedInteractionContext | None = None,
+    ) -> HandoffResponse:
+        """Commit the PostgreSQL source of truth before any public effects.
+
+        ``context`` is the interaction's trusted context, passed by keyword and
+        never serialized or stored as a whole. Only a real
+        ``ResolvedInteractionContext`` for ``request``'s tenant and session is
+        accepted: any other type raises ``TypeError`` and a tenant or session
+        mismatch raises ``InteractionContextError``, both before any record,
+        event, webhook or log.
+        """
+        if context is not None:
+            require_interaction_context(
+                context,
+                tenant_id=request.tenant_id,
+                session_id=request.session_id,
+            )
         started_at = time.perf_counter()
         handoff_id = uuid4()
         summary = self._generate_summary(request)

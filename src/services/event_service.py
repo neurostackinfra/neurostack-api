@@ -28,6 +28,13 @@ from src.api.schemas.events import (
 from src.config.logging import get_logger
 from src.core.exceptions import EventStoreError
 from src.handoff.episode_context import extract_self_identified_name
+from src.interaction_context import (
+    InteractionContextError,
+    InteractionOrigin,
+    ResolvedInteractionContext,
+    require_interaction_context,
+    unknown_interaction_context,
+)
 from src.memory import EventData
 from src.memory import EventType as StoredEventType
 from src.memory import get_event_store
@@ -675,6 +682,319 @@ def _append_llm_attempt(attempts: list[dict[str, Any]], entry: dict[str, Any]) -
     _record_llm_generation_attempt(entry)
 
 
+def _resolve_interaction_context(
+    request: CanonicalEventRequest,
+    context: Optional[ResolvedInteractionContext],
+) -> ResolvedInteractionContext:
+    """Return the request's context, or the ``unknown`` one when absent.
+
+    A supplied context must be a real ``ResolvedInteractionContext`` for the
+    same tenant, session and event type; anything else raises before any
+    effect (``TypeError`` / ``InteractionContextError``).
+    """
+    if context is None:
+        return unknown_interaction_context(
+            effective_tenant_id=request.tenant_id,
+            session_id=request.session_id,
+            event_type=request.event_type,
+        )
+    return require_interaction_context(
+        context,
+        tenant_id=request.tenant_id,
+        session_id=request.session_id,
+        event_type=request.event_type,
+    )
+
+
+def build_interaction_event_bundle(
+    request: CanonicalEventRequest,
+    result: "PipelineResult",
+    context: ResolvedInteractionContext,
+    *,
+    suggested_response: Optional[str] = None,
+    llm_usage: Optional[dict[str, int]] = None,
+    llm_model: str = "",
+    llm_attempts: Optional[list[dict[str, Any]]] = None,
+    llm_usage_total: Optional[dict[str, int]] = None,
+) -> list[EventData]:
+    """Build every Event Store row of one interaction (pure: no I/O).
+
+    Tenant, session and origin of every row come from ``context`` alone. The
+    request's own event (``message.in`` or another public type) uses the
+    pre-allocated ``context.interaction_event_id`` when it is ``message.in``;
+    ``srm.decision`` keeps ``result.event_id`` (the public ``event_id``).
+    """
+    require_interaction_context(
+        context,
+        tenant_id=request.tenant_id,
+        session_id=request.session_id,
+        event_type=request.event_type,
+    )
+    tenant_id = context.effective_tenant_id
+    session_id = context.session_id
+    origin = context.origin
+
+    # Save the incoming message event — enriched with SRM decision data
+    # so that trace_service can extract decision fields directly from message.in
+    message_event = EventData(
+        id=(
+            context.interaction_event_id
+            if context.interaction_event_id is not None
+            else uuid4()
+        ),
+        tenant_id=tenant_id,
+        session_id=session_id,
+        event_type=request.event_type.value,
+        interaction_origin=origin,
+        event_data={
+            "content": request.payload.content,
+            "channel": request.payload.channel,
+            "user_id": request.payload.user_id,
+            "role": "user",
+            # SRM decision data (enrichment for trace_service)
+            "intent": result.intent,
+            "intent_category": result.intent_category,
+            "funnel_stage": result.funnel_stage,
+            "action": result.action,
+            "confidence": result.confidence,
+            "safety_concern": result.safety_concern,
+            "safety_category": result.safety_category,
+            "needs_rag": result.needs_rag,
+            "handoff_required": result.handoff_required,
+            "handoff_reason": result.handoff_reason,
+            "mode": result.mode,
+            "reasoning": result.reasoning,
+            "sentiment_label": result.sentiment_label,
+            "sentiment_score": result.sentiment_score,
+        },
+        event_metadata={
+            "processing_time_ms": result.processing_time_ms,
+            "mode": result.mode,
+            # Duplicated for trace_service filter queries (JSONB operators)
+            "safety_concern": result.safety_concern,
+            "handoff_required": result.handoff_required,
+            "intent": result.intent,
+            # Conversational-episode tag used by
+            # ``_load_message_history`` to draw the fresh episode
+            # boundary (wish deliverable 1). ``None`` on legacy /
+            # pre-reactivation sessions keeps the audit trail
+            # intact; stored alongside the other metadata without
+            # removing any existing field.
+            "context_episode_id": result.context_episode_id,
+            # LLM token usage — legacy accepted trio (unchanged
+            # contract: attribution of ONLY the accepted result).
+            "llm_model": llm_model,
+            "llm_usage": llm_usage or {},
+            # Full attempt history + deterministic fold. Group 4
+            # trace/builder consumers prefer these over the trio when
+            # present, and fall back to the trio for legacy events.
+            "llm_attempts": list(llm_attempts or []),
+            "llm_usage_total": dict(llm_usage_total or {}),
+            "funnel_stage": result.funnel_stage,
+            # Audio transcription metadata (from webhook payload)
+            **{
+                k: v
+                for k, v in (request.payload.metadata or {}).items()
+                if k in ("whisper_model", "is_audio", "audio_seconds")
+            },
+        },
+    )
+    events = [message_event]
+
+    # Decision Trace (CTXDecisionOutput / doc MVP v0.5): version, event_id, risk_flags, policy_refs, etc.
+    risk_flags = {
+        "safety_concern": result.safety_concern,
+        "human_handoff_needed": result.handoff_required,
+        "abuse_risk": False,
+        "compliance_risk": False,
+        "reputacao_risco": False,
+        "urgencia_clinica": (
+            result.safety_category == "clinical_risk"
+            if result.safety_category
+            else False
+        ),
+        "lead_irritado": False,
+        "pedido_promessa_resultado": False,
+    }
+    policy_refs = (result.state_patch or {}).get("policy_refs") or []
+    constraints = (
+        result.constraints
+        if hasattr(result, "constraints") and result.constraints
+        else (result.state_patch or {}).get("constraints") or []
+    )
+
+    events.append(
+        EventData(
+            id=result.event_id,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            event_type="srm.decision",
+            interaction_origin=origin,
+            event_data={
+                "version": 1,
+                "event_id": str(result.event_id),
+                "timestamp": result.processed_at
+                or datetime.now(timezone.utc).isoformat(),
+                "clinic_id": str(tenant_id),
+                "user_id": (
+                    getattr(request.payload, "user_id", None)
+                    if hasattr(request, "payload")
+                    else None
+                ),
+                "channel": (
+                    getattr(request.payload, "channel", "unknown")
+                    if hasattr(request, "payload")
+                    else "unknown"
+                ),
+                "message_id": None,
+                "intent": result.intent,
+                "action": result.action,
+                "funnel_stage_before": getattr(result, "funnel_stage_before", None),
+                "funnel_stage_after": result.funnel_stage,
+                "risk_flags": risk_flags,
+                "policy_refs": policy_refs,
+                "constraints": constraints,
+                "rag": {"needs_rag": result.needs_rag},
+                "srm": {
+                    "intent": result.intent,
+                    "intent_category": result.intent_category,
+                    "confidence": result.confidence,
+                    "mode": result.mode,
+                },
+                "handoff": (
+                    {
+                        "handoff_required": result.handoff_required,
+                        "handoff_reason": result.handoff_reason,
+                        "handoff_summary": result.handoff_summary,
+                    }
+                    if result.handoff_required
+                    else None
+                ),
+                "entities": {},
+                "justificativa_curta": result.reasoning,
+                "intent_category": result.intent_category,
+                "funnel_stage": result.funnel_stage,
+                "confidence": result.confidence,
+                "safety_concern": result.safety_concern,
+                "safety_category": result.safety_category,
+                "needs_rag": result.needs_rag,
+                "handoff_required": result.handoff_required,
+                "handoff_reason": result.handoff_reason,
+                "mode": result.mode,
+                "state_patch": result.state_patch,
+                "reasoning": result.reasoning,
+            },
+            event_metadata={
+                "processing_time_ms": result.processing_time_ms,
+                "processed_at": (result.processed_at if result.processed_at else None),
+            },
+        )
+    )
+
+    # Save the prompt generation event
+    events.append(
+        EventData(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            session_id=session_id,
+            event_type="prompt.generated",
+            interaction_origin=origin,
+            event_data={
+                "system_prompt": result.system_prompt,
+                "instructions": result.instructions,
+                "constraints": result.constraints,
+                "context_summary": result.context_summary,
+                "context_sources": _filter_relevant_sources(
+                    result.context_sources or [],
+                    request.payload.content,
+                    suggested_response,
+                ),
+                "mode": result.mode,
+                "intent": result.intent,
+                "funnel_stage": result.funnel_stage,
+                "suggested_response": suggested_response,
+            },
+            event_metadata={
+                "processing_time_ms": result.processing_time_ms,
+                "processed_at": (result.processed_at if result.processed_at else None),
+                "stage_timings": result.stage_timings,
+                # Episode tag — mirrors ``message.in`` so the LLM-visible
+                # history filter treats the pair atomically (wish
+                # deliverable 1).
+                "context_episode_id": result.context_episode_id,
+            },
+        )
+    )
+
+    # convenio-particular-triage: emit when the modality slot is set.
+    # Engine only writes atendimento_tipo into state_patch when the value
+    # changes, so this fires on first set + explicit switches only.
+    _patch_slots = (result.state_patch or {}).get("slots") or {}
+    _new_atendimento_tipo = _patch_slots.get("atendimento_tipo")
+    if _new_atendimento_tipo:
+        events.append(
+            EventData(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type=StoredEventType.NS_ATENDIMENTO_TIPO_SET.value,
+                interaction_origin=origin,
+                event_data={
+                    "atendimento_tipo": _new_atendimento_tipo,
+                    "trigger_message": request.payload.content,
+                },
+                event_metadata={
+                    "channel": request.payload.channel,
+                    "user_id": request.payload.user_id,
+                },
+            )
+        )
+
+    # CRM integration events (doc MVP v0.5): ns.funnel_stage_changed, ns.handoff_created
+    if result.state_patch and result.state_patch.get("funnel_stage"):
+        events.append(
+            EventData(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type="ns.funnel_stage_changed",
+                interaction_origin=origin,
+                event_data={
+                    "ns_stage": result.funnel_stage,
+                    "crm_stage_id": None,
+                },
+                event_metadata={},
+            )
+        )
+
+    if result.handoff_required and result.handoff_summary:
+        events.append(
+            EventData(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                session_id=session_id,
+                event_type="ns.handoff_created",
+                interaction_origin=origin,
+                event_data={
+                    "handoff_id": result.handoff_summary.get("id"),
+                    "setor": result.handoff_summary.get("sector"),
+                    "prioridade": result.handoff_summary.get("sla"),
+                    "resumo": result.handoff_summary.get("summary", ""),
+                    "urgency": result.handoff_summary.get("urgency"),
+                    "status": result.handoff_summary.get("status"),
+                },
+                event_metadata={},
+            )
+        )
+
+    return events
+
+
+def _stored_interaction_origin(value: Optional[str]) -> InteractionOrigin:
+    """Map a persisted ``events.interaction_origin`` value (legacy NULL → unknown)."""
+    return InteractionOrigin(value or InteractionOrigin.UNKNOWN.value)
+
+
 class EventService:
     """Service for processing and managing events."""
 
@@ -1040,6 +1360,8 @@ class EventService:
         self,
         request: CanonicalEventRequest,
         session: Optional[AsyncSession] = None,
+        *,
+        context: Optional[ResolvedInteractionContext] = None,
     ) -> tuple[
         "PipelineResult",
         Optional[dict[str, Any]],
@@ -1058,7 +1380,20 @@ class EventService:
 
         Raises on persistence failure (does NOT swallow) so the route handler
         can detect the failure and rollback before calling finish_response().
+
+        ``context`` is the interaction's single ``ResolvedInteractionContext``
+        (``None`` → the ``unknown`` factory). It must match the request's
+        tenant, session and event type, and nothing is keyed by its session
+        or interaction ID before ``_lock_session_state`` proves the session in
+        the tenant. Without a ``session`` only an ``unknown`` context is
+        accepted. Violations raise before any effect.
         """
+        context = _resolve_interaction_context(request, context)
+        if session is None and context.origin is not InteractionOrigin.UNKNOWN:
+            raise InteractionContextError(
+                "a trusted interaction origin requires a locked session"
+            )
+
         # Lock and resolve the session through the authenticated tenant before
         # loading configuration or running any pipeline/effect. A bare session
         # id must never become a cross-tenant lookup oracle.
@@ -1141,7 +1476,9 @@ class EventService:
         # Process through the complete pipeline (CPU-bound, no I/O)
         from src.core.pipeline import PipelineResult
 
-        result: PipelineResult = await self._pipeline.process(pipeline_input)
+        result: PipelineResult = await self._pipeline.process(
+            pipeline_input, context=context
+        )
 
         # A proposal is only durable when its canonical confirmation prompt is
         # the selected final output. Safety, handoff, scheduling-confirmation
@@ -1183,13 +1520,21 @@ class EventService:
         result: "PipelineResult",
         clinic_config: Optional[dict[str, Any]],
         message_history: list[dict[str, str]],
+        *,
+        context: Optional[ResolvedInteractionContext] = None,
     ) -> EventResponse:
         """
         Phase 2 — slow I/O: LLM call + event-store writes.
 
         Called only after the DB transaction from run_pipeline() has been
         committed, so the connection is already released when this runs.
+
+        ``context`` must be the same object given to ``run_pipeline``
+        (``None`` → the ``unknown`` factory). ``interaction_event_id`` in the
+        response is set only after the Event Store batch persisted it.
         """
+        context = _resolve_interaction_context(request, context)
+
         # Convert pipeline result to API response (LLM call happens here)
         (
             response,
@@ -1210,7 +1555,7 @@ class EventService:
         suggested_response = None
         if response.prompt and response.prompt.suggested_response:
             suggested_response = response.prompt.suggested_response
-        await self._save_events_to_store(
+        interaction_event_id = await self._save_events_to_store(
             request,
             result,
             suggested_response=suggested_response,
@@ -1218,7 +1563,9 @@ class EventService:
             llm_model=llm_model,
             llm_attempts=llm_attempts,
             llm_usage_total=llm_usage_total,
+            context=context,
         )
+        response.interaction_event_id = interaction_event_id
 
         return response
 
@@ -1232,10 +1579,14 @@ class EventService:
         The /v1/events route handler calls run_pipeline() + finish_response()
         directly so it can commit between the two phases. Stateful callers
         must do the same and may not inject an unmanaged external session here.
+        Without a proved session the interaction is always ``unknown``.
         """
-        result, clinic_config, message_history = await self.run_pipeline(request)
+        context = _resolve_interaction_context(request, None)
+        result, clinic_config, message_history = await self.run_pipeline(
+            request, context=context
+        )
         return await self.finish_response(
-            request, result, clinic_config, message_history
+            request, result, clinic_config, message_history, context=context
         )
 
     async def _convert_pipeline_result_to_response(
@@ -1760,9 +2111,13 @@ class EventService:
         llm_model: str = "",
         llm_attempts: Optional[list[dict[str, Any]]] = None,
         llm_usage_total: Optional[dict[str, int]] = None,
-    ) -> None:
+        *,
+        context: Optional[ResolvedInteractionContext] = None,
+    ) -> Optional[UUID]:
         """
-        Save events to Event Store (non-blocking).
+        Save the interaction's events to the Event Store in ONE batch.
+
+        Best-effort: a failure is logged and never fails the request.
 
         Args:
             request: Original event request
@@ -1774,251 +2129,27 @@ class EventService:
                 one entry per initiated call. Serialised as-is into
                 ``message.in`` metadata for downstream consumers.
             llm_usage_total: Deterministic fold over the ``reported`` entries.
+            context: The interaction context (``None`` → ``unknown`` factory).
+
+        Returns:
+            The persisted ``message.in`` ID (``context.interaction_event_id``)
+            once the batch committed; ``None`` for other event types or when
+            the write failed, so no orphan reference ever leaves this method.
         """
+        context = _resolve_interaction_context(request, context)
         try:
+            events = build_interaction_event_bundle(
+                request,
+                result,
+                context,
+                suggested_response=suggested_response,
+                llm_usage=llm_usage,
+                llm_model=llm_model,
+                llm_attempts=llm_attempts,
+                llm_usage_total=llm_usage_total,
+            )
             event_store = await get_event_store()
-
-            # Save the incoming message event — enriched with SRM decision data
-            # so that trace_service can extract decision fields directly from message.in
-            message_event = EventData(
-                id=uuid4(),
-                tenant_id=request.tenant_id,
-                session_id=request.session_id,
-                event_type=request.event_type.value,
-                event_data={
-                    "content": request.payload.content,
-                    "channel": request.payload.channel,
-                    "user_id": request.payload.user_id,
-                    "role": "user",
-                    # SRM decision data (enrichment for trace_service)
-                    "intent": result.intent,
-                    "intent_category": result.intent_category,
-                    "funnel_stage": result.funnel_stage,
-                    "action": result.action,
-                    "confidence": result.confidence,
-                    "safety_concern": result.safety_concern,
-                    "safety_category": result.safety_category,
-                    "needs_rag": result.needs_rag,
-                    "handoff_required": result.handoff_required,
-                    "handoff_reason": result.handoff_reason,
-                    "mode": result.mode,
-                    "reasoning": result.reasoning,
-                    "sentiment_label": result.sentiment_label,
-                    "sentiment_score": result.sentiment_score,
-                },
-                event_metadata={
-                    "processing_time_ms": result.processing_time_ms,
-                    "mode": result.mode,
-                    # Duplicated for trace_service filter queries (JSONB operators)
-                    "safety_concern": result.safety_concern,
-                    "handoff_required": result.handoff_required,
-                    "intent": result.intent,
-                    # Conversational-episode tag used by
-                    # ``_load_message_history`` to draw the fresh episode
-                    # boundary (wish deliverable 1). ``None`` on legacy /
-                    # pre-reactivation sessions keeps the audit trail
-                    # intact; stored alongside the other metadata without
-                    # removing any existing field.
-                    "context_episode_id": result.context_episode_id,
-                    # LLM token usage — legacy accepted trio (unchanged
-                    # contract: attribution of ONLY the accepted result).
-                    "llm_model": llm_model,
-                    "llm_usage": llm_usage or {},
-                    # Full attempt history + deterministic fold. Group 4
-                    # trace/builder consumers prefer these over the trio when
-                    # present, and fall back to the trio for legacy events.
-                    "llm_attempts": list(llm_attempts or []),
-                    "llm_usage_total": dict(llm_usage_total or {}),
-                    "funnel_stage": result.funnel_stage,
-                    # Audio transcription metadata (from webhook payload)
-                    **{
-                        k: v
-                        for k, v in (request.payload.metadata or {}).items()
-                        if k in ("whisper_model", "is_audio", "audio_seconds")
-                    },
-                },
-            )
-            await event_store.append(message_event)
-
-            # Decision Trace (CTXDecisionOutput / doc MVP v0.5): version, event_id, risk_flags, policy_refs, etc.
-            risk_flags = {
-                "safety_concern": result.safety_concern,
-                "human_handoff_needed": result.handoff_required,
-                "abuse_risk": False,
-                "compliance_risk": False,
-                "reputacao_risco": False,
-                "urgencia_clinica": (
-                    result.safety_category == "clinical_risk"
-                    if result.safety_category
-                    else False
-                ),
-                "lead_irritado": False,
-                "pedido_promessa_resultado": False,
-            }
-            policy_refs = (result.state_patch or {}).get("policy_refs") or []
-            constraints = (
-                result.constraints
-                if hasattr(result, "constraints") and result.constraints
-                else (result.state_patch or {}).get("constraints") or []
-            )
-
-            decision_event = EventData(
-                id=result.event_id,
-                tenant_id=request.tenant_id,
-                session_id=request.session_id,
-                event_type="srm.decision",
-                event_data={
-                    "version": 1,
-                    "event_id": str(result.event_id),
-                    "timestamp": result.processed_at
-                    or datetime.now(timezone.utc).isoformat(),
-                    "clinic_id": str(request.tenant_id),
-                    "user_id": (
-                        getattr(request.payload, "user_id", None)
-                        if hasattr(request, "payload")
-                        else None
-                    ),
-                    "channel": (
-                        getattr(request.payload, "channel", "unknown")
-                        if hasattr(request, "payload")
-                        else "unknown"
-                    ),
-                    "message_id": None,
-                    "intent": result.intent,
-                    "action": result.action,
-                    "funnel_stage_before": getattr(result, "funnel_stage_before", None),
-                    "funnel_stage_after": result.funnel_stage,
-                    "risk_flags": risk_flags,
-                    "policy_refs": policy_refs,
-                    "constraints": constraints,
-                    "rag": {"needs_rag": result.needs_rag},
-                    "srm": {
-                        "intent": result.intent,
-                        "intent_category": result.intent_category,
-                        "confidence": result.confidence,
-                        "mode": result.mode,
-                    },
-                    "handoff": (
-                        {
-                            "handoff_required": result.handoff_required,
-                            "handoff_reason": result.handoff_reason,
-                            "handoff_summary": result.handoff_summary,
-                        }
-                        if result.handoff_required
-                        else None
-                    ),
-                    "entities": {},
-                    "justificativa_curta": result.reasoning,
-                    "intent_category": result.intent_category,
-                    "funnel_stage": result.funnel_stage,
-                    "confidence": result.confidence,
-                    "safety_concern": result.safety_concern,
-                    "safety_category": result.safety_category,
-                    "needs_rag": result.needs_rag,
-                    "handoff_required": result.handoff_required,
-                    "handoff_reason": result.handoff_reason,
-                    "mode": result.mode,
-                    "state_patch": result.state_patch,
-                    "reasoning": result.reasoning,
-                },
-                event_metadata={
-                    "processing_time_ms": result.processing_time_ms,
-                    "processed_at": (
-                        result.processed_at if result.processed_at else None
-                    ),
-                },
-            )
-            await event_store.append(decision_event)
-
-            # Save the prompt generation event
-            prompt_event = EventData(
-                id=uuid4(),
-                tenant_id=request.tenant_id,
-                session_id=request.session_id,
-                event_type="prompt.generated",
-                event_data={
-                    "system_prompt": result.system_prompt,
-                    "instructions": result.instructions,
-                    "constraints": result.constraints,
-                    "context_summary": result.context_summary,
-                    "context_sources": _filter_relevant_sources(
-                        result.context_sources or [],
-                        request.payload.content,
-                        suggested_response,
-                    ),
-                    "mode": result.mode,
-                    "intent": result.intent,
-                    "funnel_stage": result.funnel_stage,
-                    "suggested_response": suggested_response,
-                },
-                event_metadata={
-                    "processing_time_ms": result.processing_time_ms,
-                    "processed_at": (
-                        result.processed_at if result.processed_at else None
-                    ),
-                    "stage_timings": result.stage_timings,
-                    # Episode tag — mirrors ``message.in`` so the LLM-visible
-                    # history filter treats the pair atomically (wish
-                    # deliverable 1).
-                    "context_episode_id": result.context_episode_id,
-                },
-            )
-            await event_store.append(prompt_event)
-
-            # convenio-particular-triage: emit when the modality slot is set.
-            # Engine only writes atendimento_tipo into state_patch when the value
-            # changes, so this fires on first set + explicit switches only.
-            _patch_slots = (result.state_patch or {}).get("slots") or {}
-            _new_atendimento_tipo = _patch_slots.get("atendimento_tipo")
-            if _new_atendimento_tipo:
-                tipo_event = EventData(
-                    id=uuid4(),
-                    tenant_id=request.tenant_id,
-                    session_id=request.session_id,
-                    event_type=StoredEventType.NS_ATENDIMENTO_TIPO_SET.value,
-                    event_data={
-                        "atendimento_tipo": _new_atendimento_tipo,
-                        "trigger_message": request.payload.content,
-                    },
-                    event_metadata={
-                        "channel": request.payload.channel,
-                        "user_id": request.payload.user_id,
-                    },
-                )
-                await event_store.append(tipo_event)
-
-            # CRM integration events (doc MVP v0.5): ns.funnel_stage_changed, ns.handoff_created
-            if result.state_patch and result.state_patch.get("funnel_stage"):
-                funnel_crm_event = EventData(
-                    id=uuid4(),
-                    tenant_id=request.tenant_id,
-                    session_id=request.session_id,
-                    event_type="ns.funnel_stage_changed",
-                    event_data={
-                        "ns_stage": result.funnel_stage,
-                        "crm_stage_id": None,
-                    },
-                    event_metadata={},
-                )
-                await event_store.append(funnel_crm_event)
-
-            if result.handoff_required and result.handoff_summary:
-                handoff_crm_event = EventData(
-                    id=uuid4(),
-                    tenant_id=request.tenant_id,
-                    session_id=request.session_id,
-                    event_type="ns.handoff_created",
-                    event_data={
-                        "handoff_id": result.handoff_summary.get("id"),
-                        "setor": result.handoff_summary.get("sector"),
-                        "prioridade": result.handoff_summary.get("sla"),
-                        "resumo": result.handoff_summary.get("summary", ""),
-                        "urgency": result.handoff_summary.get("urgency"),
-                        "status": result.handoff_summary.get("status"),
-                    },
-                    event_metadata={},
-                )
-                await event_store.append(handoff_crm_event)
+            await event_store.append_batch(events)
         except EventStoreError as e:
             # Event Store error - log but don't fail the request
             logger.warning(
@@ -2028,6 +2159,7 @@ class EventService:
                 error=str(e),
                 error_type=type(e).__name__,
             )
+            return None
         except Exception as e:
             # Unexpected error - log but don't fail the request
             logger.error(
@@ -2038,6 +2170,8 @@ class EventService:
                 error_type=type(e).__name__,
                 exc_info=True,
             )
+            return None
+        return context.interaction_event_id
 
     async def get_event(
         self, tenant_id: UUID, event_id: UUID, session: AsyncSession
@@ -2069,6 +2203,7 @@ class EventService:
             tenant_id=event.tenant_id,
             session_id=event.session_id,
             event_type=EventType(event.event_type),
+            interaction_origin=_stored_interaction_origin(event.interaction_origin),
             payload=event.event_data,
             decision=event.event_data.get("decision"),
             created_at=event.created_at.isoformat(),
@@ -2125,6 +2260,9 @@ class EventService:
                     tenant_id=event.tenant_id,
                     session_id=event.session_id,
                     event_type=EventType(event.event_type),
+                    interaction_origin=_stored_interaction_origin(
+                        event.interaction_origin
+                    ),
                     payload=event.event_data,
                     decision=event.event_data.get("decision"),
                     created_at=event.created_at.isoformat(),

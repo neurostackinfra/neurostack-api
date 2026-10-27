@@ -679,3 +679,179 @@ class TestPerformance:
         # Also check reported processing time
         data = response.json()
         assert data["processing_time_ms"] < 1000  # Processing should be under 1s
+
+
+# ============================================
+# Interaction origin: persisted root ID and provenance
+# ============================================
+
+
+async def _interaction_rows(tenant_id, session_id):
+    from src.models.event import Event
+    from src.repositories.database import get_db_session
+
+    database = get_db_session()
+    try:
+        return list(
+            (
+                await database.scalars(
+                    select(Event).where(
+                        Event.tenant_id == tenant_id,
+                        Event.session_id == session_id,
+                    )
+                )
+            ).all()
+        )
+    finally:
+        await database.close()
+
+
+def _clinic_admin_headers(tenant_id):
+    from datetime import datetime, timedelta, timezone
+
+    import jwt
+
+    from src.config.settings import settings
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": str(uuid4()),
+            "tenant_id": str(tenant_id),
+            "role": "clinic_admin",
+            "iat": now,
+            "exp": now + timedelta(minutes=5),
+        },
+        settings.secret_key,
+        algorithm="HS256",
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+class TestInteractionOriginEndToEnd:
+    """``event_id`` stays ``srm.decision``; ``interaction_event_id`` is the
+    persisted ``message.in``; every row of the interaction shares one origin."""
+
+    @pytest.mark.asyncio
+    async def test_api_key_message_in_persists_root_and_keeps_event_id(
+        self, client: AsyncClient, tenant_id, session_id, auth_headers
+    ):
+        response = await client.post(
+            "/v1/events",
+            headers=auth_headers,
+            json={
+                "session_id": str(session_id),
+                "event_type": "message.in",
+                "payload": {"content": "Olá, bom dia!", "channel": "simulator"},
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        rows = await _interaction_rows(tenant_id, session_id)
+        by_id = {str(row.id): row for row in rows}
+        assert data["interaction_event_id"] is not None
+        root = by_id[data["interaction_event_id"]]
+        assert root.event_type == "message.in"
+        assert (root.tenant_id, root.session_id) == (tenant_id, session_id)
+        assert by_id[data["event_id"]].event_type == "srm.decision"
+        assert {row.interaction_origin for row in rows} == {"production"}
+
+    @pytest.mark.asyncio
+    async def test_operational_jwt_persists_simulator_on_whatsapp(
+        self, client: AsyncClient, tenant_id, session_id
+    ):
+        response = await client.post(
+            "/v1/events",
+            headers=_clinic_admin_headers(tenant_id),
+            json={
+                "session_id": str(session_id),
+                "event_type": "message.in",
+                "payload": {"content": "Olá, bom dia!", "channel": "whatsapp"},
+            },
+        )
+
+        assert response.status_code == 200
+        rows = await _interaction_rows(tenant_id, session_id)
+        assert rows
+        assert {row.interaction_origin for row in rows} == {"simulator"}
+        assert str(next(row.id for row in rows if row.event_type == "message.in")) == (
+            response.json()["interaction_event_id"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_start_keeps_type_and_returns_null_interaction_id(
+        self, client: AsyncClient, tenant_id, session_id, auth_headers
+    ):
+        response = await client.post(
+            "/v1/events",
+            headers=auth_headers,
+            json={
+                "session_id": str(session_id),
+                "event_type": "session.start",
+                "payload": {"content": "start", "channel": "whatsapp"},
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["interaction_event_id"] is None
+        rows = await _interaction_rows(tenant_id, session_id)
+        assert [row.event_type for row in rows].count("session.start") == 1
+        assert "message.in" not in {row.event_type for row in rows}
+        assert {row.interaction_origin for row in rows} == {"production"}
+
+    @pytest.mark.asyncio
+    async def test_handoff_mode_turn_persists_production_origin_on_event_rows(
+        self, client: AsyncClient, tenant_id, session_id, auth_headers
+    ):
+        response = await client.post(
+            "/v1/events",
+            headers=auth_headers,
+            json={
+                "session_id": str(session_id),
+                "event_type": "message.in",
+                "payload": {
+                    "content": "Preciso de um atendente real",
+                    "channel": "telegram",
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["mode"] == "handoff"
+        await _assert_persisted_handoff(tenant_id, session_id)
+        rows = await _interaction_rows(tenant_id, session_id)
+        assert {row.interaction_origin for row in rows} == {"production"}
+        assert str(next(row.id for row in rows if row.event_type == "message.in")) == (
+            data["interaction_event_id"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_batch_returns_null_and_leaves_no_orphan(
+        self, client: AsyncClient, tenant_id, session_id, auth_headers, monkeypatch
+    ):
+        from src.core.exceptions import EventStoreError
+        from src.memory.event_store import EventStore
+
+        monkeypatch.setattr(
+            EventStore,
+            "append_batch",
+            AsyncMock(side_effect=EventStoreError("batch unavailable")),
+        )
+
+        response = await client.post(
+            "/v1/events",
+            headers=auth_headers,
+            json={
+                "session_id": str(session_id),
+                "event_type": "message.in",
+                "payload": {"content": "Olá, bom dia!", "channel": "whatsapp"},
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["interaction_event_id"] is None
+        assert data["event_id"]
+        assert await _interaction_rows(tenant_id, session_id) == []

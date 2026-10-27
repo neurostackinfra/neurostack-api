@@ -113,7 +113,7 @@ class _PipelineHandoffStub:
         self.summarizer = ConversationSummarizer()
         self.details = {}
 
-    async def initiate_handoff(self, request):
+    async def initiate_handoff(self, request, *, context=None):
         handoff_id = uuid4()
         created_at = datetime.now(timezone.utc)
         summary = self.summarizer.summarize(
@@ -471,6 +471,58 @@ class TestCognitivePipeline:
         assert request.detected_intent == "cobranca_renegociacao"
         assert request.safety_concern is safety_concern
         assert request.key_info == {"topic": "billing"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_context", [True, False])
+    async def test_process_bridges_the_same_context_to_initiate_handoff(
+        self,
+        monkeypatch,
+        tenant_id,
+        session_id,
+        with_context,
+    ):
+        """The context is a keyword parameter, handed unchanged to the handoff."""
+        from src.interaction_context import InteractionOrigin, build_interaction_context
+
+        handoff_service = MagicMock()
+        handoff_service.initiate_handoff = AsyncMock(return_value=None)
+        pipeline = CognitivePipeline(handoff_service=handoff_service)
+        decision = pipeline_module.SRMDecisionModel(
+            intent="atendimento_humano",
+            intent_category="information",
+            funnel_stage="em_qualificacao",
+            action="handoff_administrativo",
+            confidence=0.99,
+            handoff_required=True,
+            handoff_reason="user_request",
+        )
+        monkeypatch.setattr(pipeline, "_run_srm", AsyncMock(return_value=decision))
+        context = (
+            build_interaction_context(
+                effective_tenant_id=tenant_id,
+                session_id=session_id,
+                origin=InteractionOrigin.SIMULATOR,
+                event_type="message.in",
+            )
+            if with_context
+            else None
+        )
+
+        await pipeline.process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Quero falar com uma pessoa",
+                channel="whatsapp",
+            ),
+            context=context,
+        )
+
+        handoff_service.initiate_handoff.assert_awaited_once()
+        call = handoff_service.initiate_handoff.await_args
+        assert len(call.args) == 1
+        assert set(call.kwargs) == {"context"}
+        assert call.kwargs["context"] is context
 
     @pytest.mark.asyncio
     async def test_scheduling_link_send_turn_dispatches_handoff_and_exact_response(

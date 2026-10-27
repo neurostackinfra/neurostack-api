@@ -1076,7 +1076,7 @@ async def test_message_in_metadata_carries_new_fields(
     ]
     total = {"prompt_tokens": 3, "total_tokens": 3}
 
-    store = SimpleNamespace(append=AsyncMock())
+    store = SimpleNamespace(append_batch=AsyncMock())
     with patch(
         "src.services.event_service.get_event_store",
         AsyncMock(return_value=store),
@@ -1091,7 +1091,8 @@ async def test_message_in_metadata_carries_new_fields(
             llm_usage_total=total,
         )
 
-    events = [call.args[0] for call in store.append.await_args_list]
+    store.append_batch.assert_awaited_once()
+    events = store.append_batch.await_args.args[0]
     message_in = next(e for e in events if e.event_type == "message.in")
     md = message_in.event_metadata
     # Legacy trio preserved byte-for-byte.
@@ -1122,7 +1123,7 @@ async def test_prompt_generated_remains_owner_of_response(
     result.tenant_id = request.tenant_id
     result.session_id = request.session_id
 
-    store = SimpleNamespace(append=AsyncMock())
+    store = SimpleNamespace(append_batch=AsyncMock())
     with patch(
         "src.services.event_service.get_event_store",
         AsyncMock(return_value=store),
@@ -1136,7 +1137,8 @@ async def test_prompt_generated_remains_owner_of_response(
             llm_attempts=[],
             llm_usage_total={},
         )
-    events = [call.args[0] for call in store.append.await_args_list]
+    store.append_batch.assert_awaited_once()
+    events = store.append_batch.await_args.args[0]
     prompt_ev = next(e for e in events if e.event_type == "prompt.generated")
     assert prompt_ev.event_data["suggested_response"] == "olá"
     # New attempts/total live on message.in only — prompt.generated does
