@@ -60,7 +60,9 @@ async def test_lock_precedes_pipeline_and_existing_state_flush() -> None:
     calls: list[str] = []
 
     class Pipeline:
-        async def process(self, input_data: PipelineInput) -> PipelineResult:
+        async def process(
+            self, input_data: PipelineInput, *, context: Any = None
+        ) -> PipelineResult:
             calls.append("pipeline")
             assert input_data.turn_count == 7
             return _result(input_data)

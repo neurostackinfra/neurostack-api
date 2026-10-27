@@ -57,6 +57,7 @@ from src.handoff.models import (
     HandoffUrgency,
 )
 from src.handoff.pause_policy import resolve_handoff_pause
+from src.interaction_context import ResolvedInteractionContext
 from src.observability.metric_dimensions import ContractCounter as Counter
 from src.observability.metric_dimensions import ContractHistogram as Histogram
 from src.observability.price_gate import check_price_gate
@@ -322,7 +323,12 @@ class CognitivePipeline:
         self._prompt = prompt_engine or get_prompt_engine()
         self._handoff = handoff_service or get_handoff_service()
 
-    async def process(self, input_data: PipelineInput) -> PipelineResult:
+    async def process(
+        self,
+        input_data: PipelineInput,
+        *,
+        context: Optional[ResolvedInteractionContext] = None,
+    ) -> PipelineResult:
         """
         Process a message through the complete cognitive pipeline.
 
@@ -330,6 +336,9 @@ class CognitivePipeline:
 
         Args:
             input_data: Pipeline input with message and context
+            context: The interaction's trusted context. It is a parameter,
+                never a ``PipelineInput``/``PipelineResult`` field, and is
+                handed unchanged to the synchronous handoff.
 
         Returns:
             PipelineResult with complete cognitive decision
@@ -401,7 +410,9 @@ class CognitivePipeline:
             )
             if srm_decision.handoff_required:
                 stage_start = time.perf_counter()
-                handoff_response = await self._run_handoff(input_data, srm_decision)
+                handoff_response = await self._run_handoff(
+                    input_data, srm_decision, context=context
+                )
 
                 if verification_status == "link_sent":
                     should_pause, paused_until_iso = False, None
@@ -1044,8 +1055,10 @@ class CognitivePipeline:
         self,
         input_data: PipelineInput,
         srm_decision: SRMDecisionModel,
+        *,
+        context: Optional[ResolvedInteractionContext] = None,
     ) -> Optional[HandoffResponse]:
-        """Run handoff service if required."""
+        """Run handoff service if required, passing the interaction context."""
         # Map SRM handoff reason to Handoff service reason
         reason_map = {
             SRMHandoffReason.USER_REQUEST: HandoffReason.USER_REQUEST,
@@ -1118,7 +1131,7 @@ class CognitivePipeline:
                 srm_decision, "handoff_verification_status", None
             ),
         )
-        return await self._handoff.initiate_handoff(request)
+        return await self._handoff.initiate_handoff(request, context=context)
 
     def _build_scheduling_link_response(
         self, input_data: PipelineInput

@@ -2337,6 +2337,215 @@ class TestHandoffService:
 
 
 # ============================================
+# Interaction context seam (initiate_handoff(..., context=))
+# ============================================
+
+
+class _CountingSessionFactory:
+    def __init__(self, store: _FakeHandoffStore) -> None:
+        self.store = store
+        self.opened = 0
+
+    def __call__(self) -> _FakeSession:
+        self.opened += 1
+        return _FakeSession(self.store)
+
+
+def _seam_service(
+    store: _FakeHandoffStore,
+    webhook_dispatcher: WebhookDispatcher,
+    event_store: _FakeEventStore,
+) -> tuple[HandoffService, _CountingSessionFactory, MagicMock]:
+    sessions = _CountingSessionFactory(store)
+    summarizer = MagicMock(wraps=ConversationSummarizer())
+    service = HandoffService(
+        event_store=event_store,
+        summarizer=summarizer,
+        webhook_dispatcher=webhook_dispatcher,
+        session_factory=sessions,
+        repository_factory=lambda _session: _FakeHandoffRepository(store),
+    )
+    return service, sessions, summarizer
+
+
+def _seam_context(tenant_id: UUID, session_id: UUID):
+    from src.interaction_context import InteractionOrigin, build_interaction_context
+
+    return build_interaction_context(
+        effective_tenant_id=tenant_id,
+        session_id=session_id,
+        origin=InteractionOrigin.PRODUCTION,
+        event_type="message.in",
+    )
+
+
+class TestInitiateHandoffContextSeam:
+    """Group 3 seam: signature and validation only; emission belongs to 4B."""
+
+    @pytest.mark.asyncio
+    async def test_real_context_is_accepted_and_never_serialized(
+        self,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+        sample_messages,
+        monkeypatch,
+    ):
+        store = _FakeHandoffStore()
+        event_store = _FakeEventStore()
+        service, _sessions, _summarizer = _seam_service(
+            store, webhook_dispatcher, event_store
+        )
+        log = MagicMock()
+        monkeypatch.setattr(handoff_service_module, "logger", log)
+        context = _seam_context(tenant_id, session_id)
+
+        response = await service.initiate_handoff(
+            HandoffRequest(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                reason=HandoffReason.USER_REQUEST,
+                recent_messages=sample_messages,
+            ),
+            context=context,
+        )
+
+        assert response.tenant_id == tenant_id
+        assert response.session_id == session_id
+        assert list(store.records) == [response.id]
+        # Current emission stays intact until Group 4B: one handoff.request.
+        assert [event.event_type for event in event_store.appended] == [
+            EventType.HANDOFF_REQUEST.value
+        ]
+        rendered = " ".join(
+            [
+                repr(store.records[response.id].context),
+                repr([event.model_dump(mode="json") for event in event_store.appended]),
+                repr(log.mock_calls),
+                response.model_dump_json(),
+            ]
+        )
+        assert str(context.interaction_event_id) not in rendered
+        assert "ResolvedInteractionContext" not in rendered
+        assert "interaction_event_id" not in rendered
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "forged", ["dict", "json", "namespace", "mock", "unknown-type"]
+    )
+    async def test_non_context_fails_before_any_effect(
+        self,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+        forged,
+        monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        from src.interaction_context import ResolvedInteractionContext
+
+        store = _FakeHandoffStore()
+        event_store = _FakeEventStore()
+        service, sessions, summarizer = _seam_service(
+            store, webhook_dispatcher, event_store
+        )
+        dispatch = AsyncMock()
+        monkeypatch.setattr(service, "_dispatch_creation_webhook", dispatch)
+        log = MagicMock()
+        monkeypatch.setattr(handoff_service_module, "logger", log)
+        fields_ = {
+            "effective_tenant_id": tenant_id,
+            "session_id": session_id,
+            "origin": "production",
+            "interaction_event_id": None,
+        }
+        candidate = {
+            "dict": dict(fields_),
+            "json": '{"origin": "production"}',
+            "namespace": SimpleNamespace(**fields_),
+            "mock": MagicMock(spec=ResolvedInteractionContext, **fields_),
+            "unknown-type": 42,
+        }[forged]
+
+        with pytest.raises(TypeError):
+            await service.initiate_handoff(
+                HandoffRequest(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    reason=HandoffReason.USER_REQUEST,
+                ),
+                context=candidate,
+            )
+
+        assert store.records == {}
+        assert store.order == []
+        assert sessions.opened == 0
+        assert event_store.appended == [] and event_store.append_calls == 0
+        summarizer.summarize.assert_not_called()
+        dispatch.assert_not_awaited()
+        assert log.mock_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("diverges", ["tenant", "session"])
+    async def test_divergent_context_fails_closed_without_record_or_event(
+        self,
+        webhook_dispatcher,
+        tenant_id,
+        session_id,
+        diverges,
+        monkeypatch,
+    ):
+        from src.interaction_context import InteractionContextError
+
+        store = _FakeHandoffStore()
+        event_store = _FakeEventStore()
+        service, sessions, summarizer = _seam_service(
+            store, webhook_dispatcher, event_store
+        )
+        dispatch = AsyncMock()
+        monkeypatch.setattr(service, "_dispatch_creation_webhook", dispatch)
+        context = _seam_context(
+            uuid4() if diverges == "tenant" else tenant_id,
+            uuid4() if diverges == "session" else session_id,
+        )
+
+        with pytest.raises(InteractionContextError):
+            await service.initiate_handoff(
+                HandoffRequest(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    reason=HandoffReason.USER_REQUEST,
+                ),
+                context=context,
+            )
+
+        assert store.records == {}
+        assert sessions.opened == 0
+        assert event_store.append_calls == 0
+        summarizer.summarize.assert_not_called()
+        dispatch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_is_keyword_only(
+        self, webhook_dispatcher, tenant_id, session_id
+    ):
+        service, _sessions, _summarizer = _seam_service(
+            _FakeHandoffStore(), webhook_dispatcher, _FakeEventStore()
+        )
+        request = HandoffRequest(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason=HandoffReason.USER_REQUEST,
+        )
+
+        with pytest.raises(TypeError):
+            await service.initiate_handoff(  # type: ignore[misc]
+                request, _seam_context(tenant_id, session_id)
+            )
+
+
+# ============================================
 # Model Tests
 # ============================================
 

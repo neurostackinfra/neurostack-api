@@ -54,7 +54,7 @@ def _make_result(
 
 
 async def _appended_events(request: EventRequest, result: PipelineResult) -> list:
-    store = SimpleNamespace(append=AsyncMock())
+    store = SimpleNamespace(append_batch=AsyncMock())
     with patch(
         "src.services.event_service.get_event_store",
         AsyncMock(return_value=store),
@@ -63,7 +63,8 @@ async def _appended_events(request: EventRequest, result: PipelineResult) -> lis
         await service._save_events_to_store(
             request, result, suggested_response="Você tem convênio ou é particular?"
         )
-    return [call.args[0] for call in store.append.await_args_list]
+    store.append_batch.assert_awaited_once()
+    return list(store.append_batch.await_args.args[0])
 
 
 def _tipo_events(events: list) -> list:

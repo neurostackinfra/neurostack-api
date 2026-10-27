@@ -233,7 +233,9 @@ async def test_same_session_lock_serializes_and_observes_committed_language(
     class SerialPipeline:
         calls = 0
 
-        async def process(self, input_data: PipelineInput) -> PipelineResult:
+        async def process(
+            self, input_data: PipelineInput, *, context: Any = None
+        ) -> PipelineResult:
             self.calls += 1
             if self.calls == 1:
                 first_pipeline_entered.set()
