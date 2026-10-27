@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
+from src.api.middleware.auth import TenantContext
 from src.api.routes import webhook as webhook_module
 from src.api.schemas.events import EventPayload, EventRequest, EventType
 from src.config.settings import settings
@@ -382,7 +383,11 @@ async def test_webhook_commit_releases_lock_before_finish_response(
             return {"business_rules": {"agent_language": "pt-BR"}}
 
         async def run_pipeline(
-            self, event_request: EventRequest, session: AsyncSession
+            self,
+            event_request: EventRequest,
+            session: AsyncSession,
+            *,
+            context: object = None,
         ) -> tuple[object, dict[str, object], list[dict[str, str]]]:
             expected_source = "meta_cloud" if provider == "meta" else provider
             assert event_request.payload.metadata["source"] == expected_source
@@ -392,7 +397,9 @@ async def test_webhook_commit_releases_lock_before_finish_response(
             assert row is not None
             return object(), {}, []
 
-        async def finish_response(self, *_args: object) -> SimpleNamespace:
+        async def finish_response(
+            self, *_args: object, context: object = None
+        ) -> SimpleNamespace:
             async with factory() as observer:
                 row = await asyncio.wait_for(
                     SessionRepository(observer).get_by_tenant_for_update(
@@ -576,6 +583,11 @@ async def test_webhook_commit_releases_lock_before_finish_response(
                         RequestStub(
                             body,
                             state=SimpleNamespace(
+                                tenant=TenantContext(
+                                    tenant_id=tenant_id,
+                                    is_active=True,
+                                    authentication_mode="meta_hmac",
+                                ),
                                 canonical_tenant_id=tenant_id,
                                 meta_credentials={"meta_app_secret": "secret"},
                                 meta_phone_number_id="pnid",

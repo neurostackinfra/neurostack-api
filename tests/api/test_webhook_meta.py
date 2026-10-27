@@ -29,8 +29,10 @@ Group 4 additions (media handling):
 import hashlib
 import hmac
 import json
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -2452,7 +2454,7 @@ class TestMetaSttFallbackChain:
         legacy_adapter = AsyncMock()
         captured: dict[str, str] = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -2666,7 +2668,7 @@ class TestMetaSttFallbackChain:
         send_mock = AsyncMock(return_value=_fake_meta_send_result())
         captured: dict = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -3069,3 +3071,565 @@ class TestMetaVoiceReplyOrigin:
         assert response.json() == {"ok": True, "replied": True}
         reply_gate.assert_awaited_once()
         assert reply_gate.await_args.kwargs["input_was_audio"] is True
+
+
+# ============================================
+# interaction-origin-training-safety Group 4A — origin of Meta messages
+# ============================================
+
+
+def _recording_context_builder(built: list[Any]) -> Callable[..., Any]:
+    """Wrap the Group 3 constructor and keep every context it returns."""
+    from src.interaction_context import build_interaction_context
+
+    def _build(**kwargs: Any) -> Any:
+        context = build_interaction_context(**kwargs)
+        built.append(context)
+        return context
+
+    return _build
+
+
+def _tamper_published_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate: Callable[[dict[str, Any]], None],
+) -> list[bool]:
+    """Rewrite ``request.state`` right after the real middleware published it.
+
+    ``TenantIdentityMiddleware._guard_meta`` verifies the HMAC, writes the
+    tenant state and then publishes the credit identity into the same state
+    dict; wrapping that last call is the only seam, so the HMAC stays real.
+    Returns a list that records each time the seam fired.
+    """
+    from src.api.middleware import tenant_identity
+
+    real_publish = tenant_identity.publish_credit_identity
+    fired: list[bool] = []
+
+    def _publish(state: dict[str, Any], identity: Any) -> None:
+        fired.append(True)
+        mutate(state)
+        real_publish(state, identity)
+
+    monkeypatch.setattr(tenant_identity, "publish_credit_identity", _publish)
+    return fired
+
+
+def _create_paused_session(client: TestClient, tenant_id: UUID, phone: str) -> UUID:
+    """Create the phone's active session through the webhook helper, paused."""
+    from sqlalchemy import update
+
+    from src.api.routes.webhook import _get_or_create_session
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID:
+        db = get_db_session()
+        try:
+            session_id, _ = await _get_or_create_session(tenant_id, phone, db)
+            await db.execute(
+                update(SessionRow)
+                .where(SessionRow.id == session_id)
+                .values(is_paused=True, paused_until=None)
+            )
+            await db.commit()
+            return session_id
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _tenant_rows(client: TestClient, tenant_id: UUID, model: str) -> list[Any]:
+    """Rows of ``Event`` (``message.in`` only) or ``Session`` for the tenant."""
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    statement = (
+        select(EventRow).where(
+            EventRow.tenant_id == tenant_id,
+            EventRow.event_type == "message.in",
+        )
+        if model == "message.in"
+        else select(SessionRow).where(SessionRow.tenant_id == tenant_id)
+    )
+
+    async def _run() -> list[Any]:
+        db = get_db_session()
+        try:
+            return list((await db.execute(statement)).scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _session_origins(client: TestClient, session_id: UUID) -> set[str]:
+    """The distinct ``interaction_origin`` of every event row of a session."""
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> set[str]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(EventRow.interaction_origin).where(
+                    EventRow.session_id == session_id
+                )
+            )
+            return set(result.scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _mock_pipeline_service() -> MagicMock:
+    service = MagicMock()
+    service._load_clinic_config = AsyncMock(return_value={})
+    service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+    service.finish_response = AsyncMock(return_value=_fake_event_response(None))
+    return service
+
+
+def _forward_after_file_payload(phone_number_id: str, from_phone: str) -> dict:
+    return _meta_text_payload(
+        phone_number_id=phone_number_id,
+        from_phone=from_phone,
+        text_body="Prefiro que você encaminhe pra equipe, obrigado!",
+        message_id=f"wamid.forward_{uuid4().hex[:10]}",
+    )
+
+
+class _HandoffRecorder:
+    """Class-level stand-in for ``HandoffService.initiate_handoff``."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, Any]] = []
+
+    def __get__(self, instance: Any, owner: Any) -> Callable[..., Any]:
+        async def _initiate(request: Any, *, context: Any) -> Any:
+            self.calls.append((request, context))
+            return MagicMock()
+
+        return _initiate
+
+
+class TestMetaInteractionOrigin:
+    """Meta is ``production`` only through the HMAC-bound ``meta_hmac``
+    context published by ``TenantIdentityMiddleware``; any other state is a
+    401 before effects, never a downgrade to ``unknown``."""
+
+    def test_valid_hmac_threads_one_production_context_to_both_phases(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from src.interaction_context import (
+            InteractionOrigin,
+            ResolvedInteractionContext,
+        )
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900000801",
+            text_body="Olá, quero marcar",
+            message_id=f"wamid.origin_{uuid4().hex[:10]}",
+        )
+        fired = _tamper_published_tenant(monkeypatch, lambda _state: None)
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert fired == [True]
+        assert len(built) == 1
+        context = built[0]
+        event_request = service.run_pipeline.await_args.args[0]
+        assert service.run_pipeline.await_args.kwargs["context"] is context
+        assert service.finish_response.await_args.kwargs["context"] is context
+        assert type(context) is ResolvedInteractionContext
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert context.effective_tenant_id == tenant_id == event_request.tenant_id
+        assert context.session_id == event_request.session_id
+        assert context.interaction_event_id is not None
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "body_simulator",
+            "body_unknown",
+            "nested_simulator",
+            "nested_unknown",
+            "api_key_header",
+            "panel_jwt_header",
+        ],
+    )
+    def test_production_whatever_the_request_claims(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        claim: str,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload: dict[str, Any] = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900000805",
+            text_body="Olá",
+            message_id=f"wamid.claim_{uuid4().hex[:10]}",
+        )
+        extra_headers: dict[str, str] = {}
+        if claim.startswith("body_"):
+            payload["interaction_origin"] = claim.removeprefix("body_")
+        elif claim.startswith("nested_"):
+            claimed = claim.removeprefix("nested_")
+            value = payload["entry"][0]["changes"][0]["value"]
+            value["interaction_origin"] = claimed
+            value["metadata"]["interaction_origin"] = claimed
+            value["messages"][0]["metadata"] = {"interaction_origin": claimed}
+        elif claim == "api_key_header":
+            extra_headers["X-API-Key"] = "test-api-key-12345"
+        else:
+            extra_headers["Authorization"] = _admin_headers(tenant_id)["Authorization"]
+        # Signed with the real tenant secret after every change to the body.
+        signature, raw = _sign_meta_body(payload)
+        service = _mock_pipeline_service()
+
+        with patch("src.api.routes.webhook.get_event_service", return_value=service):
+            resp = client.request(
+                "POST",
+                WEBHOOK_PATH,
+                content=raw,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": signature,
+                    **extra_headers,
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        context = service.run_pipeline.await_args.kwargs["context"]
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert service.finish_response.await_args.kwargs["context"] is context
+
+    @pytest.mark.parametrize("signature", ["missing", "wrong_secret"])
+    def test_invalid_hmac_is_401_without_classification_or_handoff(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        signature: str,
+    ) -> None:
+        from src.services.handoff_service import HandoffService
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _forward_after_file_payload(phone_id, "5511900000802")
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+        recorder = _HandoffRecorder()
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch(
+                "src.api.routes.webhook._meta_get_pending_file_review",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ) as mock_send,
+            patch.object(HandoffService, "initiate_handoff", recorder),
+        ):
+            if signature == "missing":
+                resp = client.post(WEBHOOK_PATH, json=payload)
+            else:
+                resp = _post_meta(client, payload, secret="not_the_tenant_secret")
+
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert built == []
+        assert recorder.calls == []
+        service.run_pipeline.assert_not_awaited()
+        mock_send.assert_not_awaited()
+        assert _tenant_rows(client, tenant_id, "session") == []
+
+    @pytest.mark.parametrize(
+        "state_case",
+        [
+            "tenant_missing",
+            "jwt_context",
+            "api_key_context",
+            "meta_hmac_with_api_key",
+            "meta_hmac_with_user",
+            "meta_hmac_foreign_tenant",
+            "meta_hmac_tenant_not_uuid",
+        ],
+    )
+    def test_inconsistent_published_tenant_is_401_before_any_effect(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        monkeypatch: pytest.MonkeyPatch,
+        state_case: str,
+    ) -> None:
+        from src.api.middleware.auth import TenantContext
+        from src.services.handoff_service import HandoffService
+
+        replacements: dict[str, Any] = {
+            "jwt_context": TenantContext(
+                tenant_id=tenant_id, user_id=uuid4(), role="clinic_admin"
+            ),
+            "api_key_context": TenantContext(
+                tenant_id=tenant_id, api_key="tenant-api-key"
+            ),
+            "meta_hmac_with_api_key": TenantContext(
+                tenant_id=tenant_id,
+                api_key="tenant-api-key",
+                authentication_mode="meta_hmac",
+            ),
+            "meta_hmac_with_user": TenantContext(
+                tenant_id=tenant_id,
+                user_id=uuid4(),
+                authentication_mode="meta_hmac",
+            ),
+            "meta_hmac_foreign_tenant": TenantContext(
+                tenant_id=uuid4(), authentication_mode="meta_hmac"
+            ),
+            "meta_hmac_tenant_not_uuid": TenantContext(
+                tenant_id=cast(UUID, str(tenant_id)),
+                authentication_mode="meta_hmac",
+            ),
+        }
+
+        def _mutate(state: dict[str, Any]) -> None:
+            if state_case == "tenant_missing":
+                state.pop("tenant", None)
+            else:
+                state["tenant"] = replacements[state_case]
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _forward_after_file_payload(phone_id, "5511900000803")
+        fired = _tamper_published_tenant(monkeypatch, _mutate)
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+        recorder = _HandoffRecorder()
+        forbidden = {
+            name: AsyncMock(side_effect=AssertionError(f"{name} ran"))
+            for name in (
+                "_check_bot_active",
+                "_check_pause_state",
+                "_get_or_create_session",
+                "send_meta_cloud_text",
+            )
+        }
+        claim = MagicMock(side_effect=AssertionError("replay claim ran"))
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook._claim_incoming_message", claim),
+            patch.multiple("src.api.routes.webhook", **forbidden),
+            patch.object(HandoffService, "initiate_handoff", recorder),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert fired == [True]
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert built == []
+        claim.assert_not_called()
+        for mock in forbidden.values():
+            mock.assert_not_awaited()
+        service.run_pipeline.assert_not_awaited()
+        service._load_clinic_config.assert_not_awaited()
+        assert recorder.calls == []
+        assert _tenant_rows(client, tenant_id, "session") == []
+        assert _tenant_rows(client, tenant_id, "message.in") == []
+
+    def test_persisted_message_in_id_is_the_context_interaction_id(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.services.event_service import EventService
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900000804",
+            text_body="Olá, bom dia",
+            message_id=f"wamid.persist_{uuid4().hex[:10]}",
+        )
+        seen: dict[str, Any] = {}
+        real_run = EventService.run_pipeline
+        real_finish = EventService.finish_response
+
+        async def _run(self: Any, request: Any, session: Any = None, *, context: Any):
+            seen["run"] = context
+            return await real_run(self, request, session, context=context)
+
+        async def _finish(self: Any, *args: Any, context: Any) -> Any:
+            seen["finish"] = context
+            seen["response"] = await real_finish(self, *args, context=context)
+            return seen["response"]
+
+        with (
+            patch.object(EventService, "run_pipeline", _run),
+            patch.object(EventService, "finish_response", _finish),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        context = seen["run"]
+        assert seen["finish"] is context
+        assert context.interaction_event_id is not None
+        assert seen["response"].interaction_event_id == context.interaction_event_id
+        rows = _tenant_rows(client, tenant_id, "message.in")
+        assert [row.id for row in rows] == [context.interaction_event_id]
+        assert rows[0].session_id == context.session_id
+        assert _session_origins(client, context.session_id) == {"production"}
+
+    def test_paused_capture_persists_production_under_the_context_id(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        phone = "5511900000805"
+        session_id = _create_paused_session(client, tenant_id, phone)
+        payload = _meta_text_payload(
+            phone_number_id=phone_id,
+            from_phone=phone,
+            text_body="Ainda estou aguardando",
+            message_id=f"wamid.paused_{uuid4().hex[:10]}",
+        )
+        built: list[Any] = []
+        create_session = AsyncMock(side_effect=AssertionError("session created"))
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook._get_or_create_session", create_session),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+        create_session.assert_not_awaited()
+        assert len(built) == 1
+        context = built[0]
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert (context.effective_tenant_id, context.session_id) == (
+            tenant_id,
+            session_id,
+        )
+        rows = _tenant_rows(client, tenant_id, "message.in")
+        assert [row.id for row in rows] == [context.interaction_event_id]
+        assert rows[0].interaction_origin == "production"
+        assert rows[0].event_metadata == {"paused_capture": True}
+
+    @pytest.mark.parametrize("trigger", ["forward_after_file", "audio_too_long"])
+    def test_file_handoff_receives_the_same_production_context(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        trigger: str,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+        from src.services.handoff_service import HandoffService
+
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials(client, tenant_id, phone_id)
+        if trigger == "forward_after_file":
+            payload = _forward_after_file_payload(phone_id, "5511900000806")
+            expected = {"ok": True, "replied": True, "action": "file_handoff"}
+            note = "file_pending_review"
+        else:
+            payload = _meta_audio_payload(
+                phone_number_id=phone_id,
+                from_phone="5511900000806",
+                media_id=f"media_{uuid4().hex[:12]}",
+                message_id=f"wamid.long_{uuid4().hex[:10]}",
+            )
+            expected = {"ok": True, "skipped": "audio_too_long"}
+            note = "audio_too_long"
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+        recorder = _HandoffRecorder()
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch(
+                "src.api.routes.webhook._meta_get_pending_file_review",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(
+                    return_value={
+                        "url": "https://lookaside.fbsbx.com/whatsapp_business/x",
+                        "mime_type": "audio/ogg",
+                        "file_size": 300 * 16000,
+                    }
+                ),
+            ),
+            patch(
+                "src.api.routes.webhook.send_meta_cloud_text",
+                new=AsyncMock(return_value=_fake_meta_send_result()),
+            ),
+            patch.object(HandoffService, "initiate_handoff", recorder),
+        ):
+            resp = _post_meta(client, payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == expected
+        assert len(built) == 1
+        assert len(recorder.calls) == 1
+        request, context = recorder.calls[0]
+        assert context is built[0]
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert request.tenant_id == context.effective_tenant_id == tenant_id
+        assert request.session_id == context.session_id
+        assert request.key_info["file_review_note"] == note
+        service.run_pipeline.assert_not_awaited()

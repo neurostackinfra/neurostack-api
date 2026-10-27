@@ -677,7 +677,9 @@ class TestZapiAudioEventMetadataModel:
         class _StubResponse:
             prompt = None
 
-        async def _capture(self: Any, event_request: Any, session: Any = None) -> Any:
+        async def _capture(
+            self: Any, event_request: Any, session: Any = None, *, context: Any = None
+        ) -> Any:
             captured["metadata"] = dict(event_request.payload.metadata or {})
             return object(), {}, []
 

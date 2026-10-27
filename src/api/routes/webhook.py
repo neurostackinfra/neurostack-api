@@ -36,6 +36,12 @@ from src.handoff.episode_context import (
     project_resume_state,
 )
 from src.handoff.pause_policy import resolve_handoff_pause, resolve_trigger_reactivation
+from src.interaction_context import (
+    InteractionOrigin,
+    ResolvedInteractionContext,
+    build_interaction_context,
+    classify_interaction_origin,
+)
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event as EventModel
 from src.models.tenant import Tenant as TenantModel
@@ -182,6 +188,7 @@ async def _run_pipeline_transactionally(
     service: Any,
     event_request: CanonicalEventRequest,
     db: AsyncSession,
+    context: ResolvedInteractionContext,
 ) -> EventResponse:
     """Run the locked phase, commit it, then start post-commit response I/O.
 
@@ -189,11 +196,16 @@ async def _run_pipeline_transactionally(
     Once commit succeeds, failures from response generation are deliberately
     not followed by rollback because the language/state transition is already
     durable and the PostgreSQL row lock has been released.
+
+    ``context`` is the adapter's single interaction context. The very same
+    object goes, by keyword, to both phases. It is required: every caller
+    classifies the origin and builds the context before calling.
     """
     try:
         result, clinic_config, message_history = await service.run_pipeline(
             event_request,
             session=db,
+            context=context,
         )
         await db.commit()
     except Exception:
@@ -207,8 +219,34 @@ async def _run_pipeline_transactionally(
             result,
             clinic_config,
             message_history,
+            context=context,
         ),
     )
+
+
+def _meta_authenticated_origin(
+    authenticated: object,
+    canonical_tenant_id: UUID,
+) -> Optional[InteractionOrigin]:
+    """Origin of a Meta request, or ``None`` when its proof is not consistent.
+
+    The only proof is the ``meta_hmac`` ``TenantContext`` that
+    ``TenantIdentityMiddleware`` publishes after verifying the HMAC over the
+    exact body. It must be consistent for the Group 3 classifier and bound to
+    ``canonical_tenant_id``. Anything else yields ``None`` and the route
+    answers 401: Meta is never downgraded to ``unknown``.
+    """
+    try:
+        if getattr(authenticated, "authentication_mode", None) != "meta_hmac":
+            return None
+        if getattr(authenticated, "tenant_id", None) != canonical_tenant_id:
+            return None
+    except Exception:
+        return None
+    origin = classify_interaction_origin(authenticated)
+    if origin is not InteractionOrigin.PRODUCTION:
+        return None
+    return origin
 
 
 async def _send_reply_with_optional_tts(
@@ -1075,11 +1113,20 @@ async def _check_pause_state(
     *,
     now: datetime | None = None,
     message_text: Optional[str] = None,
+    origin: InteractionOrigin = InteractionOrigin.UNKNOWN,
 ) -> Optional[dict[str, Any]]:
     """Check if session is paused. Returns action dict or None to continue.
 
     Implements lazy unpause: if paused_until has expired, unpauses the session.
+
+    ``origin`` is the value the calling adapter classified after its own
+    authenticity proof (``unknown`` by default, which keeps positional callers
+    valid). When the session is still paused, the captured ``message.in`` is
+    written through the interaction's single context: its ID is the context's
+    ``interaction_event_id`` and its origin is ``origin``.
     """
+    if not isinstance(origin, InteractionOrigin):
+        raise TypeError("origin must be an InteractionOrigin")
     repo = SessionRepository(db)
     sessions = await repo.find_by_user(
         tenant_id=tenant_id,
@@ -1156,13 +1203,21 @@ async def _check_pause_state(
             },
         )
 
-    # Still paused
+    # Still paused: the paused session is this message's interaction.
+    context = build_interaction_context(
+        effective_tenant_id=tenant_id,
+        session_id=session.id,
+        origin=origin,
+        event_type=EventType.MESSAGE_IN,
+    )
     if message_text:
         try:
             await EventRepository(db).create(
-                tenant_id=tenant_id,
-                session_id=session.id,
+                id=context.interaction_event_id,
+                tenant_id=context.effective_tenant_id,
+                session_id=context.session_id,
                 event_type=EventType.MESSAGE_IN.value,
+                interaction_origin=context.origin.value,
                 event_data={
                     "content": message_text,
                     "channel": "whatsapp",
@@ -1876,6 +1931,10 @@ async def zapi_webhook(
             content={"error": "invalid_webhook_auth"},
         )
 
+    # Origin, classified once: the capability digest matched exactly one
+    # tenant and the body is bound to its instance, so this is production.
+    origin = InteractionOrigin.PRODUCTION
+
     # ── 5) Rate limit (after auth, before replay) ──
     rate_decision = check_webhook_rate_limit(str(tenant_id), "zapi")
     if not rate_decision.allowed:
@@ -1900,6 +1959,7 @@ async def zapi_webhook(
         body=body,
         tenant_id=tenant_id,
         db=db,
+        origin=origin,
     )
 
 
@@ -1908,11 +1968,13 @@ async def _process_zapi_authenticated_body(
     body: dict[str, Any],
     tenant_id: UUID,
     db: AsyncSession,
+    origin: InteractionOrigin,
 ) -> Response | dict[str, Any]:
     """Downstream Z-API processing for an already authenticated request.
 
     Callers must have verified: canonical token, digest match, ``instanceId``
     binding, rate limit, ``messageId`` presence and replay-store claim.
+    ``origin`` is the one the caller classified after that proof.
     """
     text_obj = body.get("text")
     audio_obj = body.get("audio")
@@ -2145,7 +2207,7 @@ async def _process_zapi_authenticated_body(
 
     # ── pause check for patient messages ──
     pause_result = await _check_pause_state(
-        tenant_id, phone, db, message_text=message_text
+        tenant_id, phone, db, message_text=message_text, origin=origin
     )
     if pause_result:
         await db.commit()
@@ -2153,6 +2215,12 @@ async def _process_zapi_authenticated_body(
 
     # ── get or create a session for this phone ──
     session_id, is_new = await _get_or_create_session(tenant_id, phone, db)
+    context = build_interaction_context(
+        effective_tenant_id=tenant_id,
+        session_id=session_id,
+        origin=origin,
+        event_type=EventType.MESSAGE_IN,
+    )
 
     # ── save chatLid mapping so fromMe=true can resolve the real phone ──
     if chat_lid and "@lid" in chat_lid:
@@ -2228,6 +2296,7 @@ async def _process_zapi_authenticated_body(
         service=service,
         event_request=event_request,
         db=db,
+        context=context,
     )
 
     # ── send LLM response back via Z-API ──
@@ -2402,6 +2471,10 @@ async def evolution_webhook(
         logger.warning("Evolution webhook: no tenant for instance %s", instance_name)
         return {"ok": True, "skipped": "unknown_instance"}
 
+    # Origin, classified once: an instance name is a lookup key, not a proof
+    # of the sender's authenticity, so Evolution is never production.
+    origin = InteractionOrigin.UNKNOWN
+
     # ── require and claim the provider message id before downstream effects ──
     webhook_msg_id = str(key.get("id") or "").strip()
     if not webhook_msg_id:
@@ -2440,7 +2513,7 @@ async def evolution_webhook(
 
     # ── pause check for patient messages ──
     pause_result = await _check_pause_state(
-        tenant_id, phone, db, message_text=message_text
+        tenant_id, phone, db, message_text=message_text, origin=origin
     )
     if pause_result:
         await db.commit()
@@ -2448,6 +2521,12 @@ async def evolution_webhook(
 
     # ── get or create a session for this phone ──
     session_id, is_new = await _get_or_create_session(tenant_id, phone, db)
+    context = build_interaction_context(
+        effective_tenant_id=tenant_id,
+        session_id=session_id,
+        origin=origin,
+        event_type=EventType.MESSAGE_IN,
+    )
     await db.commit()
 
     # ── send LGPD privacy notice as the very first message of a new session ──
@@ -2502,6 +2581,7 @@ async def evolution_webhook(
         service=service,
         event_request=event_request,
         db=db,
+        context=context,
     )
 
     # ── send LLM response back via Evolution API ──
@@ -2698,6 +2778,10 @@ async def uazapi_webhook(
             instance_name,
         )
         return {"ok": True, "skipped": "unknown_instance"}
+
+    # Origin, classified once: an instance name is a lookup key, not a proof
+    # of the sender's authenticity, so Uazapi is never production.
+    origin = InteractionOrigin.UNKNOWN
 
     # Media-gate carve-outs:
     #   * ``is_from_me and is_audio_media`` — staff voice note. Group 3 routes
@@ -2955,7 +3039,7 @@ async def uazapi_webhook(
 
     # ── pause check for patient messages ──
     pause_result = await _check_pause_state(
-        tenant_id, from_phone, db, message_text=message_text
+        tenant_id, from_phone, db, message_text=message_text, origin=origin
     )
     if pause_result:
         await db.commit()
@@ -2963,6 +3047,12 @@ async def uazapi_webhook(
 
     # ── get or create a session for this phone ──
     session_id, is_new = await _get_or_create_session(tenant_id, from_phone, db)
+    context = build_interaction_context(
+        effective_tenant_id=tenant_id,
+        session_id=session_id,
+        origin=origin,
+        event_type=EventType.MESSAGE_IN,
+    )
     await db.commit()
 
     logger.info(
@@ -3027,6 +3117,7 @@ async def uazapi_webhook(
         service=service,
         event_request=event_request,
         db=db,
+        context=context,
     )
 
     suggested = (
@@ -3310,11 +3401,17 @@ async def _meta_initiate_file_handoff(
     session_id: UUID,
     from_phone: str,
     note: str,
+    *,
+    context: ResolvedInteractionContext,
 ) -> Any:
     """Initiate a human handoff signalling that a file/audio is pending review.
 
     PostgreSQL insertion is mandatory. Failures propagate to the route so it
     cannot clear state or acknowledge a handoff that does not exist.
+
+    ``context`` is the Meta message's own interaction context (``production``
+    after a valid HMAC), handed unchanged to ``initiate_handoff``, which
+    refuses it before any effect unless it matches this tenant and session.
     """
     from src.handoff.models import HandoffReason, HandoffRequest, HandoffUrgency
     from src.services.handoff_service import get_handoff_service
@@ -3332,7 +3429,7 @@ async def _meta_initiate_file_handoff(
         },
     )
     try:
-        response = await handoff_service.initiate_handoff(request)
+        response = await handoff_service.initiate_handoff(request, context=context)
     except Exception:
         logger.exception(
             "Meta file handoff creation failed tenant=%s session=%s",
@@ -3462,6 +3559,16 @@ async def meta_webhook(
         or not isinstance(phone_number_id, str)
         or not phone_number_id
     ):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "invalid_webhook_auth"},
+        )
+    # Origin, classified once, from the middleware's HMAC-bound tenant only.
+    # A missing, inconsistent or foreign context is a 401, never ``unknown``.
+    origin = _meta_authenticated_origin(
+        getattr(request.state, "tenant", None), tenant_id
+    )
+    if origin is None:
         return JSONResponse(
             status_code=401,
             content={"error": "invalid_webhook_auth"},
@@ -3644,7 +3751,11 @@ async def meta_webhook(
                     "body", ""
                 ).strip() or None
             pause_result = await _check_pause_state(
-                tenant_id, from_phone, db, message_text=_pause_check_text
+                tenant_id,
+                from_phone,
+                db,
+                message_text=_pause_check_text,
+                origin=origin,
             )
             if pause_result:
                 await db.commit()
@@ -3652,6 +3763,14 @@ async def meta_webhook(
 
             # ── get or create a session for this phone ──
             session_id, is_new = await _get_or_create_session(tenant_id, from_phone, db)
+            # One context per message: the file handoff and the pipeline below
+            # both receive this very object.
+            context = build_interaction_context(
+                effective_tenant_id=tenant_id,
+                session_id=session_id,
+                origin=origin,
+                event_type=EventType.MESSAGE_IN,
+            )
             await db.commit()
 
             # ── load clinic config + credentials ──
@@ -3724,6 +3843,7 @@ async def meta_webhook(
                             session_id,
                             from_phone,
                             "file_pending_review",
+                            context=context,
                         )
                         await _meta_clear_pending_file_review(session_id, db)
                         await db.commit()
@@ -3825,6 +3945,7 @@ async def meta_webhook(
                         session_id,
                         from_phone,
                         "audio_too_long",
+                        context=context,
                     )
                     if meta_pnid and meta_token:
                         try:
@@ -3973,6 +4094,7 @@ async def meta_webhook(
                 service=service,
                 event_request=event_request,
                 db=db,
+                context=context,
             )
 
             suggested = (

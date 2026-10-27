@@ -26,8 +26,10 @@ canonical capability-URL Z-API webhook:
 import base64
 import hashlib
 import secrets
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -851,7 +853,7 @@ class TestZapiSttFallbackChain:
         legacy_adapter = AsyncMock()
         captured: dict[str, str] = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -967,7 +969,7 @@ class TestZapiSttFallbackChain:
 
         captured: dict = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -1097,7 +1099,7 @@ class TestZapiSttFallbackChain:
         stt_mock = AsyncMock()
         captured: dict = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -1708,3 +1710,387 @@ class TestZapiVoiceReplyOrigin:
         assert response.status_code == 200, response.text
         assert response.json() == {"ok": True, "skipped": expected_skip}
         reply_gate.assert_not_awaited()
+
+
+# ============================================
+# interaction-origin-training-safety Group 4A — origin of Z-API messages
+# ============================================
+
+
+def _recording_context_builder(built: list[Any]) -> Callable[..., Any]:
+    """Wrap the Group 3 constructor and keep every context it returns."""
+    from src.interaction_context import build_interaction_context
+
+    def _build(**kwargs: Any) -> Any:
+        context = build_interaction_context(**kwargs)
+        built.append(context)
+        return context
+
+    return _build
+
+
+def _create_paused_session(client: TestClient, tenant_id: UUID, phone: str) -> UUID:
+    """Create the phone's active session through the webhook helper, paused."""
+    from sqlalchemy import update
+
+    from src.api.routes.webhook import _get_or_create_session
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID:
+        db = get_db_session()
+        try:
+            session_id, _ = await _get_or_create_session(tenant_id, phone, db)
+            await db.execute(
+                update(SessionRow)
+                .where(SessionRow.id == session_id)
+                .values(is_paused=True, paused_until=None)
+            )
+            await db.commit()
+            return session_id
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _message_in_rows(client: TestClient, tenant_id: UUID) -> list[Any]:
+    """Every persisted ``message.in`` row of the tenant, read in a new session."""
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> list[Any]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(EventRow).where(
+                    EventRow.tenant_id == tenant_id,
+                    EventRow.event_type == "message.in",
+                )
+            )
+            return list(result.scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _session_origins(client: TestClient, session_id: UUID) -> set[str]:
+    """The distinct ``interaction_origin`` of every event row of a session."""
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> set[str]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(EventRow.interaction_origin).where(
+                    EventRow.session_id == session_id
+                )
+            )
+            return set(result.scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _mock_pipeline_service() -> MagicMock:
+    service = MagicMock()
+    service._load_clinic_config = AsyncMock(return_value={})
+    service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+    service.finish_response = AsyncMock(return_value=_fake_event_response(None))
+    return service
+
+
+class TestZapiInteractionOrigin:
+    """Z-API is ``production`` only after its proof: the capability digest
+    matches exactly one tenant and the body is bound to that instance."""
+
+    def test_valid_capability_threads_one_production_context_to_both_phases(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.interaction_context import (
+            InteractionOrigin,
+            ResolvedInteractionContext,
+        )
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_origin_{uuid4().hex[:10]}",
+            phone="5511900000701",
+        )
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert resp.status_code == 200, resp.text
+        assert len(built) == 1
+        context = built[0]
+        event_request = service.run_pipeline.await_args.args[0]
+        assert service.run_pipeline.await_args.kwargs["context"] is context
+        assert service.finish_response.await_args.kwargs["context"] is context
+        assert type(context) is ResolvedInteractionContext
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert context.effective_tenant_id == tenant_id == event_request.tenant_id
+        assert context.session_id == event_request.session_id
+        assert context.interaction_event_id is not None
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "body_simulator",
+            "body_unknown",
+            "nested_simulator",
+            "nested_unknown",
+            "api_key_header",
+            "panel_jwt_header",
+        ],
+    )
+    def test_production_whatever_the_request_claims(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        claim: str,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body: dict[str, Any] = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_claim_{uuid4().hex[:10]}",
+            phone="5511900000705",
+        )
+        headers: dict[str, str] = {}
+        if claim.startswith("body_"):
+            body["interaction_origin"] = claim.removeprefix("body_")
+        elif claim.startswith("nested_"):
+            claimed = claim.removeprefix("nested_")
+            body["text"]["interaction_origin"] = claimed
+            body["metadata"] = {"interaction_origin": claimed}
+        elif claim == "api_key_header":
+            headers["X-API-Key"] = "test-api-key-12345"
+        else:
+            headers.update(_admin_headers(tenant_id))
+        service = _mock_pipeline_service()
+
+        with (
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+        ):
+            resp = client.post(
+                f"/v1/webhook/zapi/{raw_token}", json=body, headers=headers
+            )
+
+        assert resp.status_code == 200, resp.text
+        context = service.run_pipeline.await_args.kwargs["context"]
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert service.finish_response.await_args.kwargs["context"] is context
+
+    @pytest.mark.parametrize("failure", ["unregistered_token", "instance_mismatch"])
+    def test_failed_proof_is_401_without_classification_or_effects(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        failure: str,
+    ) -> None:
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_denied_{uuid4().hex[:10]}",
+            phone="5511900000702",
+        )
+        token = raw_token
+        if failure == "unregistered_token":
+            token = _new_canonical_token()
+        else:
+            body["instanceId"] = "another-instance"
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+        pause_check = AsyncMock(side_effect=AssertionError("pause check ran"))
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook._check_pause_state", pause_check),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{token}", json=body)
+
+        assert resp.status_code == 401
+        assert resp.json() == {"error": "invalid_webhook_auth"}
+        assert built == []
+        pause_check.assert_not_awaited()
+        service.run_pipeline.assert_not_awaited()
+        assert _message_in_rows(client, tenant_id) == []
+
+    def test_persisted_message_in_id_is_the_context_interaction_id(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.services.event_service import EventService
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_persist_{uuid4().hex[:10]}",
+            phone="5511900000703",
+            text="Olá, bom dia",
+        )
+        seen: dict[str, Any] = {}
+        real_run = EventService.run_pipeline
+        real_finish = EventService.finish_response
+
+        async def _run(self: Any, request: Any, session: Any = None, *, context: Any):
+            seen["run"] = context
+            return await real_run(self, request, session, context=context)
+
+        async def _finish(self: Any, *args: Any, context: Any) -> Any:
+            seen["finish"] = context
+            seen["response"] = await real_finish(self, *args, context=context)
+            return seen["response"]
+
+        with (
+            patch.object(EventService, "run_pipeline", _run),
+            patch.object(EventService, "finish_response", _finish),
+            patch(
+                "src.api.routes.webhook.send_text_message",
+                new=AsyncMock(return_value=_fake_send_result()),
+            ),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+            patch("src.api.routes.webhook.mark_conversation_unread", new=AsyncMock()),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert resp.status_code == 200, resp.text
+        context = seen["run"]
+        assert seen["finish"] is context
+        assert context.interaction_event_id is not None
+        assert seen["response"].interaction_event_id == context.interaction_event_id
+        rows = _message_in_rows(client, tenant_id)
+        assert [row.id for row in rows] == [context.interaction_event_id]
+        assert rows[0].session_id == context.session_id
+        assert _session_origins(client, context.session_id) == {"production"}
+
+    def test_paused_capture_persists_production_under_the_context_id(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        phone = "5511900000704"
+        session_id = _create_paused_session(client, tenant_id, phone)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_paused_{uuid4().hex[:10]}",
+            phone=phone,
+            text="Ainda estou aguardando",
+        )
+        built: list[Any] = []
+        create_session = AsyncMock(side_effect=AssertionError("session created"))
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook._get_or_create_session", create_session),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+        create_session.assert_not_awaited()
+        assert len(built) == 1
+        context = built[0]
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert (context.effective_tenant_id, context.session_id) == (
+            tenant_id,
+            session_id,
+        )
+        rows = _message_in_rows(client, tenant_id)
+        assert [row.id for row in rows] == [context.interaction_event_id]
+        assert rows[0].interaction_origin == "production"
+        assert rows[0].event_metadata == {"paused_capture": True}
+
+
+def test_every_adapter_call_site_passes_the_origin_keywords() -> None:
+    """The adapters always hand over what they classified, by keyword.
+
+    ``_run_pipeline_transactionally`` requires ``context``; the other callees
+    keep defaults for compatibility, so only the call sites prove that no
+    adapter silently falls back to them or passes an explicit ``None``.
+    """
+    import ast
+    import inspect
+
+    from src.api.routes import webhook as webhook_module
+
+    tree = ast.parse(inspect.getsource(webhook_module))
+    keywords_by_callee: dict[str, list[set[str]]] = {}
+    none_keywords_by_callee: dict[str, list[set[str]]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        keywords_by_callee.setdefault(name, []).append(
+            {keyword.arg for keyword in node.keywords if keyword.arg}
+        )
+        none_keywords_by_callee.setdefault(name, []).append(
+            {
+                keyword.arg
+                for keyword in node.keywords
+                if keyword.arg
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is None
+            }
+        )
+
+    expected = {
+        "_run_pipeline_transactionally": ("context", 4),
+        "_check_pause_state": ("origin", 4),
+        "_meta_initiate_file_handoff": ("context", 2),
+        "initiate_handoff": ("context", 1),
+    }
+    for callee, (keyword, count) in expected.items():
+        calls = keywords_by_callee.get(callee, [])
+        assert len(calls) == count, (callee, calls)
+        assert all(keyword in call for call in calls), (callee, calls)
+        explicit_none = none_keywords_by_callee.get(callee, [])
+        assert all(keyword not in call for call in explicit_none), (
+            callee,
+            explicit_none,
+        )

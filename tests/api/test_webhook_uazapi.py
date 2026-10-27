@@ -19,6 +19,7 @@ import copy
 import json
 import pathlib
 import re
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -3320,7 +3321,7 @@ class TestUazapiGroup4PatientAudioTranscription:
         legacy_adapter = AsyncMock()
         captured: dict[str, str] = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -3510,7 +3511,7 @@ class TestUazapiGroup4PatientAudioTranscription:
 
         captured: dict = {}
 
-        async def _capture(self, event_request, session=None):
+        async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
             return MagicMock(), {}, []
 
@@ -3965,3 +3966,379 @@ class TestUazapiVoiceReplyOrigin:
         assert response.json() == {"ok": True, "replied": True}
         reply_gate.assert_awaited_once()
         assert reply_gate.await_args.kwargs["input_was_audio"] is True
+
+
+# ============================================
+# interaction-origin-training-safety Group 4A — origin of Uazapi messages
+# ============================================
+
+
+def _recording_context_builder(built: list[Any]) -> Callable[..., Any]:
+    """Wrap the Group 3 constructor and keep every context it returns."""
+    from src.interaction_context import build_interaction_context
+
+    def _build(**kwargs: Any) -> Any:
+        context = build_interaction_context(**kwargs)
+        built.append(context)
+        return context
+
+    return _build
+
+
+def _pause_session(client: TestClient, session_id: UUID) -> None:
+    from sqlalchemy import update
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            await db.execute(
+                update(SessionRow)
+                .where(SessionRow.id == session_id)
+                .values(is_paused=True, paused_until=None)
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _message_in_rows(client: TestClient, tenant_id: UUID) -> list[Any]:
+    """Every persisted ``message.in`` row of the tenant, read in a new session."""
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> list[Any]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(EventRow).where(
+                    EventRow.tenant_id == tenant_id,
+                    EventRow.event_type == "message.in",
+                )
+            )
+            return list(result.scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _session_origins(client: TestClient, session_id: UUID) -> set[str]:
+    """The distinct ``interaction_origin`` of every event row of a session."""
+    from sqlalchemy import select
+
+    from src.models.event import Event as EventRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> set[str]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(EventRow.interaction_origin).where(
+                    EventRow.session_id == session_id
+                )
+            )
+            return set(result.scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _mock_pipeline_service() -> MagicMock:
+    service = MagicMock()
+    service._load_clinic_config = AsyncMock(return_value={})
+    service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+    service.finish_response = AsyncMock(return_value=_fake_event_response(None))
+    return service
+
+
+class TestUazapiInteractionOrigin:
+    """Uazapi is ``unknown``: its instance name selects a tenant but proves
+    nothing about the sender, so no request shape can make it ``production``.
+    """
+
+    @staticmethod
+    def _clear_state() -> None:
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    def test_resolved_instance_threads_one_unknown_context_to_both_phases(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.interaction_context import (
+            InteractionOrigin,
+            ResolvedInteractionContext,
+        )
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000601",
+            body="Olá, quero marcar",
+            message_id=f"3EB0_origin_{uuid4().hex[:8]}",
+        )
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert len(built) == 1
+        context = built[0]
+        event_request = service.run_pipeline.await_args.args[0]
+        assert service.run_pipeline.await_args.kwargs["context"] is context
+        assert service.finish_response.await_args.kwargs["context"] is context
+        assert type(context) is ResolvedInteractionContext
+        assert context.origin is InteractionOrigin.UNKNOWN
+        assert context.effective_tenant_id == tenant_id == event_request.tenant_id
+        assert context.session_id == event_request.session_id
+        assert context.interaction_event_id is not None
+
+    @pytest.mark.parametrize(
+        "claim",
+        ["body_origin", "message_origin", "api_key_header", "panel_jwt_header"],
+    )
+    def test_never_production_whatever_the_request_claims(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        claim: str,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000602",
+            body="Olá",
+            message_id=f"3EB0_claim_{uuid4().hex[:8]}",
+        )
+        headers: dict[str, str] = {}
+        if claim == "body_origin":
+            payload["interaction_origin"] = "production"
+        elif claim == "message_origin":
+            payload["message"]["interaction_origin"] = "production"
+            payload["message"]["metadata"] = {"interaction_origin": "production"}
+        elif claim == "api_key_header":
+            headers["X-API-Key"] = "test-api-key-12345"
+        else:
+            headers.update(_admin_headers(tenant_id))
+        service = _mock_pipeline_service()
+
+        with patch("src.api.routes.webhook.get_event_service", return_value=service):
+            resp = client.post(WEBHOOK_PATH, json=payload, headers=headers)
+
+        assert resp.status_code == 200, resp.text
+        context = service.run_pipeline.await_args.kwargs["context"]
+        assert context.origin is InteractionOrigin.UNKNOWN
+        assert service.finish_response.await_args.kwargs["context"] is context
+
+    def test_unresolved_instance_classifies_nothing(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        self._clear_state()
+        _seed_uazapi_credentials(client, tenant_id, f"clinica_{uuid4().hex[:8]}")
+        payload = _uazapi_text_payload(
+            instance=f"stranger_{uuid4().hex[:8]}",
+            from_phone="5511900000603",
+            body="Olá",
+            message_id=f"3EB0_stranger_{uuid4().hex[:8]}",
+        )
+        built: list[Any] = []
+        service = _mock_pipeline_service()
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "skipped": "unknown_instance"}
+        assert built == []
+        service.run_pipeline.assert_not_awaited()
+        assert _message_in_rows(client, tenant_id) == []
+
+    def test_persisted_message_in_id_is_the_context_interaction_id(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.services.event_service import EventService
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone="5511900000604",
+            body="Olá, bom dia",
+            message_id=f"3EB0_persist_{uuid4().hex[:8]}",
+        )
+        seen: dict[str, Any] = {}
+        real_run = EventService.run_pipeline
+        real_finish = EventService.finish_response
+
+        async def _run(self: Any, request: Any, session: Any = None, *, context: Any):
+            seen["run"] = context
+            return await real_run(self, request, session, context=context)
+
+        async def _finish(self: Any, *args: Any, context: Any) -> Any:
+            seen["finish"] = context
+            seen["response"] = await real_finish(self, *args, context=context)
+            return seen["response"]
+
+        with (
+            patch.object(EventService, "run_pipeline", _run),
+            patch.object(EventService, "finish_response", _finish),
+            patch(
+                "src.api.routes.webhook.send_uazapi_text",
+                new=AsyncMock(return_value=_fake_uazapi_send_result()),
+            ),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        context = seen["run"]
+        assert seen["finish"] is context
+        assert context.interaction_event_id is not None
+        assert seen["response"].interaction_event_id == context.interaction_event_id
+        rows = _message_in_rows(client, tenant_id)
+        assert [row.id for row in rows] == [context.interaction_event_id]
+        assert rows[0].session_id == context.session_id
+        assert _session_origins(client, context.session_id) == {"unknown"}
+
+    def test_paused_capture_persists_unknown_under_the_context_id(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        from src.interaction_context import InteractionOrigin
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_credentials(client, tenant_id, instance)
+        phone = "5511900000605"
+        session_id = _create_session(client, tenant_id, phone)
+        _pause_session(client, session_id)
+        payload = _uazapi_text_payload(
+            instance=instance,
+            from_phone=phone,
+            body="Ainda estou aguardando",
+            message_id=f"3EB0_paused_{uuid4().hex[:8]}",
+        )
+        built: list[Any] = []
+        create_session = AsyncMock(side_effect=AssertionError("session created"))
+
+        with (
+            patch(
+                "src.api.routes.webhook.build_interaction_context",
+                new=_recording_context_builder(built),
+            ),
+            patch("src.api.routes.webhook._get_or_create_session", create_session),
+        ):
+            resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+        create_session.assert_not_awaited()
+        assert len(built) == 1
+        context = built[0]
+        assert context.origin is InteractionOrigin.UNKNOWN
+        assert (context.effective_tenant_id, context.session_id) == (
+            tenant_id,
+            session_id,
+        )
+        rows = _message_in_rows(client, tenant_id)
+        assert [row.id for row in rows] == [context.interaction_event_id]
+        assert rows[0].interaction_origin == "unknown"
+        assert rows[0].event_metadata == {"paused_capture": True}
+
+
+class TestCheckPauseStateOrigin:
+    """``_check_pause_state`` writes the captured ``message.in`` through the
+    single constructor; ``origin`` is keyword-only and defaults to ``unknown``.
+    """
+
+    def test_positional_call_without_origin_persists_unknown(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        phone = "5511900000606"
+        session_id = _create_session(client, tenant_id, phone)
+        _pause_session(client, session_id)
+        built: list[Any] = []
+
+        async def _run() -> Any:
+            from src.repositories.database import get_db_session
+
+            db = get_db_session()
+            try:
+                with patch(
+                    "src.api.routes.webhook.build_interaction_context",
+                    new=_recording_context_builder(built),
+                ):
+                    result = await webhook_module._check_pause_state(
+                        tenant_id, phone, db, message_text="Mensagem em pausa"
+                    )
+                await db.commit()
+                return result
+            finally:
+                await db.close()
+
+        result = client._submit(_run())  # type: ignore[attr-defined]
+
+        assert result == {"ok": True, "skipped": "session_paused"}
+        assert len(built) == 1
+        rows = _message_in_rows(client, tenant_id)
+        assert [row.id for row in rows] == [built[0].interaction_event_id]
+        assert rows[0].interaction_origin == "unknown"
+
+    @pytest.mark.parametrize("origin", ["production", None, 1])
+    @pytest.mark.asyncio
+    async def test_non_enum_origin_fails_before_any_lookup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tenant_id: UUID,
+        origin: Any,
+    ) -> None:
+        repository = MagicMock(side_effect=AssertionError("session lookup ran"))
+        monkeypatch.setattr(webhook_module, "SessionRepository", repository)
+
+        with pytest.raises(TypeError, match="origin must be an InteractionOrigin"):
+            await webhook_module._check_pause_state(
+                tenant_id,
+                "5511900000607",
+                MagicMock(),
+                message_text="oi",
+                origin=origin,
+            )
+
+        repository.assert_not_called()
