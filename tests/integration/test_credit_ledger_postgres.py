@@ -24,7 +24,13 @@ What SQLite cannot show, proven against migration 038 at head:
   ``main`` with credit rows present: history stays, the deleted tenant's
   claims and outbox rows go by CASCADE, no append-only trigger interferes;
 * the ack repository writes a ``billing_fact_acks`` row the untouched ASAAS
-  reconciler accepts.
+  reconciler accepts;
+* Group 2, through ``CreditLedger``: the quarantine spend hold acts only
+  after ``credit_enforcement_at`` (and not on a spend that already held the
+  account lock, nor on another builder); concurrent debits serialize on the
+  account and never overspend; reversal debt, its origins, its settlement
+  and its restoration into an expired payer satisfy every constraint and
+  trigger.
 
 Needs ``POSTGRES_SMOKE_DATABASE_URL``; without it the module skips, and only
 ``scripts/check-credit-integration.sh`` turns that skip into a failure.
@@ -38,7 +44,7 @@ import random
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -57,6 +63,12 @@ from src.api.middleware.auth import TenantContext
 from src.api.routes import admin as admin_routes
 from src.models.billing import BillingFactDelivery, BillingOutboxEvent
 from src.models.builder import Builder
+from src.models.credit import (
+    CreditDebt,
+    CreditDebtOrigin,
+    CreditDebtSettlement,
+    CreditLedgerEntry,
+)
 from src.models.tenant import Tenant
 from src.repositories.credit import CreditRepository, LedgerMovement, fold_ledger
 from src.repositories.credit_fact_ack import (
@@ -68,6 +80,12 @@ from src.services.billing_outbox import (
     BillingFactReconciler,
     billing_fact_bundle_digest,
     payload_digest,
+)
+from src.services.credit_ledger import (
+    CreditLedger,
+    GrantSpec,
+    topup_grant_effect_id,
+    topup_lot_expires_at,
 )
 from src.services.media_assets import (
     MediaOwnerTransition,
@@ -1863,3 +1881,294 @@ async def test_the_ack_repository_refuses_effects_on_a_rejected_fact(
         )
         == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Group 2: the ledger rules through ``CreditLedger`` on real PostgreSQL.
+# ---------------------------------------------------------------------------
+
+_G2_NOW = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+
+
+def _g2_ledger(session: AsyncSession, at: datetime = _G2_NOW) -> CreditLedger:
+    """An adapter whose database clock reads the simulated ``at`` (the tests
+    act in the past; the clock rule itself is proven in the replay suite)."""
+
+    async def clock() -> datetime:
+        return at
+
+    return CreditLedger(session, reference_clock=clock)
+
+
+async def _granted_builder(harness: _Harness, *grants: int) -> tuple[UUID, list[UUID]]:
+    """A builder whose top-up lots come from ``CreditLedger`` itself."""
+
+    builder_id = await _builder_row(harness)
+    async with harness.session() as session, session.begin():
+        ledger = _g2_ledger(session)
+        book = await ledger.open_book(builder_id, at=_G2_NOW)
+        lots = []
+        for index, amount in enumerate(grants):
+            order_id = uuid4()
+            paid_at = date(2026, 10, 1) + timedelta(days=index)
+            lots.append(
+                book.grant(
+                    GrantSpec(
+                        lot_kind="topup",
+                        effect_id=topup_grant_effect_id(order_id),
+                        payment_id=f"pay-{order_id}",
+                        paid_at=paid_at,
+                        granted_mc=amount,
+                        expires_at=topup_lot_expires_at(paid_at),
+                        order_id=order_id,
+                    ),
+                    at=_G2_NOW,
+                ).id
+            )
+        await ledger.persist(book)
+    return builder_id, lots
+
+
+async def _quarantine(harness: _Harness, builder_id: UUID) -> UUID:
+    order_id = uuid4()
+    await _run(
+        harness,
+        "INSERT INTO billing_topup_orders (id, builder_id, payment_method, "
+        "catalog_version_id, offer_id, amount_cents, credit_grant_mc, "
+        "pricing_snapshot, state) VALUES (:id, :builder, 'pix', "
+        "'payment-2026-10-03', 'package_credits_500_v1', 10000, 500000, "
+        "'{}'::jsonb, 'quarantined')",
+        id=order_id,
+        builder=builder_id,
+    )
+    return order_id
+
+
+async def _debit(
+    harness: _Harness, builder_id: UUID, effect_id: str, amount: int
+) -> str:
+    async with harness.session() as session, session.begin():
+        result = await _g2_ledger(session).debit(
+            builder_id, effect_id, amount, at=_G2_NOW, effect_kind="trace"
+        )
+    return result.status
+
+
+async def _ledger_rows(harness: _Harness, builder_id: UUID) -> int:
+    return int(
+        await _value(
+            harness,
+            "SELECT count(*) FROM credit_ledger_entries WHERE builder_id = :b",
+            b=builder_id,
+        )
+    )
+
+
+async def test_the_spend_hold_acts_only_after_the_enforcement(
+    postgres_harness: _Harness,
+) -> None:
+    held, _ = await _granted_builder(postgres_harness, 10_000)
+    other, _ = await _granted_builder(postgres_harness, 10_000)
+    order_id = await _quarantine(postgres_harness, held)
+    # Before the enforcement the hold is computed but does not act.
+    assert await _debit(postgres_harness, held, "trace:before", 1_000) == "applied"
+    try:
+        await _run(
+            postgres_harness,
+            "INSERT INTO credit_enforcement_state (id, credit_enforcement_at, set_by, "
+            "set_at) VALUES (1, now(), 'user:group2-test', now())",
+        )
+        rows = await _ledger_rows(postgres_harness, held)
+        assert await _debit(postgres_harness, held, "trace:held", 1_000) == (
+            "credit_pending"
+        )
+        assert await _ledger_rows(postgres_harness, held) == rows  # nothing written
+        assert await _debit(postgres_harness, other, "trace:other", 1_000) == "applied"
+        # Facts keep applying under the hold.
+        async with postgres_harness.session() as session, session.begin():
+            ledger = _g2_ledger(session)
+            book = await ledger.open_book(held, at=_G2_NOW)
+            assert book.spend_hold.active
+            book.grant(
+                GrantSpec(
+                    lot_kind="topup",
+                    effect_id=topup_grant_effect_id(uuid4()),
+                    payment_id="pay-held",
+                    paid_at=date(2026, 10, 5),
+                    granted_mc=500,
+                    expires_at=topup_lot_expires_at(date(2026, 10, 5)),
+                    order_id=uuid4(),
+                ),
+                at=_G2_NOW,
+            )
+            await ledger.persist(book)
+
+        # A spend that took the account lock before the row turned
+        # quarantined is not undone.
+        await _run(
+            postgres_harness,
+            "UPDATE billing_topup_orders SET state = 'cancelled' WHERE id = :id",
+            id=order_id,
+        )
+        async with postgres_harness.session() as session:
+            await session.begin()
+            ledger = _g2_ledger(session)
+            book = await ledger.open_book(held, at=_G2_NOW, effect_ids=("trace:raced",))
+            assert not book.spend_hold.active
+            await _quarantine(postgres_harness, held)  # commits meanwhile
+            assert book.debit(
+                "trace:raced", 1_000, at=_G2_NOW, effect_kind="trace"
+            ).status == ("applied")
+            await ledger.persist(book)
+            await session.commit()
+        assert await _debit(postgres_harness, held, "trace:after", 1_000) == (
+            "credit_pending"
+        )
+        await _run(
+            postgres_harness,
+            "UPDATE billing_topup_orders SET state = 'cancelled' "
+            "WHERE builder_id = :b",
+            b=held,
+        )
+        assert await _debit(postgres_harness, held, "trace:released", 1_000) == (
+            "applied"
+        )
+    finally:
+        await _run(postgres_harness, "DELETE FROM credit_enforcement_state")
+
+
+async def test_concurrent_debits_serialize_on_the_account_and_never_overspend(
+    postgres_harness: _Harness,
+) -> None:
+    builder_id, lots = await _granted_builder(postgres_harness, 3_000, 2_000)
+    statuses = await asyncio.gather(
+        *(
+            _debit(postgres_harness, builder_id, f"trace:{index}", 1_500)
+            for index in range(5)
+        ),
+        _debit(postgres_harness, builder_id, "trace:0", 1_500),  # a replay
+    )
+    assert sorted(statuses) == ["applied"] * 5 + ["duplicate"]
+    async with postgres_harness.session() as session:
+        balance = await CreditRepository(session).derived_balance(builder_id)
+        entries = (
+            await session.execute(
+                select(
+                    CreditLedgerEntry.entry_type,
+                    CreditLedgerEntry.amount_mc,
+                    CreditLedgerEntry.lot_id,
+                ).where(CreditLedgerEntry.builder_id == builder_id)
+            )
+        ).all()
+    assert balance == fold_ledger(
+        LedgerMovement(t, int(a), lot) for t, a, lot in entries
+    )
+    assert dict(balance.lots) == {lots[0]: 0, lots[1]: 0}
+    assert balance.debt_mc == 5 * 1_500 - 5_000
+    debited = {lot: 0 for lot in lots}
+    for kind, amount, lot in entries:
+        if kind == "debit":
+            debited[lot] += int(amount)
+    assert debited == {lots[0]: 3_000, lots[1]: 2_000}
+
+
+async def test_reversal_restoration_and_expiry_rows_satisfy_the_schema(
+    postgres_harness: _Harness,
+) -> None:
+    builder_id, (line, payer) = await _granted_builder(postgres_harness, 4_000, 4_500)
+    assert await _debit(postgres_harness, builder_id, "trace:a", 5_000) == "applied"
+    later = _G2_NOW + timedelta(hours=1)
+    async with postgres_harness.session() as session, session.begin():
+        ledger = _g2_ledger(session, later)
+        book = await ledger.open_book(builder_id, at=later)
+        book.apply_line_targets(
+            line,
+            line_id="topup",
+            payment_id="pay-line",
+            financial_revision=2,
+            reversal_target_mc=4_000,
+            restoration_target_mc=0,
+            at=later,
+        )
+        await ledger.persist(book)
+    async with postgres_harness.session() as session:
+        (debt,) = (
+            await session.execute(
+                select(CreditDebt).where(
+                    CreditDebt.builder_id == builder_id,
+                    CreditDebt.debt_source_kind == "reversal",
+                )
+            )
+        ).scalars()
+        assert debt.original_grant_lot_id == line and debt.amount_mc == 4_000
+        origins = (
+            await session.execute(
+                select(func.count()).where(CreditDebtOrigin.debt_id == debt.id)
+            )
+        ).scalar_one()
+        assert origins == 1  # the debit entry that consumed the line
+        settlements = (
+            await session.execute(
+                select(
+                    CreditDebtSettlement.settling_grant_lot_id,
+                    CreditDebtSettlement.amount_mc,
+                ).where(CreditDebtSettlement.debt_id == debt.id)
+            )
+        ).all()
+        # FEFO consumed the line (4,000) then 1,000 of the payer, which can
+        # settle only 3,500 of the 4,000 owed.
+        assert settlements == [(payer, 3_500)]
+
+    # The payer expires; restoring the chargeback returns its share with an
+    # expiry in the same effect, and releases the rest of the debt.
+    expired = topup_lot_expires_at(date(2026, 10, 2)) + timedelta(days=1)
+
+    async def simulated() -> datetime:  # a reference clock past the real date
+        return expired
+
+    async with postgres_harness.session() as session, session.begin():
+        ledger = CreditLedger(session, reference_clock=simulated)
+        book = await ledger.open_book(builder_id, at=expired)
+        book.apply_line_targets(
+            line,
+            line_id="topup",
+            payment_id="pay-line",
+            financial_revision=3,
+            reversal_target_mc=4_000,
+            restoration_target_mc=4_000,
+            at=expired,
+        )
+        await ledger.persist(book)
+    rows = await _rows_of(
+        postgres_harness,
+        "SELECT entry_type, lot_id, amount_mc FROM credit_ledger_entries "
+        "WHERE builder_id = :b AND (effect_id LIKE 'restoration:%' "
+        "OR effect_id LIKE 'return:%') ORDER BY entry_type",
+        b=builder_id,
+    )
+    assert sorted(rows) == sorted(
+        [
+            ("debt_release", None, 500),
+            ("settlement_release", payer, 3_500),
+            ("expiry", payer, 3_500),
+        ]
+    )
+    async with postgres_harness.session() as session:
+        balance = await CreditRepository(session).derived_balance(builder_id)
+    assert balance.debt_mc == 0 and dict(balance.lots) == {line: 0, payer: 0}
+    await _refused(
+        postgres_harness,
+        "DELETE FROM credit_debt_settlements WHERE builder_id = :b",
+        "23000",
+        "credit_debt_settlements is append-only",
+        b=builder_id,
+    )
+
+
+async def _rows_of(
+    harness: _Harness, statement: str, **params: Any
+) -> list[tuple[Any, ...]]:
+    async with harness.engine.connect() as connection:
+        return [
+            tuple(row) for row in (await connection.execute(text(statement), params))
+        ]
