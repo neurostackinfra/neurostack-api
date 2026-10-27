@@ -467,6 +467,14 @@ class Settings(BaseSettings):
     # (src/services/credit_switch.py).  On is observational only.
     credit_hot_path_enabled: bool = False
     credit_switch_refresh_seconds: int = Field(default=60, ge=1, le=300)
+    # How far a credit ledger writer's clock may stray from the database
+    # clock (owner decisions, 2026-10-26: 5 minutes, at most 10): further
+    # ahead acts at database clock + tolerance (with a warning), further
+    # behind at database clock - tolerance; a builder whose ledger clock is
+    # already beyond database clock + tolerance is refused without writing
+    # anything until the database clock catches up
+    # (src/services/credit_ledger.py, CreditLedger).
+    credit_clock_tolerance_seconds: int = Field(default=300, ge=1, le=600)
 
     @field_validator("asaas_webhook_url")
     @classmethod
