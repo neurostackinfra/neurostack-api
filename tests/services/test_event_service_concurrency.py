@@ -12,6 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.routes.webhook import _run_pipeline_transactionally
 from src.api.schemas.events import EventPayload, EventRequest, EventType
 from src.core.pipeline import PipelineInput, PipelineResult
+from src.interaction_context import (
+    ResolvedInteractionContext,
+    unknown_interaction_context,
+)
 from src.models.session import CognitiveStateData, Session
 from src.services.event_service import EventService
 
@@ -22,6 +26,14 @@ def _request() -> EventRequest:
         session_id=uuid4(),
         event_type=EventType.MESSAGE_IN,
         payload=EventPayload(content="short input", channel="whatsapp"),
+    )
+
+
+def _context(request: EventRequest) -> ResolvedInteractionContext:
+    return unknown_interaction_context(
+        effective_tenant_id=request.tenant_id,
+        session_id=request.session_id,
+        event_type=request.event_type,
     )
 
 
@@ -93,6 +105,7 @@ async def test_lock_precedes_pipeline_and_existing_state_flush() -> None:
 @pytest.mark.asyncio
 async def test_webhook_helper_rolls_back_pipeline_failure_without_finish() -> None:
     request = _request()
+    context = _context(request)
     error = RuntimeError("pipeline failed")
     service = SimpleNamespace(
         run_pipeline=AsyncMock(side_effect=error),
@@ -105,6 +118,7 @@ async def test_webhook_helper_rolls_back_pipeline_failure_without_finish() -> No
             service=service,
             event_request=request,
             db=cast(AsyncSession, db),
+            context=context,
         )
 
     db.commit.assert_not_awaited()
@@ -115,6 +129,7 @@ async def test_webhook_helper_rolls_back_pipeline_failure_without_finish() -> No
 @pytest.mark.asyncio
 async def test_webhook_helper_rolls_back_commit_failure_without_finish() -> None:
     request = _request()
+    context = _context(request)
     phase: tuple[Any, dict[str, object], list[dict[str, str]]] = (
         SimpleNamespace(),
         {},
@@ -134,6 +149,7 @@ async def test_webhook_helper_rolls_back_commit_failure_without_finish() -> None
             service=service,
             event_request=request,
             db=cast(AsyncSession, db),
+            context=context,
         )
 
     db.rollback.assert_awaited_once()
@@ -143,6 +159,7 @@ async def test_webhook_helper_rolls_back_commit_failure_without_finish() -> None
 @pytest.mark.asyncio
 async def test_webhook_helper_does_not_rollback_post_commit_failure() -> None:
     request = _request()
+    context = _context(request)
     phase: tuple[Any, dict[str, object], list[dict[str, str]]] = (
         SimpleNamespace(),
         {},
@@ -159,6 +176,7 @@ async def test_webhook_helper_does_not_rollback_post_commit_failure() -> None:
             service=service,
             event_request=request,
             db=cast(AsyncSession, db),
+            context=context,
         )
 
     db.commit.assert_awaited_once()
@@ -168,4 +186,5 @@ async def test_webhook_helper_does_not_rollback_post_commit_failure() -> None:
         phase[0],
         phase[1],
         phase[2],
+        context=context,
     )
