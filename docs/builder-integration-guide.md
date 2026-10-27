@@ -114,6 +114,15 @@ curl -X POST https://api.neurostack.ai/v1/events \
   }'
 ```
 
+**Origem da interação.** O servidor grava `interaction_origin` em cada evento
+a partir da credencial, nunca de `channel` (que é só transporte): `X-API-Key`
+→ `production`; webhooks Z-API/Meta autenticados → `production`; JWT do painel
+(`clinic_admin`, `builder`, `super_admin`) → `simulator`; webhooks
+Evolution/Uazapi → `unknown`. Não envie `interaction_origin` no corpo: a API
+responde `422` `{"detail": {"code": "interaction_origin_server_managed"}}`. Um
+chat web real deve usar API key (produção) a partir do seu backend, não o JWT
+do painel. Analytics e rating não mudam com este campo.
+
 ### 4. Usar o Prompt no seu LLM
 
 ```python

@@ -178,6 +178,7 @@ igual ao tenant autenticado; divergências retornam `403` com
 ```json
 {
   "event_id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+  "interaction_event_id": "d4e5f6a7-b8c9-0123-def0-234567890123",
   "decision": {
     "intent": "agendar",
     "intent_category": "scheduling",
@@ -231,6 +232,67 @@ igual ao tenant autenticado; divergências retornam `403` com
 }
 ```
 
+#### Origem da interação (`interaction_origin`)
+
+`interaction_origin` é proveniência **server-managed**: o servidor a deriva da
+credencial autenticada e a grava em `events.interaction_origin`. Valores
+possíveis: `production`, `simulator`, `unknown`. O campo `channel` do payload é
+apenas transporte e nunca influencia a origem.
+
+| Chamador | Origem |
+|----------|--------|
+| `X-API-Key` válida | `production` |
+| JWT operacional (`clinic_admin`, `builder`, `super_admin`) | `simulator` |
+| JWT com outro papel (`investor`, desconhecido) | — (`403 caller_role_forbidden`) |
+| Webhook Z-API ou Meta (HMAC) autenticado | `production` |
+| Webhook Evolution/Uazapi e chamadores sem prova de origem | `unknown` |
+| Eventos tardios de handoff (`handoff.accept`, `handoff.complete`, `handoff.timeout`) | `unknown` |
+
+Para saber a origem de um evento tardio de handoff, junte `payload.handoff_id`
+do evento tardio a `payload.key_info.handoff_id` do evento `handoff.request`
+do mesmo handoff, que carrega a origem da interação que o iniciou. Eventos de
+handoff nunca carregam `interaction_event_id`. Eventos gravados antes de o
+servidor atribuir a origem (inclusive o backfill da revisão 018) permanecem
+`unknown`; a coluna é imutável (trigger
+`trg_events_interaction_origin_immutable`) e não há reclassificação.
+
+O campo é reservado: enviá-lo no corpo, em `payload` ou em
+`payload.metadata` retorna `422` com corpo exato:
+
+```json
+{"detail": {"code": "interaction_origin_server_managed"}}
+```
+
+Erros de validação comuns continuam no formato padrão do FastAPI
+(`{"detail": [ ... ]}`); o OpenAPI documenta os dois formatos no `422`.
+
+**Dois IDs na resposta.** `event_id` mantém o significado legado: é o ID do
+evento `srm.decision` gravado para o processamento. `interaction_event_id` é o
+ID do evento `message.in` persistido da interação; é `null` para qualquer outro `event_type` (por
+exemplo `session.start`) e quando a gravação best-effort no Event Store falhou.
+As respostas HTTP dos webhooks não carregam `interaction_event_id`.
+
+**Erros e rate limit em `POST /v1/events`.** Coexistem dois formatos de `403`
+(além do `422` do campo reservado):
+
+| Status | Erro | Corpo | Rate limit |
+|--------|------|-------|-----------|
+| `403` | `tenant_id` no corpo diferente do tenant autenticado (middleware) | `{"error": "tenant_identity_mismatch", "message": "..."}` | não consome slot |
+| `403` | Sessão ausente ou de outro tenant | `{"error": "tenant_identity_mismatch", "message": "..."}` | consome e devolve (refund) o slot |
+| `403` | Papel JWT sem política operacional | `{"detail": {"code": "caller_role_forbidden"}}` | consome o slot, sem refund |
+| `422` | Campo reservado `interaction_origin` | `{"detail": {"code": "interaction_origin_server_managed"}}` | consome o slot |
+
+Ordem de avaliação na rota (após a asserção de tenant do middleware): papel
+(`403 caller_role_forbidden`) → campo reservado (`422`) → sessão
+(`403 tenant_identity_mismatch`). Autenticação (`401`), rate limit (`429`) e o
+`422` padrão do FastAPI para corpo malformado vêm antes dessas checagens: um
+JWT `investor` com corpo malformado recebe o `422` padrão, não `403`.
+
+`GET /v1/events/{event_id}` e a listagem de eventos retornam
+`EventDetailResponse`, cujo `interaction_origin` é obrigatório. Os eventos de
+`GET /v1/sessions/{session_id}/events` trazem `interaction_origin` e
+`interaction_event_id`. Analytics e rating não mudam com este campo.
+
 #### Event Types
 
 | Tipo | Descrição |
@@ -240,10 +302,15 @@ igual ao tenant autenticado; divergências retornam `403` com
 | `session.start` | Início de sessão |
 | `session.end` | Fim de sessão |
 | `handoff.request` | Solicitação de handoff |
+| `handoff.accept` | Handoff aceito por atendente humano |
 | `handoff.complete` | Handoff concluído |
+| `handoff.timeout` | Handoff expirou sem atendimento |
 | `safety.trigger` | Safety concern detectado |
 | **`ns.funnel_stage_changed`** | **Integração CRM:** etapa do funil alterada (payload: `ns_stage`, `crm_stage_id`) |
 | **`ns.handoff_created`** | **Integração CRM:** handoff criado (payload: `setor`, `prioridade`, `resumo`, etc.) |
+| `ns.atendimento_tipo_set` | Modalidade de atendimento (`atendimento_tipo`) definida |
+| `flow.transition` | Transição de modo de fluxo registrada |
+| `mode.change` | Modo de fluxo alterado |
 
 #### Flow Modes
 

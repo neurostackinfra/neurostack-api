@@ -79,6 +79,17 @@ sessions (1) ──┬── (N) events          [session_id opcional em events]
 | idx_events_tenant_session | (tenant_id, session_id, created_at DESC) | Eventos de sessão por tenant |
 | **idx_events_tenant_type_created** | **(tenant_id, event_type, created_at DESC)** | Filtrar por tipo e tempo |
 | **idx_events_session_created** | **(session_id, created_at DESC)** WHERE session_id IS NOT NULL | Eventos da sessão ordenados |
+| idx_events_tenant_origin_type_created | (tenant_id, interaction_origin, event_type, created_at DESC) | Filtrar por origem, tipo e tempo (revisão 018) |
+
+**`events.interaction_origin`** (revisão 018): `VARCHAR(20) NOT NULL DEFAULT 'unknown'`,
+`CHECK ck_events_interaction_origin` com `('production', 'simulator', 'unknown')`.
+Proveniência server-managed, derivada da credencial e nunca de `channel`.
+Eventos gravados antes de o servidor atribuir a origem (inclusive o backfill da
+revisão 018) permanecem `unknown` e não são reclassificados. Eventos tardios de
+handoff (accept/complete/timeout) gravam `unknown`; a origem da interação está
+na linha `handoff.request` do mesmo handoff (junção
+`event_data->>'handoff_id'` do evento tardio = `event_metadata->>'handoff_id'`
+do `handoff.request`). `handoff_records` não guarda origem.
 
 ### Policies
 | Índice | Colunas | Uso |
@@ -115,6 +126,7 @@ sessions (1) ──┬── (N) events          [session_id opcional em events]
 - **update_policies_updated_at:** em `policies`, BEFORE UPDATE.
 - **update_knowledge_updated_at:** em `knowledge_documents`, BEFORE UPDATE.
 - **update_clinic_configs_updated_at:** em `clinic_configs`, BEFORE UPDATE (migração 003).
+- **trg_events_interaction_origin_immutable:** em `events`, BEFORE UPDATE OF `interaction_origin`; a função `prevent_events_interaction_origin_change` rejeita qualquer alteração de `interaction_origin` (revisão 018). Updates de outras colunas passam.
 
 ---
 

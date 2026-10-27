@@ -113,6 +113,21 @@ class PipelineResult:
     stage_timings: dict[str, float] # Tempo por estágio
 ```
 
+### Contexto da interação (`ResolvedInteractionContext`)
+
+A borda de entrada (rota `/v1/events` ou adaptador de webhook) constrói uma
+única vez um `ResolvedInteractionContext` (`src/interaction_context.py`) com
+tenant efetivo, sessão, `origin` e `interaction_event_id`. A origem vem só da
+credencial: API key e Z-API/Meta → `production`; JWT operacional →
+`simulator`; Evolution/Uazapi e chamadores sem prova → `unknown`. `channel` é
+transporte e não influencia. No pipeline, o contexto só é consumido depois que
+o lock da sessão (`_lock_session_state`) prova a sessão no tenant; a exceção é
+a captura de mensagem com a sessão pausada no webhook, que grava o `message.in`
+após uma busca da sessão filtrada por tenant, sem esse lock.
+`interaction_event_id` é reservado apenas para `message.in` e só é exposto se
+o Event Store gravou o evento. Todos os eventos da interação persistem a mesma
+`interaction_origin`.
+
 ---
 
 ## Estágios do Pipeline
@@ -210,7 +225,7 @@ class PipelineResult:
 - Gerar resumo estruturado da conversa
 - Extrair informações-chave (slots)
 - Enviar webhook para sistema externo
-- Registrar evento no Event Store
+- Registrar evento no Event Store (`handoff.request` herda a `interaction_origin` do contexto, sem `interaction_event_id`; eventos tardios accept/complete/timeout são `unknown`)
 - Retornar mensagem para o usuário
 
 ---

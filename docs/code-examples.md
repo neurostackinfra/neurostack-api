@@ -374,6 +374,8 @@ import { v4 as uuidv4 } from 'uuid';
 
 interface ProcessMessageResponse {
   event_id: string;
+  // ID do message.in persistido; null para outros event_type ou falha do Event Store
+  interaction_event_id: string | null;
   decision: {
     intent: string;
     intent_category: string;
@@ -687,6 +689,10 @@ curl -X POST https://api.neurostack.ai/v1/events \
     }
   }'
 ```
+
+A resposta traz `event_id` (legado) e `interaction_event_id` (o `message.in`
+persistido, ou `null`). Não envie `interaction_origin`: o campo é
+server-managed e retorna `422` `{"detail": {"code": "interaction_origin_server_managed"}}`.
 
 ### Listar Sessões
 
