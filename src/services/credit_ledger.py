@@ -56,9 +56,37 @@ debt.  Open debt is settled from usable capacity whenever capacity appears
 (grant, restoration) or debt appears (reversal, debit), oldest debt first
 (``created_at``, then the tie-break above), each settlement recorded in
 ``credit_debt_settlements`` with the lot that paid it; so after every
-operation open debt and usable capacity never coexist.  A refused or
-replayed debit writes nothing at all (:meth:`CreditLedger.debit` does not
-persist even the deadline sweep its book made).
+operation open debt and usable capacity never coexist (a monthly allowance
+that started since the previous operation is caught up first, O5 below).
+A refused or replayed debit writes
+nothing at all (:meth:`CreditLedger.debit` does not persist even the deadline
+sweep its book made).
+
+O5, a SPEND rule only (owner decision, 2026-10-26; Group 3a).  A monthly
+allowance may be granted before its cycle starts (an early renewal), but
+debits and debt settlement use it only from ``start_of_civil_day(
+cycle_start)`` on, compared with the instant the operation acts at
+(``DebitResult.at``): :meth:`LotState.spendable_mc` feeds :meth:`debit`,
+:meth:`settle_open_debts` and :meth:`LedgerBook.available_mc` (the figure of
+the APIs and the UI).  :meth:`LotState.available_mc` is unchanged: a reversal
+withdraws a not-yet-started allowance like any other (a refund before
+``cycle_start`` takes the lot back and creates no debt).  So an early renewal
+with open debt does not settle it before ``cycle_start``.
+
+The start catch-up (owner decision, 2026-10-28, option 2).  An allowance
+starting is the one way open debt and usable capacity come to coexist with
+no operation in between.  So EVERY operation -- the deadline sweep (before
+it expires anything), a grant, a settlement, a line's reversal/restoration,
+an accepted debit -- first settles, for each monthly allowance whose
+``start_of_civil_day(cycle_start) <= at`` (the operation's monotonic
+instant), the debt that already existed at that start, from the capacity
+spendable AT that start, as of that start: its entries are dated at the
+start (as an ``expiry`` is dated at its deadline), under the deterministic
+``cycle:...:start-settlement`` effect of that allowance (a time-driven
+effect, like the sweep's expiries: it is not the effect of the fact or the
+debit at hand).  Whether that operation comes on the start day or after
+``cycle_end``, the rows and the net position are the same, so equivalent
+histories end equal; once caught up, a start settles nothing more (no-op).
 
 Reversal (cumulative per credit-bearing line, ``reversal_target_mc =
 floor(grant_mc x reversed_cents / settled_cents)``).  A target increase D
@@ -106,12 +134,17 @@ answer ``credit_pending`` without touching the ledger; grants, reversals and
 restorations keep applying.  Before the enforcement it is computed only.
 
 Notes for later groups.  :class:`DebitResult` carries ``at``, the instant the
-debit acted at (after the clock rule); Group 3 checks against it what depends
-on time -- the monthly allowance is usable only from its ``cycle_start`` (O5),
-inside the book.  A refused debit writes nothing, so for a builder on hold
-the stored ledger (``derived_balance``) can lag behind expiries the sweep has
-not persisted: APIs and the UI (Groups 6, 7) show usable capacity from
-``LedgerBook.available_mc(at)``, never the derived balance as usable.
+debit acted at (after the clock rule); the O5 predicate above is evaluated
+at that instant, inside the book.  A refused debit writes nothing, so for a
+builder on hold the stored ledger (``derived_balance``) can lag behind
+expiries the sweep has not persisted: APIs and the UI (Groups 6, 7) show
+usable capacity from ``LedgerBook.available_mc(at)``, never the derived
+balance as usable.  Likewise the STORED open debt (``credit_debts`` and the
+derived debt) lags an allowance that started since the last write until the
+next writer persists its start catch-up: Group 5 (suspension on debt) and
+Group 7 must read open debt through a swept book (``LedgerBook.open_debt_mc``
+after :meth:`LedgerBook.sweep_expired` at the instant they judge), as they
+already must for expiries, never from the stored rows alone.
 
 Group 2 never charges RAG or media maintenance, never opens an exhaustion
 episode and never reads ``tests/``.
@@ -254,8 +287,9 @@ def monthly_lot_expires_at(cycle_end: date) -> datetime:
 
     The lot is granted when its cycle settles, which may be before
     ``cycle_start`` (an early renewal); Group 2 does not change that.  Using
-    the allowance only from ``cycle_start`` on is a restriction of the
-    metered debit (Group 3), not of the grant (owner decision O5, 2026-10-26).
+    the allowance only from ``cycle_start`` on is a restriction of spending
+    (:meth:`LotState.spendable_mc`, Group 3a), not of the grant (owner
+    decision O5, 2026-10-26).
     """
 
     return start_of_civil_day(cycle_end)
@@ -311,6 +345,17 @@ def cycle_debt_settlement_effect_id(
     return (
         f"cycle:{subscription_id}:{cycle_start.isoformat()}:"
         f"{cycle_end.isoformat()}:debt-settlement"
+    )
+
+
+def cycle_start_settlement_effect_id(
+    subscription_id: UUID, cycle_start: date, cycle_end: date
+) -> str:
+    """The start catch-up of a monthly allowance (see the module docstring)."""
+
+    return (
+        f"cycle:{subscription_id}:{cycle_start.isoformat()}:"
+        f"{cycle_end.isoformat()}:start-settlement"
     )
 
 
@@ -465,7 +510,34 @@ class LotState:
         return self.expires_at <= at
 
     def available_mc(self, at: datetime) -> int:
+        """What the lot holds at ``at``: what a reversal withdraws.
+
+        Deliberately blind to ``cycle_start`` (O5 is a SPEND rule only): a
+        refund before the cycle starts must withdraw the lot, not turn into
+        debt."""
+
         return 0 if self.expired(at) else max(self.balance_mc, 0)
+
+    def spend_starts_at(self) -> datetime | None:
+        """First instant debits and debt settlement may use this lot: the
+        civil start of ``cycle_start`` for a monthly allowance (owner decision
+        O5), ``None`` (no start) otherwise."""
+
+        if self.lot_kind != "monthly" or self.cycle_start is None:
+            return None
+        return start_of_civil_day(self.cycle_start)
+
+    def spendable_mc(self, at: datetime) -> int:
+        """What debits and debt settlement may use at ``at`` (O5).
+
+        Zero for a monthly allowance before its ``cycle_start`` (an early
+        renewal is granted before its cycle begins), otherwise exactly
+        :meth:`available_mc`."""
+
+        starts = self.spend_starts_at()
+        if starts is not None and at < starts:
+            return 0
+        return self.available_mc(at)
 
     def fefo_key(self) -> tuple[int, datetime, date, str]:
         """Monthly first, then the earliest expiry, then ``paid_at``, then the
@@ -770,8 +842,12 @@ class LedgerBook:
         return sum(self._open_by_debt().values())
 
     def available_mc(self, at: datetime) -> int:
+        """Usable capacity at ``at`` (the APIs' and the UI's figure): what
+        debits may spend, so a monthly allowance counts only from its
+        ``cycle_start`` (O5, :meth:`LotState.spendable_mc`)."""
+
         at = self._read(at)
-        return sum(lot.available_mc(at) for lot in self._lots.values())
+        return sum(lot.spendable_mc(at) for lot in self._lots.values())
 
     def available_trace_mc(self, at: datetime) -> int:
         """Usable capacity net of open debt (reservations: Group 4a)."""
@@ -795,9 +871,12 @@ class LedgerBook:
     # -- operations --------------------------------------------------------
 
     def sweep_expired(self, at: datetime) -> None:
-        """Append the ``expiry`` of every lot past its deadline with balance."""
+        """Append the ``expiry`` of every lot past its deadline with balance,
+        after the start catch-up (an allowance pays what it owed from its
+        start before it expires)."""
 
         at = self._tick(at)
+        self._settle_started_allowances(at)
         before = len(self.writes.effects)
         for lot in self.lots:
             self._expire_if_due(lot, at)
@@ -819,6 +898,7 @@ class LedgerBook:
             raise ValueError("granted_mc must be positive")
         if spec.effect_id in self._known_effects:
             raise LedgerInvariantError("grant effect already exists")
+        self._settle_started_allowances(at)
         self._ensure_effect(
             spec.effect_id, GRANT_EFFECT, decision_digest=decision_digest
         )
@@ -855,7 +935,7 @@ class LedgerBook:
         )
         self._entry(spec.effect_id, lot.id, "grant", spec.granted_mc, at)
         self._expire_if_due(lot, at)
-        self.settle_open_debts(spec.effect_id, at=at)
+        self._settle(spec.effect_id, at)
         return lot
 
     def settle_open_debts(
@@ -873,9 +953,101 @@ class LedgerBook:
         """
 
         at = self._tick(at)
+        self._settle_started_allowances(at)
+        return self._settle(effect_id, at, effect_kind=effect_kind)
+
+    def _settle_started_allowances(self, at: datetime) -> None:
+        """The start catch-up (module docstring): for each monthly allowance
+        whose spend start is not after ``at``, earliest start first (ties by
+        :meth:`LotState.fefo_key`), settle the debt that existed at that
+        start from the capacity spendable then, dated at the start.
+
+        It runs under the account lock on every operation, so it skips --
+        without changing any row -- every start where :meth:`_settle` would
+        write nothing: the open debts are read once (none open: no start
+        settles anything); a start before the oldest open debt has no debt
+        it may pay (``debts_until``), and settling only closes debt, so that
+        oldest one never gets older during the pass; a start where no lot is
+        spendable has no payer -- and only a lot holding a positive balance
+        can be spendable, settling only lowers balances, so the holders are
+        read once (none: nothing can pay at any start); once the pass closed
+        every debt open at its beginning (in millicredits), nothing is left
+        to settle.  So a book with nothing open, or nothing left to pay
+        with, costs at most one pass over its debts, whatever its history of
+        allowances.
+        """
+
+        holders = [lot for lot in self._lots.values() if lot.balance_mc > 0]
+        if not holders:
+            return
         open_amounts = self._open_by_debt()
-        pending = [debt for debt in self._debts if open_amounts[debt.id] > 0]
-        payers = [lot for lot in self.lots if lot.available_mc(at) > 0]
+        open_left = sum(open_amounts.values())
+        if open_left == 0:
+            return
+        oldest_open = min(
+            debt.created_at for debt in self._debts if open_amounts[debt.id] > 0
+        )
+        started: list[tuple[datetime, LotState]] = []
+        for lot in self._lots.values():
+            starts = lot.spend_starts_at()
+            if starts is not None and oldest_open <= starts <= at:
+                started.append((starts, lot))
+        started.sort(key=lambda pair: (pair[0], pair[1].fefo_key()))
+        for starts, lot in started:
+            if open_left == 0:
+                break
+            if (
+                lot.subscription_id is None
+                or lot.cycle_start is None
+                or lot.cycle_end is None
+            ):
+                raise LedgerInvariantError("a monthly allowance names no cycle")
+            if not any(payer.spendable_mc(starts) > 0 for payer in holders):
+                continue
+            effect_id = cycle_start_settlement_effect_id(
+                lot.subscription_id, lot.cycle_start, lot.cycle_end
+            )
+            created = effect_id not in self._known_effects
+            settled = self._settle(
+                effect_id,
+                starts,
+                effect_kind=DEBT_SETTLEMENT_EFFECT,
+                debts_until=starts,
+            )
+            open_left -= settled
+            if settled and created:
+                # Time-driven, like the sweep's expiries: not the effect of
+                # the fact or debit this operation applies.
+                self.writes.swept_effect_ids.append(effect_id)
+
+    def _settle(
+        self,
+        effect_id: str,
+        at: datetime,
+        *,
+        effect_kind: str | None = None,
+        debts_until: datetime | None = None,
+    ) -> int:
+        """Settle open debt (created at or before ``debts_until``, when
+        given) from what is spendable at ``at``, the entries dated ``at``.
+
+        ``debts_until`` is defence in depth: through the book's operations a
+        start ``s`` never sees open debt older than ``s`` next to capacity
+        spendable at ``s`` once caught up, so with the catch-up's
+        oldest-open-debt filter the guard decides nothing on histories this
+        module wrote; it does on a book loaded from rows that break that
+        (``test_a_loaded_book_pays_only_the_debt_that_existed_at_the_start``
+        pins it), where a start must never pay a debt created after it."""
+
+        open_amounts = self._open_by_debt()
+        pending = [
+            debt
+            for debt in self._debts
+            if open_amounts[debt.id] > 0
+            and (debts_until is None or debt.created_at <= debts_until)
+        ]
+        # O5: a monthly allowance not yet started pays nothing.
+        payers = [lot for lot in self.lots if lot.spendable_mc(at) > 0]
         if not pending or not payers:
             return 0
         if effect_kind is not None:
@@ -888,7 +1060,7 @@ class LedgerBook:
             for lot in payers:
                 if remaining == 0:
                     break
-                amount = min(remaining, lot.available_mc(at))
+                amount = min(remaining, lot.spendable_mc(at))
                 if amount <= 0:
                     continue
                 self._entry(effect_id, lot.id, "debt_settlement", amount, at)
@@ -931,6 +1103,7 @@ class LedgerBook:
             raise ValueError("reversal target outside [0, granted_mc]")
         if restoration_target_mc < 0:
             raise ValueError("restoration target must not be negative")
+        self._settle_started_allowances(at)
         applied_reversal = self._applied[REVERSAL_EFFECT][lot_id]
         applied_restoration = self._applied[RESTORATION_EFFECT][lot_id]
         reversal_delta = restoration_delta = 0
@@ -997,18 +1170,22 @@ class LedgerBook:
             return DebitResult("duplicate", at=at)
         if self.spend_hold.active:
             return DebitResult("credit_pending", at=at)
+        # A refused or replayed debit changes nothing; an accepted one first
+        # catches the started allowances up, then settles, then consumes.
+        self._settle_started_allowances(at)
         self._ensure_effect(
             effect_id,
             effect_kind,
             tenant_id=tenant_id,
             decision_digest=decision_digest,
         )
-        self.settle_open_debts(effect_id, at=at)
+        self._settle(effect_id, at)
         remaining = amount_mc
         for lot in self.lots:
             if remaining == 0:
                 break
-            take = min(remaining, lot.available_mc(at))
+            # O5, against the instant the debit acts at (``DebitResult.at``).
+            take = min(remaining, lot.spendable_mc(at))
             if take > 0:
                 self._entry(effect_id, lot.id, "debit", take, at)
                 remaining -= take
@@ -1171,7 +1348,7 @@ class LedgerBook:
                 original_lot_id=lot.id,
                 at=at,
             )
-            self.settle_open_debts(effect_id, at=at)
+            self._settle(effect_id, at)
 
     def _closed(self, lot: LotState, at: datetime) -> bool:
         """Expired at ``at``, or already given its ``expiry`` by a writer whose
@@ -1196,7 +1373,7 @@ class LedgerBook:
             self._entry(effect_id, lot.id, "lot_regrant", left, at)
             if self._closed(lot, at):
                 self._entry(effect_id, lot.id, "expiry", left, at)
-        self.settle_open_debts(effect_id, at=at)
+        self._settle(effect_id, at)
 
     def _release_line_debt(
         self, line: LotState, amount: int, effect_id: str, at: datetime
@@ -1696,6 +1873,7 @@ __all__ = [
     "civil_date",
     "cumulative_target_mc",
     "cycle_debt_settlement_effect_id",
+    "cycle_start_settlement_effect_id",
     "expiry_effect_id",
     "monthly_grant_effect_id",
     "monthly_lot_expires_at",

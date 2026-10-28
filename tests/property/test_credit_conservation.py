@@ -6,13 +6,20 @@ cumulative reversal/restoration targets drive one pure
 
 * the rows the book recorded fold (``fold_ledger``) to exactly the balances
   and debt it tracks; no lot is negative, no debt is negative or over-paid;
-* open debt and usable capacity never coexist (debt is settled first);
-* while nothing has expired, ``usable - open debt = granted - consumed -
-  net reversed`` exactly; with expiry the difference only loses what
-  expired: ``granted - consumed - net reversed - expired <= usable - debt <=
-  granted - consumed - net reversed``;
+* open debt and usable (spendable) capacity never coexist after any step
+  (debt is settled first), a monthly allowance that started since the
+  previous step included: every operation, the deadline sweep included,
+  first settles the debt that existed at each started allowance's start,
+  dated at that start (owner decision 2026-10-28, option 2; O5, Group 3a);
+* while nothing has expired, ``usable + not yet started - open debt =
+  granted - consumed - net reversed`` exactly (``not yet started``: the
+  balance of monthly allowances before their ``cycle_start``, held but not
+  spendable); with expiry the difference only loses what expired;
 * a debit consumes the monthly allowance first, then top-ups by expiry,
-  ``paid_at`` and id, greedily, and never a lot expired at that instant;
+  ``paid_at`` and id, greedily, and never a lot expired at that instant nor
+  a monthly allowance before its ``cycle_start`` (the instant the debit
+  acted at, ``DebitResult.at``); no debit or debt settlement ever names a
+  monthly lot before its ``start_of_civil_day(cycle_start)``;
 * a lot past its deadline holds nothing; open debt never exceeds what was
   consumed, and -- with the release cascade -- no line owes more reversal
   debt than it consumed; every cascaded release withdrew what it released;
@@ -44,7 +51,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from hypothesis import event, given, settings
+from hypothesis import event, example, given, settings
 from hypothesis import strategies as st
 
 from src.repositories.credit import LedgerMovement, fold_ledger
@@ -58,6 +65,7 @@ from src.services.credit_ledger import (
     cumulative_target_mc,
     monthly_grant_effect_id,
     monthly_lot_expires_at,
+    start_of_civil_day,
     topup_grant_effect_id,
     topup_lot_expires_at,
 )
@@ -84,6 +92,15 @@ OPERATIONS = st.lists(
 )
 
 
+def _note(label: str) -> None:
+    """``hypothesis.event`` inside a property; a no-op in a plain test."""
+
+    try:
+        event(label)
+    except Exception:  # outside a hypothesis test there is no build context
+        pass
+
+
 @dataclass
 class _Run:
     book: LedgerBook = field(
@@ -100,6 +117,10 @@ class _Run:
     # from the rows of the previous ones with the adapter's own loader.
     reload: bool = False
     stored: LedgerWrites = field(default_factory=LedgerWrites)
+    # The book's clock after the last step that touched the ledger (every
+    # operation, the sweep included, catches started allowances up and
+    # settles open debt first: owner decision 2026-10-28).
+    last_settled_at: datetime | None = None
 
     @property
     def entries(self) -> list[dict[str, Any]]:
@@ -208,6 +229,7 @@ class _Run:
                 at=self.now,
             )
             self._granted(lot.id, credits * 1_000)
+            self.last_settled_at = self.book.clock
         elif kind == "topup":
             _, credits, offset = operation
             assert isinstance(credits, int) and isinstance(offset, int)
@@ -226,15 +248,18 @@ class _Run:
                 at=self.now,
             )
             self._granted(lot.id, credits * 1_000)
+            self.last_settled_at = self.book.clock
         elif kind == "debit":
             amount = operation[1]
             assert isinstance(amount, int)
             self._debit(amount)
+            self.last_settled_at = self.book.clock
         elif kind == "advance":
             hours = operation[1]
             assert isinstance(hours, int)
             self.now += timedelta(hours=hours)
             self.book.sweep_expired(self.now)
+            self.last_settled_at = self.book.clock
         elif self.lots:
             pick = operation[1]
             assert isinstance(pick, int)
@@ -255,6 +280,7 @@ class _Run:
             self.cents[lot_id] = [reversed_cents, restored]
             self.book.sweep_expired(self.now)
             self.apply_targets(lot_id)
+            self.last_settled_at = self.book.clock
 
     def _granted(self, lot_id: UUID, amount: int) -> None:
         self.granted += amount
@@ -264,17 +290,34 @@ class _Run:
     def _debit(self, amount: int) -> None:
         book = self.book
         before = len(book.writes.entries)
+        # The instant the debit acts at: a lagging writer acts at the book's
+        # clock (``DebitResult.at``); spendability (O5) is judged there.
+        acts_at = self.now if book.clock is None else max(self.now, book.clock)
+        # Open debt is settled first, from the same spendable lots.
+        book_debt = book.open_debt_mc
         usable = [
-            (lot.id, lot.available_mc(self.now))
+            (lot.id, lot.spendable_mc(acts_at))
             for lot in book.lots
-            if lot.available_mc(self.now) > 0
+            if lot.spendable_mc(acts_at) > 0
         ]
         kinds = [book.lot(lot_id).lot_kind for lot_id, _ in usable]
         assert kinds == sorted(kinds, key=lambda k: k != "monthly")
         effect_id = f"trace:{self.serial}"
         result = book.debit(effect_id, amount, at=self.now, effect_kind="trace")
         assert result.status == "applied"
+        assert result.at == acts_at
         self.consumed += amount
+        if book_debt:
+            # The debt settlement took the head of the order; what a debit
+            # then takes is the rest, in the same order.
+            settled = 0
+            for index, (lot_id, available) in enumerate(usable):
+                take = min(book_debt - settled, available)
+                settled += take
+                usable[index] = (lot_id, available - take)
+            usable = [(lot_id, left) for lot_id, left in usable if left > 0]
+            if settled:
+                _note("a debit settled open debt first")
         expected: list[tuple[UUID, int]] = []
         remaining = amount
         for lot_id, available in usable:
@@ -308,11 +351,30 @@ def _check(run: _Run, *, expired_anything: bool) -> None:
     for debt in book.debts:
         assert 0 <= open_amounts[debt.id] <= debt.amount_mc - debt.settled_mc
     usable = book.available_mc(run.now)
+    assert usable == sum(lot.spendable_mc(run.now) for lot in book.lots)
+    # Held but not spendable yet: monthly allowances before their cycle_start.
+    not_started = sum(
+        lot.available_mc(run.now) - lot.spendable_mc(run.now) for lot in book.lots
+    )
     if book.open_debt_mc:
-        assert usable == 0
+        # Owner decision 2026-10-28 (option 2): every step touches the ledger
+        # at ``run.now`` (``advance`` sweeps) and every operation first
+        # catches started allowances up, so open debt never stands next to
+        # spendable capacity -- an allowance that started included.
+        assert run.last_settled_at is not None
+        assert all(lot.spendable_mc(run.now) == 0 for lot in book.lots)
+    caught_up = [
+        e for e in run.entries if str(e["effect_id"]).endswith(":start-settlement")
+    ]
+    if caught_up:
+        _note("a started allowance settled debt older than its start")
+        for entry in caught_up:
+            assert entry["entry_type"] == "debt_settlement"
+    if not_started:
+        _note("an allowance was granted before its cycle_start")
     expected = run.granted - run.consumed - run.net_reversed()
     expired = sum(e["amount_mc"] for e in run.entries if e["entry_type"] == "expiry")
-    position = usable - book.open_debt_mc
+    position = usable + not_started - book.open_debt_mc
     if expired_anything:
         assert expected - expired <= position <= expected
     else:
@@ -320,7 +382,11 @@ def _check(run: _Run, *, expired_anything: bool) -> None:
     lots = {lot.id: lot for lot in book.lots}
     for entry in run.entries:
         if entry["entry_type"] in ("debit", "debt_settlement"):
-            assert lots[entry["lot_id"]].expires_at > entry["occurred_at"]
+            spent = lots[entry["lot_id"]]
+            assert spent.expires_at > entry["occurred_at"]
+            if spent.lot_kind == "monthly":
+                assert spent.cycle_start is not None
+                assert entry["occurred_at"] >= start_of_civil_day(spent.cycle_start)
         assert entry["amount_mc"] > 0
     for lot in book.lots:
         if lot.expired(run.now):
@@ -608,6 +674,17 @@ def _by_grant(run: _Run) -> dict[str, int]:
     ),
     st.integers(1, SETTLED_CENTS),
     st.booleans(),
+)
+# Owner decision 2026-10-28 (option 2): the allowance started at exactly the
+# pick instant next to 1 mc of debt; only the run with the pair used to
+# settle it (the restoration), the other kept it open.
+@example(
+    prefix_and_pick=(
+        [("debit", 1), ("advance", 363), ("monthly", 10, 1), ("advance", 369)],
+        0,
+    ),
+    cents=1,
+    reload=False,
 )
 def test_a_reversal_won_at_once_changes_no_lot(
     prefix_and_pick: tuple[list[tuple[object, ...]], int], cents: int, reload: bool

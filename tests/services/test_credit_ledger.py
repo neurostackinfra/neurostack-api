@@ -38,6 +38,7 @@ from src.services.credit_ledger import (
     CREDIT_TIMEZONE,
     CreditLedger,
     DebitResult,
+    DebtState,
     GrantSpec,
     LedgerBook,
     LedgerClockAhead,
@@ -47,6 +48,7 @@ from src.services.credit_ledger import (
     add_calendar_months,
     civil_date,
     cumulative_target_mc,
+    cycle_start_settlement_effect_id,
     expiry_effect_id,
     monthly_grant_effect_id,
     monthly_lot_expires_at,
@@ -1608,3 +1610,509 @@ async def test_a_lagging_writer_is_raised_to_the_database_clock_minus_tolerance(
             "trace:1", 1, at=sao_paulo_wall_labelled_utc, effect_kind="t"
         )
     assert result.at == database - timedelta(minutes=5)
+
+
+# ---------------------------------------------------------------------------
+# Group 3a, O5: a monthly allowance is SPENT only from its cycle_start.
+# ---------------------------------------------------------------------------
+
+# The renewal of the T0 cycle (2026-10-12 -> 2026-11-12), paid at T0: early.
+NEXT_START, NEXT_END = date(2026, 11, 12), date(2026, 12, 12)
+NEXT_SPEND = start_of_civil_day(NEXT_START)  # 2026-11-12 03:00 UTC
+
+
+def test_the_spend_predicate_opens_at_the_civil_start_of_cycle_start() -> None:
+    book = _book()
+    lot_id = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+    lot = book.lot(lot_id)
+    assert NEXT_SPEND == datetime(2026, 11, 12, 3, 0, tzinfo=timezone.utc)
+    assert lot.spend_starts_at() == NEXT_SPEND
+    before = NEXT_SPEND - timedelta(microseconds=1)
+    # Held (what a reversal would withdraw) but not spendable before the start.
+    assert (lot.available_mc(before), lot.spendable_mc(before)) == (5_000_000, 0)
+    assert lot.spendable_mc(NEXT_SPEND) == lot.available_mc(NEXT_SPEND) == 5_000_000
+    assert book.available_mc(before) == 0
+    assert book.available_mc(NEXT_SPEND) == 5_000_000
+    assert book.available_trace_mc(before) == 0
+    top_id = _topup(book, grant=1_000)
+    assert book.lot(top_id).spend_starts_at() is None
+    assert book.lot(top_id).spendable_mc(T0) == book.lot(top_id).available_mc(T0)
+
+
+def test_an_early_renewal_is_not_debited_before_its_cycle_start() -> None:
+    book = _book()
+    current = _monthly(book, grant=1_000_000)  # 2026-10-12 -> 2026-11-12
+    renewal = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+    first = book.debit("trace:1", 1_500_000, at=T0, effect_kind="trace")
+    assert (first.debited_mc, first.debt_mc, first.at) == (1_000_000, 500_000, T0)
+    assert book.lot(renewal).balance_mc == 5_000_000
+    assert book.lot(current).balance_mc == 0
+    debited = {e["lot_id"] for e in book.writes.entries if e["entry_type"] == "debit"}
+    assert debited == {current}
+    # Not even one microsecond early: the debit's own instant decides.
+    almost = NEXT_SPEND - timedelta(microseconds=1)
+    early = book.debit("trace:2", 1_000, at=almost, effect_kind="trace")
+    assert (early.debited_mc, early.debt_mc) == (0, 1_000)
+    assert book.lot(renewal).balance_mc == 5_000_000
+
+
+def test_from_cycle_start_the_catch_up_settles_the_debt_before_the_debit() -> None:
+    """MEDIUM-9: the early renewal does not pay open debt before cycle_start;
+    from cycle_start on, the first operation (here a debit) first catches
+    the started allowance up -- the debt settled as of the start, under the
+    allowance's start-settlement effect (owner decision 2026-10-28, option
+    2) -- and only then debits."""
+
+    book = _book()
+    book.debit("trace:old", 300_000, at=T0, effect_kind="trace")  # no capacity
+    renewal = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+    assert book.open_debt_mc == 300_000  # the grant settled nothing
+    assert book.writes.settlements == []
+    assert book.lot(renewal).balance_mc == 5_000_000
+    assert book.settle_open_debts("cycle-opening", at=T0, effect_kind="x") == 0
+    assert "cycle-opening" not in book.writes.effect_ids
+    before = len(book.writes.entries)
+    result = book.debit("trace:new", 200_000, at=NEXT_SPEND, effect_kind="trace")
+    assert (result.status, result.debited_mc, result.debt_mc) == ("applied", 200_000, 0)
+    assert result.at == NEXT_SPEND
+    assert [
+        (e["entry_type"], e["lot_id"], e["amount_mc"])
+        for e in book.writes.entries[before:]
+    ] == [
+        ("debt_settlement", renewal, 300_000),
+        ("debit", renewal, 200_000),
+    ]
+    assert book.writes.entries[before]["effect_id"] == (
+        cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    )
+    assert book.writes.entries[before]["occurred_at"] == NEXT_SPEND
+    assert book.open_debt_mc == 0
+    assert book.lot(renewal).balance_mc == 4_500_000
+
+
+def _won_at_once(book: LedgerBook, lot_id: UUID, at: datetime) -> None:
+    """A 1 mc reversal of the line and its win, both at ``at``."""
+
+    for revision, (reversal, restoration) in enumerate(((1, 0), (1, 1)), start=1):
+        book.apply_line_targets(
+            lot_id,
+            line_id="plan",
+            payment_id="pay",
+            financial_revision=revision,
+            reversal_target_mc=reversal,
+            restoration_target_mc=restoration,
+            at=at,
+        )
+
+
+def _started_debt_history(touch_at_start: bool) -> tuple[LedgerBook, UUID]:
+    """1 mc of debt, then an early renewal (granted before its cycle); at the
+    renewal's spend start either a line is reversed and won back at once
+    (``touch_at_start``) or nothing happens; then nothing until well after
+    ``cycle_end``, when the deadline sweep runs."""
+
+    book = _book()
+    book.debit("trace:old", 1, at=T0, effect_kind="trace")  # no capacity: debt
+    renewal = _monthly(book, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+    assert book.open_debt_mc == 1 and book.lot(renewal).balance_mc == 10_000
+    if touch_at_start:
+        _won_at_once(book, renewal, NEXT_SPEND)
+    book.sweep_expired(monthly_lot_expires_at(NEXT_END) + timedelta(days=3))
+    return book, renewal
+
+
+def test_a_started_allowance_settles_old_debt_the_same_on_every_path() -> None:
+    """Owner decision 2026-10-28 (option 2), the regression of the property
+    counterexample ``[debit 1, advance, monthly (early), advance to the
+    start]``: whether the first operation after the start comes at the start
+    (a reversal won at once) or only after ``cycle_end`` (the sweep), the
+    allowance pays the debt that existed at its start, as of its start, and
+    the two histories end with the same rows and net position."""
+
+    touched, renewal = _started_debt_history(touch_at_start=True)
+    untouched, renewal_b = _started_debt_history(touch_at_start=False)
+    effect = cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    for book, lot_id in ((touched, renewal), (untouched, renewal_b)):
+        assert book.open_debt_mc == 0
+        assert book.lot(lot_id).balance_mc == 0  # expired
+        caught_up = _of_effects(book, effect)
+        assert [
+            (e["entry_type"], e["lot_id"], e["amount_mc"], e["occurred_at"])
+            for e in caught_up
+        ] == [("debt_settlement", lot_id, 1, NEXT_SPEND)]
+        # Spent before its deadline and not before its start (Groups 1a-2).
+        assert NEXT_SPEND < book.lot(lot_id).expires_at
+        expiries = [
+            e["amount_mc"]
+            for e in book.writes.entries
+            if e["entry_type"] == "expiry" and e["lot_id"] == lot_id
+        ]
+        assert expiries == [9_999]
+        # A time-driven effect: never acked as the fact's or the debit's own.
+        assert effect in book.writes.effect_ids
+        assert effect not in book.writes.operation_effect_ids
+    assert _by_effect(touched, effect) == _by_effect(untouched, effect)
+
+
+def test_once_caught_up_a_start_settles_nothing_more() -> None:
+    book = _book()
+    book.debit("trace:old", 1, at=T0, effect_kind="trace")
+    renewal = _monthly(book, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+    book.sweep_expired(NEXT_SPEND)
+    effect = cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    assert len(_of_effects(book, effect)) == 1
+    before = len(book.writes.entries)
+    # Debt created AFTER the start is never paid by the catch-up "as of the
+    # start"; the debit pays it from what is spendable at its own instant.
+    later = NEXT_SPEND + timedelta(days=1)
+    result = book.debit("trace:new", 20_000, at=later, effect_kind="trace")
+    assert (result.debited_mc, result.debt_mc) == (9_999, 10_001)
+    book.sweep_expired(later + timedelta(hours=1))
+    assert len(_of_effects(book, effect)) == 1
+    assert [e["entry_type"] for e in book.writes.entries[before:]] == ["debit", "debt"]
+    assert book.lot(renewal).balance_mc == 0 and book.open_debt_mc == 10_001
+
+
+def test_a_refused_or_replayed_debit_catches_nothing_up() -> None:
+    book = _book()
+    book.debit("trace:old", 1, at=T0, effect_kind="trace")
+    _monthly(book, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+    before = len(book.writes.entries)
+    replay = book.debit("trace:old", 1, at=NEXT_SPEND, effect_kind="trace")
+    assert replay.status == "duplicate"
+    assert len(book.writes.entries) == before and book.open_debt_mc == 1
+    # An active quarantine hold refuses the debit: no row at all, not even
+    # the catch-up of the allowance that started.
+    held = _book()
+    held.debit("trace:old", 1, at=T0, effect_kind="trace")
+    _monthly(held, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+    held.spend_hold = SpendHold(quarantined=True, enforced=True)
+    rows = {name: len(rows) for name, rows in vars(held.writes).items()}
+    refused = held.debit("trace:new", 1, at=NEXT_SPEND, effect_kind="trace")
+    assert refused.status == "credit_pending"
+    assert {name: len(rows) for name, rows in vars(held.writes).items()} == rows
+    assert held.open_debt_mc == 1
+    effect = cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    assert effect not in held.writes.effect_ids
+
+
+def test_a_grant_after_the_start_catches_the_allowance_up_first() -> None:
+    """The first operation after the start is a top-up grant: the started
+    allowance pays the old debt as of its start, under its own effect; the
+    grant's own settlement finds nothing left."""
+
+    book = _book()
+    book.debit("trace:old", 1_000, at=T0, effect_kind="trace")
+    renewal = _monthly(book, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+    later = NEXT_SPEND + timedelta(days=1)
+    order = uuid4()
+    top = _topup(book, grant=500, paid_at=civil_date(later), at=later, order_id=order)
+    effect = cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    assert [
+        (e["entry_type"], e["lot_id"], e["amount_mc"], e["occurred_at"])
+        for e in _of_effects(book, effect)
+    ] == [("debt_settlement", renewal, 1_000, NEXT_SPEND)]
+    assert [
+        e["entry_type"] for e in _of_effects(book, topup_grant_effect_id(order))
+    ] == ["grant"]
+    assert book.lot(top).balance_mc == 500 and book.open_debt_mc == 0
+    assert effect not in book.writes.operation_effect_ids
+
+
+@pytest.mark.parametrize("oldest_at_start", [False, True])
+def test_a_loaded_book_pays_only_the_debt_that_existed_at_the_start(
+    oldest_at_start: bool,
+) -> None:
+    """A book loaded from rows written before the catch-up existed (Group 2
+    left open debt next to a started allowance): the first operation pays,
+    dated at the start, exactly the debt created at or before the start --
+    one created exactly at the start included, one created after it never
+    (``debts_until``) -- even when the sweep runs after the allowance
+    expired."""
+
+    renewal = LotState(
+        id=uuid4(),
+        lot_kind="monthly",
+        paid_at=NEXT_START,
+        expires_at=monthly_lot_expires_at(NEXT_END),
+        granted_mc=10_000,
+        grant_effect_id=monthly_grant_effect_id(SUB, NEXT_START, NEXT_END),
+        subscription_id=SUB,
+        cycle_start=NEXT_START,
+        cycle_end=NEXT_END,
+        sums=Counter({"grant": 10_000}),
+    )
+
+    def debt(at: datetime, amount: int, name: str) -> DebtState:
+        return DebtState(
+            id=uuid4(),
+            created_at=at,
+            source_kind="consumption",
+            source_effect_id=name,
+            original_lot_id=None,
+            amount_mc=amount,
+        )
+
+    debts = [debt(NEXT_SPEND, 300, "trace:at-start")]
+    if not oldest_at_start:
+        debts.append(debt(T0, 500, "trace:before"))
+    after = debt(NEXT_SPEND + timedelta(days=1), 200, "trace:after")
+    debts.append(after)
+    book = LedgerBook(
+        builder_id=uuid4(),
+        account_id=uuid4(),
+        lots=[renewal],
+        debts=debts,
+        known_effects=[renewal.grant_effect_id] + [d.source_effect_id for d in debts],
+    )
+    book.sweep_expired(monthly_lot_expires_at(NEXT_END) + timedelta(days=1))
+    effect = cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    paid = 300 if oldest_at_start else 800
+    assert [
+        (e["entry_type"], e["amount_mc"], e["occurred_at"])
+        for e in _of_effects(book, effect)
+    ] == [
+        ("debt_settlement", amount, NEXT_SPEND)
+        for amount in ([300] if oldest_at_start else [500, 300])
+    ]
+    assert {row["debt_id"] for row in book.writes.settlements} == {
+        d.id for d in debts if d is not after
+    }
+    assert book.open_debt_by_id()[after.id] == 200
+    assert book.open_debt_mc == 200
+    expiries = [
+        e["amount_mc"] for e in book.writes.entries if e["entry_type"] == "expiry"
+    ]
+    assert expiries == [10_000 - paid]
+
+
+def _count_passes(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count the passes over the debts (``_open_by_debt``) and the catch-up
+    settlements (``_settle`` with ``debts_until``) a book makes."""
+
+    passes = {"open": 0, "catch_up": 0}
+    open_by_debt = LedgerBook._open_by_debt
+    settle = LedgerBook._settle
+
+    def counted_open(self: LedgerBook) -> dict[UUID, int]:
+        passes["open"] += 1
+        return open_by_debt(self)
+
+    def counted_settle(self: LedgerBook, *args: Any, **kwargs: Any) -> int:
+        if kwargs.get("debts_until") is not None:
+            passes["catch_up"] += 1
+        return settle(self, *args, **kwargs)
+
+    monkeypatch.setattr(LedgerBook, "_open_by_debt", counted_open)
+    monkeypatch.setattr(LedgerBook, "_settle", counted_settle)
+    return passes
+
+
+def test_the_catch_up_costs_one_debt_pass_whatever_the_allowance_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH-1: the catch-up runs on every operation under the account lock.
+    On a 24-month book with hundreds of debts, all settled, it reads the
+    open debts at most once and settles nothing -- not one pass per
+    allowance; with open debt newer than every start it still visits no
+    start.  Upper bounds: an equivalent shortcut may read less."""
+
+    book = _book(clock_floor=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    first = date(2024, 1, 12)
+    for month in range(24):
+        start = add_calendar_months(first, month)
+        end = add_calendar_months(first, month + 1)
+        _monthly(
+            book,
+            grant=5_000 if month == 0 else 10_000,
+            start=start,
+            end=end,
+            at=start_of_civil_day(start),
+        )
+        during = start_of_civil_day(start) + timedelta(hours=1)
+        for serial in range(40):
+            book.debit(f"trace:{month}:{serial}", 250, at=during, effect_kind="t")
+    last = start_of_civil_day(add_calendar_months(first, 24))
+    _topup(book, grant=10_000, paid_at=civil_date(last), at=last)
+    assert len(book.debts) == 24 * 20 and book.open_debt_mc == 0
+    assert sum(lot.lot_kind == "monthly" for lot in book.lots) == 24
+
+    passes = _count_passes(monkeypatch)
+    book.sweep_expired(last + timedelta(hours=1))
+    assert passes["open"] <= 1 and passes["catch_up"] == 0
+    before = len(book.writes.entries)
+    book.debit("trace:big", 20_000, at=last + timedelta(hours=2), effect_kind="t")
+    # At most the catch-up's one read, then the debit's own settlement.
+    assert passes["open"] <= 3 and passes["catch_up"] == 0
+    assert [e["entry_type"] for e in book.writes.entries[before:]] == ["debit", "debt"]
+    # Open debt now, newer than every start: still no start is visited.
+    book.sweep_expired(last + timedelta(hours=3))
+    assert passes["open"] <= 4 and passes["catch_up"] == 0
+    assert book.open_debt_mc == 15_000
+
+
+def test_the_catch_up_visits_no_start_where_nothing_can_pay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM-1/2: an old open debt that predates 24 starts, every lot spent
+    on it.  No operation settles at any of those starts -- neither with no
+    lot holding a balance, nor once a renewal granted before its own start
+    holds one (spendable at none of the past starts) -- and the passes over
+    the debts stay bounded, whatever the length of the history."""
+
+    book = _book(clock_floor=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    first = date(2024, 1, 12)
+    old_at = start_of_civil_day(first) - timedelta(days=1)
+    book.debit("trace:old", 1_000_000, at=old_at, effect_kind="t")
+    for month in range(24):
+        start = add_calendar_months(first, month)
+        end = add_calendar_months(first, month + 1)
+        _monthly(book, grant=10_000, start=start, end=end, at=start_of_civil_day(start))
+    assert book.open_debt_mc == 1_000_000 - 24 * 10_000
+    assert all(lot.balance_mc == 0 for lot in book.lots)
+    now = start_of_civil_day(add_calendar_months(first, 23)) + timedelta(hours=1)
+
+    passes = _count_passes(monkeypatch)
+    book.sweep_expired(now)  # every lot spent
+    assert passes["catch_up"] == 0 and passes["open"] <= 1
+    renewal = _monthly(
+        book,
+        grant=10_000,
+        start=add_calendar_months(first, 24),
+        end=add_calendar_months(first, 25),
+        at=now + timedelta(hours=1),
+    )
+    book.sweep_expired(now + timedelta(hours=2))
+    result = book.debit("trace:new", 1, at=now + timedelta(hours=3), effect_kind="t")
+    assert (result.debited_mc, result.debt_mc) == (0, 1)
+    assert passes["catch_up"] == 0
+    # sweep, grant (its own settlement), sweep, debit (catch-up + its own).
+    assert passes["open"] <= 5
+    assert book.lot(renewal).balance_mc == 10_000
+    assert book.open_debt_mc == 1_000_000 - 24 * 10_000 + 1
+
+
+def test_the_catch_up_counts_what_is_open_in_millicredits() -> None:
+    """LOW-1: two debts of 5 mc; then a 2 mc and a 100 mc allowance start
+    between operations.  The first start pays 2 mc and leaves 8 mc open, so
+    the pass must go on to the second start (counting open DEBTS instead of
+    millicredits would stop after the first and leave 8 mc open next to
+    100 mc spendable)."""
+
+    book = _book()
+    book.debit("trace:a", 5, at=T0, effect_kind="trace")
+    book.debit("trace:b", 5, at=T0, effect_kind="trace")
+    later_end = add_calendar_months(NEXT_END, 1)
+    small = _monthly(book, grant=2, start=NEXT_START, end=NEXT_END, at=T0)
+    large = _monthly(book, grant=100, start=NEXT_END, end=later_end, at=T0)
+    assert book.open_debt_mc == 10
+    second = start_of_civil_day(NEXT_END)
+    book.sweep_expired(second + timedelta(hours=1))
+    first_effect = cycle_start_settlement_effect_id(SUB, NEXT_START, NEXT_END)
+    second_effect = cycle_start_settlement_effect_id(SUB, NEXT_END, later_end)
+    assert [
+        (e["lot_id"], e["amount_mc"], e["occurred_at"])
+        for e in _of_effects(book, first_effect)
+    ] == [(small, 2, NEXT_SPEND)]
+    assert [
+        (e["lot_id"], e["amount_mc"], e["occurred_at"])
+        for e in _of_effects(book, second_effect)
+    ] == [(large, 3, second), (large, 5, second)]
+    assert book.open_debt_mc == 0 and book.lot(large).balance_mc == 92
+    assert {first_effect, second_effect} <= set(book.writes.swept_effect_ids)
+
+
+def test_a_lagging_writer_acts_at_the_ledger_clock_for_o5_too() -> None:
+    """``DebitResult.at``, not the caller's instant, decides spendability."""
+
+    book = _book(clock_floor=NEXT_SPEND + timedelta(hours=1))
+    renewal = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+    result = book.debit("trace:1", 1_000, at=T0, effect_kind="trace")
+    assert result.at == NEXT_SPEND + timedelta(hours=1)
+    assert (result.debited_mc, result.debt_mc) == (1_000, 0)
+    assert book.lot(renewal).balance_mc == 4_999_000
+
+
+def test_a_refund_before_cycle_start_withdraws_the_lot_and_owes_nothing() -> None:
+    """HIGH-2: ``LotState.available_mc`` stays blind to cycle_start, so a
+    reversal before the cycle starts takes the allowance back, no debt."""
+
+    book = _book()
+    renewal = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+    application = _targets(book, renewal, 5_000_000)
+    assert getattr(application, "reversal_delta_mc") == 5_000_000
+    assert book.lot(renewal).balance_mc == 0
+    assert book.open_debt_mc == 0 and book.debts == ()
+    assert _by_effect(book, "reversal:") == Counter({"reversal": 5_000_000})
+    # Partial refund before the start: the rest stays for the cycle.
+    book2 = _book()
+    renewal2 = _monthly(book2, start=NEXT_START, end=NEXT_END, at=T0)
+    _targets(book2, renewal2, 2_000_000)
+    assert book2.lot(renewal2).balance_mc == 3_000_000 and book2.open_debt_mc == 0
+    assert book2.available_mc(NEXT_SPEND) == 3_000_000
+
+
+def test_the_previous_allowance_expires_when_the_renewal_starts() -> None:
+    book = _book()
+    current = _monthly(book, grant=1_000_000)
+    renewal = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+    last = NEXT_SPEND - timedelta(microseconds=1)
+    assert book.available_mc(last) == 1_000_000  # only the current cycle
+    assert book.available_mc(NEXT_SPEND) == 5_000_000  # only the renewal
+    book.sweep_expired(NEXT_SPEND)
+    assert book.lot(current).balance_mc == 0
+    result = book.debit("trace:1", 1_000, at=NEXT_SPEND, effect_kind="trace")
+    assert (result.debited_mc, result.debt_mc) == (1_000, 0)
+    assert book.lot(renewal).balance_mc == 4_999_000
+
+
+def test_the_spend_start_follows_sao_paulo_dst_days() -> None:
+    """A cycle starting on a DST-start day (midnight did not exist in
+    2018-11-04): the civil day began at 01:00 -02, i.e. 03:00 UTC."""
+
+    book = _book(clock_floor=datetime(2018, 10, 1, tzinfo=timezone.utc))
+    lot_id = _monthly(
+        book,
+        start=date(2018, 11, 4),
+        end=date(2018, 12, 4),
+        at=datetime(2018, 10, 1, tzinfo=timezone.utc),
+    )
+    start = datetime(2018, 11, 4, 3, 0, tzinfo=timezone.utc)
+    assert book.lot(lot_id).spend_starts_at() == start
+    assert book.lot(lot_id).spendable_mc(start - timedelta(seconds=1)) == 0
+    assert book.lot(lot_id).spendable_mc(start) == 5_000_000
+
+
+async def test_the_adapter_debit_applies_o5_at_the_instant_it_acts_at(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    builder_id = uuid4()
+    async with sessions() as session, session.begin():
+        ledger = _ledger(session, T0)
+        book = await ledger.open_book(builder_id, at=T0)
+        renewal = _monthly(book, start=NEXT_START, end=NEXT_END, at=T0)
+        await ledger.persist(book)
+    async with sessions() as session, session.begin():
+        early = await _ledger(session, T0).debit(
+            builder_id, "trace:early", 1_000, at=T0, effect_kind="trace"
+        )
+    assert (early.status, early.debited_mc, early.debt_mc) == ("applied", 0, 1_000)
+    async with sessions() as session, session.begin():
+        late = await _ledger(session, NEXT_SPEND).debit(
+            builder_id, "trace:late", 2_000, at=NEXT_SPEND, effect_kind="trace"
+        )
+    assert (late.debited_mc, late.debt_mc, late.at) == (2_000, 0, NEXT_SPEND)
+    async with sessions() as session, session.begin():
+        reloaded = await _state(session, builder_id, NEXT_SPEND)
+        assert reloaded.open_debt_mc == 0
+        assert reloaded.lot(renewal).balance_mc == 5_000_000 - 3_000
+        moves = Counter(
+            (
+                await session.execute(
+                    select(CreditLedgerEntry.entry_type).where(
+                        CreditLedgerEntry.builder_id == builder_id
+                    )
+                )
+            ).scalars()
+        )
+    assert moves == Counter({"grant": 1, "debt": 1, "debt_settlement": 1, "debit": 1})
