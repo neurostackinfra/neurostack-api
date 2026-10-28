@@ -53,6 +53,10 @@ from src.repositories import (
 from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
 from src.services.egress_policy import EgressDisabledError
 from src.services.event_service import get_event_service
+from src.services.handoff_service import (
+    dispatch_committed_handoff_webhooks,
+    record_handoff_post_commit_dispatch_failure,
+)
 from src.services.meta_service import (
     download_meta_media_audio,
     extract_meta_message_id,
@@ -197,6 +201,11 @@ async def _run_pipeline_transactionally(
     not followed by rollback because the language/state transition is already
     durable and the PostgreSQL row lock has been released.
 
+    A handoff written in the locked phase is announced to the clinic only
+    after that commit, before the response I/O. The announcement is best
+    effort: its failure is logged and counted, never re-raised, so the reply
+    is still produced.
+
     ``context`` is the adapter's single interaction context. The very same
     object goes, by keyword, to both phases. It is required: every caller
     classifies the origin and builds the context before calling.
@@ -212,6 +221,15 @@ async def _run_pipeline_transactionally(
         await db.rollback()
         raise
 
+    try:
+        await dispatch_committed_handoff_webhooks(db)
+    except Exception as exc:
+        record_handoff_post_commit_dispatch_failure(
+            exc,
+            owner="adapter",
+            tenant_id=event_request.tenant_id,
+            session_id=event_request.session_id,
+        )
     return cast(
         EventResponse,
         await service.finish_response(

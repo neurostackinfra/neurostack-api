@@ -12,6 +12,7 @@ from typing import Any, Optional, Union
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, JsonValue
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from neurostack_core.flow import FlowContext, FlowDecision, FlowManager
 from neurostack_core.flow import FlowMode as FlowModeModel
@@ -328,6 +329,7 @@ class CognitivePipeline:
         input_data: PipelineInput,
         *,
         context: Optional[ResolvedInteractionContext] = None,
+        session: Optional[AsyncSession] = None,
     ) -> PipelineResult:
         """
         Process a message through the complete cognitive pipeline.
@@ -339,6 +341,9 @@ class CognitivePipeline:
             context: The interaction's trusted context. It is a parameter,
                 never a ``PipelineInput``/``PipelineResult`` field, and is
                 handed unchanged to the synchronous handoff.
+            session: The caller's phase 1 transaction, which holds the
+                ``sessions`` row lock. Like ``context`` it is only a
+                parameter; the synchronous handoff writes inside it.
 
         Returns:
             PipelineResult with complete cognitive decision
@@ -411,7 +416,7 @@ class CognitivePipeline:
             if srm_decision.handoff_required:
                 stage_start = time.perf_counter()
                 handoff_response = await self._run_handoff(
-                    input_data, srm_decision, context=context
+                    input_data, srm_decision, context=context, session=session
                 )
 
                 if verification_status == "link_sent":
@@ -1057,8 +1062,14 @@ class CognitivePipeline:
         srm_decision: SRMDecisionModel,
         *,
         context: Optional[ResolvedInteractionContext] = None,
+        session: Optional[AsyncSession] = None,
     ) -> Optional[HandoffResponse]:
-        """Run handoff service if required, passing the interaction context."""
+        """Run handoff service if required, passing the interaction context.
+
+        ``session`` reaches ``initiate_handoff`` only when the caller has one,
+        so the seam ``initiate_handoff(request, *, context=None)`` still holds
+        for session-free callers.
+        """
         # Map SRM handoff reason to Handoff service reason
         reason_map = {
             SRMHandoffReason.USER_REQUEST: HandoffReason.USER_REQUEST,
@@ -1131,7 +1142,13 @@ class CognitivePipeline:
                 srm_decision, "handoff_verification_status", None
             ),
         )
-        return await self._handoff.initiate_handoff(request, context=context)
+        if session is None:
+            return await self._handoff.initiate_handoff(request, context=context)
+        # Phase 1 holds FOR UPDATE on the sessions row: the handoff writes in
+        # this transaction, or its FKs would wait on that lock forever (#145).
+        return await self._handoff.initiate_handoff(
+            request, context=context, session=session
+        )
 
     def _build_scheduling_link_response(
         self, input_data: PipelineInput

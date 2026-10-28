@@ -355,12 +355,21 @@ class EventStore:
             )
             raise EventStoreError(f"Failed to append event: {e}") from e
 
-    async def append_batch(self, events: list[EventData]) -> list[EventData]:
+    async def append_batch(
+        self,
+        events: list[EventData],
+        *,
+        session: Optional[AsyncSession] = None,
+    ) -> list[EventData]:
         """
         Append multiple events in a single transaction.
 
         Args:
             events: List of events to append
+            session: The caller's open transaction. The rows are sent in it
+                and never committed here, so they become visible when the
+                caller commits and vanish if it rolls back. Without it the
+                store opens, commits and closes its own session.
 
         Returns:
             List of appended events
@@ -373,23 +382,12 @@ class EventStore:
 
         start_time = time.perf_counter()
         try:
-            async with self._get_session() as session:
-                query = insert(_EVENTS_TABLE)
-                for event in events:
-                    await session.execute(
-                        query,
-                        {
-                            "id": event.id,
-                            "tenant_id": event.tenant_id,
-                            "session_id": event.session_id,
-                            "event_type": event.event_type,
-                            "interaction_origin": event.interaction_origin.value,
-                            "event_data": event.event_data,
-                            "metadata": event.event_metadata,
-                            "created_at": event.created_at,
-                        },
-                    )
-                await session.commit()
+            if session is None:
+                async with self._get_session() as own_session:
+                    await self._insert_events(own_session, events)
+                    await own_session.commit()
+            else:
+                await self._insert_events(session, events)
 
             latency = time.perf_counter() - start_time
             EVENT_STORE_LATENCY.labels(operation="append_batch").observe(latency)
@@ -425,6 +423,24 @@ class EventStore:
                 exc_info=True,
             )
             raise EventStoreError(f"Failed to append batch: {e}") from e
+
+    @staticmethod
+    async def _insert_events(session: AsyncSession, events: list[EventData]) -> None:
+        query = insert(_EVENTS_TABLE)
+        for event in events:
+            await session.execute(
+                query,
+                {
+                    "id": event.id,
+                    "tenant_id": event.tenant_id,
+                    "session_id": event.session_id,
+                    "event_type": event.event_type,
+                    "interaction_origin": event.interaction_origin.value,
+                    "event_data": event.event_data,
+                    "metadata": event.event_metadata,
+                    "created_at": event.created_at,
+                },
+            )
 
     # ============================================
     # Query Operations

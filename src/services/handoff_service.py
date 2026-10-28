@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any, Optional, TypeVar, cast, overload
 from uuid import UUID, uuid4
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.logging import get_logger
@@ -85,6 +86,18 @@ HANDOFF_LATENCY = Histogram(
 
 SessionFactory = Callable[[], AsyncSession]
 RepositoryFactory = Callable[[AsyncSession], HandoffRecordRepository]
+
+
+def _is_postgresql(session: AsyncSession) -> bool:
+    """Whether ``session`` is bound to PostgreSQL (test doubles are not)."""
+    get_bind = getattr(session, "get_bind", None)
+    if get_bind is None:
+        return False
+    try:
+        dialect_name: str = get_bind().dialect.name
+    except Exception:
+        return False
+    return dialect_name == "postgresql"
 
 
 def get_db_session() -> AsyncSession:
@@ -193,6 +206,25 @@ class RecentMessageProjection:
     """Tenant-scoped, ephemeral Event Store projection for a public DTO."""
 
     messages: tuple[dict[str, Any], ...] = ()
+
+
+# ``AsyncSession.info`` key of the creation webhooks written in, and waiting
+# for the commit of, the caller's transaction.
+_PENDING_CREATION_WEBHOOKS = "neurostack.handoff.pending_creation_webhooks"
+
+
+@dataclass(frozen=True)
+class _PendingCreationWebhook:
+    """A creation webhook held in memory until the caller's commit.
+
+    ``record`` is detached from the caller's session, so the post-commit
+    delivery bookkeeping never dirties that session.
+    """
+
+    service: HandoffService
+    record: HandoffRecord
+    request: HandoffRequest
+    summary: ConversationSummary
 
 
 class _Mutation(str, Enum):
@@ -389,6 +421,7 @@ class HandoffService:
         request: HandoffRequest,
         *,
         context: ResolvedInteractionContext | None = None,
+        session: AsyncSession | None = None,
     ) -> HandoffResponse:
         """Commit the PostgreSQL source of truth before any public effects.
 
@@ -404,6 +437,17 @@ class HandoffService:
         record's tenant and session. ``interaction_event_id`` stays in memory:
         a synchronous handoff runs in pipeline phase 1, before the phase 2
         bundle writes the ``message.in`` that ID reserves.
+
+        ``session`` is the caller's open transaction, the pipeline phase 1
+        that holds ``FOR UPDATE`` on the ``sessions`` row. The record and
+        ``handoff.request`` are written in it and never committed here: both
+        FKs to ``sessions`` take ``FOR KEY SHARE``, so a second connection
+        would wait on that lock until the caller ends (#145). The creation
+        webhook is queued on ``session`` instead of sent, and the caller runs
+        ``dispatch_committed_handoff_webhooks`` after its commit. A write
+        failure raises ``HandoffPersistenceError`` and leaves the rollback to
+        the caller. Without ``session`` the handoff commits in its own session
+        and sends the webhook itself.
         """
         if context is None:
             context = unknown_interaction_context(
@@ -431,48 +475,46 @@ class HandoffService:
         )
 
         try:
-            async with self._open_session() as session:
-                repository = self._repository_factory(session)
-                if not await repository.session_belongs_to_tenant(
-                    request.tenant_id,
-                    request.session_id,
-                ):
-                    raise HandoffServiceError("handoff_session_not_found")
-                sla_configuration = await repository.load_sla_configuration(
-                    request.tenant_id
-                )
-                target_seconds = resolve_sla_target_seconds(
-                    sla_configuration.configured_minutes
-                )
-                if not self._is_valid_sla_minutes(sla_configuration.configured_minutes):
-                    logger.warning(
-                        "handoff_sla_configuration_fallback",
-                        tenant_id=str(request.tenant_id),
-                        source=sla_configuration.source,
-                        fallback_seconds=target_seconds,
-                    )
-
-                record = self._build_record(
+            webhook_sent: bool
+            webhook_status: WebhookStatus | None
+            if session is not None:
+                record = await self._write_in_caller_session(
+                    session,
                     handoff_id=handoff_id,
                     request=request,
                     summary=summary,
-                    target_seconds=target_seconds,
+                    origin=origin,
                 )
-                try:
-                    record = await repository.create_record(record)
-                    await session.commit()
-                except Exception as exc:
-                    await session.rollback()
-                    raise HandoffPersistenceError(
-                        "Failed to persist handoff in PostgreSQL"
-                    ) from exc
+                webhook_sent = False
+                webhook_status = (
+                    WebhookStatus.PENDING
+                    if self.webhook_dispatcher.is_configured(record.tenant_id)
+                    else None
+                )
+            else:
+                async with self._open_session() as own_session:
+                    repository = self._repository_factory(own_session)
+                    record = await self._prepare_record(
+                        repository,
+                        handoff_id=handoff_id,
+                        request=request,
+                        summary=summary,
+                    )
+                    try:
+                        record = await repository.create_record(record)
+                        await own_session.commit()
+                    except Exception as exc:
+                        await own_session.rollback()
+                        raise HandoffPersistenceError(
+                            "Failed to persist handoff in PostgreSQL"
+                        ) from exc
 
-            await self._emit_handoff_request(record, summary, origin=origin)
-            webhook_sent, webhook_status = await self._dispatch_creation_webhook(
-                record,
-                request,
-                summary,
-            )
+                await self._emit_handoff_request(record, summary, origin=origin)
+                webhook_sent, webhook_status = await self._dispatch_creation_webhook(
+                    record,
+                    request,
+                    summary,
+                )
 
             elapsed = time.perf_counter() - started_at
             HANDOFF_LATENCY.labels(operation="initiate").observe(elapsed)
@@ -505,6 +547,122 @@ class HandoffService:
         except Exception as exc:
             HANDOFF_OPERATIONS.labels(operation="initiate", status="error").inc()
             raise HandoffServiceError(f"Failed to initiate handoff: {exc}") from exc
+
+    async def _prepare_record(
+        self,
+        repository: HandoffRecordRepository,
+        *,
+        handoff_id: UUID,
+        request: HandoffRequest,
+        summary: ConversationSummary,
+    ) -> HandoffRecord:
+        """Prove the session in the tenant and build the unsaved record."""
+        if not await repository.session_belongs_to_tenant(
+            request.tenant_id,
+            request.session_id,
+        ):
+            raise HandoffServiceError("handoff_session_not_found")
+        sla_configuration = await repository.load_sla_configuration(request.tenant_id)
+        target_seconds = resolve_sla_target_seconds(
+            sla_configuration.configured_minutes
+        )
+        if not self._is_valid_sla_minutes(sla_configuration.configured_minutes):
+            logger.warning(
+                "handoff_sla_configuration_fallback",
+                tenant_id=str(request.tenant_id),
+                source=sla_configuration.source,
+                fallback_seconds=target_seconds,
+            )
+        return self._build_record(
+            handoff_id=handoff_id,
+            request=request,
+            summary=summary,
+            target_seconds=target_seconds,
+        )
+
+    async def _write_in_caller_session(
+        self,
+        session: AsyncSession,
+        *,
+        handoff_id: UUID,
+        request: HandoffRequest,
+        summary: ConversationSummary,
+        origin: InteractionOrigin,
+    ) -> HandoffRecord:
+        """Write record and ``handoff.request`` in the caller's transaction.
+
+        Nothing here commits, rolls back or opens another connection. The
+        creation webhook is queued on ``session`` for the post-commit
+        dispatch; the caller's rollback leaves only that in-memory entry,
+        which the dispatch drops because the record is not committed.
+        """
+        repository = self._repository_factory(session)
+        record = await self._prepare_record(
+            repository,
+            handoff_id=handoff_id,
+            request=request,
+            summary=summary,
+        )
+        if _is_postgresql(session):
+            # ``now()`` is the caller transaction's start, which can precede
+            # this insert by the whole pipeline; stamp the real insert time.
+            record.created_at = cast(Any, func.clock_timestamp())
+        try:
+            record = await repository.create_record(record)
+            session.expunge(record)
+            event_store = await self._event_store_for_operation()
+            if event_store is not None:
+                await event_store.append_batch(
+                    [self._handoff_request_event(record, summary, origin=origin)],
+                    session=session,
+                )
+        except Exception as exc:
+            raise HandoffPersistenceError(
+                "Failed to persist handoff in the caller transaction"
+            ) from exc
+        session.info.setdefault(_PENDING_CREATION_WEBHOOKS, []).append(
+            _PendingCreationWebhook(
+                service=self,
+                record=record,
+                request=request,
+                summary=summary,
+            )
+        )
+        return record
+
+    async def _dispatch_queued_creation_webhook(
+        self,
+        pending: _PendingCreationWebhook,
+    ) -> None:
+        """Send one queued creation webhook if its record is committed.
+
+        A fresh connection must see the record before anything leaves the
+        process: a queue left by a rolled-back or still-open transaction is
+        dropped, never announced.
+        """
+        record = pending.record
+        try:
+            async with self._open_session() as session:
+                lookup = await self._repository_factory(session).lookup(
+                    record.tenant_id,
+                    record.id,
+                )
+        except Exception as exc:
+            raise HandoffPostCommitError(
+                "Committed handoff could not be confirmed before its webhook"
+            ) from exc
+        if lookup.outcome is HandoffLookupOutcome.NOT_FOUND or lookup.record is None:
+            logger.warning(
+                "handoff_creation_webhook_dropped_uncommitted",
+                handoff_id=str(record.id),
+                tenant_id=str(record.tenant_id),
+            )
+            return
+        await self._dispatch_creation_webhook(
+            record,
+            pending.request,
+            pending.summary,
+        )
 
     def _build_record(
         self,
@@ -597,34 +755,45 @@ class HandoffService:
         *,
         origin: InteractionOrigin,
     ) -> None:
-        """Append ``handoff.request`` with the initiation origin only.
-
-        The emitter receives the origin, never the context, so the reserved
-        ``interaction_event_id`` cannot reach the event.
-        """
+        """Append ``handoff.request`` after the handoff's own commit."""
         try:
             event_store = await self._event_store_for_operation()
             if event_store is None:
                 return
-            event_data = HandoffEventData(
-                reason=record.reason,
-                summary=summary.summary_text,
-                urgency=record.urgency,
-                key_info={"handoff_id": str(record.id)},
+            await event_store.append(
+                self._handoff_request_event(record, summary, origin=origin)
             )
-            event = EventData(
-                tenant_id=record.tenant_id,
-                session_id=record.session_id,
-                event_type=EventType.HANDOFF_REQUEST.value,
-                interaction_origin=origin,
-                event_data=event_data.model_dump(),
-                event_metadata={"handoff_id": str(record.id)},
-            )
-            await event_store.append(event)
         except Exception as exc:
             raise HandoffPostCommitError(
                 "Handoff committed but Event Store append failed"
             ) from exc
+
+    @staticmethod
+    def _handoff_request_event(
+        record: HandoffRecord,
+        summary: ConversationSummary,
+        *,
+        origin: InteractionOrigin,
+    ) -> EventData:
+        """Build ``handoff.request`` with the initiation origin only.
+
+        The builder receives the origin, never the context, so the reserved
+        ``interaction_event_id`` cannot reach the event.
+        """
+        event_data = HandoffEventData(
+            reason=record.reason,
+            summary=summary.summary_text,
+            urgency=record.urgency,
+            key_info={"handoff_id": str(record.id)},
+        )
+        return EventData(
+            tenant_id=record.tenant_id,
+            session_id=record.session_id,
+            event_type=EventType.HANDOFF_REQUEST.value,
+            interaction_origin=origin,
+            event_data=event_data.model_dump(),
+            event_metadata={"handoff_id": str(record.id)},
+        )
 
     async def _dispatch_creation_webhook(
         self,
@@ -1458,6 +1627,58 @@ class HandoffService:
 
     def remove_webhook_config(self, tenant_id: UUID) -> bool:
         return self.webhook_dispatcher.remove_config(tenant_id)
+
+
+async def dispatch_committed_handoff_webhooks(session: AsyncSession) -> None:
+    """Send the creation webhooks queued on ``session`` after its commit.
+
+    ``initiate_handoff(..., session=session)`` queues them; the owner of that
+    transaction calls this only once its commit returned. The queue is taken
+    first, so each webhook runs at most once, and each record is re-read on a
+    fresh connection before sending, so nothing that was not committed is
+    ever announced. Objects without a SQLAlchemy ``info`` dict (test doubles)
+    carry no queue. The first delivery error is raised after the rest ran.
+    """
+    info = getattr(session, "info", None)
+    if not isinstance(info, dict):
+        return
+    queued: list[_PendingCreationWebhook] = info.pop(_PENDING_CREATION_WEBHOOKS, [])
+    first_error: BaseException | None = None
+    for pending in queued:
+        try:
+            await pending.service._dispatch_queued_creation_webhook(pending)
+        except Exception as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
+
+
+def record_handoff_post_commit_dispatch_failure(
+    error: BaseException,
+    *,
+    owner: str,
+    tenant_id: UUID,
+    session_id: UUID,
+) -> None:
+    """Log and count a failed post-commit handoff announcement, best effort.
+
+    The handoff and its pause are already committed when the owner of the
+    phase 1 transaction runs ``dispatch_committed_handoff_webhooks``, so a
+    failure there (re-reading the record, recording the delivery, or the
+    call itself) must neither roll back nor stop the reply to the patient.
+    The owner calls this from its ``except`` block and continues; the queue
+    was already taken, so nothing is retried.
+    """
+    HANDOFF_OPERATIONS.labels(operation="post_commit_dispatch", status="error").inc()
+    logger.error(
+        "handoff_post_commit_dispatch_failed",
+        owner=owner,
+        tenant_id=str(tenant_id),
+        session_id=str(session_id),
+        error=str(error),
+        error_type=type(error).__name__,
+        exc_info=True,
+    )
 
 
 _service: Optional[HandoffService] = None

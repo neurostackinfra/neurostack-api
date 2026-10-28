@@ -40,6 +40,10 @@ from src.interaction_context import (
 from src.repositories import get_db_session_dependency
 from src.services import get_event_service
 from src.services.event_service import SessionNotFoundError
+from src.services.handoff_service import (
+    dispatch_committed_handoff_webhooks,
+    record_handoff_post_commit_dispatch_failure,
+)
 
 router = APIRouter()
 
@@ -394,6 +398,18 @@ async def process_event(
 
     # ── Phase 2: slow I/O (LLM + event-store) ────────────────────────────────
     # DB session is already committed/released; failures here are independent.
+    # A phase-1 handoff is announced to the clinic only now that it is durable.
+    # The announcement is best effort: the handoff and pause are committed, so
+    # its failure is logged and counted and the patient still gets the reply.
+    try:
+        await dispatch_committed_handoff_webhooks(db)
+    except Exception as e:
+        record_handoff_post_commit_dispatch_failure(
+            e,
+            owner="events",
+            tenant_id=canonical_request.tenant_id,
+            session_id=canonical_request.session_id,
+        )
     try:
         return await service.finish_response(
             canonical_request,

@@ -550,7 +550,11 @@ async def test_one_context_object_crosses_phases_bundle_and_handoff(
 
     class _HandoffSpy:
         async def initiate_handoff(
-            self, request: HandoffRequest, *, context: Any = None
+            self,
+            request: HandoffRequest,
+            *,
+            context: Any = None,
+            session: Any = None,
         ) -> None:
             seen["handoff"] = context
             seen["handoff_request"] = request
