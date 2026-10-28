@@ -58,6 +58,16 @@ ASAAS tables read here are read-only lookups the wish allows: the
 ``quarantined`` state of the builder's ``billing_topup_orders`` /
 ``billing_subscription_cycles`` (the spend hold).  Nothing here writes an
 ASAAS table.
+
+Metering (Group 3a).  :meth:`CreditRepository.insert_ingress_claim` and
+:meth:`CreditRepository.insert_observational_effect` are the thin writers of
+:mod:`src.services.credit_metering`: idempotent inserts (``ON CONFLICT DO
+NOTHING`` via ``_insert``) in the caller's transaction, after the tenant row
+``FOR SHARE`` (lock order step 1).  A claim conflict returns the existing
+claim's ``interaction_id`` (deduplicated per tenant, so standalone and
+reparented tenants deduplicate too).  :meth:`session_message_count` is a
+plain read of the session's ``message_count`` (the claim's session version,
+audit only).
 """
 
 from __future__ import annotations
@@ -92,6 +102,7 @@ from src.models.credit import (
     CreditObservationalEffect,
 )
 from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
+from src.models.session import Session as SessionRow
 from src.models.tenant import Tenant
 
 # Direction of each entry type on a lot's available balance and on the
@@ -363,6 +374,122 @@ class CreditRepository:
                 )
             )
         ).scalar_one_or_none()
+
+    async def session_message_count(
+        self, tenant_id: UUID, session_id: UUID
+    ) -> int | None:
+        """The claim's ``session_version``: ``sessions.message_count`` of the
+        tenant's session, read WITHOUT a lock; ``None`` if the session is gone.
+
+        Audit only, never a decision input or a concurrency guard: the read is
+        not ordered against the main path, so it may already include a
+        concurrent message of the same session.
+        """
+
+        value = (
+            await self.session.execute(
+                select(SessionRow.message_count).where(
+                    SessionRow.id == session_id, SessionRow.tenant_id == tenant_id
+                )
+            )
+        ).scalar_one_or_none()
+        return None if value is None else int(value)
+
+    # -- metering writers (Group 3a; after the tenant row FOR SHARE) -----------
+
+    async def insert_ingress_claim(
+        self,
+        *,
+        tenant_id: UUID,
+        builder_id: UUID | None,
+        source: str,
+        principal_id: str,
+        interaction_id: UUID,
+        payload_sha256: str,
+        decision_version: int,
+        mode: str,
+        idempotency_key: str | None = None,
+        provider_message_id: str | None = None,
+        session_version: int | None = None,
+    ) -> UUID | None:
+        """Claim an ingress id once; return the claim's ``interaction_id``.
+
+        ``ON CONFLICT DO NOTHING``: on a conflict (same tenant and key) the
+        existing claim's ``interaction_id`` is returned, never the one given.
+        ``None`` only if the conflicting claim vanished meanwhile (its tenant
+        was deleted).
+        """
+
+        inserted = (
+            await self.session.execute(
+                self._insert(CreditIngressClaim)
+                .values(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    builder_id=builder_id,
+                    source=source,
+                    principal_id=principal_id,
+                    idempotency_key=idempotency_key,
+                    provider_message_id=provider_message_id,
+                    interaction_id=interaction_id,
+                    payload_sha256=payload_sha256,
+                    decision_version=decision_version,
+                    session_version=session_version,
+                    mode=mode,
+                )
+                .on_conflict_do_nothing()
+                .returning(CreditIngressClaim.interaction_id)
+            )
+        ).scalar_one_or_none()
+        if inserted is not None:
+            return UUID(str(inserted))
+        if idempotency_key is not None:
+            existing = await self.get_idempotency_claim(
+                tenant_id, principal_id=principal_id, idempotency_key=idempotency_key
+            )
+        elif provider_message_id is not None:
+            existing = await self.get_provider_claim(
+                tenant_id, source=source, provider_message_id=provider_message_id
+            )
+        else:
+            existing = None
+        return None if existing is None else UUID(str(existing.interaction_id))
+
+    async def insert_observational_effect(
+        self,
+        *,
+        tenant_id: UUID,
+        builder_id: UUID | None,
+        effect_id: str,
+        effect_kind: str,
+        would_debit_mc: int,
+        trace_id: UUID | None = None,
+        origin: str | None = None,
+        authenticated: bool | None = None,
+        decision_digest: str | None = None,
+    ) -> bool:
+        """Append one observational effect once (``True`` if inserted)."""
+
+        inserted = (
+            await self.session.execute(
+                self._insert(CreditObservationalEffect)
+                .values(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    builder_id=builder_id,
+                    effect_id=effect_id,
+                    effect_kind=effect_kind,
+                    trace_id=trace_id,
+                    origin=origin,
+                    authenticated=authenticated,
+                    would_debit_mc=would_debit_mc,
+                    decision_digest=decision_digest,
+                )
+                .on_conflict_do_nothing(index_elements=["tenant_id", "effect_id"])
+                .returning(CreditObservationalEffect.id)
+            )
+        ).scalar_one_or_none()
+        return inserted is not None
 
     # -- global reads ----------------------------------------------------
 

@@ -18,10 +18,20 @@ what the code under test read (non-zero: request code consulted the forced
 switch).  ``tests/services/test_credit_switch.py`` runs a probe under this
 plugin in a subprocess and asserts that ``True`` reaches
 ``request.state.credit_switch_effective``.
+
+Group 3a: with the switch on, every governed decision also runs the
+observational writer (``credit_metering.record_observational_trace``), which
+must leave the suites' answers untouched.  The plugin wraps that function --
+the module attribute, which every caller resolves at call time -- only to
+count its outcomes (``recorded``, ``replayed``, ``timeout``, ``failed`` ...),
+and prints them in the summary: proof that the forced runs really exercised
+the writer.  The wrapper changes no argument and no result; the same per-test
+check guards it against a test that swapped it and leaked the swap.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterator
 from typing import Any
 
@@ -30,6 +40,8 @@ import pytest
 _PATCHER = pytest.StashKey[pytest.MonkeyPatch]()
 _reads = 0
 _self_checks = 0
+_writer_outcomes: Counter[str] = Counter()
+_ORIGINAL_WRITER: Any = None
 
 
 def _forced_effective(_self: Any) -> bool:
@@ -38,11 +50,25 @@ def _forced_effective(_self: Any) -> bool:
     return True
 
 
+async def _counted_writer(*args: Any, **kwargs: Any) -> Any:
+    try:
+        outcome = await _ORIGINAL_WRITER(*args, **kwargs)
+    except BaseException as error:
+        _writer_outcomes[f"raised {type(error).__name__}"] += 1
+        raise
+    _writer_outcomes[str(outcome)] += 1
+    return outcome
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    global _ORIGINAL_WRITER
+    from src.services import credit_metering
     from src.services.credit_switch import CreditSwitch
 
     patcher = pytest.MonkeyPatch()
     patcher.setattr(CreditSwitch, "effective", _forced_effective)
+    _ORIGINAL_WRITER = credit_metering.record_observational_trace
+    patcher.setattr(credit_metering, "record_observational_trace", _counted_writer)
     config.stash[_PATCHER] = patcher
 
 
@@ -61,13 +87,24 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
         f"credit switch forced effective: {_reads - _self_checks} verdict reads "
         f"by the code under test ({_self_checks} plugin self-checks)"
     )
+    outcomes = ", ".join(
+        f"{name}={count}" for name, count in sorted(_writer_outcomes.items())
+    )
+    terminalreporter.write_line(
+        f"credit observational writer: {sum(_writer_outcomes.values())} calls"
+        f" ({outcomes or 'none'})"
+    )
 
 
 def _assert_forced() -> None:
     global _self_checks
+    from src.services import credit_metering
     from src.services.credit_switch import CreditSwitch, credit_switch_effective
 
     assert CreditSwitch.effective is _forced_effective, "switch is not forced"
+    assert (
+        credit_metering.record_observational_trace is _counted_writer
+    ), "the observational writer counter was swapped and not restored"
     _self_checks += 1
     assert credit_switch_effective() is True, "the forced switch does not read True"
 
