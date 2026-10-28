@@ -30,7 +30,15 @@ What SQLite cannot show, proven against migration 038 at head:
   account lock, nor on another builder); concurrent debits serialize on the
   account and never overspend; reversal debt, its origins, its settlement
   and its restoration into an expired payer satisfy every constraint and
-  trigger.
+  trigger;
+* Group 3a, O5: an early renewal (a monthly lot granted before its
+  ``cycle_start``) is not spent before ``start_of_civil_day(cycle_start)``
+  -- a debit becomes debt, a refund withdraws the lot without debt -- and
+  from that instant every operation (here a debit) first catches the
+  started allowance up: the debt that existed at the start is settled as of
+  the start, under the allowance's ``cycle:...:start-settlement`` effect
+  (owner decision 2026-10-28, option 2), then the debit debits; every row
+  it writes satisfies the schema.
 
 Needs ``POSTGRES_SMOKE_DATABASE_URL``; without it the module skips, and only
 ``scripts/check-credit-integration.sh`` turns that skip into a failure.
@@ -84,6 +92,10 @@ from src.services.billing_outbox import (
 from src.services.credit_ledger import (
     CreditLedger,
     GrantSpec,
+    cycle_start_settlement_effect_id,
+    monthly_grant_effect_id,
+    monthly_lot_expires_at,
+    start_of_civil_day,
     topup_grant_effect_id,
     topup_lot_expires_at,
 )
@@ -2172,3 +2184,124 @@ async def _rows_of(
         return [
             tuple(row) for row in (await connection.execute(text(statement), params))
         ]
+
+
+# ---------------------------------------------------------------------------
+# Group 3a, O5: a monthly allowance is spent only from its cycle_start.
+# ---------------------------------------------------------------------------
+
+
+async def test_an_early_renewal_is_spent_only_from_its_cycle_start(
+    postgres_harness: _Harness,
+) -> None:
+    builder_id = await _builder_row(postgres_harness)
+    subscription = uuid4()
+    start, end = date(2026, 11, 1), date(2026, 12, 1)
+    spend_from = start_of_civil_day(start)  # 2026-11-01 03:00 UTC
+    async with postgres_harness.session() as session, session.begin():
+        ledger = _g2_ledger(session)
+        book = await ledger.open_book(builder_id, at=_G2_NOW)
+        renewal = book.grant(
+            GrantSpec(
+                lot_kind="monthly",
+                effect_id=monthly_grant_effect_id(subscription, start, end),
+                payment_id="pay-renewal",
+                paid_at=date(2026, 10, 20),
+                granted_mc=5_000_000,
+                expires_at=monthly_lot_expires_at(end),
+                subscription_id=subscription,
+                cycle_start=start,
+                cycle_end=end,
+            ),
+            at=_G2_NOW,
+        ).id
+        await ledger.persist(book)
+
+    # Before the start: a debit is debt, the allowance is untouched.
+    async with postgres_harness.session() as session, session.begin():
+        early = await _g2_ledger(session).debit(
+            builder_id, "trace:early", 3_000, at=_G2_NOW, effect_kind="trace"
+        )
+    assert (early.status, early.debited_mc, early.debt_mc) == ("applied", 0, 3_000)
+    # A partial refund before the start withdraws the lot and owes nothing.
+    async with postgres_harness.session() as session, session.begin():
+        ledger = _g2_ledger(session)
+        book = await ledger.open_book(builder_id, at=_G2_NOW)
+        book.apply_line_targets(
+            renewal,
+            line_id="plan",
+            payment_id="pay-renewal",
+            financial_revision=2,
+            reversal_target_mc=1_000_000,
+            restoration_target_mc=0,
+            at=_G2_NOW,
+        )
+        assert book.available_mc(_G2_NOW) == 0  # not spendable yet
+        assert book.open_debt_mc == 3_000  # the refund created no debt
+        await ledger.persist(book)
+
+    # From the start: the debit first catches the started allowance up (the
+    # debt settled as of the start, under its start-settlement effect), then
+    # debits.
+    async with postgres_harness.session() as session, session.begin():
+        late = await _g2_ledger(session, spend_from).debit(
+            builder_id, "trace:late", 2_000, at=spend_from, effect_kind="trace"
+        )
+    assert (late.status, late.debited_mc, late.debt_mc, late.at) == (
+        "applied",
+        2_000,
+        0,
+        spend_from,
+    )
+    rows = await _rows_of(
+        postgres_harness,
+        "SELECT entry_type, lot_id, amount_mc, occurred_at FROM "
+        "credit_ledger_entries WHERE builder_id = :b ORDER BY occurred_at, "
+        "entry_type",
+        b=builder_id,
+    )
+    assert [(t, lot, amount) for t, lot, amount, _ in rows] == [
+        ("debt", None, 3_000),
+        ("grant", renewal, 5_000_000),
+        ("reversal", renewal, 1_000_000),
+        ("debit", renewal, 2_000),
+        ("debt_settlement", renewal, 3_000),
+    ]
+    for entry_type, _lot, _amount, occurred_at in rows:
+        if entry_type in ("debit", "debt_settlement"):
+            assert occurred_at >= spend_from
+    async with postgres_harness.session() as session:
+        balance = await CreditRepository(session).derived_balance(builder_id)
+        debts = (
+            await session.execute(
+                select(CreditDebt.debt_source_kind).where(
+                    CreditDebt.builder_id == builder_id
+                )
+            )
+        ).scalars()
+        assert list(debts) == ["consumption"]
+    assert balance.debt_mc == 0
+    assert dict(balance.lots) == {renewal: 5_000_000 - 1_000_000 - 3_000 - 2_000}
+    caught_up = cycle_start_settlement_effect_id(subscription, start, end)
+    assert caught_up == (f"cycle:{subscription}:2026-11-01:2026-12-01:start-settlement")
+    assert await _rows_of(
+        postgres_harness,
+        "SELECT effect_kind, tenant_id, decision_digest FROM credit_effects "
+        "WHERE builder_id = :b AND effect_id = :e",
+        b=builder_id,
+        e=caught_up,
+    ) == [("debt_settlement", None, None)]
+    assert await _rows_of(
+        postgres_harness,
+        "SELECT entry_type, lot_id, amount_mc, occurred_at FROM "
+        "credit_ledger_entries WHERE builder_id = :b AND effect_id = :e",
+        b=builder_id,
+        e=caught_up,
+    ) == [("debt_settlement", renewal, 3_000, spend_from)]
+    assert await _rows_of(
+        postgres_harness,
+        "SELECT amount_mc, settling_grant_lot_id FROM credit_debt_settlements "
+        "WHERE builder_id = :b AND effect_id = :e",
+        b=builder_id,
+        e=caught_up,
+    ) == [(3_000, renewal)]
