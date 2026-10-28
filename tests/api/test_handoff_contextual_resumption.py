@@ -129,7 +129,7 @@ class _NoOpHandoffStub:
     """
 
     async def initiate_handoff(
-        self, request: Any, *, context: Any = None
+        self, request: Any, *, context: Any = None, session: Any = None
     ) -> Optional[Any]:
         return None
 

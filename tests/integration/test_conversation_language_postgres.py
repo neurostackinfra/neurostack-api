@@ -235,7 +235,11 @@ async def test_same_session_lock_serializes_and_observes_committed_language(
         calls = 0
 
         async def process(
-            self, input_data: PipelineInput, *, context: Any = None
+            self,
+            input_data: PipelineInput,
+            *,
+            context: Any = None,
+            session: Any = None,
         ) -> PipelineResult:
             self.calls += 1
             if self.calls == 1:

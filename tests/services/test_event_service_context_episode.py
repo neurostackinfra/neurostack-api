@@ -60,7 +60,9 @@ class _NoOpHandoffStub:
     ``HandoffService``.
     """
 
-    async def initiate_handoff(self, request: Any, *, context: Any = None) -> None:
+    async def initiate_handoff(
+        self, request: Any, *, context: Any = None, session: Any = None
+    ) -> None:
         return None
 
 

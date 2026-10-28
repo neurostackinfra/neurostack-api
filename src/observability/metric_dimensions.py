@@ -325,7 +325,7 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
             )
         ),
         "neurostack_handoff_operations": _contract(
-            operation=_enum("initiate", "update"),
+            operation=_enum("initiate", "update", "post_commit_dispatch"),
             status=_enum("success", "error", "conflict", "not_found", "rejected"),
         ),
         "neurostack_handoff_by_reason": _contract(

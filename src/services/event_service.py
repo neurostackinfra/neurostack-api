@@ -1381,6 +1381,11 @@ class EventService:
         Raises on persistence failure (does NOT swallow) so the route handler
         can detect the failure and rollback before calling finish_response().
 
+        A synchronous handoff joins ``session``'s transaction and queues its
+        creation webhook on it: after the commit, and before
+        finish_response(), the caller runs
+        ``dispatch_committed_handoff_webhooks(session)``.
+
         ``context`` is the interaction's single ``ResolvedInteractionContext``
         (``None`` → the ``unknown`` factory). It must match the request's
         tenant, session and event type, and nothing is keyed by its session
@@ -1473,11 +1478,13 @@ class EventService:
             prior_episode_context=state.prior_episode_context,
         )
 
-        # Process through the complete pipeline (CPU-bound, no I/O)
+        # Process through the complete pipeline. A synchronous handoff writes
+        # in ``session``, the transaction holding this session's row lock
+        # (#145); its creation webhook waits for the caller's commit.
         from src.core.pipeline import PipelineResult
 
         result: PipelineResult = await self._pipeline.process(
-            pipeline_input, context=context
+            pipeline_input, context=context, session=session
         )
 
         # A proposal is only durable when its canonical confirmation prompt is

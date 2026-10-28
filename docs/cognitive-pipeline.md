@@ -350,20 +350,33 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Client
+    participant API as API (dona da transação)
     participant Pipeline
     participant SRM
     participant Handoff
+    participant DB as PostgreSQL
     participant Webhook
 
-    Client->>Pipeline: "Quero falar com atendente"
+    Client->>API: "Quero falar com atendente"
+    Note over API,DB: Fase 1: transação com FOR UPDATE na sessão
+    API->>Pipeline: run_pipeline(session=db)
     Pipeline->>SRM: process()
     SRM-->>Pipeline: handoff_required=true
-    Pipeline->>Handoff: initiate_handoff()
+    Pipeline->>Handoff: initiate_handoff(session=db)
+    Handoff->>DB: INSERT handoff_record + evento handoff.request
+    Handoff-->>Pipeline: HandoffResponse (webhook enfileirado)
+    Pipeline-->>API: PipelineResult
+    API->>DB: COMMIT
+    Note over API,Webhook: Após o commit (melhor esforço)
+    API->>Handoff: dispatch_committed_handoff_webhooks(db)
     Handoff->>Webhook: POST summary
     Webhook-->>Handoff: 200 OK
-    Handoff-->>Pipeline: HandoffResponse
-    Pipeline-->>Client: mode="handoff"
+    API-->>Client: mode="handoff" (finish_response)
 ```
+
+O registro e o `handoff.request` são gravados na transação da fase 1 e o
+webhook só sai depois do commit. Uma falha nesse envio é registrada em log e
+métrica e não impede a resposta ao paciente.
 
 ### Fluxo com Policy Block
 

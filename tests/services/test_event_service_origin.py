@@ -117,6 +117,7 @@ class _RecordingPipeline:
         input_data: PipelineInput,
         *,
         context: Optional[ResolvedInteractionContext] = None,
+        session: Any = None,
     ) -> PipelineResult:
         self.inputs.append(input_data)
         self.contexts.append(context)

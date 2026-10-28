@@ -86,7 +86,11 @@ class _PipelineStub:
         self._result_options = result_options
 
     async def process(
-        self, input_data: PipelineInput, *, context: Any = None
+        self,
+        input_data: PipelineInput,
+        *,
+        context: Any = None,
+        session: Any = None,
     ) -> PipelineResult:
         self.inputs.append(input_data)
         return _result(input_data, **self._result_options)
