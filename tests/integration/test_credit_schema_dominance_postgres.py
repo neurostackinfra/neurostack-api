@@ -17,9 +17,16 @@ store crosses runs, and every run starts from a clone of one seeded template.
 * The verdict: config off => off; config on at ``037`` => off
   (``schema_below_minimum``); config on at ``038`` => on.
 * A ``before_cursor_execute`` listener, attached only after start-up, sees no
-  SQL touching ``credit_*`` while the switch is not effective (nor, in Group
-  1b, while it is: nothing writes yet); no ``credit_*`` row exists after a
-  run at ``038``.
+  SQL touching ``credit_*`` while the switch is not effective; no ``credit_*``
+  row exists after a run at ``038`` with the config off.
+* Group 3a: with the switch effective (config on at ``038``) the only credit
+  SQL is the observational writer's -- ``credit_enforcement_state``,
+  ``credit_ingress_claims``, ``credit_observational_effects`` -- and every
+  accepted decision of the corpus left exactly its claim and observational
+  trace (origin and ``authenticated`` set, anchored on the claim or the
+  public ``event_id``), while the answers and the stored events stay equal
+  to the config-off run.  ``POST /v1/events`` without ``Idempotency-Key`` is
+  accepted; no corpus case triggers a synchronous handoff (D6).
 * In one process, the background refresh turns the switch on after
   ``upgrade 037 -> 038`` and off again after the downgrade, each within one
   interval, while requests keep answering.
@@ -74,6 +81,14 @@ _GREETING = re.compile(
     re.IGNORECASE,
 )
 _CREDIT_SQL = re.compile(r"\bcredit_[a-z_]+", re.IGNORECASE)
+# The only credit tables the observational writer (Group 3a) may touch.
+_METERING_TABLES = frozenset(
+    {
+        "credit_enforcement_state",
+        "credit_ingress_claims",
+        "credit_observational_effects",
+    }
+)
 _RUN_TIMEOUT_SECONDS = 300
 
 
@@ -421,7 +436,7 @@ def _request_for(
     names = asdict(world)
     path = _resolve(item["path"], names)
     raw = json.dumps(_resolve(item["json"], names)).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", **item.get("headers", {})}
     kind, _, subject = item["auth"].partition("/")
     if kind == "api_key":
         headers["X-API-Key"] = (
@@ -440,7 +455,57 @@ def _request_for(
     return path, raw, headers
 
 
-async def _read_back(database_url: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+_CLAIM_COLUMNS = (
+    "tenant_id",
+    "builder_id",
+    "source",
+    "principal_id",
+    "idempotency_key",
+    "provider_message_id",
+    "interaction_id",
+    "payload_sha256",
+    "decision_version",
+    "session_version",
+    "mode",
+)
+_EFFECT_COLUMNS = (
+    "tenant_id",
+    "builder_id",
+    "effect_id",
+    "effect_kind",
+    "trace_id",
+    "origin",
+    "authenticated",
+    "would_debit_mc",
+    "decision_digest",
+)
+
+
+def _plain(value: Any) -> Any:
+    return value if value is None or isinstance(value, (bool, int, str)) else str(value)
+
+
+async def _metering_rows(connection: Any) -> dict[str, list[dict[str, Any]]]:
+    from sqlalchemy import text
+
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for table, columns in (
+        ("credit_ingress_claims", _CLAIM_COLUMNS),
+        ("credit_observational_effects", _EFFECT_COLUMNS),
+    ):
+        result = await connection.execute(
+            text(f"SELECT {', '.join(columns)} FROM {table}")
+        )
+        rows[table] = [
+            {column: _plain(value) for column, value in zip(columns, row)}
+            for row in result
+        ]
+    return rows
+
+
+async def _read_back(
+    database_url: str,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, list[dict[str, Any]]]]:
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
@@ -483,9 +548,10 @@ async def _read_back(database_url: str) -> tuple[list[dict[str, Any]], dict[str,
                 )
                 for name in tables
             }
+            metering = await _metering_rows(connection) if tables else {}
     finally:
         await engine.dispose()
-    return events, credit_rows
+    return events, credit_rows, metering
 
 
 async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
@@ -533,13 +599,14 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
                         )
             finally:
                 event.remove(engine, "before_cursor_execute", record)
-    events, credit_rows = await _read_back(spec["database_url"])
+    events, credit_rows, metering = await _read_back(spec["database_url"])
     return {
         "reading": asdict(reading),
         "responses": responses,
         "events": events,
         "statements": statements,
         "credit_rows": credit_rows,
+        "metering": metering,
     }
 
 
@@ -858,22 +925,148 @@ async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> Non
 
 @pytest.mark.parametrize(
     ("revision", "enabled"),
-    [("037", False), ("037", True), ("038", False), ("038", True)],
+    [("037", False), ("037", True), ("038", False)],
 )
 async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     oracle: _Oracle, revision: str, enabled: bool
 ) -> None:
+    """While the switch is not effective (config off, or a 037 database)."""
+
     run = await oracle.run(revision, enabled=enabled)
 
     assert run["statements"], "the listener saw no SQL at all"
     touching = [s for s in run["statements"] if _CREDIT_SQL.search(s)]
-    # Required while the switch is not effective; in Group 1b nothing writes
-    # even while it is (Group 3 relaxes the effective 038 run).
     assert touching == []
     if revision == "038":
         assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
     else:
         assert run["credit_rows"] == {}
+
+
+async def test_the_effective_switch_only_meters_observationally(
+    oracle: _Oracle,
+) -> None:
+    """Config on at 038 (Group 3a): only the writer's three tables are
+    touched, and nothing financial is ever written before the enforcement."""
+
+    run = await oracle.run("038", enabled=True)
+
+    names = {
+        match.group(0).lower()
+        for statement in run["statements"]
+        for match in _CREDIT_SQL.finditer(statement)
+    }
+    rows = run["credit_rows"]
+    assert names & set(rows) == _METERING_TABLES
+    # The one other credit_* name in that SQL is the enforcement column.
+    assert names - set(rows) == {"credit_enforcement_at"}
+    assert rows["credit_ingress_claims"] > 0
+    assert rows["credit_observational_effects"] > 0
+    assert {
+        table: count
+        for table, count in rows.items()
+        if table not in _METERING_TABLES and count
+    } == {}
+
+
+def _event_id(run: dict[str, Any], case: str) -> str:
+    [body] = [r["body"] for r in run["responses"] if r["id"] == case]
+    return str(body["event_id"])
+
+
+async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
+    oracle: _Oracle,
+) -> None:
+    run = await oracle.run("038", enabled=True)
+    world = oracle.world
+    status = {r["id"]: r["status"] for r in run["responses"]}
+    claims = run["metering"]["credit_ingress_claims"]
+    effects = run["metering"]["credit_observational_effects"]
+
+    # No Idempotency-Key is still main's 200 (observational only).
+    assert status["events-api-key-scheduling"] == 200
+    assert status["events-api-key-invalid-idempotency-key"] == 200
+    # Every trace row carries origin, authenticated and its decision digest.
+    for effect in effects:
+        assert effect["origin"] in {"production", "simulator", "unknown"}
+        assert effect["authenticated"] in {True, False}
+        assert effect["effect_kind"] == "trace"
+        assert effect["decision_digest"] and len(effect["decision_digest"]) == 64
+        assert effect["effect_id"] == (
+            f"trace:{effect['tenant_id']}:{effect['trace_id']}:decision:1"
+        )
+    by_tenant: dict[str, list[dict[str, Any]]] = {}
+    for effect in effects:
+        by_tenant.setdefault(effect["tenant_id"], []).append(effect)
+
+    # API key: one claim for the key (the retry reused it), one trace per
+    # other accepted event, anchored on its public event_id.
+    [key_claim] = [c for c in claims if c["source"] == "events"]
+    assert key_claim["idempotency_key"] == "credit-dominance-key-1"
+    assert key_claim["principal_id"] == f"api_key:{world.api_tenant}"
+    assert key_claim["builder_id"] == world.builder
+    assert key_claim["mode"] == "observational"
+    assert key_claim["interaction_id"] == _event_id(
+        run, "events-api-key-idempotency-key"
+    )
+    api = by_tenant[world.api_tenant]
+    assert sorted(e["trace_id"] for e in api) == sorted(
+        [
+            _event_id(run, "events-api-key-scheduling"),
+            _event_id(run, "events-api-key-second-turn"),
+            key_claim["interaction_id"],
+            _event_id(run, "events-api-key-invalid-idempotency-key"),
+            _event_id(run, "events-api-key-session-start"),
+        ]
+    )
+    assert {(e["origin"], e["authenticated"], e["would_debit_mc"]) for e in api} == {
+        ("production", True, 1_000)
+    }
+    # The panel JWT: simulator, no claim even with a key (H3), costs nothing.
+    jwt = by_tenant[world.jwt_tenant]
+    assert sorted(e["trace_id"] for e in jwt) == sorted(
+        [
+            _event_id(run, "events-jwt-panel-simulator"),
+            _event_id(run, "events-jwt-panel-idempotency-key"),
+        ]
+    )
+    assert {(e["origin"], e["authenticated"], e["would_debit_mc"]) for e in jwt} == {
+        ("simulator", True, 0)
+    }
+    # Providers: one claim per delivered message, its trace on the claim.
+    providers = {c["source"]: [] for c in claims if c["source"] != "events"}
+    for claim in claims:
+        if claim["source"] != "events":
+            providers[claim["source"]].append(claim)
+    assert sorted(c["provider_message_id"] for c in providers["zapi"]) == [
+        "credit-dominance-zapi-1",
+        "credit-dominance-zapi-5",
+    ]
+    assert set(providers) == {"zapi", "meta", "uazapi", "evolution"}
+    expected = {
+        "zapi": (world.zapi_tenant, "production", True, 1_000),
+        "meta": (world.meta_tenant, "production", True, 1_000),
+        "uazapi": (world.uazapi_tenant, "unknown", False, 0),
+        "evolution": (world.evolution_tenant, "unknown", False, 0),
+    }
+    for source, (tenant, origin, authenticated, cost) in expected.items():
+        traced = by_tenant[tenant]
+        assert sorted(e["trace_id"] for e in traced) == sorted(
+            c["interaction_id"] for c in providers[source]
+        )
+        assert {c["principal_id"] for c in providers[source]} == {f"{source}:{tenant}"}
+        assert {
+            (e["origin"], e["authenticated"], e["would_debit_mc"]) for e in traced
+        } == {(origin, authenticated, cost)}
+    # Rejected and skipped requests left nothing: only these six tenants.
+    assert set(by_tenant) == {
+        world.api_tenant,
+        world.jwt_tenant,
+        world.zapi_tenant,
+        world.meta_tenant,
+        world.uazapi_tenant,
+        world.evolution_tenant,
+    }
 
 
 # ---------------------------------------------------------------------------

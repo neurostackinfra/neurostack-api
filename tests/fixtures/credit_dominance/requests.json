@@ -1,6 +1,6 @@
 {
   "schema_version": "credit_dominance_corpus.v1",
-  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none.",
+  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key), and no case triggers a synchronous handoff (D6).",
   "masked_fields": [
     "event_id",
     "timestamp",
@@ -376,6 +376,105 @@
         "event": "connection.update",
         "instance": "{evolution_instance}",
         "data": {"state": "open"}
+      }
+    },
+    {
+      "id": "events-api-key-idempotency-key",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "credit-dominance-key-1"},
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Quais são os horários de atendimento?",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-idempotency-retry",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "credit-dominance-key-1"},
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Quais são os horários de atendimento?",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-invalid-idempotency-key",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "not a visible ascii key"},
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Obrigado pelas informações",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-session-start",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "session.start",
+        "payload": {
+          "content": "Nova conversa",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-jwt-panel-idempotency-key",
+      "ingress": "jwt",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "jwt/jwt_tenant",
+      "headers": {"Idempotency-Key": "credit-dominance-panel-key"},
+      "json": {
+        "session_id": "{jwt_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Quais são os horários de atendimento?",
+          "channel": "web"
+        }
+      }
+    },
+    {
+      "id": "zapi-second-message",
+      "ingress": "zapi",
+      "method": "POST",
+      "path": "/v1/webhook/zapi/{zapi_token}",
+      "auth": "none",
+      "json": {
+        "instanceId": "{zapi_instance}",
+        "phone": "5511900000101",
+        "messageId": "credit-dominance-zapi-5",
+        "fromMe": false,
+        "text": {"message": "Quais são os horários de atendimento?"},
+        "momment": 1761480000000,
+        "senderName": "Paciente Z"
       }
     }
   ]

@@ -39,6 +39,7 @@ from src.interaction_context import (
 )
 from src.repositories import get_db_session_dependency
 from src.services import get_event_service
+from src.services.credit_metering import record_events_decision
 from src.services.event_service import SessionNotFoundError
 from src.services.handoff_service import (
     dispatch_committed_handoff_webhooks,
@@ -411,7 +412,7 @@ async def process_event(
             session_id=canonical_request.session_id,
         )
     try:
-        return await service.finish_response(
+        response = await service.finish_response(
             canonical_request,
             result,
             clinic_config,
@@ -433,6 +434,18 @@ async def process_event(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Response generation failed",
         )
+
+    # Observational metering (neurostack-credit-system Group 3a): only when
+    # this request captured the credit switch on at entry; after the route's
+    # transaction ended; bounded and best-effort -- never changes the answer.
+    await record_events_decision(
+        http_request,
+        db,
+        canonical_request=canonical_request,
+        context=context,
+        response=response,
+    )
+    return response
 
 
 @router.get(

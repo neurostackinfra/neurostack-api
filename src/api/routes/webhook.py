@@ -51,6 +51,15 @@ from src.repositories import (
     get_db_session_dependency,
 )
 from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
+from src.services.credit_metering import (
+    ObservationalIngress,
+    evolution_ingress,
+    meta_ingress,
+    record_meta_file_handoff,
+    record_webhook_decision,
+    uazapi_ingress,
+    zapi_ingress,
+)
 from src.services.egress_policy import EgressDisabledError
 from src.services.event_service import get_event_service
 from src.services.handoff_service import (
@@ -193,6 +202,7 @@ async def _run_pipeline_transactionally(
     event_request: CanonicalEventRequest,
     db: AsyncSession,
     context: ResolvedInteractionContext,
+    metering: Optional[ObservationalIngress] = None,
 ) -> EventResponse:
     """Run the locked phase, commit it, then start post-commit response I/O.
 
@@ -209,6 +219,12 @@ async def _run_pipeline_transactionally(
     ``context`` is the adapter's single interaction context. The very same
     object goes, by keyword, to both phases. It is required: every caller
     classifies the origin and builds the context before calling.
+
+    ``metering`` is the adapter's observational ingress (neurostack-credit-
+    system Group 3a), ``None`` unless the request captured the credit switch
+    on.  Its decision is recorded best-effort once ``finish_response`` has
+    returned (both phases' transactions are over), before any reply is sent;
+    it never changes the response.
     """
     try:
         result, clinic_config, message_history = await service.run_pipeline(
@@ -230,7 +246,7 @@ async def _run_pipeline_transactionally(
             tenant_id=event_request.tenant_id,
             session_id=event_request.session_id,
         )
-    return cast(
+    response = cast(
         EventResponse,
         await service.finish_response(
             event_request,
@@ -240,6 +256,8 @@ async def _run_pipeline_transactionally(
             context=context,
         ),
     )
+    await record_webhook_decision(metering, db, response)
+    return response
 
 
 def _meta_authenticated_origin(
@@ -1978,6 +1996,7 @@ async def zapi_webhook(
         tenant_id=tenant_id,
         db=db,
         origin=origin,
+        request=request,
     )
 
 
@@ -1987,12 +2006,15 @@ async def _process_zapi_authenticated_body(
     tenant_id: UUID,
     db: AsyncSession,
     origin: InteractionOrigin,
+    request: Optional[Request] = None,
 ) -> Response | dict[str, Any]:
     """Downstream Z-API processing for an already authenticated request.
 
     Callers must have verified: canonical token, digest match, ``instanceId``
     binding, rate limit, ``messageId`` presence and replay-store claim.
     ``origin`` is the one the caller classified after that proof.
+    ``request`` only carries the credit switch captured at entry (observational
+    metering, neurostack-credit-system Group 3a); without it nothing is metered.
     """
     text_obj = body.get("text")
     audio_obj = body.get("audio")
@@ -2315,6 +2337,11 @@ async def _process_zapi_authenticated_body(
         event_request=event_request,
         db=db,
         context=context,
+        metering=(
+            None
+            if request is None
+            else zapi_ingress(request, body=body, context=context)
+        ),
     )
 
     # ── send LLM response back via Z-API ──
@@ -2600,6 +2627,7 @@ async def evolution_webhook(
         event_request=event_request,
         db=db,
         context=context,
+        metering=evolution_ingress(request, data=data, context=context),
     )
 
     # ── send LLM response back via Evolution API ──
@@ -3136,6 +3164,7 @@ async def uazapi_webhook(
         event_request=event_request,
         db=db,
         context=context,
+        metering=uazapi_ingress(request, message=msg, context=context),
     )
 
     suggested = (
@@ -3790,6 +3819,9 @@ async def meta_webhook(
                 event_type=EventType.MESSAGE_IN,
             )
             await db.commit()
+            # Observational metering of this message's decision (credit
+            # Group 3a): ``None`` unless the switch was captured on.
+            metering = meta_ingress(request, message=msg, context=context)
 
             # ── load clinic config + credentials ──
             service = get_event_service()
@@ -3856,7 +3888,7 @@ async def meta_webhook(
                 # describe their need.
                 if await _meta_get_pending_file_review(session_id, db):
                     if _detect_forward_intent(message_text):
-                        await _meta_initiate_file_handoff(
+                        file_handoff = await _meta_initiate_file_handoff(
                             tenant_id,
                             session_id,
                             from_phone,
@@ -3865,6 +3897,9 @@ async def meta_webhook(
                         )
                         await _meta_clear_pending_file_review(session_id, db)
                         await db.commit()
+                        await record_meta_file_handoff(
+                            metering, db, file_handoff, note="file_pending_review"
+                        )
                         if meta_pnid and meta_token:
                             confirm_msg = (
                                 _FILE_FORWARDED_MSG_EN
@@ -3958,12 +3993,15 @@ async def meta_webhook(
                         if agent_lang == "en"
                         else _AUDIO_TOO_LONG_MSG_PT
                     )
-                    await _meta_initiate_file_handoff(
+                    file_handoff = await _meta_initiate_file_handoff(
                         tenant_id,
                         session_id,
                         from_phone,
                         "audio_too_long",
                         context=context,
+                    )
+                    await record_meta_file_handoff(
+                        metering, db, file_handoff, note="audio_too_long"
                     )
                     if meta_pnid and meta_token:
                         try:
@@ -4113,6 +4151,7 @@ async def meta_webhook(
                 event_request=event_request,
                 db=db,
                 context=context,
+                metering=metering,
             )
 
             suggested = (
