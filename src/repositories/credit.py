@@ -12,31 +12,42 @@ or lock below is filtered by it.  Per-tenant rows (ingress claims,
 observational effects) are always read with their ``tenant_id``.
 
 Lock order -- the same for every credit writer (spend, fact inbox,
-reconciliation, metering), so two writers never wait on each other crosswise:
+reconciliation, metering, the enforced ``POST /v1/events`` transactions), so
+two writers never wait on each other crosswise:
 
 0. ``tenant_scope(tenant_id)`` -- a plain read, no lock: a rejected request
    (unknown, deactivated or foreign tenant) stops here without locking or
    writing anything;
 1. ``tenant_scope(tenant_id, lock=True)`` -- the tenant row ``FOR SHARE``,
-   BEFORE touching any claim, response-outbox row or credit effect of that
-   tenant.  Migration 038 takes this lock anyway, later, inside the
-   tenant/builder trigger of claims and effects (and the claim/outbox
-   foreign keys take ``FOR KEY SHARE``), while ``DELETE FROM tenants`` locks
-   the tenant row first and then cascades into its claims and outbox rows.
-   Taken late -- after a claim row is already locked -- it deadlocks against
-   a concurrent clinic delete; taken first, the delete simply waits for the
-   credit transaction (or the credit transaction waits, then finds the
-   tenant gone).  It also keeps the builder scope stable: a concurrent
-   reparent waits.  A standalone tenant (``builder_id`` NULL) has no account
-   and stops after its per-tenant rows;
-2. :meth:`~CreditRepository.lock_account` -- the builder's
+   FIRST, before the session row and before touching any claim,
+   response-outbox row or credit effect of that tenant.  Migration 038 takes
+   this lock anyway, later, inside the tenant/builder trigger of claims and
+   effects (and the claim/outbox foreign keys take ``FOR KEY SHARE``), while
+   ``DELETE FROM tenants`` (``DELETE /clinics/{clinic_id}``) locks the
+   tenant row first and then cascades into its sessions, claims and outbox
+   rows.  Taken late -- after a session or claim row is already locked -- it
+   deadlocks against a concurrent clinic delete; taken first, the delete
+   simply waits for the credit transaction (or the credit transaction waits,
+   then finds the tenant gone).  It also keeps the builder scope stable: a
+   concurrent reparent waits.  A standalone tenant (``builder_id`` NULL) has
+   no account and stops after its per-tenant rows;
+2. the ``sessions`` row: ``FOR UPDATE`` in the enforced phase 1
+   (``run_pipeline``), ``FOR KEY SHARE`` through the foreign keys of the
+   final transaction's event bundle and of the phase 1 handoff -- no credit
+   lock is held while waiting on it;
+3. :meth:`~CreditRepository.lock_account` -- the builder's
    ``credit_accounts`` row ``FOR UPDATE``, the serialization point of the
    builder's credits (create it first with
    :meth:`~CreditRepository.ensure_account`);
-3. :meth:`~CreditRepository.lock_lots` -- the builder's ``credit_lots``
+4. :meth:`~CreditRepository.lock_lots` -- the builder's ``credit_lots``
    ``FOR UPDATE`` in ``id`` order;
-4. claim and outbox updates, inserts: effects, ledger entries, debts,
-   settlements, outbox.
+5. claims, outbox and inserts: effects, ledger entries, debts, settlements,
+   the response-outbox row, the claim fences.
+
+Single-row UPDATEs -- the claim takeover, the lease release, the phase 1
+marker and the final fence of a claim, and the response-outbox transitions --
+are exempt from this order: none of them waits on another credit lock while
+it holds its row (Group 3b-1, LOW-14).
 
 One transaction locks one tenant and one builder's account; should two ever
 be needed, they are locked in ascending id order.  No lock is held across an
@@ -68,17 +79,41 @@ claim's ``interaction_id`` (deduplicated per tenant, so standalone and
 reparented tenants deduplicate too).  :meth:`session_message_count` is a
 plain read of the session's ``message_count`` (the claim's session version,
 audit only).
+
+Enforced claims (Group 3b-1).  The ``POST /v1/events`` claim of an enforced
+request is fenced by a lease, without a migration: ``created_at`` is the
+START OF THE CURRENT LEASE, always written with ``clock_timestamp()`` (the
+``DEFAULT now()`` is the transaction start).  Every fence compares the
+``created_at`` its executor observed (``:observed``) and evaluates the lease
+with the database clock: the phase 1 marker
+(:meth:`~CreditRepository.mark_claim_phase1`) and the final check
+(:meth:`~CreditRepository.hold_claim_final_fence`, an ``UPDATE`` that keeps
+the row lock to the commit) lock the row first and judge the lease in
+``RETURNING`` (a ``WHERE`` is judged before a lock wait, HIGH-1); the
+takeover before phase 1 (:meth:`~CreditRepository.take_over_claim`) and the
+release of a lease on a known failure
+(:meth:`~CreditRepository.release_claim_lease`) are plain fenced
+``UPDATE`` statements.  A reader
+that may answer ``event_in_progress``/``event_failed`` takes the claim
+``FOR SHARE`` (:meth:`~CreditRepository.claim_for_share`), which waits for a
+final transaction in flight, and reads the response outbox in a NEW
+statement.  On SQLite (the unit-test dialect) ``clock_timestamp()``, the
+lease arithmetic and ``lock_timeout`` go through a dialect switch, like
+``_insert``: the Python clock (UTC, never going back within the process)
+evaluates the lease against the pinned ``:observed`` and no lock timeout
+exists.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, and_, case, func, or_, select
+from sqlalchemy import DateTime, and_, case, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
@@ -100,8 +135,10 @@ from src.models.credit import (
     CreditLedgerEntry,
     CreditLot,
     CreditObservationalEffect,
+    CreditResponseOutbox,
 )
 from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
+from src.models.handoff import HandoffRecord
 from src.models.session import Session as SessionRow
 from src.models.tenant import Tenant
 
@@ -159,6 +196,64 @@ class FactOutboxRow:
     subscription_id: UUID | None
     topup_order_id: UUID | None
     subscription_cycle_id: UUID | None
+
+
+@dataclass(frozen=True)
+class ClaimRow:
+    """One ``credit_ingress_claims`` row as read (Core columns, never an ORM
+    entity: no identity-map copy outlives the statement).
+
+    ``created_at`` is the stored value exactly as the driver returned it --
+    the ``:observed`` of every fence -- and ``now`` the database clock read
+    with it when the reader asked for it.
+    """
+
+    id: UUID
+    tenant_id: UUID
+    builder_id: UUID | None
+    principal_id: str
+    interaction_id: UUID
+    payload_sha256: str
+    decision_version: int
+    session_version: int | None
+    mode: str
+    created_at: datetime
+
+    @property
+    def lease_started_at(self) -> datetime:
+        return _as_utc(self.created_at)
+
+
+@dataclass(frozen=True)
+class ResponseOutboxRow:
+    """The stored answer of a decided interaction."""
+
+    id: UUID
+    payload: Mapping[str, Any]
+    state: str
+    created_at: datetime
+
+
+_SQLITE_CLOCK_LOCK: Final = threading.Lock()
+_sqlite_clock_last: datetime | None = None
+
+
+def _sqlite_lease_clock() -> datetime:
+    """The Python clock in UTC, never going back within the process.
+
+    SQLite (the unit-test dialect, in-process) has no ``clock_timestamp()``:
+    the lease fences use this clock instead.  A wall-clock step back (the WSL
+    time sync does it) would otherwise turn a lease just released --
+    ``created_at = now - lease`` -- into a live one for the next reader.
+    """
+
+    global _sqlite_clock_last
+    with _SQLITE_CLOCK_LOCK:
+        now = datetime.now(timezone.utc)
+        if _sqlite_clock_last is not None and now < _sqlite_clock_last:
+            now = _sqlite_clock_last
+        _sqlite_clock_last = now
+        return now
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -490,6 +585,438 @@ class CreditRepository:
             )
         ).scalar_one_or_none()
         return inserted is not None
+
+    # -- enforced claims, effects and the response outbox (Group 3b-1) ------
+
+    def _postgresql(self) -> bool:
+        return bool(self.session.get_bind().dialect.name == "postgresql")
+
+    @staticmethod
+    def _python_now() -> datetime:
+        """SQLite's clock (the unit-test dialect): the Python clock in UTC,
+        non-decreasing within the process (:func:`_sqlite_lease_clock`)."""
+
+        return _sqlite_lease_clock()
+
+    def _clock(self) -> Any:
+        """``clock_timestamp()`` on PostgreSQL (the real instant, not the
+        transaction start); the Python clock as a bound value on SQLite."""
+
+        if self._postgresql():
+            return func.clock_timestamp(type_=DateTime(timezone=True))
+        return self._python_now()
+
+    _CLAIM_COLUMNS: Final = (
+        CreditIngressClaim.id,
+        CreditIngressClaim.tenant_id,
+        CreditIngressClaim.builder_id,
+        CreditIngressClaim.principal_id,
+        CreditIngressClaim.interaction_id,
+        CreditIngressClaim.payload_sha256,
+        CreditIngressClaim.decision_version,
+        CreditIngressClaim.session_version,
+        CreditIngressClaim.mode,
+        CreditIngressClaim.created_at,
+    )
+
+    @staticmethod
+    def _claim_row(row: Any) -> ClaimRow:
+        return ClaimRow(
+            id=UUID(str(row.id)),
+            tenant_id=UUID(str(row.tenant_id)),
+            builder_id=None if row.builder_id is None else UUID(str(row.builder_id)),
+            principal_id=str(row.principal_id),
+            interaction_id=UUID(str(row.interaction_id)),
+            payload_sha256=str(row.payload_sha256),
+            decision_version=int(row.decision_version),
+            session_version=(
+                None if row.session_version is None else int(row.session_version)
+            ),
+            mode=str(row.mode),
+            created_at=row.created_at,
+        )
+
+    async def idempotency_claim(
+        self, tenant_id: UUID, *, principal_id: str, idempotency_key: str
+    ) -> ClaimRow | None:
+        """The ``POST /v1/events`` claim of this tenant, principal and key
+        (a plain read, no lock)."""
+
+        row = (
+            await self.session.execute(
+                select(*self._CLAIM_COLUMNS).where(
+                    CreditIngressClaim.tenant_id == tenant_id,
+                    CreditIngressClaim.principal_id == principal_id,
+                    CreditIngressClaim.idempotency_key == idempotency_key,
+                )
+            )
+        ).one_or_none()
+        return None if row is None else self._claim_row(row)
+
+    async def claim_for_share(self, claim_id: UUID) -> ClaimRow | None:
+        """The claim ``FOR SHARE``: waits for a fence (the phase 1 marker, the
+        final check) holding the row until its commit, then reads the row as
+        committed.  Read the outbox in a NEW statement afterwards."""
+
+        row = (
+            await self.session.execute(
+                select(*self._CLAIM_COLUMNS)
+                .where(CreditIngressClaim.id == claim_id)
+                .with_for_update(read=True)
+            )
+        ).one_or_none()
+        return None if row is None else self._claim_row(row)
+
+    async def insert_enforced_claim(
+        self,
+        *,
+        tenant_id: UUID,
+        builder_id: UUID | None,
+        principal_id: str,
+        idempotency_key: str,
+        interaction_id: UUID,
+        payload_sha256: str,
+        decision_version: int,
+    ) -> ClaimRow | None:
+        """Claim the key for an enforced execution; ``None`` on a conflict
+        (another request holds the key: re-read and answer by the table).
+
+        ``mode='enforced'``, ``session_version`` NULL and ``created_at =
+        clock_timestamp()`` -- the start of the first lease.  Call after the
+        tenant row ``FOR SHARE`` (lock order step 1).
+        """
+
+        row = (
+            await self.session.execute(
+                self._insert(CreditIngressClaim)
+                .values(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    builder_id=builder_id,
+                    source="events",
+                    principal_id=principal_id,
+                    idempotency_key=idempotency_key,
+                    provider_message_id=None,
+                    interaction_id=interaction_id,
+                    payload_sha256=payload_sha256,
+                    decision_version=decision_version,
+                    session_version=None,
+                    mode="enforced",
+                    created_at=self._clock(),
+                )
+                .on_conflict_do_nothing()
+                .returning(*self._CLAIM_COLUMNS)
+            )
+        ).one_or_none()
+        return None if row is None else self._claim_row(row)
+
+    async def _fenced_update(
+        self,
+        claim_id: UUID,
+        observed: datetime,
+        values: Mapping[str, Any],
+        *where: Any,
+        lease: timedelta,
+    ) -> bool:
+        """A fence that must still hold its lease: lock the row FIRST, then
+        judge the lease (HIGH-1).
+
+        The lease is NOT in the ``WHERE``: PostgreSQL evaluates a ``WHERE``
+        before waiting for the row lock and re-evaluates it after the wait
+        only if the holder UPDATED the row.  A reader holding the row ``FOR
+        SHARE`` changes nothing, so a predicate judged alive before the wait
+        would stand even after that reader saw the lease over and answered
+        ``event_failed``.  So the ``UPDATE`` pins only the identity (``id``,
+        ``created_at = :observed``, the phase) and ``RETURNING`` judges
+        ``clock_timestamp() < created_at + lease`` once the row is locked.
+        ``False`` -- no row, or the lease over -- and the caller rolls the
+        whole transaction back (this ``UPDATE`` with it).  SQLite: the same
+        judgement with the process clock (never going back) after the
+        statement.
+        """
+
+        if self._postgresql():
+            alive: Any = (self._clock() < CreditIngressClaim.created_at + lease).label(
+                "alive"
+            )
+        else:
+            alive = CreditIngressClaim.created_at.label("alive")
+        row = (
+            await self.session.execute(
+                update(CreditIngressClaim)
+                .where(
+                    CreditIngressClaim.id == claim_id,
+                    CreditIngressClaim.created_at == observed,
+                    *where,
+                )
+                .values(**values)
+                .returning(alive)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        if row is None:
+            return False
+        if self._postgresql():
+            return bool(row.alive)
+        return self._python_now() < _as_utc(observed) + lease
+
+    async def _claim_update(
+        self, claim_id: UUID, observed: datetime, values: Mapping[str, Any], *where: Any
+    ) -> datetime | None:
+        """One fenced single-row UPDATE; the row's ``created_at`` afterwards,
+        or ``None`` when the fence did not hold (zero rows)."""
+
+        conditions = [
+            CreditIngressClaim.id == claim_id,
+            CreditIngressClaim.created_at == observed,
+        ]
+        for condition in where:
+            if condition is False:  # a SQLite predicate already decided
+                return None
+            if condition is not True:
+                conditions.append(condition)
+        row = (
+            await self.session.execute(
+                update(CreditIngressClaim)
+                .where(*conditions)
+                .values(**values)
+                .returning(CreditIngressClaim.created_at)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        return None if row is None else row.created_at
+
+    async def take_over_claim(
+        self, claim_id: UUID, *, observed: datetime, lease: timedelta
+    ) -> datetime | None:
+        """Takeover, only before phase 1: a new lease (``created_at =
+        clock_timestamp()``) when the observed one expired and phase 1 never
+        committed.  The new ``created_at`` (the next ``:observed``), or
+        ``None`` when another executor changed the row first.  Its lease
+        predicate may stay in the ``WHERE``: "expired" stays true while the
+        statement waits for a lock, and a holder that changed the row (the
+        marker, another takeover) makes PostgreSQL re-check it."""
+
+        if self._postgresql():
+            expired: Any = self._clock() >= CreditIngressClaim.created_at + lease
+        else:
+            expired = self._python_now() >= _as_utc(observed) + lease
+        return await self._claim_update(
+            claim_id,
+            observed,
+            {"created_at": self._clock()},
+            CreditIngressClaim.session_version.is_(None),
+            expired,
+        )
+
+    async def mark_claim_phase1(
+        self,
+        claim_id: UUID,
+        *,
+        observed: datetime,
+        session_version: int,
+        lease: timedelta,
+    ) -> bool:
+        """The phase 1 marker -- the LAST statement of phase 1: ``True`` only
+        when this executor still holds the lease it observed, judged once the
+        row is locked (:meth:`_fenced_update`)."""
+
+        return await self._fenced_update(
+            claim_id,
+            observed,
+            {"session_version": session_version},
+            CreditIngressClaim.decision_version == 1,
+            CreditIngressClaim.session_version.is_(None),
+            lease=lease,
+        )
+
+    async def hold_claim_final_fence(
+        self,
+        claim_id: UUID,
+        *,
+        observed: datetime,
+        session_version: int,
+        lease: timedelta,
+    ) -> bool:
+        """The final check: ``UPDATE ... SET decision_version =
+        decision_version`` on the claim it observed, the lease judged once
+        the row is locked (:meth:`_fenced_update`).  The row lock is kept to
+        the commit, so a reader ``FOR SHARE`` waits for this transaction to
+        end; and a reader that held the row first, saw the lease over and
+        answered ``event_failed`` makes this check fail (HIGH-1)."""
+
+        return await self._fenced_update(
+            claim_id,
+            observed,
+            {"decision_version": CreditIngressClaim.decision_version},
+            CreditIngressClaim.session_version == session_version,
+            lease=lease,
+        )
+
+    async def release_claim_lease(
+        self,
+        claim_id: UUID,
+        *,
+        observed: datetime,
+        session_version: int | None,
+        lease: timedelta,
+    ) -> bool:
+        """A known failure expires the executor's own lease, through the same
+        fence: ``created_at = clock_timestamp() - lease``."""
+
+        phase = (
+            CreditIngressClaim.session_version.is_(None)
+            if session_version is None
+            else CreditIngressClaim.session_version == session_version
+        )
+        if self._postgresql():
+            expired: Any = func.clock_timestamp(type_=DateTime(timezone=True)) - lease
+        else:
+            expired = self._python_now() - lease
+        return (
+            await self._claim_update(claim_id, observed, {"created_at": expired}, phase)
+            is not None
+        )
+
+    async def lease_clock(self) -> datetime:
+        """The clock the claim fences use: PostgreSQL ``clock_timestamp()``,
+        the Python clock on SQLite (the same one its fences evaluate)."""
+
+        if not self._postgresql():
+            return self._python_now()
+        value = (await self.session.execute(select(self._clock()))).scalar_one()
+        return _as_utc(value)
+
+    async def set_local_lock_timeout(self, seconds: int) -> None:
+        """``SET LOCAL lock_timeout`` for the current transaction (PostgreSQL;
+        it dies with the commit or the rollback).  No-op on SQLite."""
+
+        if self._postgresql():
+            await self.session.execute(
+                text("SELECT set_config('lock_timeout', :value, true)"),
+                {"value": f"{int(seconds)}s"},
+            )
+
+    async def session_in_tenant(self, tenant_id: UUID, session_id: UUID) -> bool:
+        """Tenant-scoped ownership of a session: a plain read, no lock and no
+        ORM entity (the phase 1 lock reads the row afterwards)."""
+
+        found = (
+            await self.session.execute(
+                select(SessionRow.id).where(
+                    SessionRow.id == session_id, SessionRow.tenant_id == tenant_id
+                )
+            )
+        ).scalar_one_or_none()
+        return found is not None
+
+    async def insert_effect(
+        self,
+        *,
+        builder_id: UUID,
+        tenant_id: UUID | None,
+        effect_id: str,
+        effect_kind: str,
+        decision_digest: str | None,
+    ) -> bool:
+        """Append one effect with no ledger entry (an effect of zero, e.g.
+        ``trace_credit_pending``); ``True`` if inserted.  Needs the builder's
+        account (``ensure_account``) and the tenant row ``FOR SHARE``."""
+
+        inserted = (
+            await self.session.execute(
+                self._insert(CreditEffect)
+                .values(
+                    id=uuid4(),
+                    builder_id=builder_id,
+                    tenant_id=tenant_id,
+                    effect_id=effect_id,
+                    effect_kind=effect_kind,
+                    decision_digest=decision_digest,
+                )
+                .on_conflict_do_nothing(index_elements=["builder_id", "effect_id"])
+                .returning(CreditEffect.id)
+            )
+        ).scalar_one_or_none()
+        return inserted is not None
+
+    async def link_handoff_credit_effect(
+        self, *, tenant_id: UUID, handoff_id: UUID, effect_id: str
+    ) -> bool:
+        """``handoff_records.context = context || {"credit_effect_id": ...}``
+        for one handoff of the tenant (the record was written in this
+        transaction and detached by the handoff service)."""
+
+        context = HandoffRecord.context
+        merged: Any = (
+            context.op("||")(func.jsonb_build_object("credit_effect_id", effect_id))
+            if self._postgresql()
+            else func.json_set(context, "$.credit_effect_id", effect_id)
+        )
+        row = (
+            await self.session.execute(
+                update(HandoffRecord)
+                .where(
+                    HandoffRecord.tenant_id == tenant_id, HandoffRecord.id == handoff_id
+                )
+                .values(context=merged)
+                .returning(HandoffRecord.id)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        return row is not None
+
+    async def insert_response_outbox(
+        self,
+        *,
+        tenant_id: UUID,
+        effect_id: str,
+        payload: Mapping[str, Any],
+        state: str,
+    ) -> UUID:
+        """One response-outbox row, ``created_at = clock_timestamp()`` (the
+        ``DEFAULT now()`` is the transaction start).  Raises on a conflict:
+        one decision has one stored answer."""
+
+        row_id = uuid4()
+        await self.session.execute(
+            self._insert(CreditResponseOutbox).values(
+                id=row_id,
+                tenant_id=tenant_id,
+                effect_id=effect_id,
+                payload=dict(payload),
+                state=state,
+                attempts=0,
+                created_at=self._clock(),
+            )
+        )
+        return row_id
+
+    async def response_outbox_row(
+        self, tenant_id: UUID, effect_id: str
+    ) -> ResponseOutboxRow | None:
+        row = (
+            await self.session.execute(
+                select(
+                    CreditResponseOutbox.id,
+                    CreditResponseOutbox.payload,
+                    CreditResponseOutbox.state,
+                    CreditResponseOutbox.created_at,
+                ).where(
+                    CreditResponseOutbox.tenant_id == tenant_id,
+                    CreditResponseOutbox.effect_id == effect_id,
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        payload = row.payload if isinstance(row.payload, Mapping) else {}
+        return ResponseOutboxRow(
+            id=UUID(str(row.id)),
+            payload=payload,
+            state=str(row.state),
+            created_at=_as_utc(row.created_at),
+        )
 
     # -- global reads ----------------------------------------------------
 

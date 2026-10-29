@@ -5,6 +5,8 @@ Business logic for event processing and management.
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional, cast
 from uuid import UUID, uuid4
@@ -66,6 +68,18 @@ logger = get_logger(__name__)
 
 class SessionNotFoundError(ValueError):
     """The session is absent from the authorized tenant boundary."""
+
+
+@dataclass
+class GeneratedResponse:
+    """Phase 2's answer and its LLM accounting, before any write
+    (``EventService.generate_response``, the enforced credit path)."""
+
+    response: EventResponse
+    llm_usage: dict[str, int] = dataclass_field(default_factory=dict)
+    llm_model: str = ""
+    llm_attempts: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    llm_usage_total: dict[str, int] = dataclass_field(default_factory=dict)
 
 
 # These replies bypass the LLM when a handoff is required. Keep this mapping
@@ -1575,6 +1589,99 @@ class EventService:
         response.interaction_event_id = interaction_event_id
 
         return response
+
+    # ── Enforced phase 2 siblings (neurostack-credit-system Group 3b-1, M4) ──
+    # ``finish_response`` keeps its signature and its best-effort store write;
+    # the enforced credit path runs these two instead: the LLM with no write
+    # at all, then the bundle inside the caller's final transaction.
+
+    async def generate_response(
+        self,
+        request: CanonicalEventRequest,
+        result: "PipelineResult",
+        clinic_config: Optional[dict[str, Any]],
+        message_history: list[dict[str, str]],
+        *,
+        context: Optional[ResolvedInteractionContext] = None,
+    ) -> "GeneratedResponse":
+        """Phase 2's answer without any write: the LLM of
+        ``_convert_pipeline_result_to_response`` (outside every transaction).
+
+        ``interaction_event_id`` of the response stays ``None``: the enforced
+        caller sets it only after its final transaction committed the bundle.
+        """
+        _resolve_interaction_context(request, context)
+        (
+            response,
+            llm_usage,
+            llm_model,
+            llm_attempts,
+            llm_usage_total,
+        ) = await self._convert_pipeline_result_to_response(
+            result,
+            user_message=request.payload.content,
+            clinic_config=clinic_config,
+            tenant_id=request.tenant_id,
+            message_history=message_history,
+            active_language=result.response_language,
+        )
+        return GeneratedResponse(
+            response=response,
+            llm_usage=llm_usage,
+            llm_model=llm_model,
+            llm_attempts=llm_attempts,
+            llm_usage_total=llm_usage_total,
+        )
+
+    async def write_interaction_bundle(
+        self,
+        request: CanonicalEventRequest,
+        result: "PipelineResult",
+        generated: "GeneratedResponse",
+        *,
+        session: AsyncSession,
+        context: Optional[ResolvedInteractionContext] = None,
+        credit_effect_id: Optional[str] = None,
+    ) -> Optional[UUID]:
+        """Write the interaction's bundle in the caller's open transaction.
+
+        The transactional sibling of ``_save_events_to_store``: the same
+        rows (``build_interaction_event_bundle``) through ONE
+        ``EventStore.append_batch(events, session=session)``, which only
+        sends them -- the caller's commit makes them durable, its rollback
+        drops them -- and any failure RAISES (never swallowed: no decision is
+        charged without its bundle).  ``credit_effect_id`` lands in the
+        ``srm.decision`` row's metadata.  Returns the ``message.in`` id the
+        bundle carries (``context.interaction_event_id``; ``None`` for other
+        event types), valid only once the caller committed.
+        """
+        context = _resolve_interaction_context(request, context)
+        response = generated.response
+        suggested_response = (
+            response.prompt.suggested_response
+            if response.prompt and response.prompt.suggested_response
+            else None
+        )
+        events = build_interaction_event_bundle(
+            request,
+            result,
+            context,
+            suggested_response=suggested_response,
+            llm_usage=generated.llm_usage,
+            llm_model=generated.llm_model,
+            llm_attempts=generated.llm_attempts,
+            llm_usage_total=generated.llm_usage_total,
+        )
+        if credit_effect_id is not None:
+            for event in events:
+                if event.event_type == "srm.decision":
+                    event.event_metadata = {
+                        **(event.event_metadata or {}),
+                        "credit_effect_id": credit_effect_id,
+                    }
+        event_store = await get_event_store()
+        await event_store.append_batch(events, session=session)
+        return context.interaction_event_id
 
     async def process_event(
         self,

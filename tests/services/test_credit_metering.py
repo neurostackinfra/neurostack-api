@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import hashlib
 import inspect
 import json
@@ -1258,6 +1259,15 @@ def force_switch(monkeypatch: pytest.MonkeyPatch) -> Callable[[bool], None]:
         monkeypatch.setattr(CreditSwitch, "effective", lambda _self: effective)
 
     force(True)
+    # LOW-2: the app-level tests are not about the 250 ms budget (the budget
+    # tests call the writer directly, above); a loaded machine must not turn
+    # their writes into timeouts.  The route resolves the module attribute
+    # -- the forced plugin's counter included --, so it is wrapped.
+    monkeypatch.setattr(
+        credit_metering,
+        "record_observational_trace",
+        functools.partial(credit_metering.record_observational_trace, budget_seconds=5),
+    )
     return force
 
 
@@ -2141,3 +2151,243 @@ def _no_writer_leak(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         webhook._meta_initiate_file_handoff,
     )
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Group 3b-1: the enforced path's pure rules (the route and the fences run in
+# tests/api/test_events_credit_enforced.py and, under real concurrency, in
+# tests/integration/test_credit_metering_postgres.py).
+# ---------------------------------------------------------------------------
+
+
+def _claim_row(
+    *, started: datetime, session_version: int | None = None, mode: str = "enforced"
+) -> Any:
+    from src.repositories.credit import ClaimRow
+
+    return ClaimRow(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        builder_id=uuid4(),
+        principal_id="api_key:t",
+        interaction_id=uuid4(),
+        payload_sha256="a" * 64,
+        decision_version=1,
+        session_version=session_version,
+        mode=mode,
+        created_at=started,
+    )
+
+
+def _outbox(payload: dict[str, Any], created_at: datetime) -> Any:
+    from src.repositories.credit import ResponseOutboxRow
+
+    return ResponseOutboxRow(
+        id=uuid4(), payload=payload, state="delivered", created_at=created_at
+    )
+
+
+_NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
+_LEASE = timedelta(seconds=credit_metering.CLAIM_LEASE_SECONDS)
+
+
+@pytest.mark.parametrize(
+    ("started", "session_version", "may_take_over", "expected"),
+    [
+        # Claim without phase 1, within the lease: in progress, Retry-After 5.
+        (_NOW - timedelta(seconds=10), None, True, (409, "event_in_progress", 5)),
+        # ... with 2.2 s left: Retry-After 3 (whole seconds, rounded up).
+        (
+            _NOW - _LEASE + timedelta(seconds=2.2),
+            None,
+            True,
+            (409, "event_in_progress", 3),
+        ),
+        # Phase 1 committed, within the lease: in progress too.
+        (_NOW - timedelta(seconds=10), 4, True, (409, "event_in_progress", 5)),
+        # Phase 1 committed, lease over: FINAL event_failed, no Retry-After.
+        (_NOW - _LEASE - timedelta(seconds=1), 4, True, (409, "event_failed", None)),
+        # A fence loser never takes over: in progress, retry at once.
+        (
+            _NOW - _LEASE - timedelta(seconds=1),
+            None,
+            False,
+            (409, "event_in_progress", 1),
+        ),
+    ],
+)
+def test_the_claim_state_table_answers_each_window(
+    started: datetime,
+    session_version: int | None,
+    may_take_over: bool,
+    expected: tuple[int, str, int | None],
+) -> None:
+    claim = _claim_row(started=started, session_version=session_version)
+    answer = credit_metering._claim_state_answer(
+        claim, None, _NOW, may_take_over=may_take_over
+    )
+    assert isinstance(answer, credit_metering.ClaimAnswer)
+    status, code, retry_after = expected
+    assert (answer.status, answer.body["code"], answer.retry_after) == expected
+    if code == "event_failed":
+        assert answer.body == {
+            "code": code,
+            "interaction_id": str(claim.interaction_id),
+        }
+    else:
+        assert answer.body == {"code": code}
+
+
+def test_an_abandoned_claim_before_phase1_is_takeover_material() -> None:
+    claim = _claim_row(started=_NOW - _LEASE)
+    assert (
+        credit_metering._claim_state_answer(claim, None, _NOW, may_take_over=True)
+        is claim
+    )
+
+
+def test_a_decided_claim_replays_within_the_retention_then_is_a_duplicate() -> None:
+    claim = _claim_row(started=_NOW - timedelta(days=3), session_version=1)
+    retention = timedelta(hours=settings.credit_replay_retention_hours)
+    stored = {"event_id": str(uuid4()), "interaction_event_id": str(uuid4())}
+    fresh = credit_metering._claim_state_answer(
+        claim,
+        _outbox(stored, _NOW - retention + timedelta(seconds=1)),
+        _NOW,
+        may_take_over=False,
+    )
+    assert (fresh.status, fresh.body, fresh.replay) == (200, stored, True)
+    duplicate = {"code": "duplicate_event", "interaction_id": str(claim.interaction_id)}
+    for outbox in (_outbox(stored, _NOW - retention), _outbox({}, _NOW)):
+        late = credit_metering._claim_state_answer(
+            claim, outbox, _NOW, may_take_over=True
+        )
+        assert (late.status, late.body, late.replay) == (409, duplicate, False)
+
+
+def test_retry_after_is_whole_seconds_between_1_and_5() -> None:
+    assert credit_metering.RETRY_AFTER_MAX_SECONDS == 5
+    for remaining, expected in ((0.01, 1), (1.0, 1), (1.2, 2), (4.9, 5), (1e6, 5)):
+        assert credit_metering.retry_after_seconds(remaining) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, (None, "idempotency_key_required")),
+        ("", (None, "idempotency_key_invalid")),
+        ("a b", (None, "idempotency_key_invalid")),
+        ("ç", (None, "idempotency_key_invalid")),
+        ("k" * 256, (None, "idempotency_key_invalid")),
+        ("k" * 255, ("k" * 255, None)),
+        ("order-1:~!", ("order-1:~!", None)),
+    ],
+)
+def test_the_idempotency_key_rule(
+    raw: str | None, expected: tuple[str | None, str | None]
+) -> None:
+    assert credit_metering._validated_key(raw) == expected
+
+
+def test_the_enforced_constants_are_pinned() -> None:
+    assert credit_metering.CLAIM_LEASE_SECONDS == 1680
+    assert credit_metering.claim_lease() == timedelta(minutes=28)
+    assert credit_metering.PHASE1_LOCK_TIMEOUT_SECONDS == 15
+    assert credit_metering.ENFORCED_DECISION_VERSION == 1
+    assert credit_metering.CREDIT_PENDING_EFFECT_KIND == "trace_credit_pending"
+    assert credit_metering.NO_RESPONSE_EFFECT_KIND == "trace_no_response"
+    assert credit_metering.PAYLOAD_CONFLICT_LOG == "credit_payload_conflict"
+    assert credit_metering.replay_retention() == timedelta(
+        hours=settings.credit_replay_retention_hours
+    )
+
+
+def test_the_stored_answer_carries_the_committed_interaction_event_id() -> None:
+    from src.api.schemas.events import EventResponse
+
+    response = EventResponse.model_validate(
+        {
+            "event_id": str(uuid4()),
+            "decision": {
+                "intent": "agendar",
+                "intent_category": "scheduling",
+                "funnel_stage": "lead_novo",
+                "action": "responder",
+                "confidence": 0.9,
+                "safety_concern": False,
+                "needs_rag": False,
+                "handoff_required": False,
+            },
+            "state_patch": {},
+            "prompt": {"system": "s", "instructions": "i"},
+            "context": {},
+            "mode": "normal",
+            "processed_at": _NOW.isoformat(),
+            "processing_time_ms": 1,
+        }
+    )
+    interaction = uuid4()
+    payload = credit_metering.response_payload(response, interaction)
+    assert payload["interaction_event_id"] == str(interaction)
+    assert response.interaction_event_id is None  # the response is not mutated
+    assert payload == json.loads(
+        response.model_copy(
+            update={"interaction_event_id": interaction}
+        ).model_dump_json()
+    )
+
+
+def _scope(effective: bool, identity: Any = None) -> Any:
+    state: dict[str, Any] = {"credit_switch_effective": effective}
+    if identity is not None:
+        state["credit_identity"] = identity
+    return SimpleNamespace(scope={"state": state}, headers={})
+
+
+@pytest.mark.parametrize(
+    ("effective", "origin", "kind"),
+    [
+        (False, InteractionOrigin.PRODUCTION, "api_key"),  # the switch off
+        (True, InteractionOrigin.SIMULATOR, "jwt"),  # the panel
+        (True, InteractionOrigin.UNKNOWN, None),  # no proof
+    ],
+)
+async def test_only_a_production_request_with_the_switch_on_reads_the_enforcement(
+    effective: bool, origin: InteractionOrigin, kind: str | None
+) -> None:
+    tenant, session = uuid4(), uuid4()
+    context = build_interaction_context(
+        effective_tenant_id=tenant,
+        session_id=session,
+        origin=origin,
+        event_type="message.in",
+    )
+    identity = None
+    if kind == "api_key":
+        identity = credit_identity("api_key", tenant)
+    elif kind == "jwt":
+        identity = credit_identity("jwt", tenant, uuid4())
+    db = MagicMock(spec=AsyncSession)  # any statement would fail the test
+    db.execute.side_effect = AssertionError("credit_enforcement_at was read")
+    request = EventRequest.model_validate(
+        {
+            "session_id": str(session),
+            "event_type": "message.in",
+            "payload": {"content": "Olá", "channel": "whatsapp"},
+        }
+    )
+    canonical = CanonicalEventRequest(
+        tenant_id=tenant,
+        session_id=session,
+        event_type=request.event_type,
+        payload=request.payload,
+    )
+    verdict = await credit_metering.capture_events_enforcement(
+        _scope(effective, identity),  # type: ignore[arg-type]
+        db,
+        tenant=SimpleNamespace(authentication_mode="none"),
+        canonical_request=canonical,
+        context=context,
+    )
+    assert verdict is None
+    db.execute.assert_not_called()

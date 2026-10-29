@@ -9,9 +9,12 @@ and structured prompts for LLM response generation.
 Implements Task 13.0 - End-to-End Integration.
 """
 
+import json
+from contextlib import suppress
 from typing import Any, Optional
 from uuid import UUID
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,13 +36,31 @@ from src.api.schemas.events import (
     EventResponse,
     EventType,
 )
+from src.config.logging import get_logger
 from src.interaction_context import (
+    ResolvedInteractionContext,
     build_interaction_context,
     classify_interaction_origin,
 )
 from src.repositories import get_db_session_dependency
-from src.services import get_event_service
-from src.services.credit_metering import record_events_decision
+from src.services import credit_metering, get_event_service
+from src.services.credit_metering import (
+    CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
+    CREDIT_PENDING_CODE,
+    DUPLICATE_EVENT_CODE,
+    EVENT_FAILED_CODE,
+    EVENT_IN_PROGRESS_CODE,
+    IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_KEY_INVALID,
+    IDEMPOTENCY_KEY_REQUIRED,
+    PAYLOAD_CONFLICT_CODE,
+    RETRY_AFTER_MAX_SECONDS,
+    ClaimAnswer,
+    CreditEnforcementUnavailable,
+    CreditTenantGone,
+    EventsEnforcement,
+    record_events_decision,
+)
 from src.services.event_service import SessionNotFoundError
 from src.services.handoff_service import (
     dispatch_committed_handoff_webhooks,
@@ -52,6 +73,15 @@ router = APIRouter()
 # ``EventRequest`` body, its ``payload`` or ``payload.metadata``.
 RESERVED_INTERACTION_ORIGIN_FIELD = "interaction_origin"
 INTERACTION_ORIGIN_SERVER_MANAGED = "interaction_origin_server_managed"
+
+
+def _credit_code_schema(*codes: str) -> dict[str, Any]:
+    """The body of a credit answer: ``{"code": ...}`` (top level)."""
+    return {
+        "type": "object",
+        "required": ["code"],
+        "properties": {"code": {"type": "string", "enum": list(codes)}},
+    }
 
 
 def _client_sent_interaction_origin(raw_body: object) -> bool:
@@ -79,21 +109,43 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
         "model": EventResponse,
     },
     400: {
-        "description": "Invalid request payload",
-        "model": ErrorResponse,
+        "description": (
+            "Invalid request payload; or, once credits are enforced, a "
+            "production (API key) event without a usable `Idempotency-Key` "
+            "(`idempotency_key_required` when absent, `idempotency_key_invalid` "
+            "when empty, longer than 255 characters or not visible ASCII)"
+        ),
         "content": {
             "application/json": {
-                "example": {
-                    "error": "validation_error",
-                    "message": "Invalid request payload",
-                    "details": [
-                        {
-                            "field": "payload.content",
-                            "message": "Content is required",
-                            "code": "value_error.missing",
+                "schema": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/ErrorResponse"},
+                        _credit_code_schema(
+                            IDEMPOTENCY_KEY_REQUIRED, IDEMPOTENCY_KEY_INVALID
+                        ),
+                    ]
+                },
+                "examples": {
+                    "validation_error": {
+                        "value": {
+                            "error": "validation_error",
+                            "message": "Invalid request payload",
+                            "details": [
+                                {
+                                    "field": "payload.content",
+                                    "message": "Content is required",
+                                    "code": "value_error.missing",
+                                }
+                            ],
                         }
-                    ],
-                }
+                    },
+                    IDEMPOTENCY_KEY_REQUIRED: {
+                        "value": {"code": IDEMPOTENCY_KEY_REQUIRED}
+                    },
+                    IDEMPOTENCY_KEY_INVALID: {
+                        "value": {"code": IDEMPOTENCY_KEY_INVALID}
+                    },
+                },
             }
         },
     },
@@ -130,6 +182,20 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
             }
         },
     },
+    402: {
+        "description": (
+            "Credits are enforced and the clinic cannot be charged yet "
+            "(`credit_pending`: a clinic without a builder account, or a "
+            "builder whose payment is in quarantine). No LLM runs and nothing "
+            "is recorded; the rate-limit slot stays consumed."
+        ),
+        "content": {
+            "application/json": {
+                "schema": _credit_code_schema(CREDIT_PENDING_CODE),
+                "example": {"code": CREDIT_PENDING_CODE},
+            }
+        },
+    },
     404: {
         "description": "Tenant or session not found",
         "model": ErrorResponse,
@@ -139,6 +205,67 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
                     "error": "not_found",
                     "message": "Session not found",
                 }
+            }
+        },
+    },
+    409: {
+        "description": (
+            "Credits are enforced and this `Idempotency-Key` was already used: "
+            "`payload_conflict` (a different event under the same key), "
+            "`duplicate_event` (claimed before the enforcement, or its stored "
+            "answer is past the replay retention), `event_in_progress` (being "
+            "decided now; retry after `Retry-After` seconds, never more than "
+            f"{RETRY_AFTER_MAX_SECONDS}) or `event_failed` (its decision "
+            "started and can no longer finish; final, never re-executed). "
+            "A decided key within the retention replays the original 200."
+        ),
+        "headers": {
+            "Retry-After": {
+                "description": (
+                    "Only with `event_in_progress`: whole seconds, at most "
+                    f"{RETRY_AFTER_MAX_SECONDS}."
+                ),
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": RETRY_AFTER_MAX_SECONDS,
+                },
+            }
+        },
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["code"],
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "enum": [
+                                PAYLOAD_CONFLICT_CODE,
+                                DUPLICATE_EVENT_CODE,
+                                EVENT_IN_PROGRESS_CODE,
+                                EVENT_FAILED_CODE,
+                            ],
+                        },
+                        "interaction_id": {"type": "string", "format": "uuid"},
+                    },
+                },
+                "examples": {
+                    PAYLOAD_CONFLICT_CODE: {"value": {"code": PAYLOAD_CONFLICT_CODE}},
+                    DUPLICATE_EVENT_CODE: {
+                        "value": {
+                            "code": DUPLICATE_EVENT_CODE,
+                            "interaction_id": "e5f6a7b8-c9d0-1234-ef01-345678901234",
+                        }
+                    },
+                    EVENT_IN_PROGRESS_CODE: {"value": {"code": EVENT_IN_PROGRESS_CODE}},
+                    EVENT_FAILED_CODE: {
+                        "value": {
+                            "code": EVENT_FAILED_CODE,
+                            "interaction_id": "e5f6a7b8-c9d0-1234-ef01-345678901234",
+                        }
+                    },
+                },
             }
         },
     },
@@ -205,6 +332,20 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
         "description": "Internal server error",
         "model": ErrorResponse,
     },
+    503: {
+        "description": (
+            "Credits are enforced and this server can no longer read the "
+            "enforcement state (`credit_enforcement_unavailable`): a "
+            "production (API key) event is refused rather than served free. "
+            "Retry later; panel (JWT) callers are never refused."
+        ),
+        "content": {
+            "application/json": {
+                "schema": _credit_code_schema(CREDIT_ENFORCEMENT_UNAVAILABLE_CODE),
+                "example": {"code": CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+            }
+        },
+    },
 }
 
 
@@ -249,6 +390,24 @@ here to receive structured cognitive decisions.
     responses=RESPONSES_PROCESS_EVENT,
     tags=["Events"],
     openapi_extra={
+        "parameters": [
+            {
+                "name": IDEMPOTENCY_KEY_HEADER,
+                "in": "header",
+                "required": False,
+                "description": (
+                    "Client-chosen key of this event (1 to 255 visible ASCII "
+                    "characters). Optional today; once credits are enforced it "
+                    "is REQUIRED for production (API key) callers -- absent: "
+                    "400 `idempotency_key_required`; empty, too long or not "
+                    "visible ASCII: 400 `idempotency_key_invalid` -- and a "
+                    "retry with the same key never charges twice: it replays "
+                    "the stored 200 or answers 409. Panel (JWT) callers never "
+                    "need it."
+                ),
+                "schema": {"type": "string", "minLength": 1, "maxLength": 255},
+            }
+        ],
         "x-code-samples": [
             {
                 "lang": "curl",
@@ -293,7 +452,7 @@ decision = response.json()
 # decision["prompt"]["system"]     # System prompt for LLM
 """,
             },
-        ]
+        ],
     },
 )
 async def process_event(
@@ -341,6 +500,36 @@ async def process_event(
     )
 
     service = get_event_service()
+
+    # Credits (neurostack-credit-system Group 3b-1): read credit_enforcement_at
+    # once, only for a production request that captured the switch on; when it
+    # is set the request runs the enforced path end to end.  Otherwise this is
+    # main's path below (and the Group 3a observational writer).
+    try:
+        enforcement = await credit_metering.capture_events_enforcement(
+            http_request,
+            db,
+            tenant=tenant,
+            canonical_request=canonical_request,
+            context=context,
+        )
+    except CreditEnforcementUnavailable:
+        # D1: this process saw the enforcement set (it is one-way) and can no
+        # longer read it -- never main's free path; the slot stays consumed.
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"code": CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+    if enforcement is not None:
+        return await _process_enforced_event(
+            enforcement,
+            http_request=http_request,
+            tenant=tenant,
+            db=db,
+            service=service,
+            canonical_request=canonical_request,
+            context=context,
+        )
 
     # ── Phase 1: fast DB work (load state → pipeline → flush state) ──────────
     # Any exception here rolls back the transaction so nothing is left dirty.
@@ -446,6 +635,322 @@ async def process_event(
         response=response,
     )
     return response
+
+
+# ============================================
+# Enforced credits (neurostack-credit-system Group 3b-1)
+# ============================================
+
+
+class _StoredAnswerResponse(JSONResponse):
+    """The 200 of an enforced decision -- the original and every replay.
+
+    Serialized with sorted keys: the stored payload is JSONB on PostgreSQL,
+    which keeps no key order, so this is what makes a replay byte-identical
+    to the original answer (LOW-7).
+    """
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+
+def _claim_answer(answer: ClaimAnswer) -> JSONResponse:
+    if answer.replay:
+        return _StoredAnswerResponse(
+            status_code=status.HTTP_200_OK, content=dict(answer.body)
+        )
+    headers = (
+        None if answer.retry_after is None else {"Retry-After": str(answer.retry_after)}
+    )
+    return JSONResponse(
+        status_code=answer.status, content=dict(answer.body), headers=headers
+    )
+
+
+async def _session_mismatch(
+    http_request: Request, tenant: TenantContext, db: AsyncSession
+) -> JSONResponse:
+    """Main's 403 ``tenant_identity_mismatch`` -- the one answer that gives the
+    rate-limit slot back."""
+    await db.rollback()
+    http_request.state.rate_limit_refund = True
+    audit_tenant_identity_mismatch(
+        request_id=getattr(http_request.state, "request_id", None),
+        route=http_request.url.path,
+        method=http_request.method,
+        authentication_mode=tenant.authentication_mode,
+        authenticated_tenant=tenant.tenant_id,
+        claimed_tenant=None,
+    )
+    return tenant_identity_mismatch_response()
+
+
+async def _process_enforced_event(
+    enforcement: EventsEnforcement,
+    *,
+    http_request: Request,
+    tenant: TenantContext,
+    db: AsyncSession,
+    service: Any,
+    canonical_request: CanonicalEventRequest,
+    context: ResolvedInteractionContext,
+) -> JSONResponse:
+    """``POST /v1/events`` once credits are enforced (production only).
+
+    Answers in the pinned order (MEDIUM-1): 400 ``Idempotency-Key`` -> 403
+    session ownership (plain read; the slot comes back) -> the claim's
+    table (200 replay / 409) -> 402 ``credit_pending`` (nothing written, no
+    LLM, the slot stays consumed) -> claim insert or takeover -> phase 1 ->
+    LLM -> final transaction.  ``ensure_account`` and the claim are never
+    written before the session ownership is proved.
+    """
+    if enforcement.key_problem is not None:
+        return JSONResponse(status_code=400, content={"code": enforcement.key_problem})
+    try:
+        if not await credit_metering.session_in_tenant(db, enforcement):
+            return await _session_mismatch(http_request, tenant, db)
+        verdict = await credit_metering.read_events_claim(db, enforcement)
+        if isinstance(verdict, ClaimAnswer):
+            return _claim_answer(verdict)
+        precheck = await credit_metering.precheck_events(db, enforcement)
+        if precheck == "tenant_gone":
+            return await _session_mismatch(http_request, tenant, db)
+        if precheck == "credit_pending":
+            return JSONResponse(status_code=402, content={"code": CREDIT_PENDING_CODE})
+        leased = await credit_metering.acquire_events_claim(
+            db, enforcement, takeover=verdict
+        )
+    except CreditTenantGone:
+        return await _session_mismatch(http_request, tenant, db)
+    except Exception as error:
+        # Every step above ran in its own short transaction, rolled back on
+        # failure: nothing partial is left (no account, no claim).
+        await db.rollback()
+        get_logger(__name__).error(
+            "Credit pre-check failed in enforced process_event (no LLM called)",
+            tenant_id=str(canonical_request.tenant_id),
+            session_id=str(canonical_request.session_id),
+            error=str(error),
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Credit check failed",
+        )
+    if isinstance(leased, ClaimAnswer):
+        return _claim_answer(leased)
+
+    try:
+        return await _run_enforced_decision(
+            enforcement,
+            leased,
+            http_request=http_request,
+            tenant=tenant,
+            db=db,
+            service=service,
+            canonical_request=canonical_request,
+            context=context,
+        )
+    finally:
+        # The phase 1 handoff is announced only after the END of the final
+        # transaction (commit or rollback), never holding it nor the lease;
+        # best effort: a delivery error never changes the answer (MEDIUM-2).
+        try:
+            await dispatch_committed_handoff_webhooks(db)
+        except Exception as error:
+            record_handoff_post_commit_dispatch_failure(
+                error,
+                owner="events",
+                tenant_id=canonical_request.tenant_id,
+                session_id=canonical_request.session_id,
+            )
+
+
+async def _release_on_cancellation(
+    db: AsyncSession,
+    enforcement: EventsEnforcement,
+    leased: credit_metering.ClaimLease,
+    *,
+    session_version: Optional[int],
+) -> None:
+    """LOW-1: a cancellation is a known failure too.  In this stack a client
+    disconnect does not cancel the endpoint; a forced shutdown or a harness
+    cancelling the request task does.  End the route's transaction and
+    release the lease so the key is not blocked for the whole lease, inside
+    a shielded cancel scope: Starlette's task groups re-deliver the
+    cancellation at every await (level-triggered), and the shield lets the
+    release run to its end once, without re-awaiting in a loop.  The caller
+    re-raises.  Its own errors are only logged (by ``release_events_lease``).
+    """
+
+    with anyio.CancelScope(shield=True):
+        with suppress(Exception):
+            await db.rollback()
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=session_version
+        )
+
+
+async def _run_enforced_decision(
+    enforcement: EventsEnforcement,
+    leased: credit_metering.ClaimLease,
+    *,
+    http_request: Request,
+    tenant: TenantContext,
+    db: AsyncSession,
+    service: Any,
+    canonical_request: CanonicalEventRequest,
+    context: ResolvedInteractionContext,
+) -> JSONResponse:
+    logger = get_logger(__name__)
+    log_fields = {
+        "tenant_id": str(canonical_request.tenant_id),
+        "session_id": str(canonical_request.session_id),
+        "interaction_id": str(leased.interaction_id),
+    }
+
+    async def run_pipeline() -> Any:
+        return await service.run_pipeline(
+            canonical_request, session=db, context=context
+        )
+
+    # ── Phase 1 (route session; the marker is its last statement) ──────────
+    try:
+        phase1 = await credit_metering.run_enforced_phase1(
+            db, enforcement, leased, run_pipeline=run_pipeline
+        )
+    except (SessionNotFoundError, CreditTenantGone):
+        await db.rollback()
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=None
+        )
+        return await _session_mismatch(http_request, tenant, db)
+    except HTTPException:
+        await db.rollback()
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=None
+        )
+        raise
+    except Exception as error:
+        await db.rollback()
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=None
+        )
+        logger.error(
+            "Pipeline error in enforced process_event (phase 1 — no LLM called)",
+            error=str(error),
+            error_type=type(error).__name__,
+            exc_info=True,
+            **log_fields,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pipeline processing failed",
+        )
+    except BaseException:  # cancelled: release before it propagates (LOW-1)
+        await _release_on_cancellation(db, enforcement, leased, session_version=None)
+        raise
+    if phase1 is None:  # lost the phase 1 fence: everything rolled back
+        return _claim_answer(await credit_metering.reread_events_claim(db, enforcement))
+
+    # ── The LLM, outside every transaction ──────────────────────────────────
+    try:
+        generated = await service.generate_response(
+            canonical_request,
+            phase1.result,
+            phase1.clinic_config,
+            phase1.message_history,
+            context=context,
+        )
+    except HTTPException:
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=phase1.session_version
+        )
+        raise
+    except Exception as error:
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=phase1.session_version
+        )
+        logger.error(
+            "Error in enforced process_event phase 2 (LLM)",
+            error=str(error),
+            error_type=type(error).__name__,
+            exc_info=True,
+            **log_fields,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Response generation failed",
+        )
+    except BaseException:  # cancelled: release before it propagates (LOW-1)
+        await _release_on_cancellation(
+            db, enforcement, leased, session_version=phase1.session_version
+        )
+        raise
+
+    # ── Final transaction: bundle, effect, stored answer, fence ─────────────
+    async def write_bundle(credit_effect_id: Optional[str]) -> Optional[UUID]:
+        written: Optional[UUID] = await service.write_interaction_bundle(
+            canonical_request,
+            phase1.result,
+            generated,
+            session=db,
+            context=context,
+            credit_effect_id=credit_effect_id,
+        )
+        return written
+
+    try:
+        final = await credit_metering.run_enforced_final(
+            db,
+            enforcement,
+            leased,
+            phase1,
+            response=generated.response,
+            write_bundle=write_bundle,
+        )
+    except CreditTenantGone:
+        await db.rollback()
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=phase1.session_version
+        )
+        return await _session_mismatch(http_request, tenant, db)
+    except Exception as error:
+        await db.rollback()
+        await credit_metering.release_events_lease(
+            db, enforcement, leased, session_version=phase1.session_version
+        )
+        logger.error(
+            "Final transaction failed in enforced process_event",
+            error=str(error),
+            error_type=type(error).__name__,
+            exc_info=True,
+            **log_fields,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Decision persistence failed",
+        )
+    except BaseException:  # cancelled: release before it propagates (LOW-1)
+        await _release_on_cancellation(
+            db, enforcement, leased, session_version=phase1.session_version
+        )
+        raise
+    if final is None:  # lost the final fence: no bundle, no debit
+        return _claim_answer(await credit_metering.reread_events_claim(db, enforcement))
+    # The stored answer IS the answer (replay-identical, interaction_event_id
+    # set only now that the bundle is committed).
+    return _StoredAnswerResponse(
+        status_code=status.HTTP_200_OK, content=dict(final.payload)
+    )
 
 
 @router.get(

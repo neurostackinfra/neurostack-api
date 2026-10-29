@@ -1,6 +1,6 @@
 {
   "schema_version": "credit_dominance_corpus.v1",
-  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key), and no case triggers a synchronous handoff (D6).",
+  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run.",
   "masked_fields": [
     "event_id",
     "timestamp",
@@ -475,6 +475,57 @@
         "text": {"message": "Quais são os horários de atendimento?"},
         "momment": 1761480000000,
         "senderName": "Paciente Z"
+      }
+    },
+    {
+      "id": "events-api-key-enforced-decision",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "credit-dominance-enforced-1"},
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Vocês atendem aos sábados?",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-enforced-retry",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "credit-dominance-enforced-1"},
+      "json": {
+        "session_id": "{api_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Vocês atendem aos sábados?",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
+      }
+    },
+    {
+      "id": "events-api-key-handoff",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "credit-dominance-handoff-1"},
+      "json": {
+        "session_id": "{handoff_session}",
+        "event_type": "message.in",
+        "payload": {
+          "content": "Quero falar com um atendente humano",
+          "channel": "whatsapp",
+          "user_id": "credit-dominance-user"
+        }
       }
     }
   ]

@@ -26,7 +26,16 @@ store crosses runs, and every run starts from a clone of one seeded template.
   trace (origin and ``authenticated`` set, anchored on the claim or the
   public ``event_id``), while the answers and the stored events stay equal
   to the config-off run.  ``POST /v1/events`` without ``Idempotency-Key`` is
-  accepted; no corpus case triggers a synchronous handoff (D6).
+  accepted.
+* Group 3b-1: the corpus carries ``POST /v1/events`` cases with an
+  ``Idempotency-Key``, one of them a synchronous phase 1 handoff (on
+  PostgreSQL since #145/#146).  Before the enforcement they answer like the
+  config-off run (no enforced sibling runs).  With ``credit_enforcement_at``
+  set: config off answers and stores exactly like ``main`` and touches no
+  ``credit_*`` table; config on enforces -- production without a key is 400,
+  each keyed production decision is charged once with its stored answer (a
+  retry replays it), the phase 1 handoff carries its ``credit_effect_id``,
+  and simulator and webhook traffic answer like the config-off run, free.
 * In one process, the background refresh turns the switch on after
   ``upgrade 037 -> 038`` and off again after the downgrade, each within one
   interval, while requests keep answering.
@@ -123,6 +132,9 @@ class _World:
     uazapi_instance: str
     evolution_tenant: str
     evolution_instance: str
+    # Group 3b-1: a session of the API-key tenant that only the synchronous
+    # handoff case uses, so its answer does not depend on the earlier turns.
+    handoff_session: str
 
     @classmethod
     def generate(cls) -> "_World":
@@ -153,6 +165,7 @@ class _World:
             uazapi_instance=f"credit-uazapi-{uuid4().hex[:8]}",
             evolution_tenant=str(uuid4()),
             evolution_instance=f"credit-evolution-{uuid4().hex[:8]}",
+            handoff_session=str(uuid4()),
         )
 
     def known_ids(self) -> set[str]:
@@ -218,6 +231,7 @@ async def _seed_world(url: Any, world: _World) -> None:
             database.add_all(
                 [
                     session(world.api_session, world.api_tenant),
+                    session(world.handoff_session, world.api_tenant),
                     session(world.jwt_session, world.jwt_tenant),
                     ClinicConfigTable(
                         tenant_id=UUID(world.meta_tenant),
@@ -503,9 +517,51 @@ async def _metering_rows(connection: Any) -> dict[str, list[dict[str, Any]]]:
     return rows
 
 
+async def _ledger_rows(connection: Any) -> dict[str, list[dict[str, Any]]]:
+    """Group 3b-1: what the enforced path wrote (effects, ledger, stored
+    answers) and the handoffs' ``credit_effect_id``."""
+
+    from sqlalchemy import text
+
+    queries = {
+        "credit_effects": (
+            "SELECT tenant_id, builder_id, effect_id, effect_kind, "
+            "decision_digest FROM credit_effects ORDER BY effect_id"
+        ),
+        "credit_ledger_entries": (
+            "SELECT builder_id, entry_type, amount_mc, effect_id "
+            "FROM credit_ledger_entries ORDER BY effect_id, entry_type"
+        ),
+        "credit_response_outbox": (
+            "SELECT tenant_id, effect_id, state, payload "
+            "FROM credit_response_outbox ORDER BY effect_id"
+        ),
+        "handoff_records": (
+            "SELECT tenant_id, session_id, context ->> 'credit_effect_id' "
+            "AS credit_effect_id FROM handoff_records ORDER BY id"
+        ),
+    }
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for table, sql in queries.items():
+        result = await connection.execute(text(sql))
+        rows[table] = [
+            {
+                key: value if key == "payload" else _plain(value)
+                for key, value in row._mapping.items()
+            }
+            for row in result
+        ]
+    return rows
+
+
 async def _read_back(
     database_url: str,
-) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, list[dict[str, Any]]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, int],
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+]:
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
@@ -549,9 +605,10 @@ async def _read_back(
                 for name in tables
             }
             metering = await _metering_rows(connection) if tables else {}
+            ledger = await _ledger_rows(connection) if tables else {}
     finally:
         await engine.dispose()
-    return events, credit_rows, metering
+    return events, credit_rows, metering, ledger
 
 
 async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
@@ -599,7 +656,7 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
                         )
             finally:
                 event.remove(engine, "before_cursor_execute", record)
-    events, credit_rows, metering = await _read_back(spec["database_url"])
+    events, credit_rows, metering, ledger = await _read_back(spec["database_url"])
     return {
         "reading": asdict(reading),
         "responses": responses,
@@ -607,6 +664,7 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
         "statements": statements,
         "credit_rows": credit_rows,
         "metering": metering,
+        "ledger": ledger,
     }
 
 
@@ -692,7 +750,7 @@ class _Oracle:
     templates: dict[str, str]
     created: list[str]
     workdir: Path
-    runs: dict[tuple[str, bool], dict[str, Any]]
+    runs: dict[tuple[str, bool, bool], dict[str, Any]]
 
     async def clone(self, revision: str) -> str:
         name = f"neurostack_asaas_smoke_{uuid4().hex[:12]}"
@@ -710,11 +768,38 @@ class _Oracle:
         await _drop_child(self.admin, name)
         self.created.remove(name)
 
-    async def run(self, revision: str, enabled: bool) -> dict[str, Any]:
-        key = (revision, enabled)
+    async def enforce(self, name: str) -> None:
+        """Group 3b-1: set ``credit_enforcement_at`` in a ``038`` clone."""
+
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        engine = create_async_engine(
+            self.admin_url.set(database=name), poolclass=NullPool
+        )
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO credit_enforcement_state (id, "
+                        "credit_enforcement_at, set_by, set_at) VALUES (1, "
+                        "clock_timestamp() - interval '1 minute', "
+                        "'credit-dominance', clock_timestamp())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    async def run(
+        self, revision: str, enabled: bool, *, enforced: bool = False
+    ) -> dict[str, Any]:
+        key = (revision, enabled, enforced)
         if key not in self.runs:
             name = await self.clone(revision)
             try:
+                if enforced:
+                    await self.enforce(name)
                 self.runs[key] = await _run_in_subprocess(
                     self.admin_url.set(database=name),
                     self.world,
@@ -892,6 +977,10 @@ async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
         assert status[accepted] == 200, (accepted, body[accepted])
         assert body[accepted].get("replied") is True, (accepted, body[accepted])
     assert run["events"], "the accepted requests stored no event"
+    # Group 3b-1: a synchronous phase 1 handoff on PostgreSQL (#145/#146).
+    assert status["events-api-key-handoff"] == 200
+    assert body["events-api-key-handoff"]["handoff_summary"] is not None
+    assert status["events-api-key-enforced-retry"] == 200
 
 
 async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None:
@@ -1001,8 +1090,13 @@ async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
 
     # API key: one claim for the key (the retry reused it), one trace per
     # other accepted event, anchored on its public event_id.
-    [key_claim] = [c for c in claims if c["source"] == "events"]
-    assert key_claim["idempotency_key"] == "credit-dominance-key-1"
+    keyed = {c["idempotency_key"]: c for c in claims if c["source"] == "events"}
+    assert set(keyed) == {
+        "credit-dominance-key-1",
+        "credit-dominance-enforced-1",
+        "credit-dominance-handoff-1",
+    }
+    key_claim = keyed["credit-dominance-key-1"]
     assert key_claim["principal_id"] == f"api_key:{world.api_tenant}"
     assert key_claim["builder_id"] == world.builder
     assert key_claim["mode"] == "observational"
@@ -1017,8 +1111,18 @@ async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
             key_claim["interaction_id"],
             _event_id(run, "events-api-key-invalid-idempotency-key"),
             _event_id(run, "events-api-key-session-start"),
+            keyed["credit-dominance-enforced-1"]["interaction_id"],
+            keyed["credit-dominance-handoff-1"]["interaction_id"],
         ]
     )
+    # Group 3b-1 cases before the enforcement: observational claims anchored
+    # on the first execution (the retry reused it), the handoff too.
+    for key, case in (
+        ("credit-dominance-enforced-1", "events-api-key-enforced-decision"),
+        ("credit-dominance-handoff-1", "events-api-key-handoff"),
+    ):
+        assert keyed[key]["mode"] == "observational"
+        assert keyed[key]["interaction_id"] == _event_id(run, case)
     assert {(e["origin"], e["authenticated"], e["would_debit_mc"]) for e in api} == {
         ("production", True, 1_000)
     }
@@ -1067,6 +1171,146 @@ async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
         world.uazapi_tenant,
         world.evolution_tenant,
     }
+
+
+# ---------------------------------------------------------------------------
+# Group 3b-1: the corpus with ``credit_enforcement_at`` set.
+# ---------------------------------------------------------------------------
+
+# Production (API key) cases the enforcement answers differently: no usable
+# ``Idempotency-Key`` is a 400 before anything else (MEDIUM-1).
+_KEYLESS = {
+    "events-api-key-scheduling": "idempotency_key_required",
+    "events-api-key-second-turn": "idempotency_key_required",
+    "events-api-key-cross-tenant-session": "idempotency_key_required",
+    "events-api-key-invalid-idempotency-key": "idempotency_key_invalid",
+    "events-api-key-session-start": "idempotency_key_required",
+}
+# Each keyed production decision, charged once ...
+_CHARGED = {
+    "credit-dominance-key-1": "events-api-key-idempotency-key",
+    "credit-dominance-enforced-1": "events-api-key-enforced-decision",
+    "credit-dominance-handoff-1": "events-api-key-handoff",
+}
+# ... and its retry, which replays the stored answer.
+_REPLAYS = {
+    "events-api-key-idempotency-retry": "events-api-key-idempotency-key",
+    "events-api-key-enforced-retry": "events-api-key-enforced-decision",
+}
+
+
+def _without_credit_effect_id(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(row.get("event_metadata") or {})
+    metadata.pop("credit_effect_id", None)
+    return {**row, "event_metadata": metadata}
+
+
+async def test_with_the_config_off_an_enforced_database_answers_like_main(
+    oracle: _Oracle,
+) -> None:
+    """``credit_enforcement_at`` set but the switch off: ``main`` exactly,
+    no SQL touches a ``credit_*`` table, nothing is claimed or charged."""
+
+    off = await oracle.run("038", enabled=False)
+    enforced = await oracle.run("038", enabled=False, enforced=True)
+
+    assert enforced["reading"] == off["reading"]
+    _assert_same(enforced, off, oracle.world)
+    assert [s for s in enforced["statements"] if _CREDIT_SQL.search(s)] == []
+    assert {
+        table: count for table, count in enforced["credit_rows"].items() if count
+    } == {"credit_enforcement_state": 1}
+
+
+async def test_the_enforced_run_charges_each_production_decision_once(
+    oracle: _Oracle,
+) -> None:
+    off = await oracle.run("038", enabled=False)
+    run = await oracle.run("038", enabled=True, enforced=True)
+    world = oracle.world
+
+    assert run["reading"]["effective"] is True
+    answers = {r["id"]: r for r in run["responses"]}
+    for case, code in _KEYLESS.items():
+        assert (answers[case]["status"], answers[case]["body"]) == (
+            400,
+            {"code": code},
+        ), case
+    for case in _CHARGED.values():
+        assert answers[case]["status"] == 200, (case, answers[case]["body"])
+    for retry, first in _REPLAYS.items():
+        assert answers[retry]["status"] == 200
+        assert answers[retry]["body"] == answers[first]["body"]  # replayed
+    assert answers["events-api-key-handoff"]["body"]["handoff_summary"]
+
+    # Everything else -- the panel JWT (simulator), rejected requests and
+    # the provider webhooks -- answers like the config-off run.
+    production = set(_KEYLESS) | set(_REPLAYS) | set(_CHARGED.values())
+    expected, actual = _comparable(off, world), _comparable(run, world)
+    for want, got in zip(expected["responses"], actual["responses"], strict=True):
+        if got["id"] not in production:
+            assert got == want, got["id"]
+    # The handoff runs on a session of its own: its enforced answer and its
+    # stored events are main's (plus the srm.decision's credit_effect_id).
+    [want] = [r for r in expected["responses"] if r["id"] == "events-api-key-handoff"]
+    [got] = [r for r in actual["responses"] if r["id"] == "events-api-key-handoff"]
+    assert got == want
+
+    def handoff_events(source: dict[str, Any]) -> list[str]:
+        rows = [
+            _without_credit_effect_id(row)
+            for row in source["events"]
+            if row["session_id"] == world.handoff_session
+        ]
+        return _comparable({"responses": [], "events": rows}, world)["events"]
+
+    assert handoff_events(run) == handoff_events(off) != []
+
+    claims = run["metering"]["credit_ingress_claims"]
+    keyed = {c["idempotency_key"]: c for c in claims}
+    # Only the enforced claims: no observational claim or trace once the
+    # enforcement is set (the writer stands down), none for the simulator.
+    assert set(keyed) == set(_CHARGED) and len(claims) == len(_CHARGED)
+    assert {(c["mode"], c["source"], c["tenant_id"]) for c in claims} == {
+        ("enforced", "events", world.api_tenant)
+    }
+    assert all(c["session_version"] is not None for c in claims)
+    assert run["metering"]["credit_observational_effects"] == []
+    effect_ids = {
+        key: f"trace:{world.api_tenant}:{keyed[key]['interaction_id']}:decision:1"
+        for key in _CHARGED
+    }
+    ledger = run["ledger"]
+    effects = ledger["credit_effects"]
+    assert sorted(e["effect_id"] for e in effects) == sorted(effect_ids.values())
+    assert {(e["effect_kind"], e["tenant_id"], e["builder_id"]) for e in effects} == {
+        ("trace", world.api_tenant, world.builder)
+    }
+    assert all(len(e["decision_digest"] or "") == 64 for e in effects)
+    # No lot was ever granted: each trace is 1 credit of debt, once.
+    entries = ledger["credit_ledger_entries"]
+    assert sorted(
+        (e["effect_id"], e["entry_type"], e["amount_mc"]) for e in entries
+    ) == (sorted((effect, "debt", 1_000) for effect in effect_ids.values()))
+    outbox = {row["effect_id"]: row for row in ledger["credit_response_outbox"]}
+    assert set(outbox) == set(effect_ids.values())
+    for key, case in _CHARGED.items():
+        assert outbox[effect_ids[key]]["state"] == "delivered"
+        assert outbox[effect_ids[key]]["payload"] == answers[case]["body"]
+    handoffs = [
+        h for h in ledger["handoff_records"] if h["tenant_id"] == world.api_tenant
+    ]
+    assert [(h["session_id"], h["credit_effect_id"]) for h in handoffs] == [
+        (world.handoff_session, effect_ids["credit-dominance-handoff-1"])
+    ]
+    linked = sorted(
+        row["event_metadata"]["credit_effect_id"]
+        for row in run["events"]
+        if row["event_type"] == "srm.decision"
+        and "credit_effect_id" in (row["event_metadata"] or {})
+    )
+    assert linked == sorted(effect_ids.values())
+    assert run["credit_rows"]["credit_accounts"] == 1
 
 
 # ---------------------------------------------------------------------------

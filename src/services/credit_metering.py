@@ -73,6 +73,40 @@ itself propagates.  In this group a drop is only logged (owner, 2026-10-28):
 no metric, and a per-tenant drop counter is Group 7's.
 
 With the switch off (captured once per request at entry), none of this runs.
+
+Enforced ``POST /v1/events`` (Group 3b-1).  A request is ENFORCED only when
+it captured the switch on at entry, its live origin is ``production`` with an
+authenticated principal (an API key) and ``credit_enforcement_at`` -- read
+ONCE, by :func:`capture_events_enforcement`, right after the reserved-field
+422 and with no write -- is set; anything else keeps ``main``'s path and the
+writer above (``simulator`` and ``unknown`` never claim, debit or block).
+The route answers, in this order (MEDIUM-1): 403 ``caller_role_forbidden``
+-> 422 reserved field -> 400 ``idempotency_key_required`` /
+``idempotency_key_invalid`` -> 403 ``tenant_identity_mismatch`` (a plain
+tenant-scoped read of the session; the only answer that gives the rate-limit
+slot back) -> the claim's table (:func:`read_events_claim`: 200 replay, 409
+``payload_conflict`` / ``duplicate_event`` / ``event_in_progress`` with a
+capped ``Retry-After`` / ``event_failed``) -> 402 ``credit_pending``
+(:func:`precheck_events`: standalone tenant or quarantine hold; nothing
+written, no LLM, the slot stays consumed) -> the claim insert or takeover
+(:func:`acquire_events_claim`, its own short transaction) -> phase 1
+(:func:`run_enforced_phase1`) -> the LLM, outside every transaction -> the
+final transaction (:func:`run_enforced_final`).  The claim is fenced by a
+lease of :data:`CLAIM_LEASE_SECONDS` (see :mod:`src.repositories.credit`);
+whoever loses a fence rolls back and answers by the table, never taking the
+claim over by itself, and a known failure releases its own lease
+(:func:`release_events_lease`).  One decision costs one trace
+(:data:`TRACE_COST_MC`), with or without an LLM answer (D5): debited in
+phase 1 with a synchronous handoff (atomic with the handoff record, O1-A),
+otherwise in the final transaction together with the bundle and the stored
+answer.  A hold that shows up only there writes the effect of zero
+:data:`CREDIT_PENDING_EFFECT_KIND` and delivers the answer (D2).  The stored
+answer is replayable for ``credit_replay_retention_hours``; afterwards (or
+with a ``{}`` payload) a retry answers 409 ``duplicate_event`` (OWNER-d).
+Accepted race at the enforcement boundary (LOW-16): a request captured as
+observational just before ``credit_enforcement_at`` (its observational claim
+is written only after its answer) and a retry of the same key captured as
+enforced afterwards may both execute, the first one free of charge.
 """
 
 from __future__ import annotations
@@ -81,11 +115,13 @@ import asyncio
 import hashlib
 import inspect
 import json
-from collections.abc import Callable, Mapping
+import math
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
@@ -94,14 +130,17 @@ from starlette.requests import HTTPConnection
 
 from src.api.schemas.events import CanonicalEventRequest
 from src.config.logging import get_logger
+from src.config.settings import settings
 from src.interaction_context import InteractionOrigin, ResolvedInteractionContext
-from src.repositories.credit import CreditRepository
-from src.services.credit_ledger import MILLICREDITS_PER_CREDIT
+from src.repositories.credit import ClaimRow, CreditRepository, ResponseOutboxRow
+from src.services.credit_ledger import MILLICREDITS_PER_CREDIT, CreditLedger
 from src.services.credit_principal import (
     AuthenticatedIdentity,
     CreditPrincipal,
+    TenantBuilder,
     credit_identity,
     derive_credit_principal,
+    identity_from_tenant_context,
     read_tenant_builder,
     request_credit_identity,
 )
@@ -901,7 +940,834 @@ async def record_meta_file_handoff(
     )
 
 
+# ---------------------------------------------------------------------------
+# Enforced ``POST /v1/events`` (Group 3b-1).
+# ---------------------------------------------------------------------------
+
+ENFORCED_MODE: Final = "enforced"
+# The enforced executor never re-decides either: a takeover re-executes the
+# SAME decision version (OWNER-f), the fences make a bump unnecessary.
+ENFORCED_DECISION_VERSION: Final = 1
+# The two effects of zero (M7, D2, LOW-8): written at insert, no ledger
+# entry.  ``trace_no_response`` is the webhooks' (Group 3b-2).
+CREDIT_PENDING_EFFECT_KIND: Final = "trace_credit_pending"
+NO_RESPONSE_EFFECT_KIND: Final = "trace_no_response"
+# ``SET LOCAL lock_timeout`` of the enforced phase 1 only (OWNER-2).
+PHASE1_LOCK_TIMEOUT_SECONDS: Final = 15
+# Components of the worst case the claim lease covers (OWNER-1), pinned and
+# recomputed by test from the models they come from:
+#   * the synchronous status webhook of ``enrich_scheduling_verification``
+#     inside phase 1: ``WebhookConfig`` allows retry_count <= 5 attempts of
+#     timeout_seconds <= 120 with a backoff of retry_delay_seconds <= 60 x
+#     2^(k-1) between them -- 5 x 120 + 60 x (1 + 2 + 4 + 8) = 1500 s;
+#   * PHASE1_LOCK_TIMEOUT_SECONDS = 15 s;
+#   * the LLM: two primary calls and one fallback of ``LLMClient``'s 30 s;
+#   * the final transaction.
+LEASE_WEBHOOK_SECONDS: Final = 1500
+LEASE_LLM_SECONDS: Final = 90
+LEASE_FINAL_TRANSACTION_SECONDS: Final = 75
+# LOW-4: never DECREASE this value on a running fleet without draining it
+# first: a request still holding a claim under the longer lease can pass its
+# final check while a retry, judging the claim with the new shorter lease,
+# already answered the final ``event_failed``.  Increasing it is safe.
+CLAIM_LEASE_SECONDS: Final = 1680
+# ``Retry-After`` of ``event_in_progress``: min(lease left, 5 s), >= 1 s.
+RETRY_AFTER_MAX_SECONDS: Final = 5
+
+IDEMPOTENCY_KEY_REQUIRED: Final = "idempotency_key_required"
+IDEMPOTENCY_KEY_INVALID: Final = "idempotency_key_invalid"
+CREDIT_PENDING_CODE: Final = "credit_pending"
+DUPLICATE_EVENT_CODE: Final = "duplicate_event"
+PAYLOAD_CONFLICT_CODE: Final = "payload_conflict"
+EVENT_IN_PROGRESS_CODE: Final = "event_in_progress"
+EVENT_FAILED_CODE: Final = "event_failed"
+PAYLOAD_CONFLICT_LOG: Final = "credit_payload_conflict"
+ENFORCED_LOG: Final = "credit enforced decision"
+
+PrecheckOutcome = Literal["ok", "credit_pending", "tenant_gone"]
+
+
+class CreditTenantGone(Exception):
+    """The tenant row vanished under an enforced transaction (a concurrent
+    ``DELETE /clinics/{clinic_id}``): nothing of it may be written."""
+
+
+class CreditEnforcementUnavailable(Exception):
+    """This process already saw ``credit_enforcement_at`` set and can no
+    longer read it: the request is answered 503, never as ``main`` (D1)."""
+
+
+CREDIT_ENFORCEMENT_UNAVAILABLE_CODE: Final = "credit_enforcement_unavailable"
+ENFORCEMENT_UNREADABLE_AFTER_ENFORCED: Final = "enforcement_unreadable_after_enforced"
+# D1 (owner, option B): the enforcement is one-way.  Once THIS process has
+# read ``credit_enforcement_at`` set, a later failure to read it can no
+# longer mean "not enforced yet": production traffic gets a 503 instead of
+# ``main``'s free path.  Before the process ever saw it set, a failed read
+# keeps ``main``'s path (dominance).  Per process, never persisted.
+_enforcement_seen = False
+
+
+def enforcement_seen() -> bool:
+    """Whether this process has read ``credit_enforcement_at`` set."""
+
+    return _enforcement_seen
+
+
+def forget_enforcement_seen() -> None:
+    """Back to a process that never saw the enforcement (tests only)."""
+
+    global _enforcement_seen
+    _enforcement_seen = False
+
+
+def claim_lease() -> timedelta:
+    """The claim lease, read at call time (``CLAIM_LEASE_SECONDS``)."""
+
+    return timedelta(seconds=CLAIM_LEASE_SECONDS)
+
+
+def replay_retention() -> timedelta:
+    """``credit_replay_retention_hours`` (OWNER-d), read at call time."""
+
+    return timedelta(hours=settings.credit_replay_retention_hours)
+
+
+def retry_after_seconds(remaining: float) -> int:
+    """``min(seconds left of the lease, RETRY_AFTER_MAX_SECONDS)``, at least
+    1 (HTTP ``Retry-After`` is whole seconds)."""
+
+    return max(1, min(RETRY_AFTER_MAX_SECONDS, math.ceil(remaining)))
+
+
+@dataclass(frozen=True)
+class EventsEnforcement:
+    """One ``POST /v1/events`` request captured as ENFORCED: the switch on at
+    entry, ``credit_enforcement_at`` set, origin ``production`` with an
+    authenticated principal.  Decided once per request."""
+
+    tenant_id: UUID
+    session_id: UUID
+    principal_id: str
+    payload_sha256: str
+    idempotency_key: str | None
+    key_problem: str | None
+
+
+@dataclass(frozen=True)
+class ClaimAnswer:
+    """An answer read from the claim's state table (item 4-vi)."""
+
+    status: int
+    body: Mapping[str, Any]
+    retry_after: int | None = None
+    replay: bool = False
+
+
+@dataclass(frozen=True)
+class ClaimLease:
+    """The lease this executor holds: ``observed`` is the claim's
+    ``created_at`` as returned, the ``:observed`` of every fence."""
+
+    claim_id: UUID
+    interaction_id: UUID
+    observed: datetime
+
+
+@dataclass(frozen=True)
+class DecisionCharge:
+    """The effect one enforced decision wrote: a debit (``trace``) or an
+    effect of zero (``trace_credit_pending``), under ``builder_id``."""
+
+    effect_id: str
+    builder_id: UUID
+    effect_kind: str
+    debited_mc: int = 0
+    debt_mc: int = 0
+
+
+@dataclass(frozen=True)
+class Phase1Outcome:
+    result: Any
+    clinic_config: Any
+    message_history: Any
+    session_version: int
+    charge: DecisionCharge | None
+    handoff_id: UUID | None
+
+
+@dataclass(frozen=True)
+class FinalOutcome:
+    payload: Mapping[str, Any]
+    interaction_event_id: UUID | None
+    charge: DecisionCharge | None
+
+
+def _answer(status: int, code: str, **extra: Any) -> ClaimAnswer:
+    retry_after = extra.pop("retry_after", None)
+    return ClaimAnswer(
+        status=status, body={"code": code, **extra}, retry_after=retry_after
+    )
+
+
+def _validated_key(raw: str | None) -> tuple[str | None, str | None]:
+    """``(key, problem)``: absent ⇒ ``idempotency_key_required``; empty,
+    longer than 255 or outside visible ASCII ⇒ ``idempotency_key_invalid``."""
+
+    if raw is None:
+        return None, IDEMPOTENCY_KEY_REQUIRED
+    key = valid_ingress_id(raw)
+    if key is None:
+        return None, IDEMPOTENCY_KEY_INVALID
+    return key, None
+
+
+async def capture_events_enforcement(
+    request: HTTPConnection,
+    db: object,
+    *,
+    tenant: object,
+    canonical_request: CanonicalEventRequest,
+    context: ResolvedInteractionContext,
+) -> EventsEnforcement | None:
+    """Decide ONCE whether this request runs the enforced path.
+
+    ``None`` -- ``main``'s path and the Group 3a writer -- unless the request
+    captured the switch on at entry, its origin is ``production`` with an
+    authenticated principal, the route's session is a real one and
+    ``credit_enforcement_at`` (read once, here, with no write) is set.
+    ``simulator`` and ``unknown`` never get here.  A failed read is logged
+    (an alert) and keeps the request observational -- before the enforcement
+    a credit-side failure never changes ``main``'s answer -- unless this
+    process already saw ``credit_enforcement_at`` set: the enforcement is
+    one-way, so then it raises :class:`CreditEnforcementUnavailable` (the
+    route answers 503) with its own alert (D1).
+    """
+
+    global _enforcement_seen
+
+    if not request_credit_switch(request):
+        return None
+    if context.origin is not InteractionOrigin.PRODUCTION:
+        return None
+    if not isinstance(db, AsyncSession):
+        return None
+    identity = request_credit_identity(request) or identity_from_tenant_context(tenant)
+    if identity is None or identity.tenant_id != context.effective_tenant_id:
+        return None
+    principal = derive_credit_principal(
+        identity,
+        TenantBuilder(tenant_id=identity.tenant_id, builder_id=None, is_active=True),
+    )
+    if not principal.authenticated:
+        return None
+    try:
+        enforced_at = await CreditRepository(db).enforcement_at()
+    except Exception as error:
+        with suppress(Exception):
+            await db.rollback()
+        if _enforcement_seen:
+            logger.error(
+                ENFORCED_LOG,
+                alert="credit_enforcement_unavailable",
+                reason=ENFORCEMENT_UNREADABLE_AFTER_ENFORCED,
+                tenant_id=str(context.effective_tenant_id),
+                error_type=type(error).__name__,
+            )
+            raise CreditEnforcementUnavailable(
+                "credit_enforcement_at was set and can no longer be read"
+            ) from error
+        logger.warning(
+            ENFORCED_LOG,
+            alert="credit_enforcement_read",
+            reason="enforcement_unreadable",
+            tenant_id=str(context.effective_tenant_id),
+            error_type=type(error).__name__,
+        )
+        return None
+    if not isinstance(enforced_at, datetime):
+        return None
+    _enforcement_seen = True
+    key, problem = _validated_key(request.headers.get(IDEMPOTENCY_KEY_HEADER))
+    return EventsEnforcement(
+        tenant_id=context.effective_tenant_id,
+        session_id=context.session_id,
+        principal_id=principal.principal_id,
+        payload_sha256=event_payload_sha256(canonical_request),
+        idempotency_key=key,
+        key_problem=problem,
+    )
+
+
+async def session_in_tenant(db: AsyncSession, enforcement: EventsEnforcement) -> bool:
+    """The session belongs to the tenant: a plain read, no lock, no write."""
+
+    return await CreditRepository(db).session_in_tenant(
+        enforcement.tenant_id, enforcement.session_id
+    )
+
+
+def _require_key(enforcement: EventsEnforcement) -> str:
+    if enforcement.idempotency_key is None:
+        raise ValueError("an enforced execution needs its Idempotency-Key")
+    return enforcement.idempotency_key
+
+
+async def read_events_claim(
+    db: AsyncSession, enforcement: EventsEnforcement, *, may_take_over: bool = True
+) -> ClaimAnswer | ClaimRow | None:
+    """Read the key's claim in a short transaction and answer by the table.
+
+    ``None``: no claim (insert one).  A :class:`ClaimRow`: the lease expired
+    before phase 1 -- take it over (only when ``may_take_over``: a reader
+    that lost a fence never takes over by itself, it answers
+    ``event_in_progress`` and lets the next retry do it).  Otherwise the
+    :class:`ClaimAnswer`.  A different payload is ``payload_conflict`` before
+    any lock.  The reader that may answer ``event_in_progress`` or
+    ``event_failed`` takes the claim ``FOR SHARE`` -- waiting for a final
+    transaction in flight -- and only then reads the outbox, in a NEW
+    statement, so it never answers ``event_failed`` for a decision that
+    commits (HIGH-1).
+    """
+
+    repository = CreditRepository(db)
+    try:
+        claim = await repository.idempotency_claim(
+            enforcement.tenant_id,
+            principal_id=enforcement.principal_id,
+            idempotency_key=_require_key(enforcement),
+        )
+        if claim is None:
+            await db.commit()
+            return None
+        if claim.payload_sha256 != enforcement.payload_sha256:
+            await db.commit()
+            logger.warning(
+                PAYLOAD_CONFLICT_LOG,
+                tenant_id=str(enforcement.tenant_id),
+                interaction_id=str(claim.interaction_id),
+                stored_payload_sha256=claim.payload_sha256,
+                request_payload_sha256=enforcement.payload_sha256,
+            )
+            return _answer(409, PAYLOAD_CONFLICT_CODE)
+        if claim.mode != ENFORCED_MODE:
+            # Claimed before the enforcement (observational): a duplicate,
+            # never executed, replayed or charged again.
+            await db.commit()
+            return _answer(
+                409, DUPLICATE_EVENT_CODE, interaction_id=str(claim.interaction_id)
+            )
+        locked = await repository.claim_for_share(claim.id)
+        if locked is None:
+            await db.commit()
+            return None
+        now = await repository.lease_clock()
+        outbox = await repository.response_outbox_row(
+            enforcement.tenant_id,
+            trace_effect_id(
+                enforcement.tenant_id, locked.interaction_id, ENFORCED_DECISION_VERSION
+            ),
+        )
+        await db.commit()
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    return _claim_state_answer(locked, outbox, now, may_take_over=may_take_over)
+
+
+def _claim_state_answer(
+    claim: ClaimRow,
+    outbox: ResponseOutboxRow | None,
+    now: datetime,
+    *,
+    may_take_over: bool,
+) -> ClaimAnswer | ClaimRow:
+    interaction = str(claim.interaction_id)
+    if outbox is not None:
+        if not outbox.payload or now >= outbox.created_at + replay_retention():
+            return _answer(409, DUPLICATE_EVENT_CODE, interaction_id=interaction)
+        return ClaimAnswer(status=200, body=dict(outbox.payload), replay=True)
+    remaining = (claim.lease_started_at + claim_lease() - now).total_seconds()
+    if remaining > 0:
+        return _answer(
+            409, EVENT_IN_PROGRESS_CODE, retry_after=retry_after_seconds(remaining)
+        )
+    if claim.session_version is None:
+        if may_take_over:
+            return claim
+        return _answer(409, EVENT_IN_PROGRESS_CODE, retry_after=1)
+    # Phase 1 committed, the lease is over: FINAL, never re-executed (OWNER-a/f).
+    return _answer(409, EVENT_FAILED_CODE, interaction_id=interaction)
+
+
+async def precheck_events(
+    db: AsyncSession, enforcement: EventsEnforcement
+) -> PrecheckOutcome:
+    """The 402 pre-check, in a short transaction, before any LLM.
+
+    Tenant ``FOR SHARE``; a standalone tenant (no builder, no account) is
+    ``credit_pending``; a builder gets its account on demand -- a builder
+    that never paid is served as debt, never ``credit_pending`` -- and a
+    quarantine hold is ``credit_pending``.  ``credit_pending`` rolls back:
+    nothing is written (not even the account).
+    """
+
+    repository = CreditRepository(db)
+    try:
+        scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+        if scope is None:
+            await db.rollback()
+            return "tenant_gone"
+        if scope.builder_id is None:
+            await db.rollback()
+            return "credit_pending"
+        await repository.ensure_account(scope.builder_id)
+        if await repository.quarantine_hold(scope.builder_id):
+            await db.rollback()
+            return "credit_pending"
+        await db.commit()
+        return "ok"
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+
+
+async def acquire_events_claim(
+    db: AsyncSession,
+    enforcement: EventsEnforcement,
+    *,
+    takeover: ClaimRow | None,
+) -> ClaimLease | ClaimAnswer:
+    """Insert the claim (its own short transaction, after the pre-check), or
+    take an expired one over before phase 1.  A lost race re-reads the
+    claim and answers by the table, never taking it over by itself."""
+
+    repository = CreditRepository(db)
+    try:
+        if takeover is None:
+            scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+            if scope is None:
+                raise CreditTenantGone("the tenant vanished before its claim")
+            row = await repository.insert_enforced_claim(
+                tenant_id=enforcement.tenant_id,
+                builder_id=scope.builder_id,
+                principal_id=enforcement.principal_id,
+                idempotency_key=_require_key(enforcement),
+                interaction_id=uuid4(),
+                payload_sha256=enforcement.payload_sha256,
+                decision_version=ENFORCED_DECISION_VERSION,
+            )
+            await db.commit()
+            if row is not None:
+                return ClaimLease(row.id, row.interaction_id, row.created_at)
+        else:
+            observed = await repository.take_over_claim(
+                takeover.id, observed=takeover.created_at, lease=claim_lease()
+            )
+            await db.commit()
+            if observed is not None:
+                logger.info(
+                    ENFORCED_LOG,
+                    reason="claim_taken_over",
+                    tenant_id=str(enforcement.tenant_id),
+                    interaction_id=str(takeover.interaction_id),
+                )
+                return ClaimLease(takeover.id, takeover.interaction_id, observed)
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    return await reread_events_claim(db, enforcement)
+
+
+async def reread_events_claim(
+    db: AsyncSession, enforcement: EventsEnforcement
+) -> ClaimAnswer:
+    """After a lost fence or race: re-read the claim and answer by the
+    table, without ever taking it over."""
+
+    verdict = await read_events_claim(db, enforcement, may_take_over=False)
+    if isinstance(verdict, ClaimAnswer):
+        return verdict
+    # The claim vanished (its tenant was deleted) or is takeover material:
+    # the caller retries.
+    return _answer(409, EVENT_IN_PROGRESS_CODE, retry_after=1)
+
+
+async def release_events_lease(
+    db: AsyncSession,
+    enforcement: EventsEnforcement,
+    lease: ClaimLease,
+    *,
+    session_version: int | None,
+) -> None:
+    """A known failure expires the executor's own lease through the same
+    fence (MEDIUM-1), in a short transaction of its own: the next retry
+    takes over at once (before phase 1) or answers ``event_failed`` at once
+    (after it).  A failure here is only logged."""
+
+    try:
+        with suppress(Exception):
+            await db.rollback()
+        released = await CreditRepository(db).release_claim_lease(
+            lease.claim_id,
+            observed=lease.observed,
+            session_version=session_version,
+            lease=claim_lease(),
+        )
+        await db.commit()
+    except Exception as error:
+        with suppress(Exception):
+            await db.rollback()
+        logger.warning(
+            ENFORCED_LOG,
+            alert="credit_lease_release",
+            reason="lease_release_failed",
+            tenant_id=str(enforcement.tenant_id),
+            interaction_id=str(lease.interaction_id),
+            error_type=type(error).__name__,
+        )
+        return
+    logger.info(
+        ENFORCED_LOG,
+        reason="lease_released" if released else "lease_release_fenced",
+        tenant_id=str(enforcement.tenant_id),
+        interaction_id=str(lease.interaction_id),
+        phase1=session_version is not None,
+    )
+
+
+def _handoff_id(result: object) -> UUID | None:
+    summary = getattr(result, "handoff_summary", None)
+    raw = summary.get("id") if isinstance(summary, Mapping) else None
+    if raw is None:
+        return None
+    try:
+        return UUID(str(raw))
+    except ValueError:
+        return None
+
+
+def phase1_decision(result: object, handoff_id: UUID) -> dict[str, Any]:
+    """The PII-free projection of a phase 1 decision that handed off."""
+
+    event_id = getattr(result, "event_id", None)
+    projection: dict[str, Any] = {
+        "kind": "events_phase1_handoff",
+        "event_id": str(event_id) if event_id is not None else None,
+        "handoff_id": str(handoff_id),
+    }
+    for name in (
+        "intent",
+        "intent_category",
+        "funnel_stage",
+        "action",
+        "safety_concern",
+        "safety_category",
+        "handoff_required",
+        "handoff_reason",
+        "mode",
+    ):
+        projection[name] = _text(_enum_value(getattr(result, name, None)))
+    return projection
+
+
+async def _charge_decision(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    builder_id: UUID,
+    effect_id: str,
+    digest: str,
+) -> DecisionCharge:
+    """Account ``FOR UPDATE`` -> hold -> lots ``FOR UPDATE`` -> one trace of
+    debit (debt for what the capacity does not cover, O5), or -- under a
+    hold that appeared after the pre-check -- an effect of zero
+    ``trace_credit_pending`` (D2): the decision is delivered, the ledger
+    does not change."""
+
+    result = await CreditLedger(db).debit(
+        builder_id,
+        effect_id,
+        TRACE_COST_MC,
+        at=datetime.now(timezone.utc),
+        effect_kind=TRACE_EFFECT_KIND,
+        tenant_id=tenant_id,
+        decision_digest=digest,
+    )
+    if result.status == "credit_pending":
+        await CreditRepository(db).insert_effect(
+            builder_id=builder_id,
+            tenant_id=tenant_id,
+            effect_id=effect_id,
+            effect_kind=CREDIT_PENDING_EFFECT_KIND,
+            decision_digest=digest,
+        )
+        logger.info(
+            ENFORCED_LOG,
+            reason="late_hold",
+            tenant_id=str(tenant_id),
+            effect_id=effect_id,
+        )
+        return DecisionCharge(effect_id, builder_id, CREDIT_PENDING_EFFECT_KIND)
+    return DecisionCharge(
+        effect_id,
+        builder_id,
+        TRACE_EFFECT_KIND,
+        debited_mc=result.debited_mc,
+        debt_mc=result.debt_mc,
+    )
+
+
+async def run_enforced_phase1(
+    db: AsyncSession,
+    enforcement: EventsEnforcement,
+    lease: ClaimLease,
+    *,
+    run_pipeline: Callable[[], Awaitable[tuple[Any, Any, Any]]],
+) -> Phase1Outcome | None:
+    """Phase 1 of an enforced decision, in the route's session ``db``.
+
+    ``SET LOCAL lock_timeout`` -> tenant ``FOR SHARE`` -> ``run_pipeline``
+    (the session ``FOR UPDATE``; a synchronous handoff writes its record and
+    ``handoff.request`` in this transaction, #145) -> with a handoff: the
+    decision's debit (or the effect of zero under a hold, the handoff goes
+    on) and ``credit_effect_id`` merged into the handoff's context -> the
+    phase 1 marker, LAST -> commit.  ``None`` when the marker's fence did
+    not hold: everything (state, handoff, debit) was rolled back and the
+    creation webhook never leaves.  Any exception propagates with the
+    transaction still open: the caller rolls back and releases the lease.
+    """
+
+    repository = CreditRepository(db)
+    await repository.set_local_lock_timeout(PHASE1_LOCK_TIMEOUT_SECONDS)
+    scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+    if scope is None:
+        raise CreditTenantGone("the tenant vanished before phase 1")
+    result, clinic_config, message_history = await run_pipeline()
+    effect_id = trace_effect_id(
+        enforcement.tenant_id, lease.interaction_id, ENFORCED_DECISION_VERSION
+    )
+    charge: DecisionCharge | None = None
+    handoff_id = _handoff_id(result)
+    if handoff_id is not None:
+        if scope.builder_id is None:
+            logger.warning(
+                ENFORCED_LOG,
+                alert="credit_enforced_standalone",
+                reason="standalone_at_phase1",
+                tenant_id=str(enforcement.tenant_id),
+                interaction_id=str(lease.interaction_id),
+            )
+        else:
+            charge = await _charge_decision(
+                db,
+                tenant_id=enforcement.tenant_id,
+                builder_id=scope.builder_id,
+                effect_id=effect_id,
+                digest=decision_digest(
+                    tenant_id=enforcement.tenant_id,
+                    interaction_id=lease.interaction_id,
+                    decision_version=ENFORCED_DECISION_VERSION,
+                    origin=InteractionOrigin.PRODUCTION,
+                    decision=phase1_decision(result, handoff_id),
+                ),
+            )
+            if not await repository.link_handoff_credit_effect(
+                tenant_id=enforcement.tenant_id,
+                handoff_id=handoff_id,
+                effect_id=charge.effect_id,
+            ):
+                raise RuntimeError(
+                    "the phase 1 handoff record is not in this transaction"
+                )
+    session_version = (
+        await repository.session_message_count(
+            enforcement.tenant_id, enforcement.session_id
+        )
+        or 0
+    )
+    if not await repository.mark_claim_phase1(
+        lease.claim_id,
+        observed=lease.observed,
+        session_version=session_version,
+        lease=claim_lease(),
+    ):
+        await db.rollback()
+        logger.warning(
+            ENFORCED_LOG,
+            alert="credit_claim_fence",
+            reason="phase1_fence_lost",
+            tenant_id=str(enforcement.tenant_id),
+            interaction_id=str(lease.interaction_id),
+        )
+        return None
+    await db.commit()
+    return Phase1Outcome(
+        result=result,
+        clinic_config=clinic_config,
+        message_history=message_history,
+        session_version=session_version,
+        charge=charge,
+        handoff_id=handoff_id,
+    )
+
+
+def response_payload(
+    response: Any, interaction_event_id: UUID | None
+) -> dict[str, Any]:
+    """The answer a replay returns: the response JSON, ``interaction_event_id``
+    included (the value the response carries after the commit, LOW-7)."""
+
+    updated = response.model_copy(update={"interaction_event_id": interaction_event_id})
+    payload: dict[str, Any] = updated.model_dump(mode="json")
+    return payload
+
+
+async def run_enforced_final(
+    db: AsyncSession,
+    enforcement: EventsEnforcement,
+    lease: ClaimLease,
+    phase1: Phase1Outcome,
+    *,
+    response: Any,
+    write_bundle: Callable[[str | None], Awaitable[UUID | None]],
+) -> FinalOutcome | None:
+    """The final transaction (M5): the decision, its effect, the stored
+    answer and the fence commit together, or nothing does.
+
+    Tenant ``FOR SHARE`` FIRST (``DELETE /clinics`` locks the tenant and
+    cascades into ``sessions``) -> the bundle in this transaction (its
+    foreign keys take ``FOR KEY SHARE`` on ``sessions`` and wait for a
+    concurrent phase 1 of the same session holding no credit lock) ->
+    account -> hold -> lots -> one trace of debit/debt, the reuse of the
+    phase 1 charge (decided by phase 1's result, never by a new builder
+    lookup), or the effect of zero under a late hold -> the response-outbox
+    row (``delivered``) -> the final fence (keeps the claim's row lock to
+    the commit) -> commit.  ``None`` when the fence did not hold (rolled
+    back: no bundle, no debit).  Exceptions propagate with the transaction
+    open: the caller rolls back and releases the lease.
+    """
+
+    repository = CreditRepository(db)
+    scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+    if scope is None:
+        raise CreditTenantGone("the tenant vanished before the final transaction")
+    effect_id = trace_effect_id(
+        enforcement.tenant_id, lease.interaction_id, ENFORCED_DECISION_VERSION
+    )
+    charge = phase1.charge
+    # A phase 1 that handed off already decided this decision's charge (its
+    # effect and builder, or none for a tenant standalone at phase 1): the
+    # final transaction reuses that outcome and never looks the builder up
+    # again, so a reparent between the phases never charges twice (LOW-5).
+    decided_in_phase1 = phase1.handoff_id is not None
+    if charge is not None:
+        credit_effect_id: str | None = charge.effect_id
+    elif not decided_in_phase1 and scope.builder_id is not None:
+        credit_effect_id = effect_id
+    else:
+        credit_effect_id = None
+    interaction_event_id = await write_bundle(credit_effect_id)
+    if not decided_in_phase1:
+        if scope.builder_id is None:
+            # LOW-5: the tenant turned standalone since the pre-check.
+            logger.warning(
+                ENFORCED_LOG,
+                alert="credit_enforced_standalone",
+                reason="standalone_at_final",
+                tenant_id=str(enforcement.tenant_id),
+                interaction_id=str(lease.interaction_id),
+            )
+        else:
+            decided = response_decision(response)
+            projection = decided[1] if decided is not None else {"kind": "pipeline"}
+            charge = await _charge_decision(
+                db,
+                tenant_id=enforcement.tenant_id,
+                builder_id=scope.builder_id,
+                effect_id=effect_id,
+                digest=decision_digest(
+                    tenant_id=enforcement.tenant_id,
+                    interaction_id=lease.interaction_id,
+                    decision_version=ENFORCED_DECISION_VERSION,
+                    origin=InteractionOrigin.PRODUCTION,
+                    decision=projection,
+                ),
+            )
+    payload = response_payload(response, interaction_event_id)
+    await repository.insert_response_outbox(
+        tenant_id=enforcement.tenant_id,
+        effect_id=effect_id,
+        payload=payload,
+        state="delivered",
+    )
+    if not await repository.hold_claim_final_fence(
+        lease.claim_id,
+        observed=lease.observed,
+        session_version=phase1.session_version,
+        lease=claim_lease(),
+    ):
+        await db.rollback()
+        logger.warning(
+            ENFORCED_LOG,
+            alert="credit_claim_fence",
+            reason="final_fence_lost",
+            tenant_id=str(enforcement.tenant_id),
+            interaction_id=str(lease.interaction_id),
+        )
+        return None
+    await db.commit()
+    return FinalOutcome(
+        payload=payload, interaction_event_id=interaction_event_id, charge=charge
+    )
+
+
 __all__ = [
+    "CLAIM_LEASE_SECONDS",
+    "CREDIT_ENFORCEMENT_UNAVAILABLE_CODE",
+    "CREDIT_PENDING_CODE",
+    "CREDIT_PENDING_EFFECT_KIND",
+    "DUPLICATE_EVENT_CODE",
+    "ENFORCED_DECISION_VERSION",
+    "ENFORCED_MODE",
+    "EVENT_FAILED_CODE",
+    "EVENT_IN_PROGRESS_CODE",
+    "IDEMPOTENCY_KEY_INVALID",
+    "IDEMPOTENCY_KEY_REQUIRED",
+    "LEASE_FINAL_TRANSACTION_SECONDS",
+    "LEASE_LLM_SECONDS",
+    "LEASE_WEBHOOK_SECONDS",
+    "NO_RESPONSE_EFFECT_KIND",
+    "PAYLOAD_CONFLICT_CODE",
+    "PAYLOAD_CONFLICT_LOG",
+    "PHASE1_LOCK_TIMEOUT_SECONDS",
+    "RETRY_AFTER_MAX_SECONDS",
+    "ClaimAnswer",
+    "ClaimLease",
+    "CreditEnforcementUnavailable",
+    "CreditTenantGone",
+    "DecisionCharge",
+    "EventsEnforcement",
+    "FinalOutcome",
+    "Phase1Outcome",
+    "acquire_events_claim",
+    "capture_events_enforcement",
+    "claim_lease",
+    "enforcement_seen",
+    "forget_enforcement_seen",
+    "phase1_decision",
+    "precheck_events",
+    "read_events_claim",
+    "release_events_lease",
+    "replay_retention",
+    "reread_events_claim",
+    "response_payload",
+    "retry_after_seconds",
+    "run_enforced_final",
+    "run_enforced_phase1",
+    "session_in_tenant",
     "DECISION_DIGEST_SCHEMA",
     "IDEMPOTENCY_KEY_HEADER",
     "INGRESS_ID_MAX_LENGTH",
