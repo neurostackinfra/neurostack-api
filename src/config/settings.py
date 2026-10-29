@@ -475,6 +475,12 @@ class Settings(BaseSettings):
     # anything until the database clock catches up
     # (src/services/credit_ledger.py, CreditLedger).
     credit_clock_tolerance_seconds: int = Field(default=300, ge=1, le=600)
+    # How long the stored answer of an enforced POST /v1/events decision
+    # stays replayable (owner decision OWNER-d, 2026-10-27: 24 hours by
+    # default, at most 168).  An older response-outbox row is read as an
+    # empty payload and a retry answers 409 duplicate_event
+    # (src/services/credit_metering.py); validated at start-up.
+    credit_replay_retention_hours: int = Field(default=24, ge=1, le=168)
 
     @field_validator("asaas_webhook_url")
     @classmethod

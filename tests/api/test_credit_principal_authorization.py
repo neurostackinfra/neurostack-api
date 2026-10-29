@@ -12,7 +12,15 @@ Through ``src.api.main.app`` (real middleware stack and lifespan, SQLite):
   tenant, a non-canonical/unknown Z-API token or instance, an unknown
   Uazapi/Evolution instance -- answers exactly like ``main`` with the switch
   off and forced on, publishes no identity, never reaches the replay claim,
-  writes no row in any ``credit_*`` table and issues no SQL that touches one.
+  writes no row in any ``credit_*`` table and issues no SQL that touches one;
+* the one route-level rejection, a cross-tenant session on ``POST
+  /v1/events``, is authenticated, so with the switch on it reaches the route,
+  where Group 3b-1 reads ``credit_enforcement_at`` once BEFORE the session
+  ownership check -- the wish's answer order puts that read and the 400 of
+  ``Idempotency-Key`` ahead of the 403 (owner decision, option A,
+  2026-10-28).  That single SELECT of ``credit_enforcement_state`` is the
+  only credit SQL it may issue: no write, no other credit table, no row; the
+  answer stays ``main``'s 403.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
@@ -297,6 +306,27 @@ def claims(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, UUID, str]]:
 
 def _credit_sql(statements: list[str]) -> list[str]:
     return [statement for statement in statements if "credit_" in statement.lower()]
+
+
+# Group 3b-1 (owner decision, option A): with the switch on, ``POST
+# /v1/events`` reads ``credit_enforcement_at`` once, before the session
+# ownership check (``CreditRepository.enforcement_at``), and nothing else.
+_ENFORCEMENT_READ = re.compile(
+    r"SELECT credit_enforcement_state\.credit_enforcement_at\s+"
+    r"FROM credit_enforcement_state\s+"
+    r"WHERE credit_enforcement_state\.id = \?"
+)
+
+
+def _beyond_the_enforcement_read(statements: list[str]) -> list[str]:
+    """The credit SQL other than that one read (a write, a lock, another
+    credit table ...)."""
+
+    return [
+        statement
+        for statement in _credit_sql(statements)
+        if _ENFORCEMENT_READ.fullmatch(statement.strip()) is None
+    ]
 
 
 async def _credit_row_counts() -> dict[str, int]:
@@ -605,25 +635,60 @@ def test_a_cross_tenant_session_is_main_s_403_and_writes_no_credit_row(
     sql: list[str],
     force_switch: Callable[[bool], None],
 ) -> None:
-    """The API key passes; the session belongs to another tenant (route-level)."""
+    """The API key passes; the session belongs to another tenant (route-level).
+
+    With the switch on the request reaches the route, which reads
+    ``credit_enforcement_at`` before the session ownership check (Group 3b-1:
+    the wish orders that read and the 400 of ``Idempotency-Key`` ahead of
+    the 403).  That one SELECT is the only credit SQL allowed.
+    """
 
     answers = {}
+    issued: dict[bool, list[str]] = {}
     for effective in (False, True):
         force_switch(effective)
+        first = len(sql)
         response = client.post(
             EVENTS,
             json=_event_body(world.jwt_session),
             headers={"X-API-Key": world.api_key},
         )
         answers[effective] = (response.status_code, response.json())
+        issued[effective] = sql[first:]
 
     assert answers[True] == answers[False]
     assert answers[True][0] == 403
     assert answers[True][1]["error"] == "tenant_identity_mismatch"
     # Authenticated, so the identity is exposed; credit code still writes nothing.
     assert [entry["switch"] for entry in route_entries] == [False, True]
-    assert _credit_sql(sql) == []
+    assert _credit_sql(issued[False]) == []
+    # Switch on: exactly the enforcement read -- no write, no other credit
+    # table, no lock.
+    [read] = _credit_sql(issued[True])
+    assert _ENFORCEMENT_READ.fullmatch(read.strip()), read
+    assert _beyond_the_enforcement_read(issued[True]) == []
     assert client._submit(_credit_row_counts()) == dict.fromkeys(_CREDIT_TABLES, 0)
+
+
+def test_the_narrowed_check_still_refuses_any_other_credit_sql() -> None:
+    """Negative: only the exact enforcement read is tolerated; a claim
+    write, another credit table or a lock on the read fails the check."""
+
+    read = (
+        "SELECT credit_enforcement_state.credit_enforcement_at \n"
+        "FROM credit_enforcement_state \n"
+        "WHERE credit_enforcement_state.id = ?"
+    )
+    assert _beyond_the_enforcement_read([read, "SELECT 1 FROM sessions"]) == []
+    for other in (
+        "INSERT INTO credit_ingress_claims (id, tenant_id) VALUES (?, ?)",
+        "SELECT credit_ingress_claims.id FROM credit_ingress_claims "
+        "WHERE credit_ingress_claims.tenant_id = ?",
+        "SELECT credit_accounts.id FROM credit_accounts",
+        "UPDATE credit_enforcement_state SET credit_enforcement_at=?",
+        f"{read} FOR UPDATE",
+    ):
+        assert _beyond_the_enforcement_read([read, other]) == [other]
 
 
 def test_the_credit_tables_exist_in_this_database(client: Any) -> None:

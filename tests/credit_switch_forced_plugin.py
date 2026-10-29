@@ -27,6 +27,15 @@ count its outcomes (``recorded``, ``replayed``, ``timeout``, ``failed`` ...),
 and prints them in the summary: proof that the forced runs really exercised
 the writer.  The wrapper changes no argument and no result; the same per-test
 check guards it against a test that swapped it and leaked the swap.
+
+Group 3b-1: ``POST /v1/events`` decides once per request whether it runs the
+enforced path (``credit_metering.capture_events_enforcement``: switch on,
+origin ``production`` and ``credit_enforcement_at`` set).  The plugin wraps
+it the same way and counts its verdicts (``enforced`` or ``main``): with no
+enforcement row -- every existing suite -- the forced runs must show only
+``main`` captures, so no enforced sibling ever ran; only the suites that set
+``credit_enforcement_at`` themselves (``tests/api/test_events_credit_enforced.py``)
+show ``enforced`` ones.
 """
 
 from __future__ import annotations
@@ -42,6 +51,8 @@ _reads = 0
 _self_checks = 0
 _writer_outcomes: Counter[str] = Counter()
 _ORIGINAL_WRITER: Any = None
+_captures: Counter[str] = Counter()
+_ORIGINAL_CAPTURE: Any = None
 
 
 def _forced_effective(_self: Any) -> bool:
@@ -60,8 +71,18 @@ async def _counted_writer(*args: Any, **kwargs: Any) -> Any:
     return outcome
 
 
+async def _counted_capture(*args: Any, **kwargs: Any) -> Any:
+    try:
+        enforcement = await _ORIGINAL_CAPTURE(*args, **kwargs)
+    except BaseException as error:
+        _captures[f"raised {type(error).__name__}"] += 1
+        raise
+    _captures["main" if enforcement is None else "enforced"] += 1
+    return enforcement
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    global _ORIGINAL_WRITER
+    global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE
     from src.services import credit_metering
     from src.services.credit_switch import CreditSwitch
 
@@ -69,6 +90,8 @@ def pytest_configure(config: pytest.Config) -> None:
     patcher.setattr(CreditSwitch, "effective", _forced_effective)
     _ORIGINAL_WRITER = credit_metering.record_observational_trace
     patcher.setattr(credit_metering, "record_observational_trace", _counted_writer)
+    _ORIGINAL_CAPTURE = credit_metering.capture_events_enforcement
+    patcher.setattr(credit_metering, "capture_events_enforcement", _counted_capture)
     config.stash[_PATCHER] = patcher
 
 
@@ -94,6 +117,11 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
         f"credit observational writer: {sum(_writer_outcomes.values())} calls"
         f" ({outcomes or 'none'})"
     )
+    captures = ", ".join(f"{name}={count}" for name, count in sorted(_captures.items()))
+    terminalreporter.write_line(
+        f"credit enforced-path captures: {sum(_captures.values())}"
+        f" ({captures or 'none'})"
+    )
 
 
 def _assert_forced() -> None:
@@ -105,6 +133,9 @@ def _assert_forced() -> None:
     assert (
         credit_metering.record_observational_trace is _counted_writer
     ), "the observational writer counter was swapped and not restored"
+    assert (
+        credit_metering.capture_events_enforcement is _counted_capture
+    ), "the enforced-path capture counter was swapped and not restored"
     _self_checks += 1
     assert credit_switch_effective() is True, "the forced switch does not read True"
 

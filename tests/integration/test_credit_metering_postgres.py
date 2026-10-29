@@ -21,6 +21,25 @@ What SQLite cannot show, against migration 038 at head:
   and across a reparent (the tenant/builder trigger agrees), and nothing is
   written once ``credit_enforcement_at`` is set.
 
+Group 3b-1, the enforced ``POST /v1/events`` through the real app on a
+database with ``credit_enforcement_at`` set (LOW-6: the fences and the
+concurrency are PostgreSQL-only):
+
+* one decision, one trace, committed with its decision; ``lock_timeout`` of
+  15 s only inside the enforced phase 1 and gone with its commit; the LLM
+  never inside a transaction; the phase 1 handoff charged and linked, its
+  creation webhook announced once, after the final transaction;
+* the fences (HIGH-1): a phase 1 stalled past its lease loses its marker to
+  a takeover and rolls everything back; a retry waits on ``FOR SHARE`` for a
+  final transaction that passed its check and replays it, never
+  ``event_failed``; a final check after the lease writes nothing; two
+  takeovers and two first requests of one key run phase 1 once; a lock
+  timeout releases the lease for an immediate takeover;
+* the lock order (MEDIUM-1): a final transaction and ``DELETE
+  /clinics/{clinic_id}`` finish without deadlock (the tenant ``FOR SHARE``
+  first), and a phase 1 holding a session never blocks the final
+  transaction of another session of the same builder.
+
 Needs ``POSTGRES_SMOKE_DATABASE_URL``; without it the module skips, and only
 ``scripts/check-credit-integration.sh`` turns that skip into a failure.
 """
@@ -35,7 +54,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -609,16 +628,21 @@ async def _running_app(pg: _PG, monkeypatch: pytest.MonkeyPatch) -> AsyncIterato
             engine_factory=create_async_engine,
         ),
     )
-    with _fake_llm_and_providers():
-        async with app.router.lifespan_context(app):
-            from src.services.credit_switch import credit_switch_effective
+    # Each running app is a fresh process for D1's one-way latch.
+    credit_metering.forget_enforcement_seen()
+    try:
+        with _fake_llm_and_providers():
+            async with app.router.lifespan_context(app):
+                from src.services.credit_switch import credit_switch_effective
 
-            assert credit_switch_effective(), "the real switch is not effective"
-            transport = httpx.ASGITransport(app=app, client=("testclient", 50000))
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://testserver"
-            ) as client:
-                yield _App(client=client, world=world, twin_session=str(twin))
+                assert credit_switch_effective(), "the real switch is not effective"
+                transport = httpx.ASGITransport(app=app, client=("testclient", 50000))
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://testserver"
+                ) as client:
+                    yield _App(client=client, world=world, twin_session=str(twin))
+    finally:
+        credit_metering.forget_enforcement_seen()
 
 
 def _events_body(
@@ -911,3 +935,1341 @@ async def test_a_credit_fault_in_the_real_app_answers_and_stores_like_main(
     claims, effects = await _rows(direct, UUID(world.api_tenant))
     assert claims == []  # neither the switched-off nor the faulted key claimed
     assert [e.trace_id for e in effects] == [UUID(after.json()["event_id"])]
+
+
+# ---------------------------------------------------------------------------
+# Group 3b-1: enforced POST /v1/events -- the claim's fences, the lock order
+# and the atomic decision under real concurrency (PostgreSQL only, LOW-6).
+# ---------------------------------------------------------------------------
+
+_HANDOFF_TEXT = "Quero falar com um atendente humano"
+# Every enforced turn runs under asyncio.timeout: a self-wait or a deadlock
+# fails fast instead of hanging the suite.
+_TURN_SECONDS = 60
+
+
+@pytest.fixture(scope="module")
+async def enforced_pg(pg: _PG) -> AsyncIterator[_PG]:
+    """A second database at head with ``credit_enforcement_at`` set; the
+    observational tests above never see it."""
+
+    name = await pg.cluster.fresh()
+    url = pg.cluster.url(name)
+    await _migrate(url, "upgrade", "head")
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO credit_enforcement_state (id, credit_enforcement_at, "
+                    "set_by, set_at) VALUES (1, clock_timestamp() - interval "
+                    "'1 minute', 'test', clock_timestamp())"
+                )
+            )
+    finally:
+        await engine.dispose()
+    yield _PG(cluster=pg.cluster, url=url)
+
+
+@pytest.fixture
+async def enforced_direct(enforced_pg: _PG) -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine(enforced_pg.url, poolclass=NullPool)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+class _Gate:
+    """Pause the selected callers of a patched coroutine until opened;
+    ``reached`` is set once ``parties`` of them arrived."""
+
+    def __init__(self, parties: int = 1) -> None:
+        self.parties = parties
+        self.arrived = 0
+        self.reached = asyncio.Event()
+        self.opened = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.arrived += 1
+        if self.arrived >= self.parties:
+            self.reached.set()
+        await asyncio.wait_for(self.opened.wait(), _TURN_SECONDS)
+
+
+def _pause(
+    monkeypatch: pytest.MonkeyPatch,
+    owner: type,
+    name: str,
+    gate: _Gate,
+    *,
+    calls: frozenset[int] = frozenset({1}),
+    after: bool = False,
+    results: list[Any] | None = None,
+) -> None:
+    """Class-level wrapper (never a shared instance): the ``calls``-th
+    callers wait on ``gate`` before (or after) the original runs."""
+
+    original = getattr(owner, name)
+    count = 0
+
+    async def paused(self: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal count
+        count += 1
+        selected = count in calls
+        if selected and not after:
+            await gate.wait()
+        result = await original(self, *args, **kwargs)
+        if results is not None:
+            results.append(result)
+        if selected and after:
+            await gate.wait()
+        return result
+
+    monkeypatch.setattr(owner, name, paused)
+
+
+async def _until_lock_waiters(
+    direct: AsyncEngine, count: int, *, query: str = "%"
+) -> None:
+    """Until ``count`` backends of this database wait on a lock."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TURN_SECONDS
+    while True:
+        async with direct.connect() as connection:
+            waiting = int(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                            "current_database() AND wait_event_type = 'Lock' "
+                            "AND pid <> pg_backend_pid() AND query ILIKE :query"
+                        ),
+                        {"query": query},
+                    )
+                ).scalar_one()
+            )
+        if waiting >= count:
+            return
+        if loop.time() > deadline:
+            raise AssertionError(f"{waiting} lock waiters, expected {count}")
+        await asyncio.sleep(0.05)
+
+
+async def _until_lease_over(
+    direct: AsyncEngine, tenant_id: UUID, key: str, seconds: int
+) -> None:
+    """Until the database clock is past the claim's lease (a plain read: a
+    row lock never blocks it)."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TURN_SECONDS
+    while True:
+        async with direct.connect() as connection:
+            over = (
+                await connection.execute(
+                    text(
+                        "SELECT clock_timestamp() >= created_at + make_interval("
+                        "secs => :seconds) FROM credit_ingress_claims WHERE "
+                        "tenant_id = :t AND idempotency_key = :k"
+                    ),
+                    {"seconds": seconds, "t": tenant_id, "k": key},
+                )
+            ).scalar_one()
+        if over:
+            return
+        if loop.time() > deadline:
+            raise AssertionError("the lease never ended")
+        await asyncio.sleep(0.1)
+
+
+@dataclass(frozen=True)
+class _Enforced:
+    claims: list[Any]
+    effects: list[tuple[str, str]]
+    entries: dict[str, int]
+    outbox: list[tuple[str, str, Any]]
+    handoffs: list[tuple[UUID, Any]]
+    handoff_requests: int
+    decisions: list[tuple[UUID, Any]]
+    message_count: dict[UUID, int]
+
+
+async def _enforced_rows(direct: AsyncEngine, world: Any) -> _Enforced:
+    tenant, builder = UUID(world.api_tenant), UUID(world.builder)
+
+    async def rows(connection: AsyncConnection, sql: str, **params: Any) -> list[Any]:
+        return list((await connection.execute(text(sql), params)).all())
+
+    async with direct.connect() as connection:
+        claims = await rows(
+            connection,
+            "SELECT id, interaction_id, mode, session_version, created_at, "
+            "idempotency_key FROM credit_ingress_claims WHERE tenant_id = :t",
+            t=tenant,
+        )
+        effects = await rows(
+            connection,
+            "SELECT effect_id, effect_kind FROM credit_effects WHERE builder_id = :b "
+            "AND effect_kind LIKE 'trace%' ORDER BY effect_id",
+            b=builder,
+        )
+        entries = await rows(
+            connection,
+            "SELECT entry_type, sum(amount_mc) FROM credit_ledger_entries "
+            "WHERE builder_id = :b GROUP BY entry_type",
+            b=builder,
+        )
+        outbox = await rows(
+            connection,
+            "SELECT effect_id, state, payload FROM credit_response_outbox "
+            "WHERE tenant_id = :t ORDER BY effect_id",
+            t=tenant,
+        )
+        handoffs = await rows(
+            connection,
+            "SELECT id, context FROM handoff_records WHERE tenant_id = :t",
+            t=tenant,
+        )
+        requests = await rows(
+            connection,
+            "SELECT count(*) FROM events WHERE tenant_id = :t "
+            "AND event_type = 'handoff.request'",
+            t=tenant,
+        )
+        decisions = await rows(
+            connection,
+            "SELECT id, metadata FROM events WHERE tenant_id = :t "
+            "AND event_type = 'srm.decision'",
+            t=tenant,
+        )
+        counts = await rows(
+            connection,
+            "SELECT id, message_count FROM sessions WHERE tenant_id = :t",
+            t=tenant,
+        )
+    return _Enforced(
+        claims=claims,
+        effects=[(str(e), str(k)) for e, k in effects],
+        entries={str(kind): int(total) for kind, total in entries},
+        outbox=[(str(e), str(s), p) for e, s, p in outbox],
+        handoffs=[(UUID(str(i)), c) for i, c in handoffs],
+        handoff_requests=int(requests[0][0]),
+        decisions=[(UUID(str(i)), m) for i, m in decisions],
+        message_count={UUID(str(i)): int(c) for i, c in counts},
+    )
+
+
+@pytest.fixture
+def announced(monkeypatch: pytest.MonkeyPatch) -> list[UUID]:
+    """The handoff creation webhooks that would leave the process (only a
+    committed record gets this far); nothing is sent."""
+
+    from src.services.handoff_service import HandoffService
+
+    sent: list[UUID] = []
+
+    async def record(_self: Any, handoff: Any, *_args: Any) -> tuple[bool, None]:
+        sent.append(handoff.id)
+        return False, None
+
+    monkeypatch.setattr(HandoffService, "_dispatch_creation_webhook", record)
+    return sent
+
+
+def _api(world: Any, key: str) -> dict[str, str]:
+    return {"X-API-Key": world.api_key, "Idempotency-Key": key}
+
+
+def _trace(world: Any, claim: Any) -> str:
+    return f"trace:{world.api_tenant}:{claim.interaction_id}:decision:1"
+
+
+async def test_an_enforced_decision_charges_once_atomically_on_postgres(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    announced: list[UUID],
+) -> None:
+    """One plain decision and one synchronous phase 1 handoff: each costs one
+    trace committed with its decision; ``lock_timeout`` is 15 s only inside
+    the enforced phase 1 and dies with its commit; the LLM never runs inside
+    a transaction; a retry replays the stored answer byte for byte."""
+
+    lock_timeouts: dict[str, list[str]] = {"phase1": [], "final": []}
+
+    def spy_timeout(name: str, phase: str) -> None:
+        original = getattr(CreditRepository, name)
+
+        async def spy(self: CreditRepository, *args: Any, **kwargs: Any) -> Any:
+            shown = await self.session.execute(text("SHOW lock_timeout"))
+            lock_timeouts[phase].append(str(shown.scalar_one()))
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(CreditRepository, name, spy)
+
+    spy_timeout("mark_claim_phase1", "phase1")
+    spy_timeout("hold_claim_final_fence", "final")
+    from src.services.event_service import EventService
+
+    open_transactions: list[int] = []
+    generate = EventService.generate_response
+
+    async def outside(self: Any, *args: Any, **kwargs: Any) -> Any:
+        async with enforced_direct.connect() as connection:
+            open_transactions.append(
+                int(
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT count(*) FROM pg_stat_activity WHERE datname "
+                                "= current_database() AND pid <> pg_backend_pid() "
+                                "AND state LIKE 'idle in transaction%'"
+                            )
+                        )
+                    ).scalar_one()
+                )
+            )
+        return await generate(self, *args, **kwargs)
+
+    monkeypatch.setattr(EventService, "generate_response", outside)
+    defaults = await _defaults(enforced_direct)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        async with asyncio.timeout(_TURN_SECONDS):
+            plain = await client.post(
+                "/v1/events",
+                json=_events_body(running.twin_session),
+                headers=_api(world, "pg-plain"),
+            )
+            handoff = await client.post(
+                "/v1/events",
+                json=_events_body(world.api_session, _HANDOFF_TEXT),
+                headers=_api(world, "pg-handoff"),
+            )
+            replay = await client.post(
+                "/v1/events",
+                json=_events_body(world.api_session, _HANDOFF_TEXT),
+                headers=_api(world, "pg-handoff"),
+            )
+            [handoff_id] = [
+                h for h, _ in (await _enforced_rows(enforced_direct, world)).handoffs
+            ]
+            detail = await client.get(
+                f"/v1/handoffs/{handoff_id}", headers={"X-API-Key": world.api_key}
+            )
+        from src.repositories.database import get_db_engine
+
+        async with get_db_engine().connect() as pooled:
+            after = await _server_timeouts(pooled)
+    assert plain.status_code == handoff.status_code == 200, (plain.text, handoff.text)
+    assert replay.status_code == 200 and replay.content == handoff.content
+    assert handoff.json()["handoff_summary"] is not None
+    assert plain.json()["prompt"]["suggested_response"]
+    assert lock_timeouts == {"phase1": ["15s", "15s"], "final": [defaults[0]] * 2}
+    assert after == defaults
+    assert open_transactions == [0, 0]
+    seen = await _enforced_rows(enforced_direct, world)
+    by_key = {c.idempotency_key: c for c in seen.claims}
+    assert {c.mode for c in seen.claims} == {"enforced"}
+    assert all(c.session_version is not None for c in seen.claims)
+    expected = sorted((_trace(world, c), "trace") for c in seen.claims)
+    assert seen.effects == expected
+    assert seen.entries == {"debt": 2_000}  # no lot: served as debt, one trace each
+    assert sorted((e, s) for e, s, _ in seen.outbox) == sorted(
+        (effect, "delivered") for effect, _ in expected
+    )
+    assert {e: p for e, _, p in seen.outbox}[_trace(world, by_key["pg-handoff"])] == (
+        handoff.json()
+    )
+    [(_, context)] = seen.handoffs
+    assert context["credit_effect_id"] == _trace(world, by_key["pg-handoff"])
+    assert context.get("key_info") is not None  # merged, not replaced
+    assert seen.handoff_requests == 1
+    assert sorted(m["credit_effect_id"] for _, m in seen.decisions) == sorted(
+        effect for effect, _ in expected
+    )
+    assert announced == [handoff_id]  # after the final transaction, once
+    assert detail.status_code == 200 and "credit_effect_id" not in detail.text
+
+
+async def test_a_stalled_phase1_loses_its_marker_after_a_takeover(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    announced: list[UUID],
+) -> None:
+    """HIGH-1 (a): executor A stalls before its phase 1 marker -- holding the
+    session row, its handoff and its debit, uncommitted -- past its lease;
+    B takes the claim over and waits for the session.  A's marker no longer
+    matches: A rolls everything back (no handoff, no debit, no creation
+    webhook) and answers by the table; B decides once."""
+
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", 2)
+    stalled = _Gate()
+    _pause(monkeypatch, CreditRepository, "mark_claim_phase1", stalled)
+    takeover = CreditRepository.take_over_claim
+
+    async def take_over(self: CreditRepository, *args: Any, **kwargs: Any) -> Any:
+        observed = await takeover(self, *args, **kwargs)
+        if observed is not None:
+            # From now on the lease is long: B's own fences hold, and A's
+            # resumed marker fails on the claim it observed, not the clock.
+            monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", 600)
+        return observed
+
+    monkeypatch.setattr(CreditRepository, "take_over_claim", take_over)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session, _HANDOFF_TEXT)
+        async with asyncio.timeout(_TURN_SECONDS):
+            first = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "stall-1"))
+            )
+            await stalled.reached.wait()
+            await _until_lease_over(
+                enforced_direct, UUID(world.api_tenant), "stall-1", 2
+            )
+            second = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "stall-1"))
+            )
+            # B took over and now waits on the session row A holds.
+            await _until_lock_waiters(enforced_direct, 1, query="%sessions%")
+            assert not first.done() and not second.done()
+            stalled.opened.set()
+            a, b = await asyncio.gather(first, second)
+    assert b.status_code == 200, b.text
+    assert (a.status_code, a.json()) == (409, {"code": "event_in_progress"}) or (
+        a.status_code == 200 and a.content == b.content
+    ), a.text
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    assert seen.effects == [(_trace(world, claim), "trace")]
+    assert seen.entries == {"debt": 1_000}
+    [(handoff_id, context)] = seen.handoffs
+    assert seen.handoff_requests == 1
+    assert context["credit_effect_id"] == _trace(world, claim)
+    assert announced == [handoff_id]  # A's creation webhook never left
+    assert seen.message_count[UUID(world.api_session)] == 1  # advanced once
+
+
+async def test_a_retry_waits_for_a_final_transaction_past_its_lease_and_replays(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH-1 (b): the final check passed and keeps the claim's row lock;
+    the transaction pauses before COMMIT until the lease is over.  A retry
+    blocks on ``FOR SHARE``, and once the commit lands it replays the 200 --
+    never ``event_failed`` for a decision that commits and is charged."""
+
+    lease = 6
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", lease)
+    held = _Gate()
+    _pause(monkeypatch, CreditRepository, "hold_claim_final_fence", held, after=True)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session)
+        async with asyncio.timeout(_TURN_SECONDS):
+            first = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "held-1"))
+            )
+            await held.reached.wait()
+            await _until_lease_over(
+                enforced_direct, UUID(world.api_tenant), "held-1", lease
+            )
+            retry = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "held-1"))
+            )
+            blocked = asyncio.create_task(
+                _until_lock_waiters(
+                    enforced_direct, 1, query="%credit_ingress_claims%FOR SHARE%"
+                )
+            )
+            await asyncio.wait({retry, blocked}, return_when=asyncio.FIRST_COMPLETED)
+            # The retry must wait on the claim row the final check holds: an
+            # answer now would be about a decision that is about to commit.
+            assert not retry.done(), retry.result().text
+            await blocked
+            held.opened.set()
+            a, r = await asyncio.gather(first, retry)
+    assert a.status_code == 200, a.text
+    assert r.status_code == 200 and r.content == a.content
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    assert seen.effects == [(_trace(world, claim), "trace")]
+    assert seen.entries == {"debt": 1_000}
+
+
+async def test_a_final_transaction_reaching_its_fence_after_the_lease_writes_nothing(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH-1 (b): the bundle, the debit and the stored answer are written
+    but the final check comes only after the lease: it fails, everything is
+    rolled back and the answer is the final ``event_failed``."""
+
+    lease = 6
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", lease)
+    late = _Gate()
+    _pause(monkeypatch, CreditRepository, "hold_claim_final_fence", late)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        async with asyncio.timeout(_TURN_SECONDS):
+            first = asyncio.create_task(
+                client.post(
+                    "/v1/events",
+                    json=_events_body(world.api_session),
+                    headers=_api(world, "late-1"),
+                )
+            )
+            await late.reached.wait()
+            await _until_lease_over(
+                enforced_direct, UUID(world.api_tenant), "late-1", lease
+            )
+            late.opened.set()
+            answer = await first
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    assert answer.status_code == 409 and answer.json() == {
+        "code": "event_failed",
+        "interaction_id": str(claim.interaction_id),
+    }
+    assert claim.session_version is not None  # phase 1 committed
+    assert seen.decisions == [] and seen.outbox == []
+    assert seen.effects == [] and seen.entries == {}
+
+
+async def test_a_reader_that_saw_the_lease_end_wins_over_a_waiting_final_check(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH-1, R1 (reproduced by the review).  A retry holds the claim ``FOR
+    SHARE`` while the lease is alive; the final check's ``UPDATE`` waits on
+    it; the lease ends; the retry reads the clock, finds no stored answer and
+    answers the final ``event_failed``.  The final check must then fail too:
+    PostgreSQL judged a ``WHERE`` before the wait and does not judge it again
+    after a ``FOR SHARE`` holder (it changed nothing), so the lease is judged
+    in ``RETURNING`` once the row is locked.  Every answer agrees --
+    ``event_failed`` three times -- and nothing is charged."""
+
+    lease = 8
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", lease)
+    before_check = _Gate()
+    _pause(monkeypatch, CreditRepository, "hold_claim_final_fence", before_check)
+    # The retry pauses INSIDE its clock read: after its FOR SHARE, before the
+    # clock -- the read must happen while the share lock is held (M9).
+    reading = _Gate()
+    _pause(monkeypatch, CreditRepository, "lease_clock", reading)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session)
+        async with asyncio.timeout(_TURN_SECONDS):
+            original = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "r1"))
+            )
+            await before_check.reached.wait()  # bundle, debit, answer: written
+            retry = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "r1"))
+            )
+            await reading.reached.wait()  # FOR SHARE held, lease still alive
+            before_check.opened.set()
+            await _until_lock_waiters(
+                enforced_direct, 1, query="%UPDATE credit_ingress_claims%"
+            )
+            await _until_lease_over(
+                enforced_direct, UUID(world.api_tenant), "r1", lease
+            )
+            reading.opened.set()
+            a, r = await asyncio.gather(original, retry)
+            third = await client.post(
+                "/v1/events", json=body, headers=_api(world, "r1")
+            )
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    failed = {"code": "event_failed", "interaction_id": str(claim.interaction_id)}
+    assert (r.status_code, r.json()) == (409, failed), r.text
+    assert (a.status_code, a.json()) == (409, failed), a.text
+    assert (third.status_code, third.json()) == (409, failed), third.text
+    assert seen.effects == [] and seen.entries == {}
+    assert seen.outbox == [] and seen.decisions == []
+
+
+async def test_a_phase1_stalled_past_its_lease_without_a_retry_rolls_everything_back(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    announced: list[UUID],
+) -> None:
+    """m09: nobody takes the claim over; phase 1 (with a handoff and its
+    debit) only resumes after its lease.  Its marker judges the lease once
+    the row is locked: it fails, EVERYTHING is rolled back -- handoff,
+    ``handoff.request``, debit -- no creation webhook leaves, and a later
+    retry takes over and decides once."""
+
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", 3)
+    stalled = _Gate()
+    _pause(monkeypatch, CreditRepository, "mark_claim_phase1", stalled)
+    takeover = CreditRepository.take_over_claim
+
+    async def take_over(self: CreditRepository, *args: Any, **kwargs: Any) -> Any:
+        observed = await takeover(self, *args, **kwargs)
+        if observed is not None:  # the retry's own lease is long
+            monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", 600)
+        return observed
+
+    monkeypatch.setattr(CreditRepository, "take_over_claim", take_over)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session, _HANDOFF_TEXT)
+        async with asyncio.timeout(_TURN_SECONDS):
+            first = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "m09"))
+            )
+            await stalled.reached.wait()
+            await _until_lease_over(enforced_direct, UUID(world.api_tenant), "m09", 3)
+            stalled.opened.set()
+            late = await first
+            rolled_back = await _enforced_rows(enforced_direct, world)
+            retry = await client.post(
+                "/v1/events", json=body, headers=_api(world, "m09")
+            )
+    assert (late.status_code, late.json()) == (409, {"code": "event_in_progress"})
+    [claim] = rolled_back.claims
+    assert claim.session_version is None
+    assert rolled_back.handoffs == [] and rolled_back.handoff_requests == 0
+    assert rolled_back.effects == [] and rolled_back.entries == {}
+    assert retry.status_code == 200, retry.text
+    seen = await _enforced_rows(enforced_direct, world)
+    [taken] = seen.claims
+    assert taken.interaction_id == claim.interaction_id
+    assert seen.effects == [(_trace(world, taken), "trace")]
+    assert seen.entries == {"debt": 1_000}
+    [(handoff_id, _)] = seen.handoffs
+    assert announced == [handoff_id]  # the stalled phase 1 announced nothing
+
+
+async def test_a_marker_waiting_behind_a_reader_past_the_lease_loses_to_its_takeover(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    announced: list[UUID],
+) -> None:
+    """HIGH-1 (a), through the route.  Executor A reaches its phase 1 marker
+    (a handoff and its debit written) while a retry R holds the claim ``FOR
+    SHARE`` with the lease alive; A's marker waits on R; the lease ends; R
+    reads the clock under its share lock, sees an abandoned claim and takes
+    it over.  A's marker -- judged once the row is locked -- fails, A rolls
+    everything back, and R decides once."""
+
+    lease = 5
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", lease)
+    at_marker = _Gate()
+    _pause(monkeypatch, CreditRepository, "mark_claim_phase1", at_marker)
+    reading = _Gate()
+    _pause(monkeypatch, CreditRepository, "lease_clock", reading)
+    takeover = CreditRepository.take_over_claim
+
+    async def take_over(self: CreditRepository, *args: Any, **kwargs: Any) -> Any:
+        observed = await takeover(self, *args, **kwargs)
+        if observed is not None:  # R's own lease is long
+            monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", 600)
+        return observed
+
+    monkeypatch.setattr(CreditRepository, "take_over_claim", take_over)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session, _HANDOFF_TEXT)
+        async with asyncio.timeout(_TURN_SECONDS):
+            first = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "behind"))
+            )
+            await at_marker.reached.wait()
+            retry = asyncio.create_task(
+                client.post("/v1/events", json=body, headers=_api(world, "behind"))
+            )
+            await reading.reached.wait()  # R holds FOR SHARE, lease alive
+            at_marker.opened.set()
+            await _until_lock_waiters(
+                enforced_direct, 1, query="%UPDATE credit_ingress_claims%"
+            )
+            await _until_lease_over(
+                enforced_direct, UUID(world.api_tenant), "behind", lease
+            )
+            reading.opened.set()
+            a, r = await asyncio.gather(first, retry)
+    assert r.status_code == 200, r.text
+    assert (a.status_code, a.json()) == (409, {"code": "event_in_progress"}) or (
+        a.status_code == 200 and a.content == r.content
+    ), a.text
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    assert seen.effects == [(_trace(world, claim), "trace")]
+    assert seen.entries == {"debt": 1_000}
+    [(handoff_id, _)] = seen.handoffs
+    assert seen.handoff_requests == 1
+    assert announced == [handoff_id]  # A's rolled-back handoff never left
+
+
+# -- The fences one statement at a time (repository level): every actor a real
+# connection, the order forced by row locks and pg_stat_activity, the lease
+# ended by the database clock (ported from the focused review).
+
+_FENCE_LEASE_SECONDS = 3
+_FENCE_LEASE = timedelta(seconds=_FENCE_LEASE_SECONDS)
+
+
+def _fence_enforcement(seeded: _Tenant, key: str) -> Any:
+    import hashlib
+
+    return credit_metering.EventsEnforcement(
+        tenant_id=seeded.tenant_id,
+        session_id=seeded.session_id,
+        principal_id=f"api_key:{seeded.tenant_id}",
+        payload_sha256=hashlib.sha256(key.encode()).hexdigest(),
+        idempotency_key=key,
+        key_problem=None,
+    )
+
+
+async def _fence_claim(direct: AsyncEngine, seeded: _Tenant, key: str) -> Any:
+    enforcement = _fence_enforcement(seeded, key)
+    async with AsyncSession(direct) as session:
+        repository = CreditRepository(session)
+        await repository.tenant_scope(seeded.tenant_id, lock=True)
+        row = await repository.insert_enforced_claim(
+            tenant_id=seeded.tenant_id,
+            builder_id=seeded.builder_id,
+            principal_id=enforcement.principal_id,
+            idempotency_key=key,
+            interaction_id=uuid4(),
+            payload_sha256=enforcement.payload_sha256,
+            decision_version=1,
+        )
+        await session.commit()
+    assert row is not None
+    return row
+
+
+async def _fence_phase1(direct: AsyncEngine, row: Any, version: int = 7) -> None:
+    async with AsyncSession(direct) as session:
+        assert await CreditRepository(session).mark_claim_phase1(
+            row.id, observed=row.created_at, session_version=version, lease=_FENCE_LEASE
+        )
+        await session.commit()
+
+
+async def _db_past(direct: AsyncEngine, instant: datetime) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TURN_SECONDS
+    while True:
+        async with direct.connect() as connection:
+            if (
+                await connection.execute(
+                    text("SELECT clock_timestamp() >= :t"), {"t": instant}
+                )
+            ).scalar_one():
+                return
+        assert loop.time() < deadline, "the database clock never got there"
+        await asyncio.sleep(0.05)
+
+
+async def _fence_row(direct: AsyncEngine, claim_id: UUID) -> Any:
+    async with direct.connect() as connection:
+        return (
+            await connection.execute(
+                text(
+                    "SELECT session_version, created_at FROM credit_ingress_claims "
+                    "WHERE id = :i"
+                ),
+                {"i": claim_id},
+            )
+        ).one()
+
+
+async def _fence_read(direct: AsyncEngine, enforcement: Any) -> Any:
+    async with AsyncSession(direct) as session:
+        return await credit_metering.read_events_claim(session, enforcement)
+
+
+@pytest.fixture
+def fence_lease(monkeypatch: pytest.MonkeyPatch) -> timedelta:
+    """Readers judge with the module constant: the same lease as the fences."""
+
+    monkeypatch.setattr(credit_metering, "CLAIM_LEASE_SECONDS", _FENCE_LEASE_SECONDS)
+    return _FENCE_LEASE
+
+
+@pytest.fixture
+def reader_clock(monkeypatch: pytest.MonkeyPatch) -> _Gate:
+    """The first reader pauses INSIDE ``lease_clock``: its ``FOR SHARE`` is
+    held, its clock not read yet."""
+
+    gate = _Gate()
+    _pause(monkeypatch, CreditRepository, "lease_clock", gate)
+    return gate
+
+
+async def test_fence_a_marker_waiting_behind_a_reader_past_its_lease_loses(
+    enforced_direct: AsyncEngine, fence_lease: timedelta, reader_clock: _Gate
+) -> None:
+    """The reader holds ``FOR SHARE`` (lease alive, no phase 1); A's marker
+    waits; the lease ends; the reader reads the clock UNDER its share lock
+    and decides "take over"; A's marker must fail, and the takeover wins."""
+
+    seeded = await _tenant(enforced_direct)
+    row = await _fence_claim(enforced_direct, seeded, "m1")
+    reader = asyncio.create_task(
+        _fence_read(enforced_direct, _fence_enforcement(seeded, "m1"))
+    )
+    await asyncio.wait_for(reader_clock.reached.wait(), _TURN_SECONDS)
+    a = AsyncSession(enforced_direct)
+    try:
+        marker = asyncio.create_task(
+            CreditRepository(a).mark_claim_phase1(
+                row.id, observed=row.created_at, session_version=3, lease=fence_lease
+            )
+        )
+        await _until_lock_waiters(
+            enforced_direct, 1, query="%UPDATE credit_ingress_claims%"
+        )
+        await _db_past(enforced_direct, row.created_at + fence_lease)
+        reader_clock.opened.set()
+        verdict = await asyncio.wait_for(reader, _TURN_SECONDS)
+        assert not isinstance(verdict, credit_metering.ClaimAnswer), verdict
+        assert await asyncio.wait_for(marker, _TURN_SECONDS) is False
+    finally:
+        await a.rollback()
+        await a.close()
+    async with AsyncSession(enforced_direct) as b:
+        taken = await CreditRepository(b).take_over_claim(
+            row.id, observed=verdict.created_at, lease=fence_lease
+        )
+        await b.commit()
+    assert taken is not None
+    assert (await _fence_row(enforced_direct, row.id)).session_version is None
+
+
+async def test_fence_a_reader_that_saw_the_end_beats_a_waiting_final_check(
+    enforced_direct: AsyncEngine, fence_lease: timedelta, reader_clock: _Gate
+) -> None:
+    """R1 one statement at a time: the reader holds ``FOR SHARE`` with the
+    lease alive; the final check waits; the lease ends; the reader answers
+    ``event_failed``; the final check must judge the lease dead."""
+
+    seeded = await _tenant(enforced_direct)
+    row = await _fence_claim(enforced_direct, seeded, "r1")
+    await _fence_phase1(enforced_direct, row)
+    enforcement = _fence_enforcement(seeded, "r1")
+    reader = asyncio.create_task(_fence_read(enforced_direct, enforcement))
+    await asyncio.wait_for(reader_clock.reached.wait(), _TURN_SECONDS)
+    final = AsyncSession(enforced_direct)
+    try:
+        repository = CreditRepository(final)
+        await repository.tenant_scope(seeded.tenant_id, lock=True)
+        await repository.insert_response_outbox(
+            tenant_id=seeded.tenant_id,
+            effect_id=trace_effect_id(seeded.tenant_id, row.interaction_id),
+            payload={"answer": "stored"},
+            state="delivered",
+        )
+        check = asyncio.create_task(
+            repository.hold_claim_final_fence(
+                row.id, observed=row.created_at, session_version=7, lease=fence_lease
+            )
+        )
+        await _until_lock_waiters(
+            enforced_direct, 1, query="%UPDATE credit_ingress_claims%"
+        )
+        await _db_past(enforced_direct, row.created_at + fence_lease)
+        reader_clock.opened.set()
+        answer = await asyncio.wait_for(reader, _TURN_SECONDS)
+        assert answer.body["code"] == "event_failed", answer
+        assert await asyncio.wait_for(check, _TURN_SECONDS) is False
+    finally:
+        await final.rollback()
+        await final.close()
+    again = await _fence_read(enforced_direct, enforcement)
+    assert again.body["code"] == "event_failed"
+
+
+async def test_fence_a_marker_holding_first_then_a_takeover_waits_and_loses(
+    enforced_direct: AsyncEngine, fence_lease: timedelta
+) -> None:
+    seeded = await _tenant(enforced_direct)
+    row = await _fence_claim(enforced_direct, seeded, "m2")
+    a, b = AsyncSession(enforced_direct), AsyncSession(enforced_direct)
+    try:
+        assert await CreditRepository(a).mark_claim_phase1(
+            row.id, observed=row.created_at, session_version=3, lease=fence_lease
+        )
+        await _db_past(enforced_direct, row.created_at + fence_lease)
+        take = asyncio.create_task(
+            CreditRepository(b).take_over_claim(
+                row.id, observed=row.created_at, lease=fence_lease
+            )
+        )
+        await _until_lock_waiters(
+            enforced_direct, 1, query="%UPDATE credit_ingress_claims%"
+        )
+        await a.commit()  # phase 1 committed: never taken over
+        assert await asyncio.wait_for(take, _TURN_SECONDS) is None
+        await b.commit()
+    finally:
+        await a.close()
+        await b.close()
+    assert (await _fence_row(enforced_direct, row.id)).session_version == 3
+
+
+async def test_fence_a_takeover_never_passes_a_final_check_after_phase1(
+    enforced_direct: AsyncEngine, fence_lease: timedelta
+) -> None:
+    """Phase 1 committed, the final check holds the row, the lease ends: a
+    takeover answers ``None`` at once -- it never even waits for that row --
+    and the decision commits and replays."""
+
+    seeded = await _tenant(enforced_direct)
+    row = await _fence_claim(enforced_direct, seeded, "tf")
+    await _fence_phase1(enforced_direct, row)
+    final = AsyncSession(enforced_direct)
+    b = AsyncSession(enforced_direct)
+    try:
+        repository = CreditRepository(final)
+        await repository.tenant_scope(seeded.tenant_id, lock=True)
+        await repository.insert_response_outbox(
+            tenant_id=seeded.tenant_id,
+            effect_id=trace_effect_id(seeded.tenant_id, row.interaction_id),
+            payload={"answer": "stored"},
+            state="delivered",
+        )
+        assert await repository.hold_claim_final_fence(
+            row.id, observed=row.created_at, session_version=7, lease=fence_lease
+        )
+        await _db_past(enforced_direct, row.created_at + fence_lease)
+        take = asyncio.create_task(
+            CreditRepository(b).take_over_claim(
+                row.id, observed=row.created_at, lease=fence_lease
+            )
+        )
+        done, _ = await asyncio.wait({take}, timeout=5)
+        await final.commit()
+        taken = await asyncio.wait_for(take, _TURN_SECONDS)
+        await b.commit()
+    finally:
+        await final.close()
+        await b.close()
+    assert done, "the takeover waited on the final check's row"
+    assert taken is None
+    answer = await _fence_read(enforced_direct, _fence_enforcement(seeded, "tf"))
+    assert answer.status == 200 and answer.replay
+
+
+@pytest.mark.parametrize("first", ["release", "takeover"])
+async def test_fence_a_release_and_a_takeover_of_one_expired_lease(
+    enforced_direct: AsyncEngine, fence_lease: timedelta, first: str
+) -> None:
+    """A late release never kills a takeover that already happened, and a
+    takeover waiting behind a release finds the claim changed."""
+
+    seeded = await _tenant(enforced_direct)
+    row = await _fence_claim(enforced_direct, seeded, f"rel-{first}")
+    await _db_past(enforced_direct, row.created_at + fence_lease)
+    a, b = AsyncSession(enforced_direct), AsyncSession(enforced_direct)
+
+    async def release() -> bool:
+        return await CreditRepository(a).release_claim_lease(
+            row.id, observed=row.created_at, session_version=None, lease=fence_lease
+        )
+
+    async def takeover() -> Any:
+        return await CreditRepository(b).take_over_claim(
+            row.id, observed=row.created_at, lease=fence_lease
+        )
+
+    try:
+        if first == "release":
+            assert await release() is True
+            other = asyncio.create_task(takeover())
+            await _until_lock_waiters(enforced_direct, 1, query="%UPDATE%")
+            await a.commit()
+            assert await asyncio.wait_for(other, _TURN_SECONDS) is None
+            await b.commit()
+            released = await _fence_row(enforced_direct, row.id)
+            async with AsyncSession(enforced_direct) as c:  # the next retry
+                assert (
+                    await CreditRepository(c).take_over_claim(
+                        row.id, observed=released.created_at, lease=fence_lease
+                    )
+                    is not None
+                )
+                await c.commit()
+        else:
+            new = await takeover()
+            assert new is not None
+            other = asyncio.create_task(release())
+            await _until_lock_waiters(enforced_direct, 1, query="%UPDATE%")
+            await b.commit()
+            assert await asyncio.wait_for(other, _TURN_SECONDS) is False
+            await a.commit()
+            assert (await _fence_row(enforced_direct, row.id)).created_at == new
+    finally:
+        await a.close()
+        await b.close()
+
+
+async def _stale_claim(direct: AsyncEngine, world: Any, key: str, content: str) -> UUID:
+    from src.api.schemas.events import CanonicalEventRequest, EventRequest
+
+    request = EventRequest.model_validate(_events_body(world.api_session, content))
+    canonical = CanonicalEventRequest(
+        tenant_id=UUID(world.api_tenant),
+        session_id=request.session_id,
+        event_type=request.event_type,
+        payload=request.payload,
+    )
+    interaction = uuid4()
+    async with direct.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO credit_ingress_claims (id, tenant_id, builder_id, source, "
+                "principal_id, idempotency_key, interaction_id, payload_sha256, "
+                "decision_version, mode, created_at) VALUES (:id, :t, :b, 'events', "
+                ":p, :k, :i, :sha, 1, 'enforced', clock_timestamp() - interval "
+                "'1 hour')"
+            ),
+            {
+                "id": uuid4(),
+                "t": UUID(world.api_tenant),
+                "b": UUID(world.builder),
+                "p": f"api_key:{world.api_tenant}",
+                "k": key,
+                "i": interaction,
+                "sha": credit_metering.event_payload_sha256(canonical),
+            },
+        )
+    return interaction
+
+
+async def test_two_concurrent_takeovers_of_one_claim_let_one_win(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH-1 (c): both retries read the abandoned claim and reach the
+    takeover together; one CAS wins and re-executes under the same
+    ``interaction_id``, the other answers by the table."""
+
+    from src.services.event_service import EventService
+
+    both = _Gate(parties=2)
+    takeovers: list[Any] = []
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "take_over_claim",
+        both,
+        calls=frozenset({1, 2}),
+        results=takeovers,
+    )
+    pipelines: list[Any] = []
+    _pause(
+        monkeypatch,
+        EventService,
+        "run_pipeline",
+        _Gate(),
+        calls=frozenset(),
+        results=pipelines,
+    )
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        content = "Olá, quero agendar"
+        interaction = await _stale_claim(enforced_direct, world, "abandoned", content)
+        body = _events_body(world.api_session, content)
+        async with asyncio.timeout(_TURN_SECONDS):
+            tasks = [
+                asyncio.create_task(
+                    client.post(
+                        "/v1/events", json=body, headers=_api(world, "abandoned")
+                    )
+                )
+                for _ in range(2)
+            ]
+            await both.reached.wait()
+            both.opened.set()
+            answers = await asyncio.gather(*tasks)
+    assert sum(observed is not None for observed in takeovers) == 1, takeovers
+    assert len(takeovers) == 2 and len(pipelines) == 1
+    winner = [a for a in answers if a.status_code == 200]
+    assert winner, [a.text for a in answers]
+    for answer in answers:
+        assert answer.content == winner[0].content or (
+            answer.status_code,
+            answer.json(),
+        ) == (409, {"code": "event_in_progress"})
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    assert claim.interaction_id == interaction
+    assert seen.effects == [(_trace(world, claim), "trace")]
+    assert len(seen.decisions) == 1
+
+
+async def test_two_concurrent_requests_with_one_key_run_phase1_once(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.event_service import EventService
+
+    both = _Gate(parties=2)
+    inserted: list[Any] = []
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "insert_enforced_claim",
+        both,
+        calls=frozenset({1, 2}),
+        results=inserted,
+    )
+    pipelines: list[Any] = []
+    _pause(
+        monkeypatch,
+        EventService,
+        "run_pipeline",
+        _Gate(),
+        calls=frozenset(),
+        results=pipelines,
+    )
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session)
+        async with asyncio.timeout(_TURN_SECONDS):
+            tasks = [
+                asyncio.create_task(
+                    client.post("/v1/events", json=body, headers=_api(world, "twice"))
+                )
+                for _ in range(2)
+            ]
+            await both.reached.wait()
+            both.opened.set()
+            answers = await asyncio.gather(*tasks)
+    assert sum(row is not None for row in inserted) == 1 and len(pipelines) == 1
+    winner = [a for a in answers if a.status_code == 200]
+    assert len(winner) >= 1, [a.text for a in answers]
+    for answer in answers:
+        assert answer.content == winner[0].content or (
+            answer.status_code,
+            answer.json(),
+        ) == (409, {"code": "event_in_progress"})
+    seen = await _enforced_rows(enforced_direct, world)
+    [claim] = seen.claims
+    assert seen.effects == [(_trace(world, claim), "trace")]
+    assert seen.entries == {"debt": 1_000}
+
+
+def _super_admin() -> dict[str, str]:
+    import jwt
+
+    from src.config.settings import settings
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": str(uuid4()),
+            "tenant_id": str(uuid4()),
+            "role": "super_admin",
+            "email": "admin@test.com",
+            "iat": now,
+            "exp": now.replace(year=now.year + 1),
+            "jti": str(uuid4()),
+        },
+        settings.secret_key,
+        algorithm="HS256",
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_a_final_transaction_and_a_clinic_delete_finish_without_deadlock(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM-1: the final transaction takes the tenant ``FOR SHARE`` FIRST.
+    Paused right after it (before the bundle), a concurrent ``DELETE
+    /clinics/{clinic_id}`` waits on the tenant row; the decision commits
+    whole, then the delete cascades -- no deadlock, no partial write."""
+
+    from src.services.event_service import EventService
+
+    before_bundle = _Gate()
+    _pause(monkeypatch, EventService, "write_interaction_bundle", before_bundle)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        async with asyncio.timeout(_TURN_SECONDS):
+            decision = asyncio.create_task(
+                client.post(
+                    "/v1/events",
+                    json=_events_body(world.api_session),
+                    headers=_api(world, "deleted-later"),
+                )
+            )
+            await before_bundle.reached.wait()
+            delete = asyncio.create_task(
+                client.delete(
+                    f"/v1/admin/clinics/{world.api_tenant}", headers=_super_admin()
+                )
+            )
+            blocked = asyncio.create_task(
+                _until_lock_waiters(enforced_direct, 1, query="%tenants%")
+            )
+            await asyncio.wait({delete, blocked}, return_when=asyncio.FIRST_COMPLETED)
+            # The final transaction already holds the tenant row: the delete
+            # waits for it instead of cascading under the decision.
+            assert not delete.done(), delete.result().text
+            await blocked
+            before_bundle.opened.set()
+            answer, deleted = await asyncio.gather(decision, delete)
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["interaction_event_id"] is not None
+    assert deleted.status_code == 200 and deleted.json() == {"ok": True}
+    async with enforced_direct.connect() as connection:
+        gone = (
+            await connection.execute(
+                text("SELECT count(*) FROM tenants WHERE id = :t"),
+                {"t": UUID(world.api_tenant)},
+            )
+        ).scalar_one()
+        effects = (
+            await connection.execute(
+                text(
+                    "SELECT effect_kind, decision_digest IS NOT NULL FROM "
+                    "credit_effects WHERE tenant_id = :t"
+                ),
+                {"t": UUID(world.api_tenant)},
+            )
+        ).all()
+    assert gone == 0
+    # The effect outlives its tenant (its digest is the decision's proof).
+    assert [tuple(e) for e in effects] == [("trace", True)]
+
+
+async def test_a_phase1_holding_a_session_never_blocks_another_sessions_final(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEDIUM-1: Y's phase 1 holds session S ``FOR UPDATE`` (stalled before
+    its marker) and X's final transaction waits on S through its bundle's
+    foreign keys -- holding no credit lock yet, the bundle precedes the
+    account.  Z's final transaction on another session T of the same builder
+    commits meanwhile; X and Y finish once Y resumes."""
+
+    from src.services.event_service import EventService
+
+    bundle = _Gate()
+    _pause(monkeypatch, EventService, "write_interaction_bundle", bundle)
+    # Y stalls at its phase 1 marker (the 2nd one), still holding S FOR
+    # UPDATE; repository objects are fresh per call, so an instance patch of
+    # the shared pipeline by an earlier suite cannot shadow this one.
+    pipeline = _Gate()
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "mark_claim_phase1",
+        pipeline,
+        calls=frozenset({2}),
+    )
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        s, t = world.api_session, running.twin_session
+        async with asyncio.timeout(_TURN_SECONDS):
+            x = asyncio.create_task(
+                client.post(
+                    "/v1/events", json=_events_body(s), headers=_api(world, "x")
+                )
+            )
+            await bundle.reached.wait()
+            y = asyncio.create_task(
+                client.post(
+                    "/v1/events",
+                    json=_events_body(s, "Pode ser amanhã?"),
+                    headers=_api(world, "y"),
+                )
+            )
+            await pipeline.reached.wait()
+            bundle.opened.set()
+            await _until_lock_waiters(enforced_direct, 1, query="%events%")
+            z = await asyncio.wait_for(
+                client.post(
+                    "/v1/events", json=_events_body(t), headers=_api(world, "z")
+                ),
+                20,
+            )
+            assert z.status_code == 200, z.text
+            assert not x.done() and not y.done()
+            pipeline.opened.set()
+            answers = await asyncio.gather(x, y)
+    assert [a.status_code for a in answers] == [200, 200], [a.text for a in answers]
+    seen = await _enforced_rows(enforced_direct, world)
+    assert len(seen.effects) == 3 and seen.entries == {"debt": 3_000}
+
+
+@asynccontextmanager
+async def _session_row_held(
+    direct: AsyncEngine, session_id: UUID
+) -> AsyncIterator[None]:
+    async with direct.connect() as connection:
+        transaction = await connection.begin()
+        await connection.execute(
+            text("SELECT 1 FROM sessions WHERE id = :s FOR UPDATE"), {"s": session_id}
+        )
+        try:
+            yield
+        finally:
+            await transaction.rollback()
+
+
+async def test_a_phase1_lock_timeout_releases_the_lease_for_an_immediate_takeover(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIGH-1 (e): phase 1 hits its ``lock_timeout`` (shortened here) on a
+    session row held elsewhere: 500, nothing written, and the executor
+    expires its own lease, so the next retry takes over at once."""
+
+    monkeypatch.setattr(credit_metering, "PHASE1_LOCK_TIMEOUT_SECONDS", 1)
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        body = _events_body(world.api_session)
+        async with asyncio.timeout(_TURN_SECONDS):
+            async with _session_row_held(enforced_direct, UUID(world.api_session)):
+                failed = await client.post(
+                    "/v1/events", json=body, headers=_api(world, "lock-timeout")
+                )
+            released = await _enforced_rows(enforced_direct, world)
+            retry = await client.post(
+                "/v1/events", json=body, headers=_api(world, "lock-timeout")
+            )
+    assert failed.status_code == 500
+    [claim] = released.claims
+    assert claim.session_version is None
+    assert released.effects == [] and released.handoffs == []
+    async with enforced_direct.connect() as connection:
+        expired = (
+            await connection.execute(
+                text(
+                    "SELECT clock_timestamp() >= CAST(:c AS timestamptz) "
+                    "+ interval '1680 seconds'"
+                ),
+                {"c": claim.created_at},
+            )
+        ).scalar_one()
+    assert expired  # created_at = clock_timestamp() - lease
+    assert retry.status_code == 200, retry.text
+    seen = await _enforced_rows(enforced_direct, world)
+    [taken] = seen.claims
+    assert taken.interaction_id == claim.interaction_id
+    assert seen.effects == [(_trace(world, taken), "trace")]
