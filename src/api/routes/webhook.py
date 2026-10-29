@@ -10,8 +10,11 @@ import logging
 import re
 import time as _time
 from collections import OrderedDict as _OrderedDict
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional, cast
+from typing import Any, Awaitable, Callable, Final, Optional, cast, overload
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -50,9 +53,15 @@ from src.repositories import (
     SessionRepository,
     get_db_session_dependency,
 )
+from src.services import credit_metering
 from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
 from src.services.credit_metering import (
+    REPLY_PAYLOAD_KIND,
+    CreditEnforcementUnavailable,
+    CreditReplyUndeliverable,
+    InlineDelivery,
     ObservationalIngress,
+    WebhookEnforcement,
     evolution_ingress,
     meta_ingress,
     record_meta_file_handoff,
@@ -196,6 +205,362 @@ def _get_agent_language(clinic_config: Optional[dict[str, Any]]) -> str:
     return cast(str, business.get("agent_language") or "pt-BR")
 
 
+@dataclass(frozen=True)
+class _ReplyTarget:
+    """Where an enforced webhook decision's reply goes (credit Group 3b-2):
+    the channel, the patient's phone and whether the patient sent audio --
+    the arguments of ``_send_reply_with_optional_tts`` the response does not
+    carry.  Never a credential."""
+
+    channel: str  # "zapi" | "meta"
+    phone: str
+    input_was_audio: bool
+
+
+def _suggested_reply(response: EventResponse) -> Optional[str]:
+    if response.prompt and response.prompt.suggested_response:
+        return response.prompt.suggested_response
+    return None
+
+
+def _credit_reply_payload(
+    target: _ReplyTarget,
+    event_request: CanonicalEventRequest,
+    response: EventResponse,
+) -> Optional[dict[str, Any]]:
+    """The stored reply of an enforced decision: the arguments main passes to
+    ``_send_reply_with_optional_tts`` (and to its side effects) WITHOUT any
+    token or credential -- the send re-reads ``clinic_configs``.  ``None``
+    when there is nothing to send (main answers ``no_llm_response``)."""
+
+    suggested = _suggested_reply(response)
+    if not suggested:
+        return None
+    return {
+        "kind": REPLY_PAYLOAD_KIND,
+        "channel": target.channel,
+        "tenant_id": str(event_request.tenant_id),
+        "session_id": str(event_request.session_id),
+        "phone": target.phone,
+        "text": suggested,
+        "language_code": response.response_language,
+        "input_was_audio": target.input_was_audio,
+        "force_text": bool(
+            response.prompt and getattr(response.prompt, "deterministic", False)
+        ),
+        "handoff": bool(
+            response.handoff_summary
+            or (response.decision and response.decision.handoff_required)
+        ),
+    }
+
+
+@dataclass(frozen=True)
+class _PreparedReply:
+    """A stored reply ready for its provider call (no credential is ever
+    stored in the outbox: they are re-read from ``clinic_configs`` here)."""
+
+    channel: str
+    session_id: UUID
+    phone: str
+    text: str
+    language_code: str
+    input_was_audio: bool
+    force_text: bool
+    handoff: bool
+    credentials: dict[str, Any]
+
+
+class CreditReplySender:
+    """The send adapter of a stored webhook reply (credit Group 3b-2), used
+    inline by the route and by the response-outbox publisher (injected from
+    the lifespan: the credit module never imports this route, LOW-13).
+
+    Exactly main's steps after a decision, split so that only the provider
+    call is under the send timeout (OD-5): :meth:`prepare` re-reads the
+    tenant's raw credentials; :meth:`send` is ``_send_reply_with_optional_tts``
+    with TTS and ``force_text`` (and its egress gate); :meth:`record` tracks
+    the sent id (``_track_sent_message`` / ``_track_meta_sent_message``),
+    stores it with ``_store_ai_msg_id_to_db`` -- so the ``fromMe`` echo is
+    recognised as the bot's -- and, on Z-API, marks a handoff's conversation
+    unread.  Each bookkeeping step only logs its failure.
+    """
+
+    async def prepare(
+        self, payload: Mapping[str, Any], db: AsyncSession
+    ) -> _PreparedReply:
+        channel = str(payload.get("channel") or "")
+        try:
+            tenant_id = UUID(str(payload["tenant_id"]))
+            session_id = UUID(str(payload["session_id"]))
+            phone = str(payload["phone"])
+            text = str(payload["text"])
+        except (KeyError, ValueError) as error:
+            raise CreditReplyUndeliverable("payload_unusable") from error
+        if (
+            payload.get("kind") != REPLY_PAYLOAD_KIND
+            or channel not in ("zapi", "meta")
+            or not phone
+            or not text
+        ):
+            raise CreditReplyUndeliverable("payload_unusable")
+        creds = await _load_tenant_credentials(tenant_id, db)
+        if channel == "zapi":
+            ready = (creds.get("zapi_token") or "").strip() and (
+                creds.get("zapi_instance_id") or ""
+            ).strip()
+        else:
+            ready = (creds.get("meta_phone_number_id") or "").strip() and (
+                creds.get("meta_permanent_token") or ""
+            ).strip()
+        if not ready:
+            logger.warning(
+                "%s credentials missing for tenant %s",
+                "Z-API" if channel == "zapi" else "Meta",
+                tenant_id,
+            )
+            raise CreditReplyUndeliverable("no_credentials")
+        return _PreparedReply(
+            channel=channel,
+            session_id=session_id,
+            phone=phone,
+            text=text,
+            language_code=str(payload.get("language_code") or "pt-BR"),
+            input_was_audio=bool(payload.get("input_was_audio")),
+            force_text=bool(payload.get("force_text")),
+            handoff=bool(payload.get("handoff")),
+            credentials=creds,
+        )
+
+    async def send(self, prepared: _PreparedReply) -> dict[str, Any]:
+        creds, phone, text = prepared.credentials, prepared.phone, prepared.text
+        if prepared.channel == "zapi":
+            zapi_token = (creds.get("zapi_token") or "").strip()
+            zapi_inst = (creds.get("zapi_instance_id") or "").strip()
+            zapi_client_token = (creds.get("zapi_client_token") or "").strip()
+            send_result, sent_as_audio = await _send_reply_with_optional_tts(
+                credentials=creds,
+                text=text,
+                language_code=prepared.language_code,
+                channel="Z-API",
+                phone=phone,
+                input_was_audio=prepared.input_was_audio,
+                send_audio=lambda audio, mime: send_zapi_audio(
+                    zapi_inst,
+                    zapi_token,
+                    phone,
+                    audio,
+                    mime_type=mime,
+                    client_token=zapi_client_token,
+                ),
+                send_text=lambda: send_text_message(
+                    zapi_inst, zapi_token, phone, text, client_token=zapi_client_token
+                ),
+                force_text=prepared.force_text,
+            )
+        else:
+            meta_pnid = (creds.get("meta_phone_number_id") or "").strip()
+            meta_token = (creds.get("meta_permanent_token") or "").strip()
+            send_result, sent_as_audio = await _send_reply_with_optional_tts(
+                credentials=creds,
+                text=text,
+                language_code=prepared.language_code,
+                channel="Meta",
+                phone=phone,
+                input_was_audio=prepared.input_was_audio,
+                send_audio=lambda audio, mime: send_meta_cloud_audio(
+                    meta_pnid, meta_token, phone, audio, mime_type=mime
+                ),
+                send_text=lambda: send_meta_cloud_text(
+                    meta_pnid, meta_token, phone, text
+                ),
+                force_text=prepared.force_text,
+            )
+        logger.info(
+            "%s reply sent to %s (%d chars, format=%s)",
+            "Z-API" if prepared.channel == "zapi" else "Meta",
+            phone,
+            len(text),
+            "audio" if sent_as_audio else "text",
+        )
+        return send_result
+
+    async def record(
+        self,
+        prepared: _PreparedReply,
+        send_result: dict[str, Any],
+        db: AsyncSession,
+    ) -> None:
+        phone = prepared.phone
+        reply_mid = ""
+        try:
+            if prepared.channel == "zapi":
+                _track_sent_message(send_result)
+                reply_mid = send_result.get("messageId") or send_result.get(
+                    "zapiMessageId", ""
+                )
+            else:
+                _track_meta_sent_message(send_result)
+                reply_mid = extract_meta_message_id(send_result) or ""
+            if reply_mid:
+                await _store_ai_msg_id_to_db(prepared.session_id, reply_mid, db)
+                await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("reply id bookkeeping failed for %s — %s", phone, exc)
+        if prepared.channel == "zapi" and prepared.handoff:
+            creds = prepared.credentials
+            try:
+                await mark_conversation_unread(
+                    (creds.get("zapi_instance_id") or "").strip(),
+                    (creds.get("zapi_token") or "").strip(),
+                    phone,
+                    client_token=(creds.get("zapi_client_token") or "").strip(),
+                )
+                logger.info("Z-API mark_unread SUCCESS after handoff for %s", phone)
+            except Exception as exc:
+                logger.warning("Z-API mark_unread FAILED for %s — %s", phone, exc)
+
+
+CREDIT_REPLY_SENDER: Final = CreditReplySender()
+
+
+def _inline_answer(delivery: InlineDelivery) -> dict[str, Any]:
+    """The webhook body of an enforced decision after its inline send.
+
+    Main's bodies for what main also answers (``replied``,
+    ``no_credentials``, ``send_failed`` with its ``error``; a send timeout is
+    ``send_failed`` / ``send_timeout``).  Two bodies are NOT main's, and only
+    exist on the enforced path: ``send_queued`` -- the inline claim found no
+    ``pending`` row: the publisher took it first, or the row is gone with
+    its tenant (a concurrent clinic delete) -- and the OD-2 refusals
+    (``session_changed``, ``bot_inactive``, ``session_gone``,
+    ``reply_expired``, ``payload_unusable``): the reply was not sent and
+    never will be.
+    """
+
+    if delivery.outcome == "delivered":
+        return {"ok": True, "replied": True}
+    if delivery.outcome == "not_claimed":
+        return {"ok": True, "replied": False, "reason": "send_queued"}
+    if delivery.reason == "send_failed":
+        return {
+            "ok": True,
+            "replied": False,
+            "reason": "send_failed",
+            "error": delivery.error or "send_failed",
+        }
+    return {"ok": True, "replied": False, "reason": delivery.reason or "send_failed"}
+
+
+async def _dispatch_phase1_handoffs(
+    db: AsyncSession, event_request: CanonicalEventRequest
+) -> None:
+    """Announce the handoffs a committed phase 1 wrote, best effort (main's
+    post-commit dispatch; after a rollback the queue is dropped unsent)."""
+
+    try:
+        await dispatch_committed_handoff_webhooks(db)
+    except Exception as exc:
+        record_handoff_post_commit_dispatch_failure(
+            exc,
+            owner="adapter",
+            tenant_id=event_request.tenant_id,
+            session_id=event_request.session_id,
+        )
+
+
+async def _run_enforced_webhook_decision(
+    *,
+    service: Any,
+    event_request: CanonicalEventRequest,
+    db: AsyncSession,
+    context: ResolvedInteractionContext,
+    enforcement: WebhookEnforcement,
+    reply: _ReplyTarget,
+) -> dict[str, Any]:
+    """The enforced branch of ``_run_pipeline_transactionally`` (credit Group
+    3b-2): the claim (its own short transaction; a redelivery is ALWAYS
+    ``duplicate_message``) -> phase 1 (the route session, the webhook marker
+    LAST) -> the handoff announcement after its commit, as main -> the LLM
+    outside every transaction (``generate_response``) -> the final
+    transaction (bundle, one trace or ``trace_no_response``, the ``pending``
+    reply, the final fence) -> the inline send, which claims the reply first.
+    Returns the webhook body."""
+
+    leased = await credit_metering.acquire_webhook_claim(db, enforcement)
+    if not isinstance(leased, credit_metering.ClaimLease):
+        return dict(leased)
+
+    async def run_pipeline() -> Any:
+        return await service.run_pipeline(event_request, session=db, context=context)
+
+    try:
+        phase1 = await credit_metering.run_webhook_phase1(
+            db,
+            enforcement,
+            leased,
+            session_id=event_request.session_id,
+            run_pipeline=run_pipeline,
+        )
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    finally:
+        await _dispatch_phase1_handoffs(db, event_request)
+    if phase1 is None:  # the marker's fence did not hold: rolled back
+        return dict(credit_metering.DUPLICATE_MESSAGE_SKIP)
+
+    generated = await service.generate_response(
+        event_request,
+        phase1.result,
+        phase1.clinic_config,
+        phase1.message_history,
+        context=context,
+    )
+    response = cast(EventResponse, generated.response)
+
+    async def write_bundle(credit_effect_id: Optional[str]) -> Optional[UUID]:
+        written: Optional[UUID] = await service.write_interaction_bundle(
+            event_request,
+            phase1.result,
+            generated,
+            session=db,
+            context=context,
+            credit_effect_id=credit_effect_id,
+        )
+        return written
+
+    try:
+        final = await credit_metering.run_webhook_final(
+            db,
+            enforcement,
+            leased,
+            phase1,
+            response=response,
+            write_bundle=write_bundle,
+            reply=_credit_reply_payload(reply, event_request, response),
+        )
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    if final is None:  # the final fence did not hold: no bundle, no debit
+        return dict(credit_metering.DUPLICATE_MESSAGE_SKIP)
+    response.interaction_event_id = final.interaction_event_id
+    if final.outbox_id is None:
+        logger.info(
+            "%s webhook: no suggested_response for %s", reply.channel, reply.phone
+        )
+        return {"ok": True, "replied": False, "reason": "no_llm_response"}
+    delivery = await credit_metering.deliver_reply_inline(
+        final.outbox_id, sender=CREDIT_REPLY_SENDER
+    )
+    return _inline_answer(delivery)
+
+
+@overload
 async def _run_pipeline_transactionally(
     *,
     service: Any,
@@ -203,7 +568,32 @@ async def _run_pipeline_transactionally(
     db: AsyncSession,
     context: ResolvedInteractionContext,
     metering: Optional[ObservationalIngress] = None,
-) -> EventResponse:
+) -> EventResponse: ...
+
+
+@overload
+async def _run_pipeline_transactionally(
+    *,
+    service: Any,
+    event_request: CanonicalEventRequest,
+    db: AsyncSession,
+    context: ResolvedInteractionContext,
+    metering: Optional[ObservationalIngress] = None,
+    enforcement: Optional[WebhookEnforcement],
+    reply: _ReplyTarget,
+) -> EventResponse | dict[str, Any]: ...
+
+
+async def _run_pipeline_transactionally(
+    *,
+    service: Any,
+    event_request: CanonicalEventRequest,
+    db: AsyncSession,
+    context: ResolvedInteractionContext,
+    metering: Optional[ObservationalIngress] = None,
+    enforcement: Optional[WebhookEnforcement] = None,
+    reply: Optional[_ReplyTarget] = None,
+) -> EventResponse | dict[str, Any]:
     """Run the locked phase, commit it, then start post-commit response I/O.
 
     Pipeline or commit failures roll back and never reach ``finish_response``.
@@ -225,7 +615,25 @@ async def _run_pipeline_transactionally(
     on.  Its decision is recorded best-effort once ``finish_response`` has
     returned (both phases' transactions are over), before any reply is sent;
     it never changes the response.
+
+    ``enforcement`` (credit Group 3b-2) is the Z-API/Meta pre-check's verdict
+    for this message: with it, the decision runs the enforced branch
+    (:func:`_run_enforced_webhook_decision`) -- claimed, charged with its
+    bundle in one commit and its reply sent inline from the response
+    outbox -- and the WEBHOOK BODY is returned instead of the response (the
+    reply was already sent or queued).  Without it, ``main``'s path.
     """
+    if enforcement is not None:
+        if reply is None:
+            raise TypeError("an enforced webhook decision needs its reply target")
+        return await _run_enforced_webhook_decision(
+            service=service,
+            event_request=event_request,
+            db=db,
+            context=context,
+            enforcement=enforcement,
+            reply=reply,
+        )
     try:
         result, clinic_config, message_history = await service.run_pipeline(
             event_request,
@@ -2253,6 +2661,32 @@ async def _process_zapi_authenticated_body(
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
 
+    # ── credit pre-check (neurostack-credit-system Group 3b-2) ──
+    # Right after the pause check and before the session exists: under a
+    # hold (or for a standalone tenant) once credits are enforced, a new
+    # patient gets no session row and no LGPD notice.  Accepted per channel
+    # (D4/OWNER-c): on Z-API ``audio_too_long``, the STT and its fallback ran
+    # above and their fixed messages already reached the patient, and the
+    # message was already marked read.
+    enforcement: Optional[WebhookEnforcement] = None
+    if request is not None:
+        try:
+            verdict = await credit_metering.precheck_zapi(
+                request, db, tenant_id=tenant_id, body=body
+            )
+        except CreditEnforcementUnavailable:
+            # D1 latch.  In practice this DROPS the message: main's replay
+            # claim (Redis) was already taken above, so the provider's retry
+            # of this 503 answers ``duplicate_message``.
+            return JSONResponse(
+                status_code=503,
+                content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+            )
+        if verdict == "credit_pending":
+            return dict(credit_metering.CREDIT_PENDING_SKIP)
+        if isinstance(verdict, WebhookEnforcement):
+            enforcement = verdict
+
     # ── get or create a session for this phone ──
     session_id, is_new = await _get_or_create_session(tenant_id, phone, db)
     context = build_interaction_context(
@@ -2332,17 +2766,23 @@ async def _process_zapi_authenticated_body(
         ),
     )
 
-    response = await _run_pipeline_transactionally(
+    outcome = await _run_pipeline_transactionally(
         service=service,
         event_request=event_request,
         db=db,
         context=context,
         metering=(
             None
-            if request is None
+            if request is None or enforcement is not None
             else zapi_ingress(request, body=body, context=context)
         ),
+        enforcement=enforcement,
+        reply=_ReplyTarget("zapi", phone, patient_audio_input),
     )
+    if isinstance(outcome, dict):
+        # Enforced: claimed, charged and its reply sent from the outbox.
+        return outcome
+    response = outcome
 
     # ── send LLM response back via Z-API ──
     suggested = (
@@ -3450,6 +3890,7 @@ async def _meta_initiate_file_handoff(
     note: str,
     *,
     context: ResolvedInteractionContext,
+    session: Optional[AsyncSession] = None,
 ) -> Any:
     """Initiate a human handoff signalling that a file/audio is pending review.
 
@@ -3459,6 +3900,11 @@ async def _meta_initiate_file_handoff(
     ``context`` is the Meta message's own interaction context (``production``
     after a valid HMAC), handed unchanged to ``initiate_handoff``, which
     refuses it before any effect unless it matches this tenant and session.
+
+    ``session`` (credit Group 3b-2, the enforced file handoff): the route's
+    open transaction; the record and ``handoff.request`` are written in it
+    and the creation webhook waits for its commit (``initiate_handoff``'s
+    caller-session mode, #145).  Without it the handoff commits on its own.
     """
     from src.handoff.models import HandoffReason, HandoffRequest, HandoffUrgency
     from src.services.handoff_service import get_handoff_service
@@ -3475,8 +3921,15 @@ async def _meta_initiate_file_handoff(
             "file_review_note": note,
         },
     )
+    # Main's call stays exactly ``initiate_handoff(request, context=...)``;
+    # only the enforced path adds the caller's session.
+    caller_session: dict[str, AsyncSession] = (
+        {} if session is None else {"session": session}
+    )
     try:
-        response = await handoff_service.initiate_handoff(request, context=context)
+        response = await handoff_service.initiate_handoff(
+            request, context=context, **caller_session
+        )
     except Exception:
         logger.exception(
             "Meta file handoff creation failed tenant=%s session=%s",
@@ -3491,6 +3944,69 @@ async def _meta_initiate_file_handoff(
         note,
     )
     return response
+
+
+async def _meta_file_handoff(
+    *,
+    tenant_id: UUID,
+    session_id: UUID,
+    from_phone: str,
+    note: str,
+    context: ResolvedInteractionContext,
+    db: AsyncSession,
+    metering: Optional[ObservationalIngress],
+    enforcement: Optional[WebhookEnforcement],
+    clear_pending_review: bool,
+) -> Optional[dict[str, Any]]:
+    """The Meta file handoff decision of both call sites (forward-on-request
+    and ``audio_too_long``).  ``None``: the handoff is committed, the route
+    sends the patient's text as today.  A dict: the 200 body to answer with,
+    nothing handed off and nothing sent.
+
+    Without ``enforcement``, main's sequence (the handoff commits on its own;
+    the forward then clears the pending review) and the Group 3a writer.
+    With it (credit Group 3b-2, O2), ONE transaction in ``db``
+    (``run_meta_file_handoff``): claim, handoff, debit and the
+    ``credit_effect_id`` link commit together -- a hold answers
+    ``credit_pending``, a redelivery ``duplicate_message`` -- and the
+    creation webhook is announced only after that transaction ends.
+    """
+    if enforcement is None:
+        file_handoff = await _meta_initiate_file_handoff(
+            tenant_id, session_id, from_phone, note, context=context
+        )
+        if clear_pending_review:
+            await _meta_clear_pending_file_review(session_id, db)
+            await db.commit()
+        await record_meta_file_handoff(metering, db, file_handoff, note=note)
+        return None
+
+    async def initiate() -> Any:
+        return await _meta_initiate_file_handoff(
+            tenant_id, session_id, from_phone, note, context=context, session=db
+        )
+
+    async def clear() -> None:
+        await _meta_clear_pending_file_review(session_id, db)
+
+    try:
+        outcome = await credit_metering.run_meta_file_handoff(
+            db,
+            enforcement,
+            session_id=session_id,
+            note=note,
+            initiate=initiate,
+            before_commit=clear if clear_pending_review else None,
+        )
+    finally:
+        # After the transaction's end only: a rolled-back record is dropped.
+        try:
+            await dispatch_committed_handoff_webhooks(db)
+        except Exception as exc:
+            record_handoff_post_commit_dispatch_failure(
+                exc, owner="adapter", tenant_id=tenant_id, session_id=session_id
+            )
+    return None if outcome.answer is None else dict(outcome.answer)
 
 
 @router.get(
@@ -3808,6 +4324,29 @@ async def meta_webhook(
                 await db.commit()
                 return JSONResponse(status_code=202, content=pause_result)
 
+            # ── credit pre-check (neurostack-credit-system Group 3b-2) ──
+            # For every message type, right after the pause check and before
+            # the session exists: under a hold (or for a standalone tenant)
+            # once credits are enforced, a new patient gets no session row,
+            # no LGPD notice, no file ack and no STT (it runs after the
+            # session, below).
+            try:
+                verdict = await credit_metering.precheck_meta(
+                    request, db, tenant_id=tenant_id, message=msg
+                )
+            except CreditEnforcementUnavailable:
+                # D1 latch; in practice the message is dropped (main's replay
+                # claim is spent: the provider's retry is a duplicate).
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE
+                    },
+                )
+            if verdict == "credit_pending":
+                return dict(credit_metering.CREDIT_PENDING_SKIP)
+            enforcement = verdict if isinstance(verdict, WebhookEnforcement) else None
+
             # ── get or create a session for this phone ──
             session_id, is_new = await _get_or_create_session(tenant_id, from_phone, db)
             # One context per message: the file handoff and the pipeline below
@@ -3820,8 +4359,13 @@ async def meta_webhook(
             )
             await db.commit()
             # Observational metering of this message's decision (credit
-            # Group 3a): ``None`` unless the switch was captured on.
-            metering = meta_ingress(request, message=msg, context=context)
+            # Group 3a): ``None`` unless the switch was captured on, and once
+            # the message is enforced (3b-2) the enforced path decides.
+            metering = (
+                None
+                if enforcement is not None
+                else meta_ingress(request, message=msg, context=context)
+            )
 
             # ── load clinic config + credentials ──
             service = get_event_service()
@@ -3888,18 +4432,19 @@ async def meta_webhook(
                 # describe their need.
                 if await _meta_get_pending_file_review(session_id, db):
                     if _detect_forward_intent(message_text):
-                        file_handoff = await _meta_initiate_file_handoff(
-                            tenant_id,
-                            session_id,
-                            from_phone,
-                            "file_pending_review",
+                        skipped = await _meta_file_handoff(
+                            tenant_id=tenant_id,
+                            session_id=session_id,
+                            from_phone=from_phone,
+                            note="file_pending_review",
                             context=context,
+                            db=db,
+                            metering=metering,
+                            enforcement=enforcement,
+                            clear_pending_review=True,
                         )
-                        await _meta_clear_pending_file_review(session_id, db)
-                        await db.commit()
-                        await record_meta_file_handoff(
-                            metering, db, file_handoff, note="file_pending_review"
-                        )
+                        if skipped is not None:
+                            return skipped
                         if meta_pnid and meta_token:
                             confirm_msg = (
                                 _FILE_FORWARDED_MSG_EN
@@ -3993,16 +4538,19 @@ async def meta_webhook(
                         if agent_lang == "en"
                         else _AUDIO_TOO_LONG_MSG_PT
                     )
-                    file_handoff = await _meta_initiate_file_handoff(
-                        tenant_id,
-                        session_id,
-                        from_phone,
-                        "audio_too_long",
+                    skipped = await _meta_file_handoff(
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        from_phone=from_phone,
+                        note="audio_too_long",
                         context=context,
+                        db=db,
+                        metering=metering,
+                        enforcement=enforcement,
+                        clear_pending_review=False,
                     )
-                    await record_meta_file_handoff(
-                        metering, db, file_handoff, note="audio_too_long"
-                    )
+                    if skipped is not None:
+                        return skipped
                     if meta_pnid and meta_token:
                         try:
                             await send_meta_cloud_text(
@@ -4146,13 +4694,19 @@ async def meta_webhook(
                 ),
             )
 
-            response = await _run_pipeline_transactionally(
+            outcome = await _run_pipeline_transactionally(
                 service=service,
                 event_request=event_request,
                 db=db,
                 context=context,
                 metering=metering,
+                enforcement=enforcement,
+                reply=_ReplyTarget("meta", from_phone, input_was_audio),
             )
+            if isinstance(outcome, dict):
+                # Enforced: claimed, charged and its reply sent from the outbox.
+                return outcome
+            response = outcome
 
             suggested = (
                 response.prompt.suggested_response

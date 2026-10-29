@@ -107,6 +107,35 @@ Accepted race at the enforcement boundary (LOW-16): a request captured as
 observational just before ``credit_enforcement_at`` (its observational claim
 is written only after its answer) and a retry of the same key captured as
 enforced afterwards may both execute, the first one free of charge.
+
+Enforced Z-API and Meta webhooks (Group 3b-2).  Each adapter runs its
+pre-check (:func:`precheck_zapi` / :func:`precheck_meta`, the same as
+3b-1's: ``credit_enforcement_at`` read once, standalone, account on demand,
+hold) right after ``_check_pause_state`` and before the session is created;
+``credit_pending`` answers 200 ``{"ok": true, "skipped": "credit_pending"}``
+with no session row, no LGPD notice, no Meta file ack and no Meta STT (on
+Z-API ``audio_too_long``, the STT and its fallback, and the mark-as-read run
+before the pre-check and still reach the patient: accepted per channel,
+D4/OWNER-c).  An enforced decision claims ``(tenant_id, source,
+provider_message_id)`` in a short transaction right before phase 1
+(:func:`acquire_webhook_claim`); its fences are 3b-1's without the lease
+clause (no takeover, no ``event_failed``); a redelivery answers ALWAYS 200
+``duplicate_message`` (``payload_conflict`` when the stable fields differ),
+never a second reply.  The final transaction (:func:`run_webhook_final`)
+charges one trace for a deliverable decision (LLM, deterministic answer or
+handoff), writes ``trace_no_response`` (zero) otherwise, and stores the
+reply in a ``pending`` outbox row; :func:`deliver_reply_inline` claims it
+``pending -> sending`` before sending.  Owner decisions of the 3b-2 review:
+a failed (or timed-out: uncertain) send is ``failed`` at once with its PII
+erased, like main's lost reply (OD-1); every send first re-checks the
+session's pause state against the one phase 1 left, the bot and a maximum
+age (OD-2); only the provider call is under the send timeout, and the
+bookkeeping after it is shielded and bounded (OD-5).
+:class:`CreditResponsePublisher` only recovers the crash windows, at most
+once per row; :func:`run_retention_sweeper` erases expired payloads config
+on or off (OD-3).  The Meta file handoff is one enforced transaction
+(:func:`run_meta_file_handoff`).  Uazapi and Evolution (``unknown``) never
+reach any of this.
 """
 
 from __future__ import annotations
@@ -118,9 +147,9 @@ import json
 import math
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -130,9 +159,14 @@ from starlette.requests import HTTPConnection
 
 from src.api.schemas.events import CanonicalEventRequest
 from src.config.logging import get_logger
-from src.config.settings import settings
+from src.config.settings import Settings, settings
 from src.interaction_context import InteractionOrigin, ResolvedInteractionContext
-from src.repositories.credit import ClaimRow, CreditRepository, ResponseOutboxRow
+from src.repositories.credit import (
+    ClaimRow,
+    CreditRepository,
+    OutboxClaim,
+    ResponseOutboxRow,
+)
 from src.services.credit_ledger import MILLICREDITS_PER_CREDIT, CreditLedger
 from src.services.credit_principal import (
     AuthenticatedIdentity,
@@ -144,7 +178,11 @@ from src.services.credit_principal import (
     read_tenant_builder,
     request_credit_identity,
 )
-from src.services.credit_switch import request_credit_switch
+from src.services.credit_switch import (
+    credit_switch_effective,
+    request_credit_switch,
+    run_credit_worker_tick,
+)
 
 logger = get_logger(__name__)
 
@@ -1093,6 +1131,9 @@ class Phase1Outcome:
     session_version: int
     charge: DecisionCharge | None
     handoff_id: UUID | None
+    # Webhooks (3b-2, OD-2): the session's pause state as phase 1 left it --
+    # the decision's own handoff pause included -- read under its lock.
+    session_pause: Any = None
 
 
 @dataclass(frozen=True)
@@ -1100,6 +1141,8 @@ class FinalOutcome:
     payload: Mapping[str, Any]
     interaction_event_id: UUID | None
     charge: DecisionCharge | None
+    # The response-outbox row the final transaction wrote (``None``: none).
+    outbox_id: UUID | None = None
 
 
 def _answer(status: int, code: str, **extra: Any) -> ClaimAnswer:
@@ -1449,12 +1492,16 @@ def _handoff_id(result: object) -> UUID | None:
         return None
 
 
-def phase1_decision(result: object, handoff_id: UUID) -> dict[str, Any]:
-    """The PII-free projection of a phase 1 decision that handed off."""
+def phase1_decision(
+    result: object, handoff_id: UUID, *, kind: str = "events_phase1_handoff"
+) -> dict[str, Any]:
+    """The PII-free projection of a phase 1 decision that handed off
+    (``kind``: ``events_phase1_handoff``, or ``{source}_phase1_handoff`` for
+    a webhook)."""
 
     event_id = getattr(result, "event_id", None)
     projection: dict[str, Any] = {
-        "kind": "events_phase1_handoff",
+        "kind": kind,
         "event_id": str(event_id) if event_id is not None else None,
         "handoff_id": str(handoff_id),
     }
@@ -1540,15 +1587,53 @@ async def run_enforced_phase1(
     transaction still open: the caller rolls back and releases the lease.
     """
 
+    async def mark(repository: CreditRepository, session_version: int) -> bool:
+        # The lease is read at the marker (CLAIM_LEASE_SECONDS at call time).
+        return await repository.mark_claim_phase1(
+            lease.claim_id,
+            observed=lease.observed,
+            session_version=session_version,
+            lease=claim_lease(),
+        )
+
+    return await _run_phase1(
+        db,
+        tenant_id=enforcement.tenant_id,
+        session_id=enforcement.session_id,
+        interaction_id=lease.interaction_id,
+        run_pipeline=run_pipeline,
+        mark=mark,
+        lock_timeout=PHASE1_LOCK_TIMEOUT_SECONDS,
+        decision_kind="events_phase1_handoff",
+    )
+
+
+async def _run_phase1(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    session_id: UUID,
+    interaction_id: UUID,
+    run_pipeline: Callable[[], Awaitable[tuple[Any, Any, Any]]],
+    mark: Callable[[CreditRepository, int], Awaitable[bool]],
+    lock_timeout: int | None,
+    decision_kind: str,
+    observe: Callable[[CreditRepository], Awaitable[Any]] | None = None,
+) -> Phase1Outcome | None:
+    """Phase 1 of an enforced decision (``POST /v1/events`` and webhooks):
+    ``SET LOCAL lock_timeout`` (only when given) -> tenant ``FOR SHARE`` ->
+    ``run_pipeline`` -> the phase 1 handoff's charge and link -> ``mark``
+    (the claim's phase 1 marker, LAST) -> commit; ``None`` (rolled back)
+    when the marker's fence did not hold."""
+
     repository = CreditRepository(db)
-    await repository.set_local_lock_timeout(PHASE1_LOCK_TIMEOUT_SECONDS)
-    scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+    if lock_timeout is not None:
+        await repository.set_local_lock_timeout(lock_timeout)
+    scope = await repository.tenant_scope(tenant_id, lock=True)
     if scope is None:
         raise CreditTenantGone("the tenant vanished before phase 1")
     result, clinic_config, message_history = await run_pipeline()
-    effect_id = trace_effect_id(
-        enforcement.tenant_id, lease.interaction_id, ENFORCED_DECISION_VERSION
-    )
+    effect_id = trace_effect_id(tenant_id, interaction_id, ENFORCED_DECISION_VERSION)
     charge: DecisionCharge | None = None
     handoff_id = _handoff_id(result)
     if handoff_id is not None:
@@ -1557,50 +1642,41 @@ async def run_enforced_phase1(
                 ENFORCED_LOG,
                 alert="credit_enforced_standalone",
                 reason="standalone_at_phase1",
-                tenant_id=str(enforcement.tenant_id),
-                interaction_id=str(lease.interaction_id),
+                tenant_id=str(tenant_id),
+                interaction_id=str(interaction_id),
             )
         else:
             charge = await _charge_decision(
                 db,
-                tenant_id=enforcement.tenant_id,
+                tenant_id=tenant_id,
                 builder_id=scope.builder_id,
                 effect_id=effect_id,
                 digest=decision_digest(
-                    tenant_id=enforcement.tenant_id,
-                    interaction_id=lease.interaction_id,
+                    tenant_id=tenant_id,
+                    interaction_id=interaction_id,
                     decision_version=ENFORCED_DECISION_VERSION,
                     origin=InteractionOrigin.PRODUCTION,
-                    decision=phase1_decision(result, handoff_id),
+                    decision=phase1_decision(result, handoff_id, kind=decision_kind),
                 ),
             )
             if not await repository.link_handoff_credit_effect(
-                tenant_id=enforcement.tenant_id,
+                tenant_id=tenant_id,
                 handoff_id=handoff_id,
                 effect_id=charge.effect_id,
             ):
                 raise RuntimeError(
                     "the phase 1 handoff record is not in this transaction"
                 )
-    session_version = (
-        await repository.session_message_count(
-            enforcement.tenant_id, enforcement.session_id
-        )
-        or 0
-    )
-    if not await repository.mark_claim_phase1(
-        lease.claim_id,
-        observed=lease.observed,
-        session_version=session_version,
-        lease=claim_lease(),
-    ):
+    session_version = await repository.session_message_count(tenant_id, session_id) or 0
+    session_pause = None if observe is None else await observe(repository)
+    if not await mark(repository, session_version):
         await db.rollback()
         logger.warning(
             ENFORCED_LOG,
             alert="credit_claim_fence",
             reason="phase1_fence_lost",
-            tenant_id=str(enforcement.tenant_id),
-            interaction_id=str(lease.interaction_id),
+            tenant_id=str(tenant_id),
+            interaction_id=str(interaction_id),
         )
         return None
     await db.commit()
@@ -1611,6 +1687,7 @@ async def run_enforced_phase1(
         session_version=session_version,
         charge=charge,
         handoff_id=handoff_id,
+        session_pause=session_pause,
     )
 
 
@@ -1650,13 +1727,57 @@ async def run_enforced_final(
     open: the caller rolls back and releases the lease.
     """
 
+    async def fence(repository: CreditRepository) -> bool:
+        return await repository.hold_claim_final_fence(
+            lease.claim_id,
+            observed=lease.observed,
+            session_version=phase1.session_version,
+            lease=claim_lease(),
+        )
+
+    return await _run_final(
+        db,
+        tenant_id=enforcement.tenant_id,
+        interaction_id=lease.interaction_id,
+        phase1=phase1,
+        response=response,
+        write_bundle=write_bundle,
+        deliverable=True,  # D5: a POST /v1/events decision always costs a trace
+        stored_answer=lambda interaction_event_id: (
+            response_payload(response, interaction_event_id),
+            "delivered",
+        ),
+        fence=fence,
+    )
+
+
+async def _run_final(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    interaction_id: UUID,
+    phase1: Phase1Outcome,
+    response: Any,
+    write_bundle: Callable[[str | None], Awaitable[UUID | None]],
+    deliverable: bool,
+    stored_answer: Callable[[UUID | None], tuple[dict[str, Any], str] | None],
+    fence: Callable[[CreditRepository], Awaitable[bool]],
+) -> FinalOutcome | None:
+    """The final transaction shared by ``POST /v1/events`` and the webhooks.
+
+    Tenant ``FOR SHARE`` -> bundle -> one trace of debit/debt (or the reuse
+    of phase 1's charge, an effect of zero under a late hold, or -- for a
+    decision that is not ``deliverable`` -- the effect of zero
+    ``trace_no_response``) -> the response-outbox row ``stored_answer``
+    returns (payload and state; none when it returns ``None``) -> ``fence``
+    -> commit.
+    """
+
     repository = CreditRepository(db)
-    scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+    scope = await repository.tenant_scope(tenant_id, lock=True)
     if scope is None:
         raise CreditTenantGone("the tenant vanished before the final transaction")
-    effect_id = trace_effect_id(
-        enforcement.tenant_id, lease.interaction_id, ENFORCED_DECISION_VERSION
-    )
+    effect_id = trace_effect_id(tenant_id, interaction_id, ENFORCED_DECISION_VERSION)
     charge = phase1.charge
     # A phase 1 that handed off already decided this decision's charge (its
     # effect and builder, or none for a tenant standalone at phase 1): the
@@ -1677,54 +1798,1188 @@ async def run_enforced_final(
                 ENFORCED_LOG,
                 alert="credit_enforced_standalone",
                 reason="standalone_at_final",
-                tenant_id=str(enforcement.tenant_id),
-                interaction_id=str(lease.interaction_id),
+                tenant_id=str(tenant_id),
+                interaction_id=str(interaction_id),
             )
         else:
             decided = response_decision(response)
             projection = decided[1] if decided is not None else {"kind": "pipeline"}
-            charge = await _charge_decision(
-                db,
-                tenant_id=enforcement.tenant_id,
-                builder_id=scope.builder_id,
-                effect_id=effect_id,
-                digest=decision_digest(
-                    tenant_id=enforcement.tenant_id,
-                    interaction_id=lease.interaction_id,
-                    decision_version=ENFORCED_DECISION_VERSION,
-                    origin=InteractionOrigin.PRODUCTION,
-                    decision=projection,
-                ),
+            digest = decision_digest(
+                tenant_id=tenant_id,
+                interaction_id=interaction_id,
+                decision_version=ENFORCED_DECISION_VERSION,
+                origin=InteractionOrigin.PRODUCTION,
+                decision=projection,
             )
-    payload = response_payload(response, interaction_event_id)
-    await repository.insert_response_outbox(
-        tenant_id=enforcement.tenant_id,
-        effect_id=effect_id,
-        payload=payload,
-        state="delivered",
-    )
-    if not await repository.hold_claim_final_fence(
-        lease.claim_id,
-        observed=lease.observed,
-        session_version=phase1.session_version,
-        lease=claim_lease(),
-    ):
+            if deliverable:
+                charge = await _charge_decision(
+                    db,
+                    tenant_id=tenant_id,
+                    builder_id=scope.builder_id,
+                    effect_id=effect_id,
+                    digest=digest,
+                )
+            else:
+                charge = await _no_response_effect(
+                    db,
+                    tenant_id=tenant_id,
+                    builder_id=scope.builder_id,
+                    effect_id=effect_id,
+                    digest=digest,
+                )
+    stored = stored_answer(interaction_event_id)
+    payload: dict[str, Any] = {}
+    outbox_id: UUID | None = None
+    if stored is not None:
+        payload, state = stored
+        outbox_id = await repository.insert_response_outbox(
+            tenant_id=tenant_id,
+            effect_id=effect_id,
+            payload=payload,
+            state=state,
+        )
+    if not await fence(repository):
         await db.rollback()
         logger.warning(
             ENFORCED_LOG,
             alert="credit_claim_fence",
             reason="final_fence_lost",
-            tenant_id=str(enforcement.tenant_id),
-            interaction_id=str(lease.interaction_id),
+            tenant_id=str(tenant_id),
+            interaction_id=str(interaction_id),
         )
         return None
     await db.commit()
     return FinalOutcome(
-        payload=payload, interaction_event_id=interaction_event_id, charge=charge
+        payload=payload,
+        interaction_event_id=interaction_event_id,
+        charge=charge,
+        outbox_id=outbox_id,
     )
 
 
+async def _no_response_effect(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    builder_id: UUID,
+    effect_id: str,
+    digest: str,
+) -> DecisionCharge:
+    """``trace_no_response`` (MEDIUM-3, OWNER-e; webhooks only): a decision
+    with nothing deliverable -- every LLM attempt failed, or the builder has
+    no LLM, and there was no deterministic answer nor handoff -- is an effect
+    of zero, written at insert, with no ledger entry."""
+
+    repository = CreditRepository(db)
+    await repository.ensure_account(builder_id)
+    await repository.insert_effect(
+        builder_id=builder_id,
+        tenant_id=tenant_id,
+        effect_id=effect_id,
+        effect_kind=NO_RESPONSE_EFFECT_KIND,
+        decision_digest=digest,
+    )
+    logger.info(
+        ENFORCED_LOG,
+        reason="no_response",
+        tenant_id=str(tenant_id),
+        effect_id=effect_id,
+    )
+    return DecisionCharge(effect_id, builder_id, NO_RESPONSE_EFFECT_KIND)
+
+
+# ---------------------------------------------------------------------------
+# Enforced Z-API and Meta webhooks, the Meta file handoff and the response
+# outbox (Group 3b-2).
+# ---------------------------------------------------------------------------
+
+WebhookSource = Literal["zapi", "meta"]
+WebhookPrecheck = Literal["credit_pending"]
+
+# The 200 bodies of the enforced webhook paths (the providers retry non-2xx).
+CREDIT_PENDING_SKIP: Final[Mapping[str, Any]] = {
+    "ok": True,
+    "skipped": CREDIT_PENDING_CODE,
+}
+DUPLICATE_MESSAGE_SKIP: Final[Mapping[str, Any]] = {
+    "ok": True,
+    "skipped": "duplicate_message",
+}
+PAYLOAD_CONFLICT_SKIP: Final[Mapping[str, Any]] = {
+    "ok": True,
+    "skipped": PAYLOAD_CONFLICT_CODE,
+}
+
+# Delivery of a stored reply (OD-1/OD-2/OD-5, owner decisions of the 3b-2
+# review).  ONE ``asyncio.timeout`` bounds the PROVIDER CALL only
+# (``ReplySender.send``: ``_send_reply_with_optional_tts`` with TTS and its
+# text fallback).  Its worst case is recomputed by test from the real httpx
+# timeouts of the senders and the TTS providers, one connect + write + read
+# per request: TTS 10+45+45 = 100 s, then the audio (Z-API 5+30+30 = 65 s;
+# Meta upload 65 s + send 5+15+15 = 35 s), then the text fallback (35 s):
+# Z-API 200 s, Meta 235 s.  A timeout is an UNCERTAIN result: never resent.
+REPLY_SEND_TIMEOUT_SECONDS: Final = 240
+# The bookkeeping after an accepted send (the echo id tracked and stored, the
+# conversation marked unread) has its own bound and is shielded; its failure
+# only logs -- the reply IS delivered once the provider returned.
+REPLY_RECORD_TIMEOUT_SECONDS: Final = 30
+# The publisher never takes a ``pending`` row younger than this: the inline
+# send of a fresh row has a whole send timeout plus a margin first (pinned).
+PUBLISHER_MIN_AGE_MARGIN_SECONDS: Final = 30
+PUBLISHER_MIN_AGE_SECONDS: Final = 300
+# A row left ``sending`` (a crash between the claim and the mark) is
+# reclaimed after this many seconds since its claim: longer than a send plus
+# its bookkeeping (pinned).
+SENDING_LEASE_SECONDS: Final = 330
+# OD-1: the publisher only recovers the CRASH windows (commit -> send, send ->
+# mark) and sends one row at most ONCE: a failed send -- inline or recovered
+# -- is ``failed`` at once (main's behaviour: the patient never gets it
+# later), and a row the publisher already took (attempts >= 1) that comes
+# back is ``failed`` without a send.
+PUBLISHER_MAX_ATTEMPTS: Final = 1
+PUBLISHER_POLL_SECONDS: Final = 10.0
+# Rows the publisher delivers per tick, one at a time.
+PUBLISHER_BATCH: Final = 20
+# OD-2: a stored reply older than this (since its decision) is never sent;
+# longer than the publisher's recovery windows (pinned).
+REPLY_MAX_AGE_SECONDS: Final = 600
+# The retention sweep (OWNER-d, OD-3): its own lifespan task, every interval
+# (first tick one interval after start-up), in batches of this many rows.
+RETENTION_SWEEP_INTERVAL_SECONDS: Final = 300.0
+RETENTION_SWEEP_BATCH: Final = 500
+# The personal data of a stored webhook reply, erased as soon as the row is
+# ``delivered`` or ``failed`` (OWNER-3); the whole payload goes after the
+# retention.
+REPLY_PII_KEYS: Final = ("phone", "text")
+REPLY_PAYLOAD_KIND: Final = "webhook_reply.v1"
+PUBLISHER_LOG: Final = "credit response outbox"
+
+
+class CreditReplyUndeliverable(Exception):
+    """The send adapter refused a stored reply before any provider call
+    (missing credentials, an unusable payload); ``reason`` is the stable
+    code the webhook answers with."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class ReplySender(Protocol):
+    """The send adapter of a stored reply (``src.api.routes.webhook``),
+    injected by its caller -- the route inline, the lifespan for the
+    publisher -- so this module never imports the route (LOW-13).  Three
+    steps, so only the provider call is under the send timeout (OD-5)."""
+
+    async def prepare(self, payload: Mapping[str, Any], db: AsyncSession) -> Any:
+        """Read what the send needs (the tenant's credentials) with ``db``;
+        no provider call.  Raises :class:`CreditReplyUndeliverable`."""
+
+    async def send(self, prepared: Any) -> Any:
+        """The provider call only (``_send_reply_with_optional_tts``);
+        raises when nothing was sent."""
+
+    async def record(self, prepared: Any, sent: Any, db: AsyncSession) -> None:
+        """Main's bookkeeping after an accepted send (the echo id tracked and
+        stored, the conversation marked unread on a handoff)."""
+
+
+@dataclass(frozen=True)
+class WebhookEnforcement:
+    """One Z-API/Meta message captured as ENFORCED by its adapter's
+    pre-check (switch on at entry, ``production`` with an authenticated
+    principal, ``credit_enforcement_at`` set, an account and no hold)."""
+
+    source: WebhookSource
+    tenant_id: UUID
+    principal_id: str
+    provider_message_id: str
+    payload_sha256: str
+
+
+def provider_claim_id(raw: str) -> str:
+    """The storable claim id of a provider message: the id itself when it is
+    1..255 visible ASCII characters, else ``sha256:<hex>`` of its UTF-8 (an
+    enforced decision is never left without its claim)."""
+
+    valid = valid_ingress_id(raw)
+    if valid is not None:
+        return valid
+    return "sha256:" + sha256_hex(raw.encode("utf-8"))
+
+
+async def precheck_webhook(
+    request: HTTPConnection,
+    db: object,
+    *,
+    source: WebhookSource,
+    tenant_id: UUID,
+    identity: Callable[[], AuthenticatedIdentity | None],
+    provider_message_id: str,
+    payload_sha256: Callable[[], str],
+) -> WebhookEnforcement | WebhookPrecheck | None:
+    """The per-adapter pre-check (MEDIUM-4, D4, OWNER-c), the same as 3b-1's.
+
+    ``None`` -- main's path and the Group 3a writer -- unless the request
+    captured the switch on at entry, the route's session is a real one, the
+    principal is authenticated and ``credit_enforcement_at`` (read ONCE,
+    here) is set.  Then, in the same short transaction: tenant ``FOR SHARE``
+    -> a standalone tenant is ``credit_pending`` -> the builder's account on
+    demand -> a quarantine hold is ``credit_pending`` -> commit.
+    ``credit_pending`` rolls back: nothing is written, nothing is sent.  A
+    failed read keeps main's path (logged) unless this process already saw
+    the enforcement set: then :class:`CreditEnforcementUnavailable` (D1) and
+    the webhook answers 503 -- which in practice drops the message: main's
+    replay claim (Redis, before this pre-check) is already spent, so the
+    provider's retry answers ``duplicate_message``.  Uazapi and Evolution
+    never call this.
+    """
+
+    global _enforcement_seen
+
+    try:
+        # Like the Group 3a ingress, the capture never raises: a caller
+        # without a request scope (a direct call, a stub) is main's path.
+        if not request_credit_switch(request):
+            return None
+        if not isinstance(db, AsyncSession):
+            return None
+        principal_identity = identity()
+        if principal_identity is None or principal_identity.tenant_id != tenant_id:
+            return None
+        principal = derive_credit_principal(
+            principal_identity,
+            TenantBuilder(tenant_id=tenant_id, builder_id=None, is_active=True),
+        )
+    except Exception as error:
+        logger.warning(
+            ENFORCED_LOG,
+            alert="credit_enforcement_read",
+            reason="request_unreadable",
+            source=source,
+            tenant_id=str(tenant_id),
+            error_type=type(error).__name__,
+        )
+        return None
+    if not principal.authenticated:
+        return None
+    repository = CreditRepository(db)
+    try:
+        enforced_at = await repository.enforcement_at()
+    except Exception as error:
+        with suppress(Exception):
+            await db.rollback()
+        if _enforcement_seen:
+            logger.error(
+                ENFORCED_LOG,
+                alert="credit_enforcement_unavailable",
+                reason=ENFORCEMENT_UNREADABLE_AFTER_ENFORCED,
+                source=source,
+                tenant_id=str(tenant_id),
+                error_type=type(error).__name__,
+            )
+            raise CreditEnforcementUnavailable(
+                "credit_enforcement_at was set and can no longer be read"
+            ) from error
+        logger.warning(
+            ENFORCED_LOG,
+            alert="credit_enforcement_read",
+            reason="enforcement_unreadable",
+            source=source,
+            tenant_id=str(tenant_id),
+            error_type=type(error).__name__,
+        )
+        return None
+    if not isinstance(enforced_at, datetime):
+        return None
+    _enforcement_seen = True
+    try:
+        scope = await repository.tenant_scope(tenant_id, lock=True)
+        if scope is None or scope.builder_id is None:
+            await db.rollback()
+            return "credit_pending"
+        await repository.ensure_account(scope.builder_id)
+        if await repository.quarantine_hold(scope.builder_id):
+            await db.rollback()
+            return "credit_pending"
+        await db.commit()
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    return WebhookEnforcement(
+        source=source,
+        tenant_id=tenant_id,
+        principal_id=principal.principal_id,
+        provider_message_id=provider_claim_id(provider_message_id),
+        payload_sha256=payload_sha256(),
+    )
+
+
+async def precheck_zapi(
+    request: HTTPConnection, db: object, *, tenant_id: UUID, body: Mapping[str, Any]
+) -> WebhookEnforcement | WebhookPrecheck | None:
+    """Z-API: the capability token proved the tenant; ``body.messageId``."""
+
+    return await precheck_webhook(
+        request,
+        db,
+        source="zapi",
+        tenant_id=tenant_id,
+        identity=lambda: credit_identity("zapi", tenant_id),
+        provider_message_id=str(body.get("messageId") or "").strip(),
+        payload_sha256=lambda: zapi_payload_sha256(body),
+    )
+
+
+async def precheck_meta(
+    request: HTTPConnection, db: object, *, tenant_id: UUID, message: Mapping[str, Any]
+) -> WebhookEnforcement | WebhookPrecheck | None:
+    """Meta: the HMAC identity of the middleware; ``messages[0].id``."""
+
+    return await precheck_webhook(
+        request,
+        db,
+        source="meta",
+        tenant_id=tenant_id,
+        identity=lambda: request_credit_identity(request),
+        provider_message_id=str(message.get("id") or "").strip(),
+        payload_sha256=lambda: provider_message_sha256(message),
+    )
+
+
+async def _claimed_answer(
+    db: AsyncSession, enforcement: WebhookEnforcement
+) -> Mapping[str, Any]:
+    """A redelivery, whatever the first claim's state (in progress,
+    abandoned, phase 1 committed, decided or observational): ALWAYS
+    ``duplicate_message`` -- never a takeover, never a second reply (the
+    recovery of a committed decision is the publisher's) --, or
+    ``payload_conflict`` (logged) when the stable fields differ."""
+
+    try:
+        claim = await CreditRepository(db).provider_claim(
+            enforcement.tenant_id,
+            source=enforcement.source,
+            provider_message_id=enforcement.provider_message_id,
+        )
+        await db.commit()
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    if claim is not None and claim.payload_sha256 != enforcement.payload_sha256:
+        logger.warning(
+            PAYLOAD_CONFLICT_LOG,
+            source=enforcement.source,
+            tenant_id=str(enforcement.tenant_id),
+            interaction_id=str(claim.interaction_id),
+            stored_payload_sha256=claim.payload_sha256,
+            request_payload_sha256=enforcement.payload_sha256,
+        )
+        return PAYLOAD_CONFLICT_SKIP
+    return DUPLICATE_MESSAGE_SKIP
+
+
+async def acquire_webhook_claim(
+    db: AsyncSession, enforcement: WebhookEnforcement
+) -> ClaimLease | Mapping[str, Any]:
+    """The webhook claim, a short transaction of its own right before phase 1:
+    tenant ``FOR SHARE`` -> ``INSERT ... ON CONFLICT DO NOTHING`` on
+    ``(tenant_id, source, provider_message_id)`` -> commit.  A conflict
+    answers by :func:`_claimed_answer`.  The PostgreSQL claim is the only
+    dedupe authority for charging: ``_claim_incoming_message`` falls back to
+    per-process memory when Redis fails outside ``is_production``."""
+
+    repository = CreditRepository(db)
+    try:
+        scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
+        if scope is None:
+            raise CreditTenantGone("the tenant vanished before its claim")
+        row = await repository.insert_webhook_claim(
+            tenant_id=enforcement.tenant_id,
+            builder_id=scope.builder_id,
+            source=enforcement.source,
+            principal_id=enforcement.principal_id,
+            provider_message_id=enforcement.provider_message_id,
+            interaction_id=uuid4(),
+            payload_sha256=enforcement.payload_sha256,
+            decision_version=ENFORCED_DECISION_VERSION,
+        )
+        await db.commit()
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    if row is None:
+        return await _claimed_answer(db, enforcement)
+    return ClaimLease(row.id, row.interaction_id, row.created_at)
+
+
+async def run_webhook_phase1(
+    db: AsyncSession,
+    enforcement: WebhookEnforcement,
+    lease: ClaimLease,
+    *,
+    session_id: UUID,
+    run_pipeline: Callable[[], Awaitable[tuple[Any, Any, Any]]],
+) -> Phase1Outcome | None:
+    """Phase 1 of an enforced webhook decision in the route's session: the
+    same as 3b-1's -- tenant ``FOR SHARE`` -> ``run_pipeline`` (the session
+    ``FOR UPDATE``, the synchronous handoff in this transaction) -> the
+    handoff's charge and ``credit_effect_id`` -> the marker -- with the
+    webhook marker, which has no lease clause (LOW-1), and without
+    ``SET LOCAL lock_timeout``: that bound exists to size the ``POST
+    /v1/events`` lease (OWNER-1/2) and a webhook has no lease; a webhook
+    phase 1 waits for the session like main's.  It also reads the session's
+    pause state as phase 1 leaves it (under its lock: the decision's own
+    handoff pause included), the snapshot every send of the reply compares
+    against (OD-2).  ``None``: the marker did not hold (rolled back)."""
+
+    async def mark(repository: CreditRepository, session_version: int) -> bool:
+        return await repository.mark_webhook_claim_phase1(
+            lease.claim_id, observed=lease.observed, session_version=session_version
+        )
+
+    async def observe(repository: CreditRepository) -> Any:
+        return await repository.session_pause_state(enforcement.tenant_id, session_id)
+
+    return await _run_phase1(
+        db,
+        tenant_id=enforcement.tenant_id,
+        session_id=session_id,
+        interaction_id=lease.interaction_id,
+        run_pipeline=run_pipeline,
+        mark=mark,
+        lock_timeout=None,
+        decision_kind=f"{enforcement.source}_phase1_handoff",
+        observe=observe,
+    )
+
+
+async def run_webhook_final(
+    db: AsyncSession,
+    enforcement: WebhookEnforcement,
+    lease: ClaimLease,
+    phase1: Phase1Outcome,
+    *,
+    response: Any,
+    write_bundle: Callable[[str | None], Awaitable[UUID | None]],
+    reply: Mapping[str, Any] | None,
+) -> FinalOutcome | None:
+    """The final transaction of an enforced webhook decision: 3b-1's, with
+    the webhook final fence (no lease clause) and two differences.  A
+    decision with nothing deliverable (no LLM, deterministic answer nor
+    handoff) is the effect of zero ``trace_no_response`` (OWNER-e).  The
+    response-outbox row is born ``pending`` -- ``created_at =
+    clock_timestamp()`` -- with ``reply`` (the send's arguments, never a
+    credential) and only when there is a reply to send, plus what every send
+    re-checks first (OD-2): ``decided_at`` (the maximum age) and
+    ``session_pause`` (the session's pause state as phase 1 left it)."""
+
+    async def fence(repository: CreditRepository) -> bool:
+        return await repository.hold_webhook_claim_final_fence(
+            lease.claim_id,
+            observed=lease.observed,
+            session_version=phase1.session_version,
+        )
+
+    if reply is not None:
+        reply = {
+            **reply,
+            "decided_at": datetime.now(timezone.utc).isoformat(),
+            "session_pause": phase1.session_pause,
+        }
+
+    return await _run_final(
+        db,
+        tenant_id=enforcement.tenant_id,
+        interaction_id=lease.interaction_id,
+        phase1=phase1,
+        response=response,
+        write_bundle=write_bundle,
+        deliverable=deliverable_response(response),
+        stored_answer=lambda _interaction_event_id: (
+            None if reply is None else (dict(reply), "pending")
+        ),
+        fence=fence,
+    )
+
+
+@dataclass(frozen=True)
+class FileHandoffOutcome:
+    """The enforced Meta file handoff: ``handoff`` (committed with its
+    claim, debit and ``credit_effect_id``) or the 200 skip ``answer``."""
+
+    handoff: Any = None
+    answer: Mapping[str, Any] | None = None
+    charge: DecisionCharge | None = None
+
+
+def file_handoff_decision(handoff_id: UUID, note: str) -> dict[str, Any]:
+    """The PII-free projection of a Meta file handoff decision (O2)."""
+
+    return {"kind": "meta_file_handoff", "handoff_id": str(handoff_id), "note": note}
+
+
+async def run_meta_file_handoff(
+    db: AsyncSession,
+    enforcement: WebhookEnforcement,
+    *,
+    session_id: UUID,
+    note: str,
+    initiate: Callable[[], Awaitable[Any]],
+    before_commit: Callable[[], Awaitable[None]] | None = None,
+) -> FileHandoffOutcome:
+    """The Meta file handoff as ONE enforced transaction in the route's
+    session (O2, MEDIUM-5), in the documented order: tenant ``FOR SHARE`` ->
+    session ``FOR UPDATE`` -> account ``FOR UPDATE`` -> hold (rollback,
+    ``credit_pending``: no handoff, no ack) -> lots ``FOR UPDATE`` -> the
+    enforced claim of ``(tenant_id, 'meta', message_id)`` (a conflict rolls
+    back: ``duplicate_message``, no second handoff nor debit) -> ``initiate``
+    (``initiate_handoff(..., session=db)``: record and ``handoff.request``
+    in this transaction) -> debit/debt -> the effect with its
+    ``decision_digest`` -> ``credit_effect_id`` merged into the record's
+    context by ``(tenant_id, id)`` -> ``before_commit`` (the forward clears
+    the pending file review) -> commit.  No SRM, no LLM: the handoff IS the
+    decision.  The caller dispatches the creation webhook after the commit.
+    Any exception rolls everything back and propagates."""
+
+    repository = CreditRepository(db)
+    tenant_id = enforcement.tenant_id
+    try:
+        scope = await repository.tenant_scope(tenant_id, lock=True)
+        if scope is None:
+            raise CreditTenantGone("the tenant vanished before the file handoff")
+        session_version = await repository.lock_session(tenant_id, session_id)
+        if session_version is None:
+            raise CreditTenantGone("the session vanished before the file handoff")
+        if scope.builder_id is None:
+            # Turned standalone since the pre-check: no account to charge.
+            await db.rollback()
+            return FileHandoffOutcome(answer=CREDIT_PENDING_SKIP)
+        builder_id = scope.builder_id
+        await repository.ensure_account(builder_id)
+        await repository.lock_account(builder_id)
+        if await repository.quarantine_hold(builder_id):
+            await db.rollback()
+            return FileHandoffOutcome(answer=CREDIT_PENDING_SKIP)
+        await repository.lock_lots(builder_id)
+        claim = await repository.insert_webhook_claim(
+            tenant_id=tenant_id,
+            builder_id=builder_id,
+            source=enforcement.source,
+            principal_id=enforcement.principal_id,
+            provider_message_id=enforcement.provider_message_id,
+            interaction_id=uuid4(),
+            payload_sha256=enforcement.payload_sha256,
+            decision_version=ENFORCED_DECISION_VERSION,
+            session_version=session_version,
+        )
+        if claim is None:
+            await db.rollback()
+            return FileHandoffOutcome(answer=await _claimed_answer(db, enforcement))
+        handoff = await initiate()
+        handoff_id = getattr(handoff, "id", None)
+        if not isinstance(handoff_id, UUID):
+            raise RuntimeError("the file handoff returned no record id")
+        effect_id = trace_effect_id(
+            tenant_id, claim.interaction_id, ENFORCED_DECISION_VERSION
+        )
+        charge = await _charge_decision(
+            db,
+            tenant_id=tenant_id,
+            builder_id=builder_id,
+            effect_id=effect_id,
+            digest=decision_digest(
+                tenant_id=tenant_id,
+                interaction_id=claim.interaction_id,
+                decision_version=ENFORCED_DECISION_VERSION,
+                origin=InteractionOrigin.PRODUCTION,
+                decision=file_handoff_decision(handoff_id, note),
+            ),
+        )
+        if not await repository.link_handoff_credit_effect(
+            tenant_id=tenant_id, handoff_id=handoff_id, effect_id=charge.effect_id
+        ):
+            raise RuntimeError("the file handoff record is not in this transaction")
+        if before_commit is not None:
+            await before_commit()
+        await db.commit()
+    except BaseException:
+        with suppress(Exception):
+            await db.rollback()
+        raise
+    logger.info(
+        ENFORCED_LOG,
+        reason="file_handoff",
+        tenant_id=str(tenant_id),
+        effect_id=charge.effect_id,
+        effect_kind=charge.effect_kind,
+    )
+    return FileHandoffOutcome(handoff=handoff, charge=charge)
+
+
+def scrub_reply(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The stored reply without its personal data (phone and text)."""
+
+    return {key: value for key, value in payload.items() if key not in REPLY_PII_KEYS}
+
+
+def _sendable(payload: Mapping[str, Any]) -> bool:
+    return (
+        payload.get("kind") == REPLY_PAYLOAD_KIND
+        and isinstance(payload.get("phone"), str)
+        and bool(payload.get("phone"))
+        and isinstance(payload.get("text"), str)
+        and bool(payload.get("text"))
+    )
+
+
+def _decided_at(payload: Mapping[str, Any]) -> datetime | None:
+    raw = payload.get("decided_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        decided = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return decided if decided.tzinfo is not None else None
+
+
+async def _reply_refusal(
+    repository: CreditRepository, payload: Mapping[str, Any]
+) -> str | None:
+    """OD-2: before ANY send of a stored reply (inline, or recovered by the
+    publisher): the reason it must not be sent, or ``None``.  Older than
+    :data:`REPLY_MAX_AGE_SECONDS` since its decision; the tenant or session
+    gone; the bot turned off; or the session's pause state no longer the one
+    phase 1 left (a human takeover, a reactivation, another handoff)."""
+
+    if not _sendable(payload):
+        return "payload_unusable"
+    decided = _decided_at(payload)
+    if decided is None:
+        return "payload_unusable"
+    age = datetime.now(timezone.utc) - decided
+    if age > timedelta(seconds=REPLY_MAX_AGE_SECONDS):
+        return "reply_expired"
+    try:
+        tenant_id = UUID(str(payload["tenant_id"]))
+        session_id = UUID(str(payload["session_id"]))
+    except (KeyError, ValueError):
+        return "payload_unusable"
+    state = await repository.reply_guard_state(tenant_id, session_id)
+    if state is None:
+        return "session_gone"
+    bot_active, pause = state
+    if not bot_active:
+        return "bot_inactive"
+    if pause != payload.get("session_pause"):
+        return "session_changed"
+    return None
+
+
+InlineOutcome = Literal["delivered", "failed", "not_claimed"]
+
+
+@dataclass(frozen=True)
+class InlineDelivery:
+    """What the inline send of one stored reply did."""
+
+    outcome: InlineOutcome
+    reason: str | None = None
+    error: str | None = None
+
+
+DeliveryOutcome = Literal["delivered", "failed", "fenced"]
+
+
+@dataclass(frozen=True)
+class _Delivery:
+    outcome: DeliveryOutcome
+    reason: str | None = None
+    error: str | None = None
+
+
+async def _end_transaction(db: AsyncSession) -> None:
+    with suppress(Exception):
+        await db.rollback()
+
+
+async def _mark_failed(
+    factory: Callable[[], AsyncSession], claim: OutboxClaim, reason: str
+) -> _Delivery:
+    """``sending -> failed`` with the PII erased (OWNER-3), and its alert.
+    The log never carries the phone nor the text."""
+
+    try:
+        async with factory() as session:
+            moved = await CreditRepository(session).mark_outbox_failed(
+                claim.id, observed=claim.observed, payload=scrub_reply(claim.payload)
+            )
+            await session.commit()
+    except Exception as error:
+        # The row stays ``sending``: the publisher takes it after the lease.
+        logger.error(
+            PUBLISHER_LOG,
+            alert="credit_response_failed",
+            reason="failed_mark_lost",
+            outbox_id=str(claim.id),
+            error_type=type(error).__name__,
+        )
+        return _Delivery("fenced", reason=reason)
+    logger.error(
+        PUBLISHER_LOG,
+        alert="credit_response_failed",
+        reason=reason,
+        outbox_id=str(claim.id),
+        tenant_id=str(claim.tenant_id),
+        effect_id=claim.effect_id,
+        attempts=claim.attempts,
+        fenced=not moved,
+    )
+    return _Delivery("failed" if moved else "fenced", reason=reason)
+
+
+async def _record_bounded(
+    sender: ReplySender,
+    prepared: Any,
+    sent: Any,
+    factory: Callable[[], AsyncSession],
+) -> None:
+    """The bookkeeping after an accepted send, in its own session and its own
+    bound (:data:`REPLY_RECORD_TIMEOUT_SECONDS`); a failure or a timeout only
+    logs.  A statement cut by the bound leaves its connection invalidated,
+    never pooled; a single-connection pool (SQLite ``:memory:``) is never
+    cut mid-statement (it runs unbounded)."""
+
+    session = factory()
+    held: list[AsyncConnection] = []
+    single = _single_connection_pool(session)
+
+    async def steps() -> None:
+        try:
+            held.append(await session.connection())
+            await sender.record(prepared, sent, session)
+        except BaseException:
+            if not single and session.in_transaction():
+                for connection in held:
+                    await _invalidate_connection(connection)
+            raise
+        finally:
+            with suppress(Exception):
+                await session.close()
+
+    try:
+        if single:
+            await steps()
+        else:
+            async with asyncio.timeout(REPLY_RECORD_TIMEOUT_SECONDS):
+                await steps()
+    except Exception as error:
+        logger.warning(
+            PUBLISHER_LOG,
+            alert="credit_response_record",
+            reason="record_failed",
+            error_type=type(error).__name__,
+        )
+
+
+async def _finish_delivered(
+    sender: ReplySender,
+    prepared: Any,
+    sent: Any,
+    claim: OutboxClaim,
+    factory: Callable[[], AsyncSession],
+) -> _Delivery:
+    """After the provider returned: the bookkeeping (bounded, failure only
+    logs), then ``sending -> delivered`` with phone and text erased."""
+
+    await _record_bounded(sender, prepared, sent, factory)
+    try:
+        async with factory() as session:
+            moved = await CreditRepository(session).mark_outbox_delivered(
+                claim.id, observed=claim.observed, payload=scrub_reply(claim.payload)
+            )
+            await session.commit()
+    except Exception as error:
+        # Sent, never marked: the row stays ``sending`` -- the send -> mark
+        # window the publisher may recover once (at-least-once).
+        logger.error(
+            PUBLISHER_LOG,
+            alert="credit_response_publisher",
+            reason="delivered_mark_lost",
+            outbox_id=str(claim.id),
+            error_type=type(error).__name__,
+        )
+        return _Delivery("delivered", reason="mark_lost")
+    if not moved:
+        # Sent all the same (the provider returned); only the mark lost its
+        # fence (the row is gone with its tenant, or was reclaimed).
+        logger.warning(
+            PUBLISHER_LOG,
+            alert="credit_response_publisher",
+            reason="delivered_mark_fenced",
+            outbox_id=str(claim.id),
+        )
+        return _Delivery("delivered", reason="mark_fenced")
+    return _Delivery("delivered")
+
+
+async def _deliver_claimed(
+    claim: OutboxClaim,
+    sender: ReplySender,
+    factory: Callable[[], AsyncSession],
+) -> _Delivery:
+    """One send of a claimed (``sending``) row, inline or recovered.
+
+    OD-2 first (:func:`_reply_refusal`) and the sender's preparation (the
+    credentials), in a short read; then the PROVIDER CALL alone under
+    :data:`REPLY_SEND_TIMEOUT_SECONDS` (OD-5).  A refusal, a failure or a
+    timeout -- an UNCERTAIN result -- turns the row ``failed`` at once with
+    its PII erased and is never resent (OD-1).  Once the provider returned
+    the reply IS delivered: the bookkeeping and the ``delivered`` mark run
+    shielded from a cancellation of the caller.
+    """
+
+    try:
+        async with factory() as session:
+            refusal = await _reply_refusal(CreditRepository(session), claim.payload)
+            prepared: Any = None
+            if refusal is None:
+                prepared = await sender.prepare(claim.payload, session)
+            await session.rollback()
+    except CreditReplyUndeliverable as refused:
+        refusal = refused.reason
+    if refusal is not None:
+        return await _mark_failed(factory, claim, refusal)
+    try:
+        async with asyncio.timeout(REPLY_SEND_TIMEOUT_SECONDS):
+            sent = await sender.send(prepared)
+    except TimeoutError:
+        failed = await _mark_failed(factory, claim, "send_uncertain")
+        return _Delivery(failed.outcome, reason="send_failed", error="send_timeout")
+    except CreditReplyUndeliverable as refused:
+        return await _mark_failed(factory, claim, refused.reason)
+    except Exception as error:
+        failed = await _mark_failed(factory, claim, "send_failed")
+        return _Delivery(failed.outcome, reason="send_failed", error=str(error))
+    finish = asyncio.ensure_future(
+        _finish_delivered(sender, prepared, sent, claim, factory)
+    )
+    return await asyncio.shield(finish)
+
+
+async def deliver_reply_inline(
+    outbox_id: UUID,
+    *,
+    sender: ReplySender,
+    session_factory: Callable[[], AsyncSession] | None = None,
+) -> InlineDelivery:
+    """Right after the final commit (H4, LOW-2): claim the row ``pending ->
+    sending`` with ``RETURNING`` -- no row means the publisher took it (or
+    the row is gone with its tenant), so nothing is sent here -- then one
+    send (:func:`_deliver_claimed`): ``delivered``, or ``failed`` at once
+    with its PII erased, like main's lost reply (OD-1).  Runs in sessions of
+    its own: the route's transaction already ended."""
+
+    factory = session_factory or _session_factory()
+    try:
+        async with factory() as session:
+            claim = await CreditRepository(session).claim_outbox_inline(outbox_id)
+            await session.commit()
+    except Exception as error:
+        logger.warning(
+            PUBLISHER_LOG,
+            alert="credit_response_inline",
+            reason="inline_claim_failed",
+            outbox_id=str(outbox_id),
+            error_type=type(error).__name__,
+        )
+        return InlineDelivery("failed", reason="send_failed", error="claim_failed")
+    if claim is None:
+        logger.info(
+            PUBLISHER_LOG, reason="inline_not_claimed", outbox_id=str(outbox_id)
+        )
+        return InlineDelivery("not_claimed")
+    delivery = await _deliver_claimed(claim, sender, factory)
+    if delivery.outcome == "delivered":
+        return InlineDelivery("delivered")
+    return InlineDelivery("failed", reason=delivery.reason, error=delivery.error)
+
+
+PublisherOutcome = Literal["delivered", "failed", "fenced"]
+
+
+@dataclass
+class PublisherTick:
+    """What one publisher tick did (``None`` from :meth:`run_once` when the
+    switch was off: nothing was read)."""
+
+    enforced: bool = False
+    outcomes: list[PublisherOutcome] = field(default_factory=list)
+
+
+class CreditResponsePublisher:
+    """The relational publisher of ``credit_response_outbox`` (H4, MEDIUM-4),
+    which only RECOVERS the crash windows of the inline send (OD-1): a
+    ``pending`` row older than :data:`PUBLISHER_MIN_AGE_SECONDS` (a crash
+    between the final commit and the inline claim) or a ``sending`` row
+    older than :data:`SENDING_LEASE_SECONDS` (a crash between the claim and
+    the mark).  It claims nothing with the switch off -- re-read before EVERY
+    row -- nor before ``credit_enforcement_at``; claims ONE row at a time in a
+    short transaction (``FOR UPDATE SKIP LOCKED``) committed as ``sending``
+    before the provider call -- two tasks never send one row at once, and no
+    row lock is held across a send --; and sends a row at most ONCE: a row it
+    already took (``attempts`` >= :data:`PUBLISHER_MAX_ATTEMPTS`) that comes
+    back is ``failed`` without a send, and its own send is
+    :func:`_deliver_claimed` (``delivered``, or ``failed`` with the PII
+    erased).  The send -> mark window of the inline send may thus deliver a
+    reply twice: the one accepted at-least-once case.  The retention sweep is
+    :func:`run_retention_sweeper`'s, not this task's (OD-3).
+    """
+
+    def __init__(
+        self,
+        sender: ReplySender,
+        *,
+        session_factory: Callable[[], AsyncSession] | None = None,
+        poll_seconds: float = PUBLISHER_POLL_SECONDS,
+        batch: int = PUBLISHER_BATCH,
+    ) -> None:
+        self._sender = sender
+        self._factory = session_factory
+        self.poll_seconds = poll_seconds
+        self.batch = batch
+
+    def _sessions(self) -> Callable[[], AsyncSession]:
+        return self._factory or _session_factory()
+
+    async def run_once(self) -> PublisherTick | None:
+        """One tick behind the worker guard (``None``: the switch is off)."""
+
+        return await run_credit_worker_tick(self._tick)
+
+    async def run(self) -> None:
+        """The lifespan task: a tick every :attr:`poll_seconds` until
+        cancelled; a failed tick is logged (an alert) and the loop goes on."""
+
+        while True:
+            await asyncio.sleep(self.poll_seconds)
+            try:
+                await self.run_once()
+            except Exception as error:
+                logger.error(
+                    PUBLISHER_LOG,
+                    alert="credit_response_publisher",
+                    reason="tick_failed",
+                    error_type=type(error).__name__,
+                )
+
+    async def _tick(self) -> PublisherTick:
+        tick = PublisherTick()
+        factory = self._sessions()
+        async with factory() as session:
+            enforced_at = await CreditRepository(session).enforcement_at()
+            await session.rollback()
+        if enforced_at is None:
+            return tick
+        tick.enforced = True
+        for _ in range(self.batch):
+            if not credit_switch_effective():  # re-read before every row
+                break
+            claim = await self._claim(factory)
+            if claim is None:
+                break
+            tick.outcomes.append(await self._deliver(factory, claim))
+        return tick
+
+    async def _claim(self, factory: Callable[[], AsyncSession]) -> OutboxClaim | None:
+        async with factory() as session:
+            claim = await CreditRepository(session).claim_outbox_for_publish(
+                min_age=timedelta(seconds=PUBLISHER_MIN_AGE_SECONDS),
+                sending_lease=timedelta(seconds=SENDING_LEASE_SECONDS),
+            )
+            await session.commit()
+        return claim
+
+    async def _deliver(
+        self, factory: Callable[[], AsyncSession], claim: OutboxClaim
+    ) -> PublisherOutcome:
+        if claim.attempts > PUBLISHER_MAX_ATTEMPTS:
+            # The publisher already took this row once (and was cut): its
+            # send is uncertain, never repeated.
+            delivery = await _mark_failed(factory, claim, "resend_refused")
+        else:
+            delivery = await _deliver_claimed(claim, self._sender, factory)
+        return delivery.outcome
+
+
+def start_credit_response_publisher(
+    sender: ReplySender, source: Settings | None = None
+) -> asyncio.Task[None] | None:
+    """Start the publisher in the lifespan, only when the configuration is
+    on (no task with ``credit_hot_path_enabled`` off, like the switch
+    refresher); every row still re-reads the effective switch first."""
+
+    configured = settings if source is None else source
+    if configured.credit_hot_path_enabled is not True:
+        return None
+    return asyncio.create_task(
+        CreditResponsePublisher(sender).run(), name="credit-response-publisher"
+    )
+
+
+async def _stop_task(task: asyncio.Task[None] | None, name: str) -> None:
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as error:
+        logger.error(
+            PUBLISHER_LOG,
+            alert=name,
+            reason="stopped_with_error",
+            error_type=type(error).__name__,
+        )
+
+
+async def stop_credit_response_publisher(task: asyncio.Task[None] | None) -> None:
+    """Cancel the publisher (before the pool closes); never raises.  A row
+    cut mid-send stays ``sending``: reclaimed after
+    :data:`SENDING_LEASE_SECONDS` and then ``failed`` (OD-1), never resent
+    by the publisher."""
+
+    await _stop_task(task, "credit_response_publisher")
+
+
+# -- the retention sweep (OWNER-d; OD-3) -------------------------------------
+
+
+async def _outbox_table_exists(session: AsyncSession) -> bool:
+    """A database below migration 038 has no outbox (dominance: credit code
+    on a ``037`` database works like main).  PostgreSQL only; any other
+    dialect has it (``create_all``)."""
+
+    if session.get_bind().dialect.name != "postgresql":
+        return True
+    found = await session.scalar(
+        text("SELECT to_regclass('public.credit_response_outbox') IS NOT NULL")
+    )
+    return bool(found)
+
+
+async def sweep_expired_replies(
+    session_factory: Callable[[], AsyncSession] | None = None,
+) -> int:
+    """``payload = '{}'`` on every outbox row that is not ``sending`` and is
+    older than ``credit_replay_retention_hours`` -- ``delivered``, ``failed``
+    and abandoned ``pending`` ones, of webhooks and of ``POST /v1/events`` --
+    in batches of :data:`RETENTION_SWEEP_BATCH`.  OD-3: it runs WHATEVER the
+    switch and the config: the one explicit exception to Decision 20, and
+    only to ERASE expired personal data -- it never sends nor claims.
+    Returns how many rows it emptied."""
+
+    factory = session_factory or _session_factory()
+    total = 0
+    while True:
+        async with factory() as session:
+            if not await _outbox_table_exists(session):
+                await session.rollback()
+                return total
+            emptied = await CreditRepository(session).sweep_outbox_payloads(
+                retention=replay_retention(), limit=RETENTION_SWEEP_BATCH
+            )
+            await session.commit()
+        total += emptied
+        if emptied < RETENTION_SWEEP_BATCH:
+            break
+    if total:
+        logger.info(PUBLISHER_LOG, reason="retention_swept", rows=total)
+    return total
+
+
+async def run_retention_sweeper(
+    interval_seconds: float = RETENTION_SWEEP_INTERVAL_SECONDS,
+    *,
+    session_factory: Callable[[], AsyncSession] | None = None,
+) -> None:
+    """The lifespan's sweep task: one sweep every ``interval_seconds`` (the
+    first one interval after start-up) until cancelled; a failed sweep is
+    logged (an alert) and the loop goes on."""
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await sweep_expired_replies(session_factory)
+        except Exception as error:
+            logger.error(
+                PUBLISHER_LOG,
+                alert="credit_retention_sweep",
+                reason="sweep_failed",
+                error_type=type(error).__name__,
+            )
+
+
+def start_credit_retention_sweeper() -> asyncio.Task[None]:
+    """Always started by the lifespan (OD-3), config on or off."""
+
+    return asyncio.create_task(run_retention_sweeper(), name="credit-retention-sweep")
+
+
+async def stop_credit_retention_sweeper(task: asyncio.Task[None] | None) -> None:
+    """Cancel the sweeper before the pool closes; never raises."""
+
+    await _stop_task(task, "credit_retention_sweep")
+
+
 __all__ = [
+    "CREDIT_PENDING_SKIP",
+    "DUPLICATE_MESSAGE_SKIP",
+    "REPLY_SEND_TIMEOUT_SECONDS",
+    "REPLY_RECORD_TIMEOUT_SECONDS",
+    "REPLY_MAX_AGE_SECONDS",
+    "PAYLOAD_CONFLICT_SKIP",
+    "PUBLISHER_BATCH",
+    "PUBLISHER_LOG",
+    "PUBLISHER_MAX_ATTEMPTS",
+    "PUBLISHER_MIN_AGE_MARGIN_SECONDS",
+    "PUBLISHER_MIN_AGE_SECONDS",
+    "PUBLISHER_POLL_SECONDS",
+    "REPLY_PAYLOAD_KIND",
+    "REPLY_PII_KEYS",
+    "RETENTION_SWEEP_BATCH",
+    "RETENTION_SWEEP_INTERVAL_SECONDS",
+    "SENDING_LEASE_SECONDS",
+    "CreditReplyUndeliverable",
+    "CreditResponsePublisher",
+    "FileHandoffOutcome",
+    "InlineDelivery",
+    "PublisherTick",
+    "ReplySender",
+    "run_retention_sweeper",
+    "start_credit_retention_sweeper",
+    "stop_credit_retention_sweeper",
+    "sweep_expired_replies",
+    "WebhookEnforcement",
+    "WebhookSource",
+    "acquire_webhook_claim",
+    "deliver_reply_inline",
+    "file_handoff_decision",
+    "precheck_meta",
+    "precheck_webhook",
+    "precheck_zapi",
+    "provider_claim_id",
+    "run_meta_file_handoff",
+    "run_webhook_final",
+    "run_webhook_phase1",
+    "scrub_reply",
+    "start_credit_response_publisher",
+    "stop_credit_response_publisher",
     "CLAIM_LEASE_SECONDS",
     "CREDIT_ENFORCEMENT_UNAVAILABLE_CODE",
     "CREDIT_PENDING_CODE",

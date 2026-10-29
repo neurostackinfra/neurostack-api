@@ -71,11 +71,16 @@ from src.models.base import Base
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.credit import (
+    CreditAccount,
+    CreditEffect,
     CreditEnforcementState,
     CreditIngressClaim,
+    CreditLedgerEntry,
     CreditObservationalEffect,
+    CreditResponseOutbox,
 )
 from src.models.event import Event as EventRow
+from src.models.handoff import HandoffRecord
 from src.models.session import Session
 from src.models.tenant import Tenant
 from src.repositories.credit import CreditRepository
@@ -2088,9 +2093,19 @@ def test_the_writer_runs_only_at_the_governed_decision_points() -> None:
     webhook_calls = _calls(webhook)
     [pipeline] = webhook_calls["record_webhook_decision"]
     assert _enclosing(webhook, pipeline) == "_run_pipeline_transactionally"
-    handoff_sites = webhook_calls["record_meta_file_handoff"]
-    assert len(handoff_sites) == len(webhook_calls["_meta_initiate_file_handoff"]) == 2
-    assert {_enclosing(webhook, c) for c in handoff_sites} == {"meta_webhook"}
+    # Group 3b-2: both Meta file handoff call sites (forward-on-request and
+    # audio_too_long) go through one decision helper; its main branch is the
+    # writer's only call, its enforced branch the handoff in ``db``.
+    [handoff_writer] = webhook_calls["record_meta_file_handoff"]
+    assert _enclosing(webhook, handoff_writer) == "_meta_file_handoff"
+    decision_sites = webhook_calls["_meta_file_handoff"]
+    assert len(decision_sites) == 2
+    assert {_enclosing(webhook, c) for c in decision_sites} == {"meta_webhook"}
+    initiated = webhook_calls["_meta_initiate_file_handoff"]
+    assert sorted(_enclosing(webhook, c) for c in initiated) == [
+        "_meta_file_handoff",
+        "initiate",
+    ]
     # Every pipeline call site hands over its ingress (built only when on).
     pipeline_calls = webhook_calls["_run_pipeline_transactionally"]
     assert len(pipeline_calls) == 4
@@ -2391,3 +2406,1231 @@ async def test_only_a_production_request_with_the_switch_on_reads_the_enforcemen
     )
     assert verdict is None
     db.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Group 3b-2: enforced Z-API and Meta webhooks through the real app (SQLite).
+# The races under real concurrency (Redis down with two sessions, two
+# publishers, the inline claim against the publisher) are PostgreSQL-only:
+# tests/integration/test_credit_metering_postgres.py.  The publisher itself:
+# tests/services/test_credit_response_publisher.py.
+# ---------------------------------------------------------------------------
+
+_HANDOFF_TEXT = "Quero falar com um atendente humano"
+
+
+async def _enforce_credits() -> None:
+    at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    database = get_db_session()
+    try:
+        async with database.begin():
+            database.add(
+                CreditEnforcementState(
+                    id=1, credit_enforcement_at=at, set_by="test", set_at=at
+                )
+            )
+    finally:
+        await database.close()
+
+
+@pytest.fixture
+def enforced(
+    client: Any, world: World, providers: Providers, force_switch: Any
+) -> Iterator[World]:
+    """``credit_enforcement_at`` set, the switch on; a fresh process for D1."""
+
+    client._submit(_enforce_credits())
+    credit_metering.forget_enforcement_seen()
+    yield world
+    credit_metering.forget_enforcement_seen()
+
+
+@pytest.fixture
+def redis_forgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The replay store forgot every id (Redis down on another process): only
+    the PostgreSQL claim can stop a redelivery."""
+
+    monkeypatch.setattr(webhook, "_claim_incoming_message", lambda *_args: True)
+
+
+@pytest.fixture
+def announced(monkeypatch: pytest.MonkeyPatch) -> list[UUID]:
+    """Handoff creation webhooks that would leave the process (only a
+    committed record gets this far); nothing is sent."""
+
+    from src.services.handoff_service import HandoffService
+
+    sent: list[UUID] = []
+
+    async def record(_self: Any, handoff: Any, *_args: Any) -> tuple[bool, None]:
+        sent.append(handoff.id)
+        return False, None
+
+    monkeypatch.setattr(HandoffService, "_dispatch_creation_webhook", record)
+    return sent
+
+
+def _all_rows(client: Any, model: type[Any]) -> list[Any]:
+    return list(client._submit(_rows(model)))
+
+
+def _ledger(client: Any) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for entry in _all_rows(client, CreditLedgerEntry):
+        totals[entry.entry_type] = totals.get(entry.entry_type, 0) + entry.amount_mc
+    return totals
+
+
+def _sends(providers: Providers, name: str, phone: str) -> list[str]:
+    """The texts ``name`` sent to ``phone`` (Z-API: args[2]/[3]; Meta too)."""
+
+    return [
+        args[3] for sent, args in providers.sent if sent == name and args[2] == phone
+    ]
+
+
+async def _patient_sessions(tenant_id: UUID, phone: str) -> list[Session]:
+    database = get_db_session()
+    try:
+        return list(
+            (
+                await database.execute(
+                    select(Session).where(
+                        Session.tenant_id == tenant_id, Session.user_id == phone
+                    )
+                )
+            ).scalars()
+        )
+    finally:
+        await database.close()
+
+
+def _decision_links(client: Any) -> list[Any]:
+    return [
+        (row.event_metadata or {}).get("credit_effect_id")
+        for row in _all_rows(client, EventRow)
+        if row.event_type == "srm.decision"
+    ]
+
+
+_NO_CREDIT_ROWS = {
+    "credit_accounts": 0,
+    "credit_ingress_claims": 0,
+    "credit_effects": 0,
+    "credit_ledger_entries": 0,
+    "credit_response_outbox": 0,
+    "credit_observational_effects": 0,
+}
+
+
+def _credit_rows(client: Any) -> dict[str, int]:
+    return {
+        model.__tablename__: len(_all_rows(client, model))
+        for model in (
+            CreditAccount,
+            CreditIngressClaim,
+            CreditEffect,
+            CreditLedgerEntry,
+            CreditResponseOutbox,
+            CreditObservationalEffect,
+        )
+    }
+
+
+def test_an_enforced_zapi_decision_is_charged_once_and_delivered_inline(
+    client: Any, enforced: World, providers: Providers
+) -> None:
+    world, phone = enforced, "5511900007001"
+    body = _zapi_body(world, "zapi-enforced-1", phone=phone)
+    assert _zapi(client, world, body).json() == {"ok": True, "replied": True}
+
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "enforced",
+        "zapi-enforced-1",
+    )
+    assert claim.principal_id == f"zapi:{world.zapi_tenant}"
+    assert claim.payload_sha256 == zapi_payload_sha256(body)
+    assert claim.session_version is not None  # the phase 1 marker ran
+    effect_id = trace_effect_id(world.zapi_tenant, claim.interaction_id)
+    effects = _all_rows(client, CreditEffect)
+    assert [(e.effect_id, e.effect_kind, e.tenant_id) for e in effects] == [
+        (effect_id, "trace", world.zapi_tenant)
+    ]
+    assert len(effects[0].decision_digest or "") == 64
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # no lot: one trace of debt
+    assert _decision_links(client) == [effect_id]  # committed with its bundle
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert (outbox.effect_id, outbox.state, outbox.attempts) == (
+        effect_id,
+        "delivered",
+        0,
+    )
+    # Delivered: phone and text erased; never a credential.
+    assert "phone" not in outbox.payload and "text" not in outbox.payload
+    assert outbox.payload["channel"] == "zapi"
+    assert not [k for k in outbox.payload if "token" in k or "key" in k]
+    # Main's sends: the LGPD notice of the new session, then the reply, once.
+    texts = _sends(providers, "send_text_message", phone)
+    assert len(texts) == 2 and texts[1] == _LLM_REPLY
+    assert _effects(client) == []  # the observational writer stood down
+
+
+@pytest.mark.parametrize("cross_worker", [False, True])
+def test_the_echo_of_an_enforced_reply_never_pauses_the_ai(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+    cross_worker: bool,
+) -> None:
+    """The sent id is tracked (memory and Redis) and stored in the session
+    (main's side effects), so the ``fromMe`` echo of the bot's own reply is
+    skipped, on this worker or on another one with Redis down -- never a
+    human takeover."""
+
+    world, phone = enforced, "5511900007002"
+    sent_ids: list[str] = []
+
+    async def distinct(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+        # One provider id per send: the LGPD notice's id must not stand in
+        # for the reply's (each send registers its own).
+        sent_ids.append(f"zapi-sent-{uuid4().hex[:8]}")
+        providers.sent.append(("send_text_message", args))
+        return {"messageId": sent_ids[-1]}
+
+    monkeypatch.setattr(webhook, "send_text_message", distinct)
+    assert _zapi(client, world, _zapi_body(world, "zapi-echo-1", phone=phone)).json()[
+        "replied"
+    ]
+    lgpd_id, reply_id = sent_ids  # the notice of the new session, the reply
+    assert _sends(providers, "send_text_message", phone)[1] == _LLM_REPLY
+    if cross_worker:
+        # Another worker, Redis down: only the database knows the id.
+        webhook._INMEM_SENT.clear()
+        monkeypatch.setattr(webhook, "_get_redis", lambda: None)
+    echo = _zapi(
+        client,
+        world,
+        _zapi_body(world, reply_id, phone=phone, fromMe=True, text=_LLM_REPLY),
+    )
+    assert echo.json() == {
+        "ok": True,
+        "skipped": "ai_echo_db" if cross_worker else "ai_echo",
+    }
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert session.is_paused is False
+
+
+def test_an_enforced_meta_decision_is_charged_once_and_delivered_inline(
+    client: Any, enforced: World, providers: Providers
+) -> None:
+    world, phone = enforced, "5511900007101"
+    message = _meta_text("wamid.enforced-1", "Olá, quero agendar", phone)
+    assert _meta(client, world, message).json() == {"ok": True, "replied": True}
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "meta",
+        "enforced",
+        "wamid.enforced-1",
+    )
+    assert claim.payload_sha256 == provider_message_sha256(message)
+    effect_id = trace_effect_id(world.meta_tenant, claim.interaction_id)
+    assert [e.effect_id for e in _all_rows(client, CreditEffect)] == [effect_id]
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "delivered" and "phone" not in outbox.payload
+    assert _sends(providers, "send_meta_cloud_text", phone) == [_LLM_REPLY]
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    stored_ids = [entry[0] for entry in session.session_metadata["ai_msg_ids"]]
+    assert stored_ids == ["wamid.reply"]  # the sent id, for the echo dedup
+
+
+async def _make_standalone(tenant_id: UUID) -> None:
+    database = get_db_session()
+    try:
+        async with database.begin():
+            tenant = await database.get(Tenant, tenant_id)
+            assert tenant is not None
+            tenant.builder_id = None
+    finally:
+        await database.close()
+
+
+@pytest.fixture
+def hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A quarantine hold on the builder (class-level, never an instance)."""
+
+    async def held(_self: Any, _builder_id: UUID) -> bool:
+        return True
+
+    monkeypatch.setattr(CreditRepository, "quarantine_hold", held)
+
+
+@pytest.mark.parametrize("channel", ["zapi", "meta"])
+@pytest.mark.parametrize("cause", ["hold", "standalone"])
+def test_credit_pending_answers_before_the_session_and_the_lgpd_notice(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    cause: str,
+) -> None:
+    world = enforced
+    tenant = world.zapi_tenant if channel == "zapi" else world.meta_tenant
+    if cause == "hold":
+
+        async def held(_self: Any, _builder_id: UUID) -> bool:
+            return True
+
+        monkeypatch.setattr(CreditRepository, "quarantine_hold", held)
+    else:
+        client._submit(_make_standalone(tenant))
+    phone = "5511900007201"
+    if channel == "zapi":
+        response = _zapi(client, world, _zapi_body(world, "zapi-pending", phone=phone))
+        sender = "send_text_message"
+    else:
+        response = _meta(client, world, _meta_text("wamid.pending", "Olá", phone))
+        sender = "send_meta_cloud_text"
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "skipped": "credit_pending"}
+    # No session row, no LGPD notice nor reply, no LLM, no credit row.
+    assert client._submit(_patient_sessions(tenant, phone)) == []
+    assert _sends(providers, sender, phone) == []
+    providers.llm.assert_not_called()
+    assert _credit_rows(client) == _NO_CREDIT_ROWS
+    if channel == "zapi":
+        # D4/OWNER-c: Z-API marked the message read BEFORE the pre-check.
+        assert [n for n, _ in providers.sent] == ["mark_message_read"]
+
+
+def test_meta_under_a_hold_sends_no_file_ack_and_runs_no_stt(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    hold: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, phone = enforced, "5511900007301"
+    resolved: list[Any] = []
+
+    async def resolve(*args: Any, **_kwargs: Any) -> dict[str, Any]:
+        resolved.append(args)
+        return {"url": "https://media.invalid/a.ogg", "file_size": 1_000}
+
+    monkeypatch.setattr(webhook, "resolve_meta_media", resolve)
+    document = {
+        "from": phone,
+        "id": "wamid.held-document",
+        "type": "document",
+        "document": {"id": "media-doc", "mime_type": "application/pdf"},
+    }
+    audio = {
+        "from": phone,
+        "id": "wamid.held-audio",
+        "type": "audio",
+        "audio": {"id": "media-audio", "mime_type": "audio/ogg"},
+    }
+    for message in (document, audio):
+        assert _meta(client, world, message).json() == {
+            "ok": True,
+            "skipped": "credit_pending",
+        }
+    assert resolved == []  # the STT (after the session) never ran
+    assert _sends(providers, "send_meta_cloud_text", phone) == []  # no ack
+    assert client._submit(_patient_sessions(world.meta_tenant, phone)) == []
+    assert _credit_rows(client) == _NO_CREDIT_ROWS
+
+
+def test_zapi_under_a_hold_still_answers_what_runs_before_the_precheck(
+    client: Any, enforced: World, providers: Providers, hold: None
+) -> None:
+    """Accepted per channel (D4/OWNER-c): Z-API runs ``audio_too_long``, the
+    STT and its fallback before the pre-check, so their fixed messages still
+    reach the patient of a builder on hold; none of them is a decision."""
+
+    world = enforced
+    long_audio = _zapi(client, world, _audio_body(world, "zapi-held-long", seconds=600))
+    assert long_audio.json() == {"ok": True, "skipped": "audio_too_long"}
+    reroute = _zapi(client, world, _audio_body(world, "zapi-held-stt", seconds=5))
+    assert reroute.json()["action"] == "stt_fallback"
+    phone = "5511900000555"  # _audio_body's patient
+    texts = _sends(providers, "send_text_message", phone)
+    assert len(texts) == 2
+    assert texts[0] in (webhook._AUDIO_TOO_LONG_MSG_PT, webhook._AUDIO_TOO_LONG_MSG_EN)
+    assert texts[1] in (
+        webhook._STT_NEVER_CONFIGURED_MSG_PT,
+        webhook._STT_NEVER_CONFIGURED_MSG_EN,
+    )
+    assert _credit_rows(client) == _NO_CREDIT_ROWS
+
+
+async def _insert_claim(
+    world: World, *, message_id: str, payload_sha256: str, phase: str
+) -> None:
+    database = get_db_session()
+    try:
+        async with database.begin():
+            database.add(
+                CreditIngressClaim(
+                    id=uuid4(),
+                    tenant_id=world.zapi_tenant,
+                    builder_id=_BUILDER,
+                    source="zapi",
+                    principal_id=f"zapi:{world.zapi_tenant}",
+                    provider_message_id=message_id,
+                    interaction_id=uuid4(),
+                    payload_sha256=payload_sha256,
+                    decision_version=1,
+                    session_version=None if phase == "in_progress" else 1,
+                    mode="observational" if phase == "observational" else "enforced",
+                    created_at=datetime.now(timezone.utc) - timedelta(days=2),
+                )
+            )
+            database.add(
+                _session_row(
+                    uuid4(),
+                    world.zapi_tenant,
+                    channel="whatsapp",
+                    user_id="5511900007401",
+                )
+            )
+    finally:
+        await database.close()
+
+
+@pytest.mark.parametrize(
+    "phase", ["in_progress", "phase1_committed", "decided", "observational"]
+)
+def test_a_redelivery_is_a_duplicate_in_every_state_of_the_claim(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    redis_forgets: None,
+    phase: str,
+) -> None:
+    """In progress, abandoned (a crash before phase 1), phase 1 committed,
+    decided or claimed before the enforcement: ALWAYS 200
+    ``duplicate_message`` -- no takeover, no second reply, no charge."""
+
+    world, phone = enforced, "5511900007401"
+    body = _zapi_body(world, f"zapi-redelivered-{phase}", phone=phone)
+    if phase == "decided":
+        assert _zapi(client, world, body).json() == {"ok": True, "replied": True}
+    else:
+        client._submit(
+            _insert_claim(
+                world,
+                message_id=body["messageId"],
+                payload_sha256=zapi_payload_sha256(body),
+                phase=phase,
+            )
+        )
+    sent_before = list(providers.sent)
+    calls_before = providers.llm.call_count
+    effects_before = len(_all_rows(client, CreditEffect))
+    assert _zapi(client, world, body).json() == {
+        "ok": True,
+        "skipped": "duplicate_message",
+    }
+    new_sends = [n for n, _ in providers.sent[len(sent_before) :]]
+    assert new_sends == ["mark_message_read"]  # main's, before the pre-check
+    assert providers.llm.call_count == calls_before  # no pipeline, no LLM
+    assert len(_all_rows(client, CreditEffect)) == effects_before
+    assert len(_claims(client)) == 1
+    assert len(_all_rows(client, CreditResponseOutbox)) == (
+        1 if phase == "decided" else 0
+    )
+
+
+def test_a_redelivery_with_other_stable_fields_is_a_payload_conflict(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    redis_forgets: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, phone = enforced, "5511900007501"
+    body = _zapi_body(world, "zapi-conflict", phone=phone)
+    assert _zapi(client, world, body).json()["replied"] is True
+    recorder = _Recorder()
+    monkeypatch.setattr(credit_metering, "logger", recorder)
+    # Only volatile fields differ: the same message, a duplicate.
+    volatile = {**body, "senderName": "Outro nome", "momment": 1711900999000}
+    assert _zapi(client, world, volatile).json() == {
+        "ok": True,
+        "skipped": "duplicate_message",
+    }
+    changed = {**body, "text": {"message": "Outra coisa"}}
+    assert _zapi(client, world, changed).json() == {
+        "ok": True,
+        "skipped": "payload_conflict",
+    }
+    [claim] = _claims(client)
+    conflicts = [f for m, f in recorder.warnings if m == "credit_payload_conflict"]
+    assert conflicts == [
+        {
+            "source": "zapi",
+            "tenant_id": str(world.zapi_tenant),
+            "interaction_id": str(claim.interaction_id),
+            "stored_payload_sha256": zapi_payload_sha256(body),
+            "request_payload_sha256": zapi_payload_sha256(changed),
+        }
+    ]
+    assert len(_sends(providers, "send_text_message", phone)) == 2  # LGPD + reply
+    assert len(_all_rows(client, CreditEffect)) == 1
+
+
+class _FailingLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        raise RuntimeError("the LLM provider is down")
+
+
+@pytest.mark.parametrize("cause", ["no_llm_configured", "every_llm_attempt_failed"])
+def test_a_webhook_decision_with_nothing_to_deliver_costs_zero(
+    client: Any, enforced: World, providers: Providers, cause: str
+) -> None:
+    failing = _FailingLLM()
+    providers.llm.return_value = None if cause == "no_llm_configured" else failing
+    world, phone = enforced, "5511900007601"
+    response = _zapi(client, world, _zapi_body(world, f"zapi-{cause}", phone=phone))
+    assert response.json() == {
+        "ok": True,
+        "replied": False,
+        "reason": "no_llm_response",
+    }
+    if cause == "every_llm_attempt_failed":
+        assert failing.calls >= 1  # the LLM was attempted
+    [claim] = _claims(client)
+    effect_id = trace_effect_id(world.zapi_tenant, claim.interaction_id)
+    [effect] = _all_rows(client, CreditEffect)
+    assert (effect.effect_id, effect.effect_kind) == (effect_id, "trace_no_response")
+    assert len(effect.decision_digest or "") == 64
+    assert _ledger(client) == {}  # an effect of zero: no ledger entry
+    assert _all_rows(client, CreditResponseOutbox) == []  # nothing to send
+    assert _decision_links(client) == [effect_id]  # the decision is still durable
+    assert _sends(providers, "send_text_message", phone)[1:] == []  # LGPD only
+
+
+def test_a_webhook_handoff_costs_one_trace_charged_in_phase1(
+    client: Any, enforced: World, providers: Providers, announced: list[UUID]
+) -> None:
+    world, phone = enforced, "5511900007701"
+    body = _zapi_body(world, "zapi-handoff", phone=phone, text=_HANDOFF_TEXT)
+    assert _zapi(client, world, body).json() == {"ok": True, "replied": True}
+    [claim] = _claims(client)
+    effect_id = trace_effect_id(world.zapi_tenant, claim.interaction_id)
+    assert [(e.effect_id, e.effect_kind) for e in _all_rows(client, CreditEffect)] == [
+        (effect_id, "trace")
+    ]
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+    [record] = _all_rows(client, HandoffRecord)
+    assert record.context["credit_effect_id"] == effect_id
+    assert announced == [record.id]
+    assert _decision_links(client) == [effect_id]
+    # The handoff reply went out once, and the conversation was marked unread.
+    assert len(_sends(providers, "send_text_message", phone)) == 2  # LGPD + reply
+    assert "mark_conversation_unread" in [n for n, _ in providers.sent]
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "delivered" and outbox.payload["handoff"] is True
+
+
+def test_a_failed_inline_send_is_lost_like_main_and_charged_once(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def down(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("provider down")
+
+    world, phone = enforced, "5511900007801"
+    sent: list[Any] = []
+    original = webhook.send_text_message
+
+    async def lgpd_then_down(*args: Any, **kwargs: Any) -> Any:
+        sent.append(args)
+        if len(sent) == 1:
+            return await original(*args, **kwargs)  # the LGPD notice
+        return await down()
+
+    monkeypatch.setattr(webhook, "send_text_message", lgpd_then_down)
+    answer = _zapi(client, world, _zapi_body(world, "zapi-down", phone=phone)).json()
+    assert answer == {
+        "ok": True,
+        "replied": False,
+        "reason": "send_failed",
+        "error": "provider down",
+    }
+    # OD-1: like main, the reply is lost -- ``failed`` at once, PII erased,
+    # never recovered by the publisher; the decision stays charged (OD-4).
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert (outbox.state, outbox.attempts) == ("failed", 0)
+    assert "phone" not in outbox.payload and "text" not in outbox.payload
+    client._submit(_age_outbox(credit_metering.PUBLISHER_MIN_AGE_SECONDS + 1))
+    tick = _publish(client)
+    assert tick is not None and tick.outcomes == []
+    assert len(sent) == 2  # the LGPD notice and the one failed reply
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # charged once, kept
+
+
+def test_missing_credentials_answer_like_main_and_lose_the_reply(
+    client: Any, enforced: World, providers: Providers
+) -> None:
+    world, phone = enforced, "5511900007901"
+    client._submit(_set_credentials(world.meta_tenant, meta_permanent_token=""))
+    answer = _meta(client, world, _meta_text("wamid.no-creds", "Olá", phone)).json()
+    assert answer == {"ok": True, "replied": False, "reason": "no_credentials"}
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "failed" and "phone" not in outbox.payload  # OD-1
+    assert _sends(providers, "send_meta_cloud_text", phone) == []
+
+
+def _age_outbox(seconds: float) -> Any:
+    async def age() -> None:
+        database = get_db_session()
+        try:
+            async with database.begin():
+                from sqlalchemy import update as sa_update
+
+                await database.execute(
+                    sa_update(CreditResponseOutbox).values(
+                        created_at=datetime.now(timezone.utc)
+                        - timedelta(seconds=seconds)
+                    )
+                )
+        finally:
+            await database.close()
+
+    return age()
+
+
+def _publish(client: Any) -> Any:
+    publisher = credit_metering.CreditResponsePublisher(webhook.CREDIT_REPLY_SENDER)
+    return client._submit(publisher.run_once())
+
+
+def test_a_crash_between_the_commit_and_the_send_is_delivered_once_by_the_publisher(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inline send never ran (crash right after the final commit): the
+    publisher delivers the reply once, through the same adapter -- tracked,
+    its id stored for the echo, the handoff marked unread."""
+
+    world, phone = enforced, "5511900008001"
+
+    async def crashed(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("the process died right after the final commit")
+
+    body = _zapi_body(world, "zapi-crash", phone=phone, text=_HANDOFF_TEXT)
+    with monkeypatch.context() as patch:
+        patch.setattr(credit_metering, "deliver_reply_inline", crashed)
+        with pytest.raises(RuntimeError, match="the process died"):
+            _zapi(client, world, body)
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "pending"
+    assert len(_sends(providers, "send_text_message", phone)) == 1  # LGPD only
+    # Too young for the publisher: the inline send owns it for a while.
+    tick = _publish(client)
+    assert tick is not None and tick.outcomes == []
+    client._submit(_age_outbox(credit_metering.PUBLISHER_MIN_AGE_SECONDS + 1))
+    tick = _publish(client)
+    assert tick is not None and tick.outcomes == ["delivered"]
+    assert _publish(client).outcomes == []  # delivered once, never again
+    texts = _sends(providers, "send_text_message", phone)
+    assert len(texts) == 2  # LGPD + the reply, once
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert (outbox.state, outbox.attempts) == ("delivered", 1)
+    assert "phone" not in outbox.payload
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert [e[0] for e in session.session_metadata["ai_msg_ids"]][-1] == "zapi-reply"
+    assert "mark_conversation_unread" in [n for n, _ in providers.sent]
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+
+
+def test_a_crash_between_the_send_and_its_mark_resends_at_most_once(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, phone = enforced, "5511900008101"
+
+    async def lost(*_args: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("connection lost before the mark")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CreditRepository, "mark_outbox_delivered", lost)
+        answer = _zapi(client, world, _zapi_body(world, "zapi-unmarked", phone=phone))
+    assert answer.json() == {"ok": True, "replied": True}
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "sending"  # sent, never marked
+    tick = _publish(client)
+    assert tick is not None and tick.outcomes == []  # within the sending lease
+    client._submit(_age_outbox(credit_metering.SENDING_LEASE_SECONDS + 1))
+    tick = _publish(client)
+    assert tick is not None and tick.outcomes == ["delivered"]
+    assert _publish(client).outcomes == []
+    replies = _sends(providers, "send_text_message", phone)[1:]
+    assert replies == [_LLM_REPLY, _LLM_REPLY]  # the one resend, never more
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+
+
+def _document(phone: str) -> dict[str, Any]:
+    return {
+        "from": phone,
+        "id": f"wamid.document-{phone}",
+        "type": "document",
+        "document": {"id": "media-doc", "mime_type": "application/pdf"},
+    }
+
+
+def test_the_enforced_meta_file_handoffs_commit_claim_handoff_debit_and_link(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    redis_forgets: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, phone = enforced, "5511900008201"
+    ack = _meta(client, world, _document(phone))
+    assert ack.json()["action"] == "file_ack"
+    assert _claims(client) == [] and _all_rows(client, CreditEffect) == []  # free
+    forward = _meta_text("wamid.forward-1", "Pode encaminhar", phone)
+    assert _meta(client, world, forward).json() == {
+        "ok": True,
+        "replied": True,
+        "action": "file_handoff",
+    }
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"url": "https://media.invalid/long.ogg", "file_size": 50_000_000}
+
+    monkeypatch.setattr(webhook, "resolve_meta_media", resolve)
+    audio = {
+        "from": phone,
+        "id": "wamid.long-1",
+        "type": "audio",
+        "audio": {"id": "media-long", "mime_type": "audio/ogg"},
+    }
+    assert _meta(client, world, audio).json() == {
+        "ok": True,
+        "skipped": "audio_too_long",
+    }
+    claims = {c.provider_message_id: c for c in _claims(client)}
+    assert set(claims) == {"wamid.forward-1", "wamid.long-1"}
+    assert {(c.mode, c.source) for c in claims.values()} == {("enforced", "meta")}
+    assert all(c.session_version is not None for c in claims.values())
+    records = {
+        r.context["credit_effect_id"]: r for r in _all_rows(client, HandoffRecord)
+    }
+    expected = {
+        trace_effect_id(world.meta_tenant, c.interaction_id): c for c in claims.values()
+    }
+    assert set(records) == set(expected)
+    assert sorted(e.effect_id for e in _all_rows(client, CreditEffect)) == sorted(
+        expected
+    )
+    assert _ledger(client) == {"debt": 2 * TRACE_COST_MC}  # one trace each
+    assert sorted(announced) == sorted(r.id for r in records.values())
+    texts = _sends(providers, "send_meta_cloud_text", phone)
+    assert (
+        webhook._FILE_FORWARDED_MSG_PT in texts
+        or webhook._FILE_FORWARDED_MSG_EN in texts
+    )
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert "pending_file_review" not in (session.session_metadata or {})
+    # A redelivery (the replay store forgot): no second handoff nor debit.
+    for message in (forward, audio):
+        assert _meta(client, world, message).json() == {
+            "ok": True,
+            "skipped": "duplicate_message",
+        }
+    assert len(_all_rows(client, HandoffRecord)) == 2
+    assert _ledger(client) == {"debt": 2 * TRACE_COST_MC}
+    # GET /handoffs/{id} never exposes the link.
+    token = _jwt(world.meta_tenant)
+    for record in records.values():
+        detail = client.get(
+            f"/v1/handoffs/{record.id}", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert detail.status_code == 200, detail.text
+        assert "credit_effect_id" not in detail.text
+
+
+def test_a_hold_seen_in_the_file_handoff_transaction_hands_nothing_off(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hold appears after the pre-check (re-read under the account lock):
+    rollback, ``credit_pending``, no handoff, no text."""
+
+    world, phone = enforced, "5511900008301"
+    assert _meta(client, world, _document(phone)).json()["action"] == "file_ack"
+    seen: list[UUID] = []
+
+    async def late(_self: Any, builder_id: UUID) -> bool:
+        seen.append(builder_id)
+        return len(seen) > 1  # free at the pre-check, held in the transaction
+
+    monkeypatch.setattr(CreditRepository, "quarantine_hold", late)
+    forward = _meta_text("wamid.forward-held", "Pode encaminhar", phone)
+    assert _meta(client, world, forward).json() == {
+        "ok": True,
+        "skipped": "credit_pending",
+    }
+    assert _all_rows(client, HandoffRecord) == [] and announced == []
+    assert _claims(client) == [] and _all_rows(client, CreditEffect) == []
+    texts = _sends(providers, "send_meta_cloud_text", phone)
+    assert webhook._FILE_FORWARDED_MSG_PT not in texts
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert session.session_metadata.get("pending_file_review") is True  # untouched
+
+
+def test_a_failure_inside_the_file_handoff_transaction_leaves_nothing(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault after the handoff insert (the ``credit_effect_id`` link): the
+    claim, the handoff, ``handoff.request`` and the debit roll back together
+    and no creation webhook leaves."""
+
+    world, phone = enforced, "5511900008401"
+    assert _meta(client, world, _document(phone)).json()["action"] == "file_ack"
+
+    async def broken(_self: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("injected after the handoff insert")
+
+    monkeypatch.setattr(CreditRepository, "link_handoff_credit_effect", broken)
+    forward = _meta_text("wamid.forward-broken", "Pode encaminhar", phone)
+    with pytest.raises(RuntimeError, match="injected after the handoff insert"):
+        _meta(client, world, forward)
+    assert _all_rows(client, HandoffRecord) == [] and announced == []
+    assert [
+        e for e in _all_rows(client, EventRow) if e.event_type == "handoff.request"
+    ] == []
+    assert _claims(client) == [] and _all_rows(client, CreditEffect) == []
+    assert _ledger(client) == {}
+
+
+@pytest.mark.parametrize("source", ["uazapi", "evolution"])
+def test_uazapi_and_evolution_never_take_the_enforced_path(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    prechecks: list[Any] = []
+    original = credit_metering.precheck_webhook
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        prechecks.append(kwargs.get("source"))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(credit_metering, "precheck_webhook", spy)
+    world = enforced
+    if source == "uazapi":
+        response = client.post(
+            "/v1/webhook/uazapi", json=_uazapi_body(world, "uazapi-enforced")
+        )
+    else:
+        response = client.post(
+            "/v1/webhook/evolution", json=_evolution_body(world, "evolution-enforced")
+        )
+    assert response.status_code == 200 and response.json().get("replied") is True
+    assert prechecks == []
+    assert _credit_rows(client) == _NO_CREDIT_ROWS  # no claim, debit nor block
+
+
+def test_with_the_switch_off_an_enforced_database_answers_webhooks_like_main(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    force_switch: Callable[[bool], None],
+) -> None:
+    force_switch(False)
+    statements: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement)
+
+    engine = get_db_engine().sync_engine
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        world = enforced
+        zapi = _zapi(client, world, _zapi_body(world, "zapi-off-enforced"))
+        meta = _meta(client, world, _meta_text("wamid.off-enforced", "Olá"))
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+    assert zapi.json() == meta.json() == {"ok": True, "replied": True}
+    assert statements and [s for s in statements if "credit_" in s.lower()] == []
+
+
+def test_a_d1_latch_answers_503_once_the_enforcement_was_seen(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before this process ever saw the enforcement a failed read keeps main's
+    path; after it saw it, never main's free path again (D1)."""
+
+    world = enforced
+
+    async def unreadable(_self: Any) -> Any:
+        raise RuntimeError("credit_enforcement_state unreadable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CreditRepository, "enforcement_at", unreadable)
+        before = _zapi(
+            client, world, _zapi_body(world, "zapi-unread-1", phone="551191")
+        )
+    assert before.json() == {"ok": True, "replied": True}
+    assert _claims(client) == []  # main's path: no claim, no charge
+    seen = _zapi(client, world, _zapi_body(world, "zapi-seen", phone="551192"))
+    assert seen.json() == {"ok": True, "replied": True}
+    assert credit_metering.enforcement_seen()
+    with monkeypatch.context() as patch:
+        patch.setattr(CreditRepository, "enforcement_at", unreadable)
+        after = _zapi(client, world, _zapi_body(world, "zapi-unread-2", phone="551193"))
+    assert after.status_code == 503
+    assert after.json() == {"error": "credit_enforcement_unavailable"}
+
+
+async def test_a_webhook_without_an_authenticated_principal_is_never_enforced() -> None:
+    tenant = uuid4()
+    db = MagicMock(spec=AsyncSession)
+    db.execute.side_effect = AssertionError("credit_enforcement_at was read")
+    on = SimpleNamespace(scope={"state": {"credit_switch_effective": True}}, headers={})
+    off = SimpleNamespace(
+        scope={"state": {"credit_switch_effective": False}}, headers={}
+    )
+    for request, identity in (
+        (off, credit_identity("zapi", tenant)),  # the switch off
+        (on, None),  # no proof
+        (on, credit_identity("zapi", uuid4())),  # another tenant's proof
+        (on, credit_identity("uazapi", tenant)),  # authenticated=False
+    ):
+        verdict = await credit_metering.precheck_webhook(
+            request,  # type: ignore[arg-type]
+            db,
+            source="zapi",
+            tenant_id=tenant,
+            identity=lambda identity=identity: identity,
+            provider_message_id="m-1",
+            payload_sha256=lambda: "a" * 64,
+        )
+        assert verdict is None
+    db.execute.assert_not_called()
+
+
+def test_an_unstorable_provider_id_still_gets_a_claim() -> None:
+    assert credit_metering.provider_claim_id("wamid.ok") == "wamid.ok"
+    long_id = "x" * 300
+    claimed = credit_metering.provider_claim_id(long_id)
+    assert claimed == "sha256:" + hashlib.sha256(long_id.encode()).hexdigest()
+    assert credit_metering.provider_claim_id("não-ascii") != "não-ascii"
+    assert valid_ingress_id(claimed) == claimed  # storable and deterministic
+
+
+def test_the_webhook_decision_projection_kinds_are_pinned() -> None:
+    handoff = uuid4()
+    assert credit_metering.file_handoff_decision(handoff, "audio_too_long") == {
+        "kind": "meta_file_handoff",
+        "handoff_id": str(handoff),
+        "note": "audio_too_long",
+    }
+    result = SimpleNamespace(event_id=None)
+    assert (
+        credit_metering.phase1_decision(result, handoff, kind="zapi_phase1_handoff")[
+            "kind"
+        ]
+        == "zapi_phase1_handoff"
+    )
+    assert credit_metering.phase1_decision(result, handoff)["kind"] == (
+        "events_phase1_handoff"
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "deterministic", "handoff", "kind", "debt"),
+    [
+        ("Olá!", False, None, "trace", TRACE_COST_MC),  # an LLM answer
+        ("Agende aqui: https://x", True, None, "trace", TRACE_COST_MC),
+        (None, False, {"id": "h"}, "trace", TRACE_COST_MC),  # a handoff summary
+        (None, False, None, "trace_no_response", 0),  # nothing deliverable
+    ],
+)
+async def test_the_webhook_final_transaction_charges_by_deliverability(
+    store: _Store,
+    answer: str | None,
+    deterministic: bool,
+    handoff: Any,
+    kind: str,
+    debt: int,
+) -> None:
+    """MEDIUM-3/OWNER-e at the final transaction: an LLM, deterministic or
+    handoff answer costs one trace; nothing deliverable is the effect of zero
+    ``trace_no_response`` -- and the reply row is born ``pending``."""
+
+    from src.models.credit import CreditEffect as EffectRow
+    from src.models.credit import CreditLedgerEntry as EntryRow
+    from src.models.credit import CreditResponseOutbox as OutboxRow
+
+    enforcement = credit_metering.WebhookEnforcement(
+        source="zapi",
+        tenant_id=store.tenant,
+        principal_id=f"zapi:{store.tenant}",
+        provider_message_id=f"m-{uuid4().hex}",
+        payload_sha256="a" * 64,
+    )
+    reply = None if answer is None else {"kind": "webhook_reply.v1", "text": answer}
+    async with store.sessions() as db:
+        await CreditRepository(db).ensure_account(store.builder)  # the pre-check
+        await db.commit()
+        lease = await credit_metering.acquire_webhook_claim(db, enforcement)
+        assert isinstance(lease, credit_metering.ClaimLease)
+        assert await CreditRepository(db).mark_webhook_claim_phase1(
+            lease.claim_id, observed=lease.observed, session_version=0
+        )
+        await db.commit()
+        phase1 = credit_metering.Phase1Outcome(
+            result=None,
+            clinic_config=None,
+            message_history=[],
+            session_version=0,
+            charge=None,
+            handoff_id=None,
+        )
+        response = SimpleNamespace(
+            event_id=uuid4(),
+            prompt=SimpleNamespace(
+                suggested_response=answer, deterministic=deterministic
+            ),
+            handoff_summary=handoff,
+            decision=None,
+            mode=None,
+        )
+
+        async def no_bundle(_effect: str | None) -> None:
+            return None
+
+        final = await credit_metering.run_webhook_final(
+            db,
+            enforcement,
+            lease,
+            phase1,
+            response=response,
+            write_bundle=no_bundle,
+            reply=reply,
+        )
+    assert final is not None and final.charge is not None
+    assert final.charge.effect_kind == kind
+    [effect] = await _all(store, EffectRow)
+    assert effect.effect_kind == kind
+    entries = await _all(store, EntryRow)
+    assert sum(e.amount_mc for e in entries) == debt
+    outbox = await _all(store, OutboxRow)
+    stamped = ("decided_at", "session_pause")  # what every send re-checks
+    assert [
+        (o.state, {k: v for k, v in o.payload.items() if k not in stamped})
+        for o in outbox
+    ] == ([] if reply is None else [("pending", reply)])
+    assert all(set(stamped) <= set(o.payload) for o in outbox)
+    assert (final.outbox_id is None) is (reply is None)
+
+
+async def test_a_caller_without_a_request_scope_keeps_main_s_path() -> None:
+    """Like the Group 3a ingress, the pre-check never raises on a request it
+    cannot read (a direct call with a stub): main's path, nothing read."""
+
+    tenant = uuid4()
+    db = MagicMock(spec=AsyncSession)
+    db.execute.side_effect = AssertionError("credit_enforcement_at was read")
+    stub = SimpleNamespace(headers={}, state=SimpleNamespace())  # no ``scope``
+    verdict = await credit_metering.precheck_zapi(
+        stub,  # type: ignore[arg-type]
+        db,
+        tenant_id=tenant,
+        body={"messageId": "m-1", "phone": "5511"},
+    )
+    assert verdict is None
+    meta = await credit_metering.precheck_meta(
+        stub,  # type: ignore[arg-type]
+        db,
+        tenant_id=tenant,
+        message={"id": "wamid.m-1"},
+    )
+    assert meta is None
+    db.execute.assert_not_called()
+
+
+async def _change_patient(tenant_id: UUID, phone: str, change: str) -> None:
+    from sqlalchemy import update as sa_update
+
+    database = get_db_session()
+    try:
+        async with database.begin():
+            if change == "takeover":
+                await database.execute(
+                    sa_update(Session)
+                    .where(Session.tenant_id == tenant_id, Session.user_id == phone)
+                    .values(
+                        is_paused=True,
+                        paused_until=datetime.now(timezone.utc) + timedelta(hours=1),
+                    )
+                )
+            else:
+                await database.execute(
+                    sa_update(Tenant)
+                    .where(Tenant.id == tenant_id)
+                    .values(bot_active=False)
+                )
+    finally:
+        await database.close()
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"), [("takeover", "session_changed"), ("bot_off", "bot_inactive")]
+)
+def test_a_takeover_while_the_reply_is_generated_stops_the_reply(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    reason: str,
+) -> None:
+    """OD-2 on the inline send: the clinic took the conversation over (or
+    turned the bot off) after phase 1, while the LLM ran -- the reply is
+    never sent, its row is ``failed`` without PII, the decision stays
+    charged (OD-4)."""
+
+    from src.services.event_service import EventService
+
+    world, phone = enforced, "5511900008501"
+    original = EventService.generate_response
+
+    async def meanwhile(self: Any, *args: Any, **kwargs: Any) -> Any:
+        await _change_patient(world.zapi_tenant, phone, change)
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(EventService, "generate_response", meanwhile)
+    answer = _zapi(client, world, _zapi_body(world, f"zapi-{change}", phone=phone))
+    assert answer.json() == {"ok": True, "replied": False, "reason": reason}
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "failed" and "phone" not in outbox.payload
+    assert _sends(providers, "send_text_message", phone)[1:] == []  # LGPD only
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+
+
+async def test_a_redelivery_is_judged_by_its_own_tenant_s_claim(
+    store: _Store,
+) -> None:
+    """M5: the claim lookup of a redelivery is tenant-scoped -- two tenants
+    with the same provider message id never see each other's claim."""
+
+    def enforcement(tenant: UUID, digest: str) -> Any:
+        return credit_metering.WebhookEnforcement(
+            source="zapi",
+            tenant_id=tenant,
+            principal_id=f"zapi:{tenant}",
+            provider_message_id="same-provider-id",
+            payload_sha256=digest * 64,
+        )
+
+    first = enforcement(store.tenant, "a")
+    second = enforcement(store.standalone, "b")
+    async with store.sessions() as db:
+        assert isinstance(
+            await credit_metering.acquire_webhook_claim(db, first),
+            credit_metering.ClaimLease,
+        )
+        assert isinstance(
+            await credit_metering.acquire_webhook_claim(db, second),
+            credit_metering.ClaimLease,
+        )
+        for redelivery in (second, first):
+            assert await credit_metering.acquire_webhook_claim(db, redelivery) == (
+                credit_metering.DUPLICATE_MESSAGE_SKIP
+            )
+
+
+def test_the_webhook_phase1_sets_no_lock_timeout(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M7 (the pinned deviation): a webhook claim has no lease, so its phase
+    1 never sets ``lock_timeout`` -- it waits for the session like main's;
+    ``POST /v1/events`` keeps its 15 s (3b-1)."""
+
+    calls: list[int] = []
+    original = CreditRepository.set_local_lock_timeout
+
+    async def spy(self: CreditRepository, seconds: int) -> None:
+        calls.append(seconds)
+        await original(self, seconds)
+
+    monkeypatch.setattr(CreditRepository, "set_local_lock_timeout", spy)
+    world = enforced
+    assert _zapi(client, world, _zapi_body(world, "zapi-no-lock-timeout")).json()[
+        "replied"
+    ]
+    assert _meta(client, world, _meta_text("wamid.no-lock-timeout", "Olá")).json()[
+        "replied"
+    ]
+    assert calls == []
+    assert len(_claims(client)) == 2  # both enforced, both through phase 1
+
+
+def test_the_final_transaction_writes_the_reply_row_after_the_debit(
+    client: Any, enforced: World, providers: Providers
+) -> None:
+    """The lock order of the final transaction: tenant -> bundle -> account
+    -> lots -> the effect and its ledger entries -> THEN the outbox row."""
+
+    statements: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(" ".join(statement.split()).lower())
+
+    engine = get_db_engine().sync_engine
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        world = enforced
+        assert _zapi(client, world, _zapi_body(world, "zapi-lock-order")).json()[
+            "replied"
+        ]
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+
+    def positions(prefix: str) -> list[int]:
+        return [i for i, s in enumerate(statements) if s.startswith(prefix)]
+
+    [outbox] = positions("insert into credit_response_outbox")
+    effects = positions("insert into credit_effects")
+    entries = positions("insert into credit_ledger_entries")
+    accounts = positions("select credit_accounts")
+    events = positions("insert into events")
+    assert effects and entries and accounts and events
+    assert max(effects + entries + accounts + events) < outbox

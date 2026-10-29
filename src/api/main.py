@@ -71,6 +71,12 @@ from src.services.billing_fact_worker import (
     start_billing_fact_worker,
 )
 from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
+from src.services.credit_metering import (
+    start_credit_response_publisher,
+    start_credit_retention_sweeper,
+    stop_credit_response_publisher,
+    stop_credit_retention_sweeper,
+)
 from src.services.credit_switch import (
     CreditUnavailableError,
     credit_unavailable_exception_handler,
@@ -190,11 +196,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # fails closed and never raises; with the config off it reads nothing.
     await refresh_credit_switch()
     credit_switch_refresher: asyncio.Task[None] | None = None
+    credit_publisher: asyncio.Task[None] | None = None
+    credit_sweeper: asyncio.Task[None] | None = None
     webhook_refresher = _start_webhook_readiness_refresher()
     fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
     try:
         credit_switch_refresher = start_credit_switch_refresher()
+        # The response-outbox publisher (neurostack-credit-system Group 3b-2):
+        # only with the credit config on; it claims nothing while the switch
+        # is not effective nor before credit_enforcement_at.  The send
+        # adapter comes from the webhook route (no import cycle, LOW-13).
+        credit_publisher = start_credit_response_publisher(webhook.CREDIT_REPLY_SENDER)
+        # The retention sweep of the outbox's personal data runs config on or
+        # off (OD-3: the one exception to the dominance rule, and only to
+        # ERASE expired payloads; it never sends).
+        credit_sweeper = start_credit_retention_sweeper()
         fact_worker = _start_billing_fact_worker()
         if settings.environment == "staging":
             redis_client = Redis.from_url(
@@ -209,6 +226,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # First, and it never raises: off (and the refresher cancelled) before
         # anything else stops and before the pool closes.
         await stop_credit_switch(credit_switch_refresher)
+        # Before the pool closes; it never raises.  A reply cut mid-send
+        # stays ``sending`` and is reclaimed after its lease.
+        await stop_credit_response_publisher(credit_publisher)
+        await stop_credit_retention_sweeper(credit_sweeper)
         if webhook_refresher is not None:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):

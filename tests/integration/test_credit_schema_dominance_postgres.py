@@ -35,7 +35,21 @@ store crosses runs, and every run starts from a clone of one seeded template.
   ``credit_*`` table; config on enforces -- production without a key is 400,
   each keyed production decision is charged once with its stored answer (a
   retry replays it), the phase 1 handoff carries its ``credit_effect_id``,
-  and simulator and webhook traffic answer like the config-off run, free.
+  and simulator traffic answers like the config-off run, free.
+* Group 3b-2: the corpus carries a Meta file attachment (its ack, free) and
+  the patient's forward-on-request reply (a Meta file handoff).  With
+  ``credit_enforcement_at`` set and the config on, every Z-API and Meta
+  decision -- the file handoff included -- is claimed and charged once,
+  answers exactly like the config-off run (its reply sent inline from the
+  response outbox, ``delivered`` with phone and text erased) and stores the
+  same events (plus ``credit_effect_id``); a redelivery is
+  ``duplicate_message``; Uazapi and Evolution stay free and unclaimed.
+  The one explicit exception to "no SQL touches ``credit_*`` while the
+  switch is not effective" is the outbox's retention sweeper (owner decision
+  OD-3: it only ERASES expired payloads, config on or off); its first tick
+  comes one interval (``RETENTION_SWEEP_INTERVAL_SECONDS``) after start-up,
+  so it never runs inside a replay (pinned below), and it skips a ``037``
+  database (no outbox).
 * In one process, the background refresh turns the switch on after
   ``upgrade 037 -> 038`` and off again after the downgrade, each within one
   interval, while requests keep answering.
@@ -99,6 +113,12 @@ _METERING_TABLES = frozenset(
     }
 )
 _RUN_TIMEOUT_SECONDS = 300
+# The one statement of ``CreditRepository.enforcement_at()``.
+_ENFORCEMENT_READ = re.compile(
+    r"SELECT credit_enforcement_state\.credit_enforcement_at\s+"
+    r"FROM credit_enforcement_state\s+"
+    r"WHERE credit_enforcement_state\.id = \$1::SMALLINT"
+)
 
 
 def _corpus() -> dict[str, Any]:
@@ -890,6 +910,16 @@ def test_the_mask_hides_generated_values_only() -> None:
     }
 
 
+def test_the_retention_sweeper_never_ticks_inside_a_replay() -> None:
+    """OD-3's sweeper runs config on or off; the statement listeners of the
+    runs below stay exact because its first tick waits a whole interval,
+    longer than any replay is allowed to take."""
+
+    from src.services.credit_metering import RETENTION_SWEEP_INTERVAL_SECONDS
+
+    assert RETENTION_SWEEP_INTERVAL_SECONDS >= _RUN_TIMEOUT_SECONDS
+
+
 def test_the_corpus_covers_every_ingress_accepted_and_rejected() -> None:
     corpus = _corpus()
     by_ingress: dict[str, set[str]] = {}
@@ -976,6 +1006,13 @@ async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
     ):
         assert status[accepted] == 200, (accepted, body[accepted])
         assert body[accepted].get("replied") is True, (accepted, body[accepted])
+    # Group 3b-2: a Meta file ack, then a Meta file handoff on PostgreSQL.
+    assert body["meta-file-document"]["action"] == "file_ack"
+    assert body["meta-file-forward"] == {
+        "ok": True,
+        "replied": True,
+        "action": "file_handoff",
+    }
     assert run["events"], "the accepted requests stored no event"
     # Group 3b-1: a synchronous phase 1 handoff on PostgreSQL (#145/#146).
     assert status["events-api-key-handoff"] == 200
@@ -1197,6 +1234,16 @@ _REPLAYS = {
     "events-api-key-idempotency-retry": "events-api-key-idempotency-key",
     "events-api-key-enforced-retry": "events-api-key-enforced-decision",
 }
+# Group 3b-2: each Z-API/Meta decision of the corpus, charged once -- the
+# duplicate delivery and the free file ack are not.  ``True`` when its reply
+# went through the response outbox (the file handoff texts the patient as
+# today, without it).
+_WEBHOOK_CHARGED = {
+    ("zapi", "credit-dominance-zapi-1"): True,
+    ("zapi", "credit-dominance-zapi-5"): True,
+    ("meta", "wamid.credit-dominance-meta-1"): True,
+    ("meta", "wamid.credit-dominance-meta-forward"): False,
+}
 
 
 def _without_credit_effect_id(row: dict[str, Any]) -> dict[str, Any]:
@@ -1244,7 +1291,8 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     assert answers["events-api-key-handoff"]["body"]["handoff_summary"]
 
     # Everything else -- the panel JWT (simulator), rejected requests and
-    # the provider webhooks -- answers like the config-off run.
+    # the provider webhooks, enforced or not -- answers like the config-off
+    # run.
     production = set(_KEYLESS) | set(_REPLAYS) | set(_CHARGED.values())
     expected, actual = _comparable(off, world), _comparable(run, world)
     for want, got in zip(expected["responses"], actual["responses"], strict=True):
@@ -1266,50 +1314,100 @@ async def test_the_enforced_run_charges_each_production_decision_once(
 
     assert handoff_events(run) == handoff_events(off) != []
 
+    # Group 3b-2: the webhook tenants stored the same events as main (the
+    # srm.decision rows carry their credit_effect_id on top).
+    def tenant_events(source: dict[str, Any], tenant: str) -> list[str]:
+        rows = [
+            _without_credit_effect_id(row)
+            for row in source["events"]
+            if row["tenant_id"] == tenant
+        ]
+        return _comparable({"responses": [], "events": rows}, world)["events"]
+
+    for tenant in (world.zapi_tenant, world.meta_tenant):
+        assert tenant_events(run, tenant) == tenant_events(off, tenant) != []
+
     claims = run["metering"]["credit_ingress_claims"]
-    keyed = {c["idempotency_key"]: c for c in claims}
+    keyed = {c["idempotency_key"]: c for c in claims if c["source"] == "events"}
+    by_message = {
+        (c["source"], c["provider_message_id"]): c
+        for c in claims
+        if c["source"] != "events"
+    }
     # Only the enforced claims: no observational claim or trace once the
-    # enforcement is set (the writer stands down), none for the simulator.
-    assert set(keyed) == set(_CHARGED) and len(claims) == len(_CHARGED)
-    assert {(c["mode"], c["source"], c["tenant_id"]) for c in claims} == {
-        ("enforced", "events", world.api_tenant)
+    # enforcement is set (the writer stands down), none for the simulator,
+    # Uazapi or Evolution.
+    assert set(keyed) == set(_CHARGED) and set(by_message) == set(_WEBHOOK_CHARGED)
+    assert len(claims) == len(_CHARGED) + len(_WEBHOOK_CHARGED)
+    tenant_of = {
+        "events": world.api_tenant,
+        "zapi": world.zapi_tenant,
+        "meta": world.meta_tenant,
+    }
+    assert {(c["mode"], c["tenant_id"]) for c in claims} == {
+        ("enforced", tenant_of[c["source"]]) for c in claims
+    }
+    assert {c["principal_id"] for c in by_message.values()} == {
+        f"zapi:{world.zapi_tenant}",
+        f"meta:{world.meta_tenant}",
     }
     assert all(c["session_version"] is not None for c in claims)
     assert run["metering"]["credit_observational_effects"] == []
-    effect_ids = {
-        key: f"trace:{world.api_tenant}:{keyed[key]['interaction_id']}:decision:1"
-        for key in _CHARGED
-    }
+
+    def trace(claim: dict[str, Any]) -> str:
+        return f"trace:{claim['tenant_id']}:{claim['interaction_id']}:decision:1"
+
+    effect_ids = {key: trace(keyed[key]) for key in _CHARGED}
+    webhook_effects = {key: trace(claim) for key, claim in by_message.items()}
+    every_effect = sorted([*effect_ids.values(), *webhook_effects.values()])
     ledger = run["ledger"]
     effects = ledger["credit_effects"]
-    assert sorted(e["effect_id"] for e in effects) == sorted(effect_ids.values())
-    assert {(e["effect_kind"], e["tenant_id"], e["builder_id"]) for e in effects} == {
-        ("trace", world.api_tenant, world.builder)
+    assert sorted(e["effect_id"] for e in effects) == every_effect
+    assert {(e["effect_kind"], e["builder_id"]) for e in effects} == {
+        ("trace", world.builder)
     }
     assert all(len(e["decision_digest"] or "") == 64 for e in effects)
     # No lot was ever granted: each trace is 1 credit of debt, once.
     entries = ledger["credit_ledger_entries"]
     assert sorted(
         (e["effect_id"], e["entry_type"], e["amount_mc"]) for e in entries
-    ) == (sorted((effect, "debt", 1_000) for effect in effect_ids.values()))
+    ) == (sorted((effect, "debt", 1_000) for effect in every_effect))
     outbox = {row["effect_id"]: row for row in ledger["credit_response_outbox"]}
-    assert set(outbox) == set(effect_ids.values())
+    replied = {
+        webhook_effects[key] for key, outboxed in _WEBHOOK_CHARGED.items() if outboxed
+    }
+    assert set(outbox) == set(effect_ids.values()) | replied
     for key, case in _CHARGED.items():
         assert outbox[effect_ids[key]]["state"] == "delivered"
         assert outbox[effect_ids[key]]["payload"] == answers[case]["body"]
+    for effect in replied:
+        # Sent inline, then delivered with phone and text erased.
+        assert outbox[effect]["state"] == "delivered"
+        payload = outbox[effect]["payload"]
+        assert "phone" not in payload and "text" not in payload
+        assert payload["kind"] == "webhook_reply.v1"
     handoffs = [
-        h for h in ledger["handoff_records"] if h["tenant_id"] == world.api_tenant
+        h
+        for h in ledger["handoff_records"]
+        if h["tenant_id"] in (world.api_tenant, world.meta_tenant)
     ]
-    assert [(h["session_id"], h["credit_effect_id"]) for h in handoffs] == [
-        (world.handoff_session, effect_ids["credit-dominance-handoff-1"])
-    ]
+    assert sorted((h["tenant_id"], h["credit_effect_id"]) for h in handoffs) == sorted(
+        [
+            (world.api_tenant, effect_ids["credit-dominance-handoff-1"]),
+            (
+                world.meta_tenant,
+                webhook_effects[("meta", "wamid.credit-dominance-meta-forward")],
+            ),
+        ]
+    )
     linked = sorted(
         row["event_metadata"]["credit_effect_id"]
         for row in run["events"]
         if row["event_type"] == "srm.decision"
         and "credit_effect_id" in (row["event_metadata"] or {})
     )
-    assert linked == sorted(effect_ids.values())
+    # A file handoff has no srm.decision: its link is the handoff's context.
+    assert linked == sorted(set(every_effect) - set(webhook_effects.values()) | replied)
     assert run["credit_rows"]["credit_accounts"] == 1
 
 
@@ -1397,4 +1495,9 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     assert [r.status_code for r in (before, during, after)] == [401, 401, 401]
     assert before.json() == during.json() == after.json()
     assert any("alembic_version" in statement for statement in statements)
-    assert [s for s in statements if _CREDIT_SQL.search(s)] == []
+    # The rejected requests touch no credit table.  Group 3b-2: with the
+    # config on, the response-outbox publisher's tick reads
+    # credit_enforcement_at while the switch is effective -- that read and
+    # nothing else (no claim, no sweep: the enforcement is not set).
+    credit_sql = [s for s in statements if _CREDIT_SQL.search(s)]
+    assert all(_ENFORCEMENT_READ.fullmatch(s.strip()) for s in credit_sql), credit_sql
