@@ -43,6 +43,15 @@ authenticated ``production`` and ``credit_enforcement_at`` set).  The
 plugin wraps it the same way and counts its verdicts (``enforced``,
 ``credit_pending`` or ``main``): every existing webhook suite must show only
 ``main`` ones -- no enforced claim, debit, hold or outbox ever ran there.
+
+Group 4a: knowledge and media routes read their credit mode once
+(``credit_inventory.read_credit_mode``: ``off`` -- a suite's fake session or
+request --, ``observational`` or ``enforced``) and, observationally, run the
+inventory writers (``credit_inventory.record_observational_upload`` and
+``record_observational_egress``).  The plugin wraps the three the same way
+and counts their verdicts and outcomes: every existing media and knowledge
+suite must show no ``enforced`` mode, so no reservation, maintenance or
+egress debit ever ran there.
 """
 
 from __future__ import annotations
@@ -62,6 +71,11 @@ _captures: Counter[str] = Counter()
 _ORIGINAL_CAPTURE: Any = None
 _webhook_prechecks: Counter[str] = Counter()
 _ORIGINAL_WEBHOOK_PRECHECK: Any = None
+_inventory_modes: Counter[str] = Counter()
+_inventory_writes: Counter[str] = Counter()
+_ORIGINAL_MODE: Any = None
+_ORIGINAL_UPLOAD_WRITER: Any = None
+_ORIGINAL_EGRESS_WRITER: Any = None
 
 
 def _forced_effective(_self: Any) -> bool:
@@ -105,9 +119,45 @@ async def _counted_webhook_precheck(*args: Any, **kwargs: Any) -> Any:
     return verdict
 
 
+async def _counted_mode(*args: Any, **kwargs: Any) -> Any:
+    try:
+        mode = await _ORIGINAL_MODE(*args, **kwargs)
+    except BaseException as error:
+        _inventory_modes[f"raised {type(error).__name__}"] += 1
+        raise
+    if mode.enforced:
+        _inventory_modes["enforced"] += 1
+    elif mode.observational:
+        _inventory_modes["observational"] += 1
+    else:
+        _inventory_modes["off"] += 1
+    return mode
+
+
+async def _counted_upload_writer(*args: Any, **kwargs: Any) -> Any:
+    try:
+        outcome = await _ORIGINAL_UPLOAD_WRITER(*args, **kwargs)
+    except BaseException as error:
+        _inventory_writes[f"upload raised {type(error).__name__}"] += 1
+        raise
+    _inventory_writes[f"upload {outcome}"] += 1
+    return outcome
+
+
+async def _counted_egress_writer(*args: Any, **kwargs: Any) -> Any:
+    try:
+        outcome = await _ORIGINAL_EGRESS_WRITER(*args, **kwargs)
+    except BaseException as error:
+        _inventory_writes[f"egress raised {type(error).__name__}"] += 1
+        raise
+    _inventory_writes[f"egress {outcome}"] += 1
+    return outcome
+
+
 def pytest_configure(config: pytest.Config) -> None:
     global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE, _ORIGINAL_WEBHOOK_PRECHECK
-    from src.services import credit_metering
+    global _ORIGINAL_MODE, _ORIGINAL_UPLOAD_WRITER, _ORIGINAL_EGRESS_WRITER
+    from src.services import credit_inventory, credit_metering
     from src.services.credit_switch import CreditSwitch
 
     patcher = pytest.MonkeyPatch()
@@ -118,6 +168,16 @@ def pytest_configure(config: pytest.Config) -> None:
     patcher.setattr(credit_metering, "capture_events_enforcement", _counted_capture)
     _ORIGINAL_WEBHOOK_PRECHECK = credit_metering.precheck_webhook
     patcher.setattr(credit_metering, "precheck_webhook", _counted_webhook_precheck)
+    _ORIGINAL_MODE = credit_inventory.read_credit_mode
+    patcher.setattr(credit_inventory, "read_credit_mode", _counted_mode)
+    _ORIGINAL_UPLOAD_WRITER = credit_inventory.record_observational_upload
+    patcher.setattr(
+        credit_inventory, "record_observational_upload", _counted_upload_writer
+    )
+    _ORIGINAL_EGRESS_WRITER = credit_inventory.record_observational_egress
+    patcher.setattr(
+        credit_inventory, "record_observational_egress", _counted_egress_writer
+    )
     config.stash[_PATCHER] = patcher
 
 
@@ -155,11 +215,25 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
         f"credit webhook pre-checks: {sum(_webhook_prechecks.values())}"
         f" ({prechecks or 'none'})"
     )
+    modes = ", ".join(
+        f"{name}={count}" for name, count in sorted(_inventory_modes.items())
+    )
+    terminalreporter.write_line(
+        f"credit inventory modes: {sum(_inventory_modes.values())}"
+        f" ({modes or 'none'})"
+    )
+    writes = ", ".join(
+        f"{name}={count}" for name, count in sorted(_inventory_writes.items())
+    )
+    terminalreporter.write_line(
+        f"credit inventory writer: {sum(_inventory_writes.values())} calls"
+        f" ({writes or 'none'})"
+    )
 
 
 def _assert_forced() -> None:
     global _self_checks
-    from src.services import credit_metering
+    from src.services import credit_inventory, credit_metering
     from src.services.credit_switch import CreditSwitch, credit_switch_effective
 
     assert CreditSwitch.effective is _forced_effective, "switch is not forced"
@@ -172,6 +246,11 @@ def _assert_forced() -> None:
     assert (
         credit_metering.precheck_webhook is _counted_webhook_precheck
     ), "the webhook pre-check counter was swapped and not restored"
+    assert (
+        credit_inventory.read_credit_mode is _counted_mode
+        and credit_inventory.record_observational_upload is _counted_upload_writer
+        and credit_inventory.record_observational_egress is _counted_egress_writer
+    ), "a credit inventory counter was swapped and not restored"
     _self_checks += 1
     assert credit_switch_effective() is True, "the forced switch does not read True"
 

@@ -1,6 +1,6 @@
 {
   "schema_version": "credit_dominance_corpus.v1",
-  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run. Group 3b-2 appends a Meta file attachment (its fixed ack, free) and the patient's forward-on-request reply, a Meta file handoff: before the enforcement they answer like main; in the enforced run the Z-API and Meta decisions -- the file handoff included -- are claimed and charged once each, with the same answers.",
+  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at the credit-ready head (039), with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run. Group 3b-2 appends a Meta file attachment (its fixed ack, free) and the patient's forward-on-request reply, a Meta file handoff: before the enforcement they answer like main; in the enforced run the Z-API and Meta decisions -- the file handoff included -- are claimed and charged once each, with the same answers. Group 4a appends a knowledge text upload (JSON), a media upload (multipart) and a download of a seeded media asset -- answered like main config on or off, measured observationally before the enforcement and reserved/charged in the enforced run -- and the multipart DOCX/PDF knowledge upload, a credit surface ('credit_surface': 503 credit_unavailable while the switch is not effective, 201 with it). 'multipart' builds a multipart/form-data body from 'fields' and 'files' (each file's bytes read from 'fixture', a path under tests/fixtures); an item without 'json' or 'multipart' has no body.",
   "masked_fields": [
     "event_id",
     "timestamp",
@@ -592,6 +592,61 @@
                 }
               }
             ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "knowledge-json-upload",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/knowledge/documents",
+      "auth": "api_key/api_tenant",
+      "json": {
+        "content": "Atendemos de segunda a sexta, das 8h às 18h. Aceitamos Unimed e SulAmérica.",
+        "metadata": {"title": "Horários e convênios"}
+      }
+    },
+    {
+      "id": "media-upload-pdf",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/media-assets",
+      "auth": "api_key/api_tenant",
+      "multipart": {
+        "fields": {"display_name": "Tabela de preços", "original_filename": "precos.pdf"},
+        "files": [
+          {
+            "field": "file",
+            "filename": "precos.pdf",
+            "content_type": "application/pdf",
+            "fixture": "credit_storage_conformance/positive/textual.pdf"
+          }
+        ]
+      }
+    },
+    {
+      "id": "media-download-seeded",
+      "ingress": "api_key",
+      "method": "GET",
+      "path": "/v1/media-assets/{media_asset}/content",
+      "auth": "api_key/api_tenant"
+    },
+    {
+      "id": "knowledge-files-upload",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/knowledge/documents/upload",
+      "auth": "api_key/api_tenant",
+      "credit_surface": true,
+      "multipart": {
+        "fields": {},
+        "files": [
+          {
+            "field": "files",
+            "filename": "horarios.pdf",
+            "content_type": "application/pdf",
+            "fixture": "credit_storage_conformance/positive/textual.pdf"
           }
         ]
       }

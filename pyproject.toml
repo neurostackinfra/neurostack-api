@@ -45,6 +45,12 @@ lingua-language-detector = "2.1.1"
 # import it at request time and fail closed when it is missing.
 boto3 = ">=1.43.0,<2"
 botocore = ">=1.43.0,<2"
+# neurostack-credit-system Group 4a: text of uploaded DOCX / textual PDF
+# knowledge documents (POST /v1/knowledge/documents/upload).  Parsers of
+# untrusted uploads: pinned exactly, bumped only with a review of their
+# limits (src/services/knowledge_service.py).
+pypdf = "6.21.4"
+python-docx = "1.2.0"
 neurostack-core = {path = "packages/neurostack-core", develop = true}
 
 [tool.poetry.group.dev.dependencies]

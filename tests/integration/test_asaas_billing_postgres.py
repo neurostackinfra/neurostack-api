@@ -673,10 +673,11 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     assert postgres_harness.schemas_equivalent is True
     assert postgres_harness.legacy_survived_downgrade is True
     async with postgres_harness.engine.connect() as connection:
-        # Head: 038, the additive credit schema (neurostack-credit-system G1a).
+        # Head: 039, the credit inventory (neurostack-credit-system G4a) on
+        # top of the additive credit schema 038 (G1a).
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "038"
+            == "039"
         )
         legacy = (
             await connection.execute(

@@ -117,7 +117,9 @@ def test_the_image_chain_is_this_repository_s_linear_chain() -> None:
     assert chain == _expected_chain()
     assert chain[0] == "001"
     assert chain[-1] == current_head()
-    assert chain.index("037") + 1 == chain.index(CREDIT_SCHEMA_MIN_REVISION)
+    # 038 (the credit schema) follows 037; Group 4a's 039 (the credit
+    # inventory) is the highest credit revision today.
+    assert chain.index("037") + 2 == chain.index(CREDIT_SCHEMA_MIN_REVISION)
 
 
 def test_the_minimum_is_the_highest_credit_revision_of_the_wish() -> None:
@@ -293,9 +295,11 @@ async def test_config_off_by_default_settings_is_off(
 @pytest.mark.parametrize(
     ("enabled", "rows", "effective", "reason"),
     [
-        (False, ("038",), False, "config_disabled"),
+        (False, ("039",), False, "config_disabled"),
         (True, ("037",), False, "schema_below_minimum"),
-        (True, ("038",), True, "schema_ready"),
+        # Group 4a: 039 is the minimum; 038 alone is below it.
+        (True, ("038",), False, "schema_below_minimum"),
+        (True, ("039",), True, "schema_ready"),
         (True, (), False, "version_row_count"),
         (True, ("038", "037"), False, "version_row_count"),
         (True, ("deadbeef",), False, "revision_outside_image_chain"),
@@ -434,7 +438,7 @@ async def test_refresh_reflects_an_upgrade_and_a_downgrade(
         await refresh_credit_switch(enabled=True, session_factory=version_db.factory)
     ).effective
 
-    await version_db.rows("038")
+    await version_db.rows("039")
     assert (
         await refresh_credit_switch(enabled=True, session_factory=version_db.factory)
     ).effective
@@ -470,7 +474,7 @@ async def test_the_background_refresher_follows_the_schema_within_an_interval(
     task = asyncio.create_task(run_credit_switch_refresher(interval, refresh=refresh))
     try:
         assert credit_switch_effective() is False
-        await version_db.rows("038")
+        await version_db.rows("039")
         assert await _wait_for(True, 2.0) <= 2 * interval + 1.0
         await version_db.rows("037")
         assert await _wait_for(False, 2.0) <= 2 * interval + 1.0

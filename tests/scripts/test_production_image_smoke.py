@@ -384,7 +384,13 @@ def test_locked_main_is_the_main_group_for_the_image_interpreter() -> None:
     assert locked["neurostack-core"] == "0.1.0"
     for tooling in ("poetry", "pip", "setuptools", "pytest", "dulwich"):
         assert tooling not in locked, tooling
-    assert len(locked) == 75
+    # neurostack-credit-system Group 4a: + pypdf, python-docx and lxml.
+    assert (locked["pypdf"], locked["python-docx"], locked["lxml"]) == (
+        "6.21.4",
+        "1.2.0",
+        "6.1.3",
+    )
+    assert len(locked) == 78
 
 
 def test_locked_main_evaluates_markers_in_the_given_environment() -> None:

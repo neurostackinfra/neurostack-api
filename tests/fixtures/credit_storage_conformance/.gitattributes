@@ -1,0 +1,4 @@
+# Parser fixtures are bytes, never text: a PDF cross-reference entry ends in
+# a required space, which a whitespace check of text would reject.
+*.pdf binary
+*.docx binary

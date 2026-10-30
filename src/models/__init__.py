@@ -57,6 +57,11 @@ from src.models.credit import (
     CreditResponseOutbox,
 )
 from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
+from src.models.credit_inventory import (
+    CreditAllocation,
+    CreditEgressDelivery,
+    CreditInventoryVersion,
+)
 from src.models.demo_lead import DemoLead
 from src.models.event import Event
 from src.models.handoff import HandoffRecord
@@ -117,6 +122,10 @@ __all__ = [
     "CreditEnforcementState",
     "CreditEnforcementBinding",
     "CreditObservationalEffect",
+    # Credit inventory (neurostack-credit-system Group 4a, migration 039)
+    "CreditInventoryVersion",
+    "CreditAllocation",
+    "CreditEgressDelivery",
     # Core Models
     "Builder",
     "Coupon",

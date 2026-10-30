@@ -1,4 +1,17 @@
-"""Authorized tenant-scoped Media Assets catalog endpoints."""
+"""Authorized tenant-scoped Media Assets catalog endpoints.
+
+Credits (neurostack-credit-system Group 4a, :mod:`src.services.credit_inventory`).
+With the credit switch off nothing changes.  With it on and before
+``credit_enforcement_at``, uploads and downloads keep ``main``'s limits,
+allowlist and answers and are measured observationally after their own
+transaction.  After the enforcement: the PDF's stricter per-type limits
+(image 5 MB, PDF 20 MB, audio/video 16 MB) apply before any reservation --
+M4A and OGG-Opus stay ``media_type_unsupported`` (deferred, owner decision
+A) --; an upload debits its media reservation in the same transaction, and
+a download debits its egress overage in a short transaction BEFORE it is
+answered; a standalone tenant or a quarantine hold is 402 ``credit_pending``
+before anything is stored or any byte is sent.
+"""
 
 from __future__ import annotations
 
@@ -45,6 +58,13 @@ from src.config.settings import settings
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
+from src.services import credit_inventory
+from src.services.credit_allocations import ENFORCED_MEDIA_MAX_BYTES
+from src.services.credit_metering import (
+    CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
+    CreditEnforcementUnavailable,
+    CreditTenantGone,
+)
 from src.services.media_assets import (
     MediaAssetDomainError,
     MediaStorageCapacityExceeded,
@@ -121,6 +141,34 @@ _UNAVAILABLE_RESPONSE = {
 
 def _media_error(status_code: int, code: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code})
+
+
+_CREDIT_PENDING_RESPONSE = {
+    "description": (
+        "After credit_enforcement_at only: the tenant has no credit account "
+        "(standalone) or its builder is on a quarantine hold (credit_pending); "
+        "nothing was stored and no byte was sent."
+    ),
+    "model": MediaAssetErrorResponse,
+}
+
+
+async def _credit_mode(
+    request: Request, session: AsyncSession
+) -> credit_inventory.CreditMode:
+    """Read once, before any row is loaded (switch off: no SQL)."""
+
+    try:
+        return await credit_inventory.read_credit_mode(request, session)
+    except CreditEnforcementUnavailable:
+        raise _media_error(503, CREDIT_ENFORCEMENT_UNAVAILABLE_CODE) from None
+
+
+def _enforce_media_limit(category: str, size_bytes: int) -> None:
+    """The PDF's per-type limit, after the enforcement only."""
+
+    if size_bytes > ENFORCED_MEDIA_MAX_BYTES[category]:
+        raise MediaAssetDomainError("media_size_exceeded")
 
 
 async def _rollback(session: AsyncSession) -> None:
@@ -349,6 +397,7 @@ def _authorized_media_target_exists(
             "model": MediaAssetErrorResponse,
         },
         401: _AUTHENTICATION_RESPONSE,
+        402: _CREDIT_PENDING_RESPONSE,
         403: _FORBIDDEN_RESPONSE,
         409: {
             "description": (
@@ -430,6 +479,7 @@ async def upload_media_asset(
     upload: UploadFile | None = None
     target: Tenant | None = None
     try:
+        mode = await _credit_mode(request, session)
         # Authorization and target classification deliberately precede multipart
         # parsing, validation and every access to media_assets.
         target = await _authorized_target(request, tenant, tenant_id, session)
@@ -445,6 +495,8 @@ async def upload_media_asset(
             payload,
             upload.content_type or "",
         )
+        if mode.enforced:
+            _enforce_media_limit(classification.category, len(payload))
 
         async with media_storage_capacity_guard(
             session,
@@ -466,6 +518,18 @@ async def upload_media_asset(
             )
             session.add(asset)
             await session.flush()
+            if mode.enforced:
+                assert mode.enforcement_at is not None
+                reserved = await credit_inventory.reserve_upload(
+                    session,
+                    tenant_id=target.id,
+                    category="media",
+                    object_ids=[asset.id],
+                    upload_id=asset.id,
+                    enforcement_at=mode.enforcement_at,
+                )
+                if reserved.status == "credit_pending":
+                    raise credit_inventory.CreditPendingError()
         await session.commit()
         logger.info(
             "media_asset_upload",
@@ -475,7 +539,23 @@ async def upload_media_asset(
             size_bytes=asset.size_bytes,
             result="created",
         )
+        if mode.observational:
+            await credit_inventory.record_observational_upload(
+                session,
+                tenant_id=asset.tenant_id,
+                category="media",
+                object_ids=[asset.id],
+                upload_id=asset.id,
+            )
         return asset
+    except credit_inventory.CreditPendingError:
+        await _rollback(session)
+        raise _media_error(402, "credit_pending") from None
+    except CreditTenantGone:
+        await _rollback(session)
+        raise _media_error(
+            status.HTTP_403_FORBIDDEN, "media_tenant_forbidden"
+        ) from None
     except MediaAssetDomainError as error:
         await _rollback(session)
         status_code = 413 if error.code == "media_size_exceeded" else 422
@@ -621,6 +701,7 @@ async def list_media_assets(
             },
         },
         401: _AUTHENTICATION_RESPONSE,
+        402: _CREDIT_PENDING_RESPONSE,
         403: _FORBIDDEN_RESPONSE,
         404: {
             "description": "Asset is absent or not visible in the effective tenant.",
@@ -644,6 +725,7 @@ async def download_media_asset(
     """Stream exact stored bytes as a non-sniffable attachment."""
     permit: ImmediatePermit | None = None
     try:
+        mode = await _credit_mode(request, session)
         target = await _authorized_target(request, tenant, tenant_id, session)
         target_id = target.id
         permit = _download_permit(request)
@@ -667,6 +749,23 @@ async def download_media_asset(
             permit.release()
             permit = None
             raise _media_error(404, "media_asset_not_found")
+        if mode.enforced:
+            # The egress overage is charged BEFORE the answer (owner G).
+            assert mode.enforcement_at is not None
+            await session.rollback()
+            charged = await credit_inventory.charge_egress(
+                session,
+                tenant_id=target_id,
+                media_id=asset.id,
+                size_bytes=asset.size_bytes,
+                enforcement_at=mode.enforcement_at,
+            )
+            if charged.status == "credit_pending":
+                await _rollback(session)
+                permit.release()
+                permit = None
+                raise _media_error(402, "credit_pending")
+            await session.commit()
         response = _PermitStreamingResponse(
             _single_chunk(asset.payload),
             permit=permit,
@@ -682,6 +781,13 @@ async def download_media_asset(
             },
         )
         await session.rollback()
+        if mode.observational:
+            await credit_inventory.record_observational_egress(
+                session,
+                tenant_id=target_id,
+                media_id=asset.id,
+                size_bytes=asset.size_bytes,
+            )
         permit = None
         logger.info(
             "media_asset_download",
@@ -692,6 +798,11 @@ async def download_media_asset(
             result="downloaded",
         )
         return response
+    except CreditTenantGone:
+        if permit is not None:
+            permit.release()
+        await _rollback(session)
+        raise _media_error(404, "media_asset_not_found") from None
     except HTTPException:
         if permit is not None:
             permit.release()
