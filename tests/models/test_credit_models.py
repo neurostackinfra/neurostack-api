@@ -138,13 +138,16 @@ def migration() -> ModuleType:
     return _load()
 
 
-# Group 4a: the credit inventory tables of migration 039 (pinned by
+# Group 4a/4b: credit inventory plus object-copy tables (pinned by
 # tests/integration/test_credit_orm_ddl_drift_postgres.py and the 039 part of
 # tests/integration/test_credit_migration_guards_postgres.py).
 _LATER_TABLES = {
     "credit_inventory_versions",
     "credit_allocations",
     "credit_egress_deliveries",
+    "credit_object_copies",
+    "credit_object_copy_jobs",
+    "credit_qdrant_jobs",
 }
 
 
@@ -184,8 +187,8 @@ def _created_columns(statement: str) -> list[str]:
 
 def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("038", "037")
-    # Group 4a: 039 (the credit inventory) follows 038 and is the head.
-    assert current_head() == "039"
+    # Group 4b: 040 (additional object copies) follows 039 and is the head.
+    assert current_head() == "040"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 

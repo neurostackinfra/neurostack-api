@@ -62,6 +62,11 @@ from src.models.credit_inventory import (
     CreditEgressDelivery,
     CreditInventoryVersion,
 )
+from src.models.credit_object_copy import (
+    CreditObjectCopy,
+    CreditObjectCopyJob,
+    CreditQdrantJob,
+)
 from src.models.demo_lead import DemoLead
 from src.models.event import Event
 from src.models.handoff import HandoffRecord
@@ -126,6 +131,9 @@ __all__ = [
     "CreditInventoryVersion",
     "CreditAllocation",
     "CreditEgressDelivery",
+    "CreditObjectCopy",
+    "CreditObjectCopyJob",
+    "CreditQdrantJob",
     # Core Models
     "Builder",
     "Coupon",

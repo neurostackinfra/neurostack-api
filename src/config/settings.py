@@ -481,6 +481,15 @@ class Settings(BaseSettings):
     # empty payload and a retry answers 409 duplicate_event
     # (src/services/credit_metering.py); validated at start-up.
     credit_replay_retention_hours: int = Field(default=24, ge=1, le=168)
+    # Group 4b's additional (never authoritative) development/test object
+    # copy.  Empty values intentionally disable the workers even when the
+    # credit dominance switch is effective.  Production is rejected by the
+    # worker predicate, not by a caller-provided flag.
+    credit_object_store_endpoint: str = ""
+    credit_object_store_bucket: str = ""
+    credit_object_store_access_key_id: str = ""
+    credit_object_store_secret_access_key: SecretStr = SecretStr("")
+    credit_object_worker_interval_seconds: int = Field(default=15, ge=1, le=300)
 
     @field_validator("asaas_webhook_url")
     @classmethod

@@ -59,15 +59,24 @@ import json
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import text
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from starlette.requests import HTTPConnection
 
 from src.config.logging import get_logger
+from src.config.settings import settings
+from src.models.credit_object_copy import (
+    CreditObjectCopy,
+    CreditObjectCopyJob,
+    CreditQdrantJob,
+)
+from src.models.knowledge import KnowledgeDocument
+from src.models.media_asset import MediaAsset
+from src.models.tenant import Tenant
 from src.repositories.credit import CreditRepository, TenantScope
 from src.repositories.credit_inventory import CreditInventoryRepository, SourceRow
 from src.services.credit_allocations import (
@@ -102,7 +111,7 @@ from src.services.credit_metering import (
     end_route_transaction,
     enforcement_seen,
 )
-from src.services.credit_switch import request_credit_switch
+from src.services.credit_switch import credit_switch_effective, request_credit_switch
 
 logger = get_logger(__name__)
 
@@ -784,6 +793,561 @@ async def lock_tenant_for_reservation(session: AsyncSession, tenant_id: UUID) ->
 
 
 # ---------------------------------------------------------------------------
+# Additional object copies and derived Qdrant work (Group 4b).
+#
+# All entries below are intentionally after the Group 4a accounting API: they
+# do not participate in credit debits, nor can a failure change an API answer.
+# Source bytes stay in PostgreSQL.  A job is durable so source deletion and a
+# process crash merely delay the best-effort external copy/cleanup.
+# ---------------------------------------------------------------------------
+
+_COPY_BATCH_SIZE: Final = 16
+_OBJECT_JOB_LEASE: Final = timedelta(minutes=5)
+
+
+def object_copy_runtime_enabled() -> bool:
+    """Whether Group 4b may touch external stores, fail-closed.
+
+    There is no production exception: rollout opening owns that decision.
+    Empty settings leave development/test harmless and inert.
+    """
+
+    return bool(
+        credit_switch_effective()
+        and settings.environment in ("development", "test")
+        and settings.credit_object_store_endpoint
+        and settings.credit_object_store_bucket
+        and settings.credit_object_store_access_key_id
+        and settings.credit_object_store_secret_access_key.get_secret_value()
+    )
+
+
+def qdrant_runtime_enabled() -> bool:
+    """Derived-vector work has the same switch/environment dominance but
+    shares the explicit additional-store configuration boundary."""
+
+    return bool(
+        object_copy_runtime_enabled()
+        and settings.qdrant_host
+        and settings.qdrant_collection_name
+    )
+
+
+async def enqueue_object_copy(
+    session: AsyncSession,
+    *,
+    source_kind: Literal["media", "knowledge"],
+    source_id: UUID,
+    tenant_id: UUID,
+) -> None:
+    """Persist post-commit work only when the captured switch is effective.
+
+    Callers invoke this after the authoritative route transaction committed.
+    The queue insert is best effort; it never rolls back the primary content
+    write and a repeated enqueue is safe (a completed duplicate does nothing).
+    """
+
+    copy_enabled = object_copy_runtime_enabled()
+    qdrant_enabled = qdrant_runtime_enabled()
+    if not copy_enabled and not qdrant_enabled:
+        return
+    if copy_enabled:
+        copy_exists = await session.scalar(
+            select(CreditObjectCopyJob.id).where(
+                CreditObjectCopyJob.source_kind == source_kind,
+                CreditObjectCopyJob.source_id == source_id,
+                CreditObjectCopyJob.operation == "copy",
+                CreditObjectCopyJob.state.in_(("pending", "running")),
+            )
+        )
+        if copy_exists is None:
+            session.add(
+                CreditObjectCopyJob(
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    tenant_id=tenant_id,
+                    operation="copy",
+                )
+            )
+    # Qdrant's rebuildable representation is document text.  Raw media stays
+    # in PostgreSQL/S3 copies and never gets misrepresented as searchable
+    # text merely because the optional vector service is reachable.
+    if qdrant_enabled and source_kind == "knowledge":
+        qdrant_exists = await session.scalar(
+            select(CreditQdrantJob.id).where(
+                CreditQdrantJob.source_kind == source_kind,
+                CreditQdrantJob.source_id == source_id,
+                CreditQdrantJob.operation == "rebuild",
+                CreditQdrantJob.state.in_(("pending", "running")),
+            )
+        )
+        if qdrant_exists is None:
+            session.add(
+                CreditQdrantJob(
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    tenant_id=tenant_id,
+                    operation="rebuild",
+                )
+            )
+    await session.commit()
+
+
+async def enqueue_source_collection(
+    session: AsyncSession,
+    *,
+    source_kind: Literal["media", "knowledge"],
+    source_id: UUID,
+    tenant_id: UUID,
+) -> None:
+    """Schedule source-GC after its authoritative delete committed."""
+
+    copy_enabled = object_copy_runtime_enabled()
+    qdrant_enabled = qdrant_runtime_enabled()
+    if not copy_enabled and not qdrant_enabled:
+        return
+    jobs: list[tuple[Any, str]] = []
+    if copy_enabled:
+        jobs.append((CreditObjectCopyJob, "gc"))
+    if qdrant_enabled and source_kind == "knowledge":
+        jobs.append((CreditQdrantJob, "delete"))
+    for model, operation in jobs:
+        exists = await session.scalar(
+            select(model.id).where(
+                model.source_kind == source_kind,
+                model.source_id == source_id,
+                model.operation == operation,
+                model.state.in_(("pending", "running")),
+            )
+        )
+        if exists is None:
+            session.add(
+                model(
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    tenant_id=tenant_id,
+                    operation=operation,
+                )
+            )
+    await session.commit()
+
+
+async def _claim_copy_jobs(session: AsyncSession) -> list[CreditObjectCopyJob]:
+    stale_before = _now() - _OBJECT_JOB_LEASE
+    statement = (
+        select(CreditObjectCopyJob)
+        .where(
+            or_(
+                CreditObjectCopyJob.state == "pending",
+                and_(
+                    CreditObjectCopyJob.state == "running",
+                    CreditObjectCopyJob.claimed_at < stale_before,
+                ),
+            )
+        )
+        .order_by(CreditObjectCopyJob.created_at, CreditObjectCopyJob.id)
+        .limit(_COPY_BATCH_SIZE)
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update(skip_locked=True)
+    jobs = list((await session.execute(statement)).scalars())
+    now = _now()
+    for job in jobs:
+        job.state = "running"
+        job.claimed_at = now
+        job.attempts += 1
+    await session.commit()
+    return jobs
+
+
+async def _enqueue_orphan_copy_collection(session: AsyncSession) -> None:
+    """Discover CASCADE-orphaned registry rows.
+
+    Clinic/builder deletion removes source rows through database cascades and
+    therefore cannot enqueue per-source work in the request transaction. The
+    registry deliberately has no source FK, so this bounded scan is the
+    durable recovery path. It does nothing while the Group 4b runtime is off.
+    """
+
+    copies = list(
+        (
+            await session.execute(
+                select(CreditObjectCopy)
+                .where(CreditObjectCopy.state == "ready")
+                .order_by(CreditObjectCopy.created_at)
+                .limit(_COPY_BATCH_SIZE)
+            )
+        ).scalars()
+    )
+    for copy in copies:
+        model = MediaAsset if copy.source_kind == "media" else KnowledgeDocument
+        source = await session.scalar(
+            select(model.id).where(
+                model.id == copy.source_id, model.tenant_id == copy.tenant_id
+            )
+        )
+        if source is not None:
+            continue
+        exists = await session.scalar(
+            select(CreditObjectCopyJob.id).where(
+                CreditObjectCopyJob.source_kind == copy.source_kind,
+                CreditObjectCopyJob.source_id == copy.source_id,
+                CreditObjectCopyJob.operation == "gc",
+                CreditObjectCopyJob.state.in_(("pending", "running")),
+            )
+        )
+        if exists is None:
+            session.add(
+                CreditObjectCopyJob(
+                    source_kind=copy.source_kind,
+                    source_id=copy.source_id,
+                    tenant_id=copy.tenant_id,
+                    operation="gc",
+                )
+            )
+        if copy.source_kind == "knowledge" and qdrant_runtime_enabled():
+            qdrant_exists = await session.scalar(
+                select(CreditQdrantJob.id).where(
+                    CreditQdrantJob.source_kind == copy.source_kind,
+                    CreditQdrantJob.source_id == copy.source_id,
+                    CreditQdrantJob.operation == "delete",
+                    CreditQdrantJob.state.in_(("pending", "running")),
+                )
+            )
+            if qdrant_exists is None:
+                session.add(
+                    CreditQdrantJob(
+                        source_kind=copy.source_kind,
+                        source_id=copy.source_id,
+                        tenant_id=copy.tenant_id,
+                        operation="delete",
+                    )
+                )
+    await session.commit()
+
+
+async def _finish_copy_job(
+    session: AsyncSession, job_id: UUID, *, state: str, error: str | None = None
+) -> None:
+    await session.execute(
+        update(CreditObjectCopyJob)
+        .where(CreditObjectCopyJob.id == job_id)
+        .values(
+            state=state,
+            last_error=error,
+            completed_at=_now() if state != "failed" else None,
+        )
+    )
+    await session.commit()
+
+
+async def _claim_qdrant_jobs(session: AsyncSession) -> list[CreditQdrantJob]:
+    stale_before = _now() - _OBJECT_JOB_LEASE
+    statement = (
+        select(CreditQdrantJob)
+        .where(
+            or_(
+                CreditQdrantJob.state == "pending",
+                and_(
+                    CreditQdrantJob.state == "running",
+                    CreditQdrantJob.claimed_at < stale_before,
+                ),
+            )
+        )
+        .order_by(CreditQdrantJob.created_at, CreditQdrantJob.id)
+        .limit(_COPY_BATCH_SIZE)
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update(skip_locked=True)
+    jobs = list((await session.execute(statement)).scalars())
+    for job in jobs:
+        job.state = "running"
+        job.claimed_at = _now()
+        job.attempts += 1
+    await session.commit()
+    return jobs
+
+
+async def _finish_qdrant_job(
+    session: AsyncSession, job_id: UUID, *, state: str, error: str | None = None
+) -> None:
+    await session.execute(
+        update(CreditQdrantJob)
+        .where(CreditQdrantJob.id == job_id)
+        .values(
+            state=state,
+            last_error=error,
+            completed_at=_now() if state != "failed" else None,
+        )
+    )
+    await session.commit()
+
+
+async def _run_qdrant_job(
+    factory: Callable[[], AsyncSession], job: CreditQdrantJob
+) -> None:
+    """Operate only rebuildable document chunks, never source content."""
+
+    from src.storage.credit_qdrant import (
+        CreditQdrantError,
+        delete_derived_chunks,
+        replace_derived_chunks,
+    )
+
+    try:
+        if job.operation == "delete":
+            await delete_derived_chunks(
+                tenant_id=job.tenant_id, source_id=job.source_id
+            )
+        else:
+            async with factory() as session:
+                content = await session.scalar(
+                    select(KnowledgeDocument.content).where(
+                        KnowledgeDocument.id == job.source_id,
+                        KnowledgeDocument.tenant_id == job.tenant_id,
+                    )
+                )
+            # A concurrent source deletion is not a Qdrant failure.  Its
+            # paired delete job (or the next source delete) owns collection.
+            if content is not None:
+                await replace_derived_chunks(
+                    tenant_id=job.tenant_id,
+                    source_id=job.source_id,
+                    content=str(content),
+                )
+    except CreditQdrantError as error:
+        async with factory() as session:
+            await _finish_qdrant_job(
+                session, job.id, state="failed", error=str(error)[:500]
+            )
+        return
+    async with factory() as session:
+        await _finish_qdrant_job(session, job.id, state="completed")
+
+
+async def _source_bytes(
+    session: AsyncSession, job: CreditObjectCopyJob
+) -> tuple[bytes, bytes, UUID | None] | None:
+    """Load source only for a worker; never to serve an application request."""
+
+    if job.source_kind == "media":
+        row = (
+            await session.execute(
+                select(MediaAsset.payload, MediaAsset.sha256, Tenant.builder_id)
+                .join(Tenant, Tenant.id == MediaAsset.tenant_id)
+                .where(
+                    MediaAsset.id == job.source_id,
+                    MediaAsset.tenant_id == job.tenant_id,
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return bytes(row.payload), bytes(row.sha256), row.builder_id
+    knowledge_row = (
+        await session.execute(
+            select(KnowledgeDocument.content, Tenant.builder_id)
+            .join(Tenant, Tenant.id == KnowledgeDocument.tenant_id)
+            .where(
+                KnowledgeDocument.id == job.source_id,
+                KnowledgeDocument.tenant_id == job.tenant_id,
+            )
+        )
+    ).one_or_none()
+    if knowledge_row is None:
+        return None
+    payload = str(knowledge_row.content).encode("utf-8")
+    return payload, hashlib.sha256(payload).digest(), knowledge_row.builder_id
+
+
+async def _copy_one(
+    factory: Callable[[], AsyncSession], job: CreditObjectCopyJob
+) -> None:
+    from src.storage.credit_object_store import ObjectCopyError, put_immutable_copy
+
+    async with factory() as session:
+        source = await _source_bytes(session, job)
+    if source is None:
+        async with factory() as session:
+            await _finish_copy_job(session, job.id, state="completed")
+        return
+    payload, digest, builder_id = source
+    try:
+        stored = await asyncio.to_thread(
+            put_immutable_copy,
+            tenant_id=job.tenant_id,
+            object_id=job.source_id,
+            payload=payload,
+            expected_sha256=digest,
+        )
+    except ObjectCopyError as error:
+        logger.warning(
+            "credit object copy failed",
+            alert="credit_object_copy",
+            error_type=type(error).__name__,
+        )
+        async with factory() as session:
+            await _finish_copy_job(
+                session, job.id, state="failed", error=str(error)[:500]
+            )
+        return
+    async with factory() as session:
+        existing = (
+            await session.execute(
+                select(CreditObjectCopy.id).where(
+                    CreditObjectCopy.source_kind == job.source_kind,
+                    CreditObjectCopy.source_id == job.source_id,
+                    CreditObjectCopy.content_sha256 == stored.content_sha256,
+                )
+            )
+        ).first()
+        if existing is None:
+            session.add(
+                CreditObjectCopy(
+                    source_kind=job.source_kind,
+                    source_id=job.source_id,
+                    tenant_id=job.tenant_id,
+                    builder_id=builder_id,
+                    object_key=stored.object_key,
+                    version_id=stored.version_id,
+                    etag=stored.etag,
+                    content_sha256=stored.content_sha256,
+                )
+            )
+        await _finish_copy_job(session, job.id, state="completed")
+
+
+async def _collect_one(
+    factory: Callable[[], AsyncSession], job: CreditObjectCopyJob
+) -> None:
+    from src.storage.credit_object_store import (
+        ObjectCopyError,
+        ObjectCopyHeld,
+        StoredCopy,
+        delete_exact_copy,
+    )
+
+    async with factory() as session:
+        copies = list(
+            (
+                await session.execute(
+                    select(CreditObjectCopy).where(
+                        CreditObjectCopy.source_kind == job.source_kind,
+                        CreditObjectCopy.source_id == job.source_id,
+                        CreditObjectCopy.state == "ready",
+                    )
+                )
+            ).scalars()
+        )
+    for copy in copies:
+        try:
+            await asyncio.to_thread(
+                delete_exact_copy,
+                copy=StoredCopy(
+                    copy.object_key, copy.version_id, copy.etag, copy.content_sha256
+                ),
+            )
+        except ObjectCopyHeld as error:
+            logger.warning(
+                "credit object copy collection held",
+                alert="credit_object_copy_held",
+                source_kind=copy.source_kind,
+            )
+            async with factory() as session:
+                await session.execute(
+                    update(CreditObjectCopy)
+                    .where(CreditObjectCopy.id == copy.id)
+                    .values(state="held")
+                )
+                await _finish_copy_job(
+                    session, job.id, state="held", error=str(error)[:500]
+                )
+            return
+        except ObjectCopyError as error:
+            async with factory() as session:
+                await _finish_copy_job(
+                    session, job.id, state="failed", error=str(error)[:500]
+                )
+            return
+        async with factory() as session:
+            await session.execute(
+                update(CreditObjectCopy)
+                .where(CreditObjectCopy.id == copy.id)
+                .values(state="deleted")
+            )
+            await session.commit()
+    async with factory() as session:
+        await _finish_copy_job(session, job.id, state="completed")
+
+
+async def run_credit_object_copy_once(
+    session_factory: Callable[[], AsyncSession] | None = None,
+) -> int:
+    """Claim a bounded batch using ``SKIP LOCKED`` and run no work when off."""
+
+    copy_enabled = object_copy_runtime_enabled()
+    qdrant_enabled = qdrant_runtime_enabled()
+    if not copy_enabled and not qdrant_enabled:
+        return 0
+    factory = session_factory or _session_factory()
+    async with factory() as session:
+        if copy_enabled:
+            await _enqueue_orphan_copy_collection(session)
+            jobs = await _claim_copy_jobs(session)
+        else:
+            jobs = []
+        qdrant_jobs = await _claim_qdrant_jobs(session) if qdrant_enabled else []
+    for job in jobs:
+        if job.operation == "copy":
+            await _copy_one(factory, job)
+        else:
+            await _collect_one(factory, job)
+    for qdrant_job in qdrant_jobs:
+        await _run_qdrant_job(factory, qdrant_job)
+    return len(jobs) + len(qdrant_jobs)
+
+
+async def run_credit_object_workers(
+    interval: float | None = None,
+    *,
+    session_factory: Callable[[], AsyncSession] | None = None,
+) -> None:
+    """Cancellable lifespan loop; it does not even claim rows while off."""
+
+    delay = float(
+        settings.credit_object_worker_interval_seconds if interval is None else interval
+    )
+    while True:
+        try:
+            await run_credit_object_copy_once(session_factory)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "credit object worker failed",
+                alert="credit_object_worker",
+                error_type=type(error).__name__,
+            )
+        await asyncio.sleep(delay)
+
+
+def start_credit_object_workers() -> asyncio.Task[None] | None:
+    """Start a dormant worker; the loop itself stays inert switch-off/staging."""
+
+    if settings.environment not in ("development", "test"):
+        return None
+    return asyncio.create_task(run_credit_object_workers(), name="credit-object-worker")
+
+
+async def stop_credit_object_workers(task: asyncio.Task[None] | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+# ---------------------------------------------------------------------------
 # The observational writer (switch on, before the enforcement).
 # ---------------------------------------------------------------------------
 
@@ -1077,12 +1641,20 @@ __all__ = [
     "WindowWork",
     "charge_egress",
     "charge_rag_reprocessing",
+    "enqueue_object_copy",
+    "enqueue_source_collection",
     "forget_enforcement_seen",
     "lock_tenant_for_reservation",
     "open_window_for_debit",
+    "object_copy_runtime_enabled",
+    "qdrant_runtime_enabled",
     "read_credit_mode",
     "readback",
     "record_observational_egress",
     "record_observational_upload",
     "reserve_upload",
+    "run_credit_object_copy_once",
+    "run_credit_object_workers",
+    "start_credit_object_workers",
+    "stop_credit_object_workers",
 ]

@@ -839,3 +839,92 @@ async def test_the_039_downgrade_gives_up_after_the_lock_timeout(
     )
     _assert_lock_timeout_in_the_preflight(code, output)
     assert await _catalog(baseline.cluster, at_039) == before
+
+
+# ---------------------------------------------------------------------------
+# Migration 040 (Group 4b): additional object copies and durable jobs.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_040_PATH = (
+    _ROOT / "alembic" / "versions" / "20261030_000002_040_credit_object_copies.py"
+)
+_DOWNGRADE_040_REFUSED = "downgrade of migration 040 refused (nothing was changed): "
+_TABLES_040 = (
+    "credit_object_copies",
+    "credit_object_copy_jobs",
+    "credit_qdrant_jobs",
+)
+_ROWS_040 = {
+    "credit_object_copies": (
+        "INSERT INTO credit_object_copies (id, source_kind, source_id, tenant_id, "
+        "object_key, version_id, etag, content_sha256) VALUES (gen_random_uuid(), "
+        "'media', gen_random_uuid(), gen_random_uuid(), 'tenants/a/objects/b/versions/"
+        + "a" * 64
+        + "', 'v1', 'etag', '"
+        + "a" * 64
+        + "')"
+    ),
+    "credit_object_copy_jobs": (
+        "INSERT INTO credit_object_copy_jobs (id, source_kind, source_id, tenant_id, operation) "
+        "VALUES (gen_random_uuid(), 'media', gen_random_uuid(), gen_random_uuid(), 'copy')"
+    ),
+    "credit_qdrant_jobs": (
+        "INSERT INTO credit_qdrant_jobs (id, source_kind, source_id, tenant_id, operation) "
+        "VALUES (gen_random_uuid(), 'knowledge', gen_random_uuid(), gen_random_uuid(), 'rebuild')"
+    ),
+}
+
+
+def _load_040() -> ModuleType:
+    import alembic as alembic_package
+
+    if not hasattr(alembic_package, "op"):
+        setattr(alembic_package, "op", SimpleNamespace())
+    spec = importlib.util.spec_from_file_location("migration_040", _MIGRATION_040_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_MIGRATION_040 = _load_040()
+
+
+@pytest.fixture
+async def at_040(baseline: _Baseline, baseline_039: _Baseline039) -> AsyncIterator[str]:
+    name = await baseline.cluster.clone(baseline_039.template_039)
+    await _migrate(baseline.cluster.url(name), "upgrade", "040")
+    try:
+        yield name
+    finally:
+        await baseline.cluster.drop(name)
+
+
+def test_040_declares_exactly_its_tables() -> None:
+    assert (_MIGRATION_040.revision, _MIGRATION_040.down_revision) == ("040", "039")
+    assert _MIGRATION_040.CREATED_TABLES == _TABLES_040
+    assert set(_ROWS_040) == set(_TABLES_040)
+
+
+@pytest.mark.parametrize("table", _TABLES_040)
+async def test_one_row_in_any_040_table_refuses_its_downgrade(
+    baseline: _Baseline, at_040: str, table: str
+) -> None:
+    await _execute(baseline.cluster, at_040, _PLANT, _ROWS_040[table])
+    before = await _catalog(baseline.cluster, at_040)
+    code, output = await _alembic(baseline.cluster.url(at_040), "downgrade", "039")
+    assert code != 0, output
+    assert _refusal(output, _DOWNGRADE_040_REFUSED) == (
+        f"{_DOWNGRADE_040_REFUSED}tables that have rows: {table}"
+    )
+    assert await _catalog(baseline.cluster, at_040) == before
+
+
+async def test_the_empty_040_round_trip_restores_039_exactly(
+    baseline: _Baseline, baseline_039: _Baseline039, at_040: str
+) -> None:
+    cluster = baseline.cluster
+    await _migrate(cluster.url(at_040), "downgrade", "039")
+    assert await _catalog(cluster, at_040) == baseline_039.catalog_039
+    await _migrate(cluster.url(at_040), "upgrade", "040")
+    assert (await _catalog(cluster, at_040))["alembic_version"] == [("040",)]

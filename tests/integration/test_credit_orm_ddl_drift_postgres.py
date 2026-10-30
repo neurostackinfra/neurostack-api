@@ -53,6 +53,10 @@ _EXPECTED_TABLES = {
     "credit_inventory_versions",
     "credit_allocations",
     "credit_egress_deliveries",
+    # Group 4b, migration 040: additional-copy registry and durable jobs.
+    "credit_object_copies",
+    "credit_object_copy_jobs",
+    "credit_qdrant_jobs",
 }
 
 
@@ -181,7 +185,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "039"
+    assert version == "040"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 
