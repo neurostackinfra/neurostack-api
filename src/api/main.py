@@ -71,6 +71,10 @@ from src.services.billing_fact_worker import (
     start_billing_fact_worker,
 )
 from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
+from src.services.credit_inventory import (
+    start_credit_object_workers,
+    stop_credit_object_workers,
+)
 from src.services.credit_metering import (
     start_credit_response_publisher,
     start_credit_retention_sweeper,
@@ -198,6 +202,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     credit_switch_refresher: asyncio.Task[None] | None = None
     credit_publisher: asyncio.Task[None] | None = None
     credit_sweeper: asyncio.Task[None] | None = None
+    credit_object_workers: asyncio.Task[None] | None = None
     webhook_refresher = _start_webhook_readiness_refresher()
     fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
@@ -212,6 +217,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # off (OD-3: the one exception to the dominance rule, and only to
         # ERASE expired payloads; it never sends).
         credit_sweeper = start_credit_retention_sweeper()
+        # Group 4b: external copies are additive and worker-owned.  The loop
+        # remains inert unless the effective switch and dev/test store config
+        # are both present; it is cancelled before the shared pool closes.
+        credit_object_workers = start_credit_object_workers()
         fact_worker = _start_billing_fact_worker()
         if settings.environment == "staging":
             redis_client = Redis.from_url(
@@ -230,6 +239,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # stays ``sending`` and is reclaimed after its lease.
         await stop_credit_response_publisher(credit_publisher)
         await stop_credit_retention_sweeper(credit_sweeper)
+        await stop_credit_object_workers(credit_object_workers)
         if webhook_refresher is not None:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):

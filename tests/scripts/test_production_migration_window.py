@@ -598,7 +598,7 @@ def test_runbook_migration_sections_record_036_and_037_as_applied() -> None:
     # The image smoke names the head of main, which is the tree's own head.
     flat = " ".join(raw.split())
     head = _alembic_head()
-    assert head == "039"
+    assert head == "040"
     assert flat.count("on `main` today") == flat.count(f"`{head}` on `main` today")
     assert flat.count(f"`{head}` on `main` today") == 2
 

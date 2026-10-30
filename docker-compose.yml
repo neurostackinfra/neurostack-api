@@ -145,6 +145,25 @@ services:
       - neurostack-network
     restart: unless-stopped
 
+  # Group 4b: development-only, versioned S3-compatible target for the
+  # additive credit copy. RustFS implements the S3 versioning/Object-Lock
+  # APIs used by the integration tests; the test harness creates its own
+  # Object-Lock bucket. API code remains inert without explicit settings.
+  object-store:
+    image: rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+    command: server /data
+    environment:
+      RUSTFS_ACCESS_KEY: credit-test
+      RUSTFS_SECRET_KEY: credit-test-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - object_store_data:/data
+    networks:
+      - neurostack-network
+    restart: unless-stopped
+
   # ============================================
   # Observability - Grafana
   # ============================================
@@ -329,6 +348,8 @@ volumes:
   redis_data:
     driver: local
   qdrant_data:
+    driver: local
+  object_store_data:
     driver: local
   grafana_data:
     driver: local

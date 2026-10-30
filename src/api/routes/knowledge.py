@@ -87,6 +87,7 @@ from src.api.schemas.knowledge import (
     SearchRequest,
     SearchResponse,
 )
+from src.config.logging import get_logger
 from src.models.knowledge import KnowledgeDocument
 from src.models.tenant import Tenant
 from src.repositories import KnowledgeDocumentRepository, get_db_session_dependency
@@ -104,10 +105,39 @@ from src.services.credit_metering import (
 from src.services.credit_switch import CreditSwitchRoute
 from src.services.knowledge_service import KnowledgeFileError, extract_documents
 
+logger = get_logger(__name__)
+
 
 def _no_store(response: Response) -> None:
     """Forbid browsers and shared caches from storing tenant knowledge data."""
     response.headers["Cache-Control"] = "no-store"
+
+
+async def _enqueue_credit_object_copies(
+    session: AsyncSession, *, tenant_id: UUID, documents: list[KnowledgeDocument]
+) -> None:
+    """Schedule only additional copies after authoritative commit.
+
+    A queue/database failure after the content commit is logged and swallowed:
+    vector/S3 availability must not rewrite the established knowledge API.
+    """
+
+    for document in documents:
+        try:
+            await credit_inventory.enqueue_object_copy(
+                session,
+                source_kind="knowledge",
+                source_id=document.id,
+                tenant_id=tenant_id,
+            )
+        except Exception as error:
+            logger.warning(
+                "credit object-copy enqueue failed",
+                alert="credit_object_copy",
+                error_type=type(error).__name__,
+            )
+            await session.rollback()
+            return
 
 
 def _validation_response_without_input(error: RequestValidationError) -> JSONResponse:
@@ -491,6 +521,9 @@ async def upload_document(
             object_ids=[document.id],
             upload_id=document.id,
         )
+    await _enqueue_credit_object_copies(
+        session, tenant_id=effective_tenant_id, documents=[document]
+    )
     return response
 
 
@@ -677,6 +710,9 @@ async def upload_document_files(
             object_ids=[document.id for document in documents],
             upload_id=upload_id,
         )
+    await _enqueue_credit_object_copies(
+        session, tenant_id=effective_tenant_id, documents=documents
+    )
     return response
 
 
@@ -992,6 +1028,20 @@ async def delete_document(
         raise _document_not_found(document_id)
 
     await session.commit()
+    # The external copy/vector cleanup runs after the authoritative deletion
+    # and is best effort; it must not turn an already committed 204 into a
+    # storage error.
+    try:
+        from src.services.credit_inventory import enqueue_source_collection
+
+        await enqueue_source_collection(
+            session,
+            source_kind="knowledge",
+            source_id=document_id,
+            tenant_id=effective_tenant_id,
+        )
+    except Exception:
+        await session.rollback()
     # TODO: Delete from vector database (Task 19.0). It must run only after the
     # commit above, never while the row lock taken by delete_by_id_and_tenant
     # is held (a slow external call would block every writer of this row) nor

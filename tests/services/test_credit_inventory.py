@@ -50,6 +50,7 @@ from src.models.credit_inventory import (
     CreditEgressDelivery,
     CreditInventoryVersion,
 )
+from src.models.credit_object_copy import CreditObjectCopyJob, CreditQdrantJob
 from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
@@ -1141,3 +1142,125 @@ def test_the_observational_writer_refuses_a_route_session_with_pending_writes(
             await session.close()
 
     assert run(client, scenario()) == "route_busy"
+
+
+def test_object_copy_worker_is_inert_without_the_effective_runtime(
+    client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switch-off/staging must not even construct a database session."""
+
+    def unavailable() -> Any:
+        raise AssertionError("an inert copy worker must not claim a job")
+
+    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: False)
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: False)
+
+    assert run(client, credit_inventory.run_credit_object_copy_once(unavailable)) == 0
+
+
+def test_object_copy_lifecycle_is_not_registered_outside_development_or_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(credit_inventory.settings, "environment", "staging")
+
+    assert credit_inventory.start_credit_object_workers() is None
+
+
+def test_object_copy_lifecycle_cancels_cleanly(
+    client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(credit_inventory.settings, "environment", "test")
+    monkeypatch.setattr(
+        credit_inventory.settings, "credit_object_worker_interval_seconds", 300
+    )
+    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: False)
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: False)
+
+    async def scenario() -> None:
+        task = credit_inventory.start_credit_object_workers()
+        assert task is not None and task.get_name() == "credit-object-worker"
+        await credit_inventory.stop_credit_object_workers(task)
+        assert task.cancelled()
+
+    run(client, scenario())
+
+
+def test_stale_object_copy_claim_is_recoverable_after_cancellation(
+    client: Any, clock: Clock
+) -> None:
+    async def scenario() -> None:
+        job_id = uuid4()
+        session = get_db_session()
+        try:
+            async with session.begin():
+                session.add(
+                    CreditObjectCopyJob(
+                        id=job_id,
+                        source_kind="media",
+                        source_id=uuid4(),
+                        tenant_id=uuid4(),
+                        operation="copy",
+                        state="running",
+                        claimed_at=clock.now
+                        - credit_inventory._OBJECT_JOB_LEASE
+                        - timedelta(seconds=1),
+                    )
+                )
+        finally:
+            await session.close()
+        session = get_db_session()
+        try:
+            claimed = await credit_inventory._claim_copy_jobs(session)
+            assert [job.id for job in claimed] == [job_id]
+            assert claimed[0].attempts == 1
+        finally:
+            await session.close()
+
+    run(client, scenario())
+
+
+def test_qdrant_rebuild_job_is_durable_and_derived_only(
+    client: Any, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.storage import credit_qdrant
+
+    rebuilt: list[tuple[UUID, UUID, str]] = []
+
+    async def replace(
+        *, tenant_id: UUID, source_id: UUID, content: str, **_kwargs: Any
+    ) -> int:
+        rebuilt.append((tenant_id, source_id, content))
+        return 1
+
+    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: False)
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: True)
+    monkeypatch.setattr(credit_qdrant, "replace_derived_chunks", replace)
+
+    async def scenario() -> None:
+        document = _document(world.tenant, 42)
+        await _store(document)
+        session = get_db_session()
+        try:
+            await credit_inventory.enqueue_object_copy(
+                session,
+                source_kind="knowledge",
+                source_id=document.id,
+                tenant_id=world.tenant,
+            )
+        finally:
+            await session.close()
+        assert await credit_inventory.run_credit_object_copy_once(get_db_session) == 1
+        assert rebuilt == [(world.tenant, document.id, document.content)]
+        session = get_db_session()
+        try:
+            state = await session.scalar(
+                select(CreditQdrantJob.state).where(
+                    CreditQdrantJob.source_id == document.id
+                )
+            )
+            assert state == "completed"
+        finally:
+            await session.close()
+
+    run(client, scenario())
