@@ -2273,3 +2273,1147 @@ async def test_a_phase1_lock_timeout_releases_the_lease_for_an_immediate_takeove
     [taken] = seen.claims
     assert taken.interaction_id == claim.interaction_id
     assert seen.effects == [(_trace(world, taken), "trace")]
+
+
+# ---------------------------------------------------------------------------
+# Group 3b-2: enforced Z-API/Meta webhooks, the Meta file handoff and the
+# response outbox on PostgreSQL (the races SQLite cannot show).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Webhook:
+    claims: list[Any]
+    effects: list[tuple[str, str]]
+    entries: dict[str, int]
+    outbox: list[tuple[str, str, Any, int]]
+    handoffs: list[tuple[UUID, Any]]
+    handoff_requests: int
+    links: list[Any]
+
+
+async def _webhook_rows(direct: AsyncEngine, tenant_id: UUID) -> _Webhook:
+    async def rows(connection: AsyncConnection, sql: str) -> list[Any]:
+        return list((await connection.execute(text(sql), {"t": tenant_id})).all())
+
+    async with direct.connect() as connection:
+        claims = await rows(
+            connection,
+            "SELECT id, source, mode, provider_message_id, interaction_id, "
+            "session_version, payload_sha256 FROM credit_ingress_claims "
+            "WHERE tenant_id = :t",
+        )
+        effects = await rows(
+            connection,
+            "SELECT effect_id, effect_kind FROM credit_effects WHERE tenant_id = :t "
+            "ORDER BY effect_id",
+        )
+        entries = await rows(
+            connection,
+            "SELECT e.entry_type, sum(e.amount_mc) FROM credit_ledger_entries e "
+            "JOIN credit_effects f ON f.builder_id = e.builder_id "
+            "AND f.effect_id = e.effect_id WHERE f.tenant_id = :t "
+            "GROUP BY e.entry_type",
+        )
+        outbox = await rows(
+            connection,
+            "SELECT effect_id, state, payload, attempts FROM credit_response_outbox "
+            "WHERE tenant_id = :t ORDER BY effect_id",
+        )
+        handoffs = await rows(
+            connection, "SELECT id, context FROM handoff_records WHERE tenant_id = :t"
+        )
+        requests = await rows(
+            connection,
+            "SELECT count(*) FROM events WHERE tenant_id = :t "
+            "AND event_type = 'handoff.request'",
+        )
+        links = await rows(
+            connection,
+            "SELECT metadata ->> 'credit_effect_id' FROM events WHERE tenant_id = :t "
+            "AND event_type = 'srm.decision'",
+        )
+    return _Webhook(
+        claims=claims,
+        effects=[(str(e), str(k)) for e, k in effects],
+        entries={str(kind): int(total) for kind, total in entries},
+        outbox=[(str(e), str(s), p, int(a)) for e, s, p, a in outbox],
+        handoffs=[(UUID(str(i)), c) for i, c in handoffs],
+        handoff_requests=int(requests[0][0]),
+        links=[link for (link,) in links],
+    )
+
+
+def _clinic_admin(tenant_id: UUID) -> dict[str, str]:
+    import jwt
+
+    from src.config.settings import settings
+
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": str(uuid4()),
+            "tenant_id": str(tenant_id),
+            "role": "clinic_admin",
+            "iat": now - timedelta(minutes=1),
+            "exp": now + timedelta(hours=1),
+        },
+        settings.secret_key,
+        algorithm="HS256",
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _wtrace(tenant_id: Any, claim: Any) -> str:
+    return f"trace:{tenant_id}:{claim.interaction_id}:decision:1"
+
+
+@pytest.fixture
+def redis_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redis is out: no echo/notice store, and the replay claim -- per-process
+    memory outside ``is_production`` (``ENVIRONMENT=staging`` in real
+    production) -- answers "first delivery" to every process.  Patched, so
+    the criterion does not depend on PR #112 (LOW-3)."""
+
+    from src.api.routes import webhook
+
+    monkeypatch.setattr(webhook, "_get_redis", lambda: None)
+    monkeypatch.setattr(webhook, "_claim_incoming_message", lambda *_args: True)
+
+
+async def _seed_patient(url: URL, tenant_id: str, phone: str) -> None:
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with AsyncSession(engine) as session, session.begin():
+            session.add(
+                Session(
+                    id=uuid4(),
+                    tenant_id=UUID(tenant_id),
+                    user_id=phone,
+                    channel="whatsapp",
+                    cognitive_state={},
+                    session_metadata={"phone": phone, "source": "webhook"},
+                )
+            )
+    finally:
+        await engine.dispose()
+
+
+def _sent_to(mock: Any, phone: str) -> list[str]:
+    return [call.args[3] for call in mock.await_args_list if call.args[2] == phone]
+
+
+@pytest.mark.parametrize("channel", ["zapi", "meta"])
+async def test_redis_down_two_sessions_charge_one_decision(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+    channel: str,
+) -> None:
+    """Redis down, ``ENVIRONMENT=staging``, the switch on, the enforcement
+    set: two route sessions receive the SAME provider message at once (both
+    pass the replay store) and meet at the PostgreSQL claim.  One decides
+    and replies, the other answers ``duplicate_message``: one trace, one
+    reply."""
+
+    from src.api.routes import webhook
+    from src.config.settings import settings
+
+    both = _Gate(parties=2)
+    inserted: list[Any] = []
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "insert_webhook_claim",
+        both,
+        calls=frozenset({1, 2}),
+        results=inserted,
+    )
+    phone = "5511900009001" if channel == "zapi" else "5511900009002"
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        monkeypatch.setattr(settings, "environment", "staging")
+        assert settings.is_production is False
+        tenant = world.zapi_tenant if channel == "zapi" else world.meta_tenant
+        await _seed_patient(enforced_pg.url, tenant, phone)
+        if channel == "zapi":
+            body = json.dumps(
+                {
+                    "instanceId": world.zapi_instance,
+                    "messageId": "pg-redis-down-1",
+                    "phone": phone,
+                    "fromMe": False,
+                    "text": {"message": "Olá, quero agendar"},
+                }
+            ).encode()
+            path, headers = f"/v1/webhook/zapi/{world.zapi_token}", {
+                "Content-Type": "application/json"
+            }
+            sender = webhook.send_text_message
+        else:
+            body, headers = _signed_meta(
+                world,
+                {
+                    "from": phone,
+                    "id": "wamid.pg-redis-down-1",
+                    "type": "text",
+                    "text": {"body": "Olá, quero agendar"},
+                },
+            )
+            path, sender = "/v1/webhook/meta", webhook.send_meta_cloud_text
+        async with asyncio.timeout(_TURN_SECONDS):
+            tasks = [
+                asyncio.create_task(client.post(path, content=body, headers=headers))
+                for _ in range(2)
+            ]
+            await both.reached.wait()
+            both.opened.set()
+            answers = await asyncio.gather(*tasks)
+        replies = _sent_to(sender, phone)
+    assert [a.status_code for a in answers] == [200, 200], [a.text for a in answers]
+    assert sorted(json.dumps(a.json(), sort_keys=True) for a in answers) == sorted(
+        [
+            json.dumps({"ok": True, "replied": True}, sort_keys=True),
+            json.dumps({"ok": True, "skipped": "duplicate_message"}, sort_keys=True),
+        ]
+    )
+    assert sum(row is not None for row in inserted) == 1  # PostgreSQL decided
+    seen = await _webhook_rows(enforced_direct, UUID(tenant))
+    [claim] = seen.claims
+    assert (claim.source, claim.mode) == (channel, "enforced")
+    assert seen.effects == [(_wtrace(tenant, claim), "trace")]
+    assert seen.entries == {"debt": 1_000}  # charged exactly once
+    assert [(e, s) for e, s, _p, _a in seen.outbox] == [
+        (_wtrace(tenant, claim), "delivered")
+    ]
+    assert len(replies) == 1  # one reply, never two
+
+
+async def test_an_enforced_zapi_decision_charges_once_and_delivers_inline_on_postgres(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claim, phase 1, the LLM outside every transaction, then bundle +
+    trace + ``pending`` reply in one commit; the inline send claims the row,
+    sends once and marks it ``delivered`` with phone and text erased."""
+
+    from src.api.routes import webhook
+    from src.services.event_service import EventService
+
+    open_transactions: list[int] = []
+    generate = EventService.generate_response
+
+    async def outside(self: Any, *args: Any, **kwargs: Any) -> Any:
+        async with enforced_direct.connect() as connection:
+            open_transactions.append(
+                int(
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT count(*) FROM pg_stat_activity WHERE datname "
+                                "= current_database() AND pid <> pg_backend_pid() "
+                                "AND state LIKE 'idle in transaction%'"
+                            )
+                        )
+                    ).scalar_one()
+                )
+            )
+        return await generate(self, *args, **kwargs)
+
+    monkeypatch.setattr(EventService, "generate_response", outside)
+    # M7 (the pinned deviation): no ``lock_timeout`` in the webhook phase 1.
+    phase1_lock_timeouts: list[str] = []
+    marker = CreditRepository.mark_webhook_claim_phase1
+
+    async def spy_marker(self: CreditRepository, *args: Any, **kwargs: Any) -> Any:
+        shown = await self.session.execute(text("SHOW lock_timeout"))
+        phase1_lock_timeouts.append(str(shown.scalar_one()))
+        return await marker(self, *args, **kwargs)
+
+    monkeypatch.setattr(CreditRepository, "mark_webhook_claim_phase1", spy_marker)
+    defaults = await _defaults(enforced_direct)
+    states: list[str] = []
+    original_send = webhook._send_reply_with_optional_tts
+
+    async def observed_send(**kwargs: Any) -> Any:
+        async with enforced_direct.connect() as connection:
+            states.extend(
+                str(state)
+                for (state,) in await connection.execute(
+                    text(
+                        "SELECT state FROM credit_response_outbox WHERE "
+                        "payload ->> 'phone' = :p"
+                    ),
+                    {"p": kwargs["phone"]},
+                )
+            )
+        return await original_send(**kwargs)
+
+    monkeypatch.setattr(webhook, "_send_reply_with_optional_tts", observed_send)
+    phone = "5511900009101"
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        async with asyncio.timeout(_TURN_SECONDS):
+            answer = await client.post(
+                f"/v1/webhook/zapi/{world.zapi_token}",
+                json={
+                    "instanceId": world.zapi_instance,
+                    "messageId": "pg-zapi-enforced-1",
+                    "phone": phone,
+                    "fromMe": False,
+                    "text": {"message": "Olá, quero agendar"},
+                },
+            )
+        replies = _sent_to(webhook.send_text_message, phone)
+    assert answer.json() == {"ok": True, "replied": True}, answer.text
+    assert phase1_lock_timeouts == [defaults[0]]  # the server default, not 15s
+    assert open_transactions == [0]  # the LLM ran outside every transaction
+    assert states == ["sending"]  # the row was claimed, committed, before the send
+    assert replies == ["Olá! Posso ajudar com o seu agendamento."]
+    seen = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+    [claim] = seen.claims
+    assert claim.session_version is not None
+    effect = _wtrace(world.zapi_tenant, claim)
+    assert seen.effects == [(effect, "trace")] and seen.entries == {"debt": 1_000}
+    assert seen.links == [effect]
+    [(outbox_effect, state, payload, attempts)] = seen.outbox
+    assert (outbox_effect, state, attempts) == (effect, "delivered", 0)
+    assert "phone" not in payload and "text" not in payload
+    assert not [key for key in payload if "token" in key or "secret" in key]
+
+
+async def test_an_enforced_meta_file_handoff_commits_atomically_on_postgres(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """O2/MEDIUM-5: claim, handoff (record and ``handoff.request``), debit
+    and the ``credit_effect_id`` link commit together; the creation webhook
+    leaves only after that commit; a redelivery (Redis down) creates no
+    second handoff nor debit; a fault after the handoff insert leaves
+    nothing; ``GET /handoffs/{id}`` never exposes the link."""
+
+    from src.services.handoff_service import HandoffService
+
+    committed_at_dispatch: list[tuple[int, int]] = []
+    tenants: list[UUID] = []
+
+    async def announce(_self: Any, handoff: Any, *_args: Any) -> tuple[bool, None]:
+        # Seen from another connection: the record AND its charge committed.
+        async with enforced_direct.connect() as connection:
+            committed_at_dispatch.append(
+                tuple(  # type: ignore[arg-type]
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT (SELECT count(*) FROM handoff_records WHERE "
+                                "id = :h AND context ? 'credit_effect_id'), (SELECT "
+                                "count(*) FROM credit_effects WHERE tenant_id = :t)"
+                            ),
+                            {"h": handoff.id, "t": tenants[0]},
+                        )
+                    ).one()
+                )
+            )
+        return False, None
+
+    monkeypatch.setattr(HandoffService, "_dispatch_creation_webhook", announce)
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"url": "https://media.invalid/long.ogg", "file_size": 50_000_000}
+
+    monkeypatch.setattr("src.api.routes.webhook.resolve_meta_media", resolve)
+    phone = "5511900009201"
+    document = {
+        "from": phone,
+        "id": "wamid.pg-document",
+        "type": "document",
+        "document": {"id": "pg-doc", "mime_type": "application/pdf"},
+    }
+    forward = {
+        "from": phone,
+        "id": "wamid.pg-forward",
+        "type": "text",
+        "text": {"body": "Pode encaminhar para a equipe"},
+    }
+    audio = {
+        "from": phone,
+        "id": "wamid.pg-long-audio",
+        "type": "audio",
+        "audio": {"id": "pg-media", "mime_type": "audio/ogg"},
+    }
+    broken = {**audio, "id": "wamid.pg-broken"}
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        tenants.append(UUID(world.meta_tenant))
+        answers = []
+        async with asyncio.timeout(_TURN_SECONDS):
+            for message in (document, forward, audio, forward, audio):
+                raw, headers = _signed_meta(world, message)
+                answers.append(
+                    await client.post("/v1/webhook/meta", content=raw, headers=headers)
+                )
+            before_fault = await _webhook_rows(enforced_direct, tenants[0])
+
+            async def fault(_self: Any, **_kwargs: Any) -> bool:
+                raise RuntimeError("injected after the handoff insert")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(CreditRepository, "link_handoff_credit_effect", fault)
+                raw, headers = _signed_meta(world, broken)
+                with pytest.raises(RuntimeError, match="after the handoff insert"):
+                    await client.post("/v1/webhook/meta", content=raw, headers=headers)
+            seen = await _webhook_rows(enforced_direct, tenants[0])
+            details = [
+                await client.get(
+                    f"/v1/handoffs/{handoff_id}", headers=_clinic_admin(tenants[0])
+                )
+                for handoff_id, _context in seen.handoffs
+            ]
+    assert [a.json() for a in answers] == [
+        {"ok": True, "replied": True, "action": "file_ack"},
+        {"ok": True, "replied": True, "action": "file_handoff"},
+        {"ok": True, "skipped": "audio_too_long"},
+        {"ok": True, "skipped": "duplicate_message"},
+        {"ok": True, "skipped": "duplicate_message"},
+    ]
+    assert seen == before_fault  # the fault left nothing durable
+    claims = {c.provider_message_id: c for c in seen.claims}
+    assert set(claims) == {"wamid.pg-forward", "wamid.pg-long-audio"}
+    assert all(
+        c.mode == "enforced" and c.session_version is not None for c in claims.values()
+    )
+    expected = sorted(_wtrace(tenants[0], c) for c in claims.values())
+    assert sorted(e for e, _ in seen.effects) == expected
+    assert {k for _, k in seen.effects} == {"trace"}
+    assert seen.entries == {"debt": 2_000}  # one trace per file handoff
+    assert sorted(c["credit_effect_id"] for _, c in seen.handoffs) == expected
+    assert all(c.get("key_info") for _, c in seen.handoffs)  # merged, not replaced
+    assert seen.handoff_requests == 2
+    assert seen.outbox == []  # the patient's text is sent as today
+    assert committed_at_dispatch == [(1, 1), (1, 2)]
+    assert [d.status_code for d in details] == [200, 200]
+    assert all("credit_effect_id" not in d.text for d in details)
+
+
+# -- the response outbox: publishers, the inline claim and the sweep -------
+
+
+async def _outbox_row(
+    direct: AsyncEngine,
+    seeded: _Tenant,
+    *,
+    state: str = "pending",
+    age_seconds: float = 3600,
+    payload: dict[str, Any] | None = None,
+) -> UUID:
+    """A stored reply as ``run_webhook_final`` writes it, for ``seeded``'s
+    session (its OD-2 snapshot: not paused); ``marker`` = the row id."""
+
+    row_id = uuid4()
+    async with direct.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO credit_response_outbox (id, tenant_id, effect_id, "
+                "payload, state, attempts, created_at) VALUES (:id, :t, :e, "
+                "CAST(:p AS jsonb), :s, 0, clock_timestamp() - make_interval("
+                "secs => :age))"
+            ),
+            {
+                "id": row_id,
+                "t": seeded.tenant_id,
+                "e": f"trace:{seeded.tenant_id}:{uuid4()}:decision:1",
+                "p": json.dumps(
+                    {
+                        "kind": "webhook_reply.v1",
+                        "channel": "zapi",
+                        "tenant_id": str(seeded.tenant_id),
+                        "session_id": str(seeded.session_id),
+                        "phone": "5511900009301",
+                        "text": "Olá!",
+                        "decided_at": datetime.now(timezone.utc).isoformat(),
+                        "session_pause": [False, None],
+                        "marker": str(row_id),
+                    }
+                    if payload is None
+                    else payload
+                ),
+                "s": state,
+                "age": age_seconds,
+            },
+        )
+    return row_id
+
+
+async def _outbox_state(direct: AsyncEngine, row_id: UUID) -> tuple[str, Any, int]:
+    async with direct.connect() as connection:
+        state, payload, attempts = (
+            await connection.execute(
+                text(
+                    "SELECT state, payload, attempts FROM credit_response_outbox "
+                    "WHERE id = :id"
+                ),
+                {"id": row_id},
+            )
+        ).one()
+    return str(state), payload, int(attempts)
+
+
+class _Recorded:
+    """A ``ReplySender`` that records its sends (by ``marker``)."""
+
+    def __init__(self, delay: float = 0) -> None:
+        self.sent: list[str] = []
+        self.delay = delay
+
+    async def prepare(self, payload: Any, db: AsyncSession) -> Any:
+        return payload
+
+    async def send(self, prepared: Any) -> Any:
+        self.sent.append(prepared["marker"])
+        if self.delay:
+            await asyncio.sleep(self.delay)  # the provider call overlaps
+        return {"messageId": "pg"}
+
+    async def record(self, prepared: Any, sent: Any, db: AsyncSession) -> None:
+        return None
+
+
+@pytest.fixture
+async def enforced_pool(enforced_pg: _PG) -> AsyncIterator[_Pool]:
+    engine = create_async_engine(
+        enforced_pg.url, pool_size=5, max_overflow=0, pool_timeout=30
+    )
+    try:
+        yield _Pool(
+            engine=engine,
+            sessions=async_sessionmaker(
+                engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+
+async def test_two_publishers_never_send_the_same_row(
+    enforced_direct: AsyncEngine,
+    enforced_pool: _Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``FOR UPDATE SKIP LOCKED`` and the ``sending`` claim committed before
+    the provider call: two ECS tasks never send one row at once."""
+
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: True)
+    seeded = await _tenant(enforced_direct)
+    rows = [await _outbox_row(enforced_direct, seeded) for _ in range(6)]
+    sender = _Recorded(delay=0.05)
+    publishers = [
+        credit_metering.CreditResponsePublisher(
+            sender, session_factory=enforced_pool.sessions
+        )
+        for _ in range(2)
+    ]
+    async with asyncio.timeout(_TURN_SECONDS):
+        ticks = await asyncio.gather(*(p.run_once() for p in publishers))
+    assert all(tick is not None and tick.enforced for tick in ticks)
+    assert len(sender.sent) == len(set(sender.sent))  # no row sent twice
+    mine = sorted(s for s in sender.sent if UUID(s) in rows)
+    assert mine == sorted(map(str, rows))
+    for row in rows:
+        state, payload, attempts = await _outbox_state(enforced_direct, row)
+        assert (state, attempts) == ("delivered", 1) and "phone" not in payload
+
+
+async def test_the_inline_claim_waits_for_the_publishers_claim_and_loses(
+    enforced_direct: AsyncEngine,
+    enforced_pool: _Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LOW-2: the publisher holds the row ``FOR UPDATE`` (its claim not yet
+    committed); the inline ``UPDATE ... WHERE state = 'pending' RETURNING``
+    waits, then sees ``sending`` and returns nothing: no inline send.  A
+    second publisher skips the locked row without waiting."""
+
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: True)
+    seeded = await _tenant(enforced_direct)
+    row = await _outbox_row(enforced_direct, seeded)
+    held = _Gate()
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "claim_outbox_for_publish",
+        held,
+        calls=frozenset({1}),
+        after=True,
+    )
+    published = _Recorded()
+    inline_sender = _Recorded()
+    first = credit_metering.CreditResponsePublisher(
+        published, session_factory=enforced_pool.sessions
+    )
+    second = credit_metering.CreditResponsePublisher(
+        published, session_factory=enforced_pool.sessions
+    )
+    async with asyncio.timeout(_TURN_SECONDS):
+        holder = asyncio.create_task(first.run_once())
+        await held.reached.wait()  # the row is locked, its claim uncommitted
+        skipped = await second.run_once()  # SKIP LOCKED: never waits
+        assert skipped is not None and str(row) not in published.sent
+        inline = asyncio.create_task(
+            credit_metering.deliver_reply_inline(
+                row, sender=inline_sender, session_factory=enforced_pool.sessions
+            )
+        )
+        await _until_lock_waiters(
+            enforced_direct, 1, query="%UPDATE credit_response_outbox%"
+        )
+        held.opened.set()
+        delivery = await inline
+        tick = await holder
+    assert delivery.outcome == "not_claimed" and inline_sender.sent == []
+    assert tick is not None and "delivered" in tick.outcomes
+    assert published.sent.count(str(row)) == 1
+    assert (await _outbox_state(enforced_direct, row))[0] == "delivered"
+
+
+async def test_the_retention_sweep_on_postgres(
+    enforced_direct: AsyncEngine,
+    enforced_pool: _Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OD-3: with the switch OFF and the config off, every row that is not
+    ``sending`` and older than the retention gets ``payload = '{}'``
+    (``delivered``, ``failed``, abandoned ``pending``, a ``POST /v1/events``
+    answer); ``sending`` and young rows keep theirs; an emptied row is never
+    rewritten; a row another transaction holds is skipped without waiting;
+    nothing is claimed."""
+
+    from src.config.settings import settings
+
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: False)
+    monkeypatch.setattr(settings, "credit_hot_path_enabled", False)
+    seeded = await _tenant(enforced_direct)
+    old = settings.credit_replay_retention_hours * 3600 + 60
+    events_answer = {"event_id": str(uuid4()), "prompt": {"suggested_response": "x"}}
+    rows = {
+        "delivered": await _outbox_row(
+            enforced_direct, seeded, state="delivered", age_seconds=old
+        ),
+        "failed": await _outbox_row(
+            enforced_direct, seeded, state="failed", age_seconds=old
+        ),
+        "pending": await _outbox_row(
+            enforced_direct, seeded, state="pending", age_seconds=old
+        ),
+        "events": await _outbox_row(
+            enforced_direct,
+            seeded,
+            state="delivered",
+            age_seconds=old,
+            payload=events_answer,
+        ),
+        "sending": await _outbox_row(
+            enforced_direct, seeded, state="sending", age_seconds=old
+        ),
+        "young": await _outbox_row(
+            enforced_direct, seeded, state="delivered", age_seconds=60
+        ),
+        "empty": await _outbox_row(
+            enforced_direct, seeded, state="delivered", age_seconds=old, payload={}
+        ),
+        "locked": await _outbox_row(
+            enforced_direct, seeded, state="failed", age_seconds=old
+        ),
+    }
+
+    async def xmin(row: UUID) -> str:
+        async with enforced_direct.connect() as connection:
+            return str(
+                (
+                    await connection.execute(
+                        text("SELECT xmin FROM credit_response_outbox WHERE id = :id"),
+                        {"id": row},
+                    )
+                ).scalar_one()
+            )
+
+    empty_before = await xmin(rows["empty"])
+    async with enforced_direct.connect() as holder:
+        transaction = await holder.begin()
+        await holder.execute(
+            text("SELECT 1 FROM credit_response_outbox WHERE id = :id FOR UPDATE"),
+            {"id": rows["locked"]},
+        )
+        async with asyncio.timeout(_TURN_SECONDS):
+            swept = await credit_metering.sweep_expired_replies(enforced_pool.sessions)
+        await transaction.rollback()
+    assert swept >= 4  # other tests' rows may be swept too
+    for name in ("delivered", "failed", "pending", "events"):
+        assert (await _outbox_state(enforced_direct, rows[name]))[1] == {}, name
+    assert (await _outbox_state(enforced_direct, rows["pending"]))[0] == "pending"
+    for name in ("sending", "young", "locked"):
+        assert (await _outbox_state(enforced_direct, rows[name]))[1]["phone"], name
+    assert await xmin(rows["empty"]) == empty_before  # never rewritten
+
+
+async def test_the_sweep_skips_a_database_without_the_outbox(
+    pg: _PG, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Credit code on a ``037`` database works like main: the always-on
+    sweep finds no outbox and touches nothing (no error, no alert)."""
+
+    name = await pg.cluster.fresh()
+    url = pg.cluster.url(name)
+    await _migrate(url, "upgrade", "037")
+    engine = create_async_engine(url, poolclass=NullPool)
+    recorder = _Recorder()
+    recorder.error = recorder.warning  # type: ignore[attr-defined]
+    monkeypatch.setattr(credit_metering, "logger", recorder)
+    try:
+        sessions = async_sessionmaker(engine, class_=AsyncSession)
+        assert await credit_metering.sweep_expired_replies(sessions) == 0
+    finally:
+        await engine.dispose()
+    assert recorder.warnings == []
+
+
+# -- the reviewer's probes (3b-2 review), ported -----------------------------
+
+
+def _no_app_publisher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The app's own publisher stays out of the races these tests drive."""
+
+    import src.api.main as main_module
+
+    monkeypatch.setattr(
+        main_module, "start_credit_response_publisher", lambda *_a, **_k: None
+    )
+
+
+async def _patient_session(direct: AsyncEngine, tenant: str, phone: str) -> UUID:
+    async with direct.connect() as connection:
+        return UUID(
+            str(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT id FROM sessions WHERE tenant_id = :t AND "
+                            "user_id = :p"
+                        ),
+                        {"t": UUID(tenant), "p": phone},
+                    )
+                ).scalar_one()
+            )
+        )
+
+
+def _zapi_message(world: Any, message_id: str, phone: str, text_: str) -> Any:
+    return {
+        "instanceId": world.zapi_instance,
+        "messageId": message_id,
+        "phone": phone,
+        "fromMe": False,
+        "text": {"message": text_},
+    }
+
+
+async def test_a_session_lock_during_the_bookkeeping_never_multiplies_a_reply(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """Review probe A (OD-5): the provider ACCEPTED the reply, then the echo
+    bookkeeping waits on the patient's session row (another message's phase
+    1).  Only the provider call is under the send timeout: the reply is
+    delivered once, the bookkeeping gives up at its own bound (its
+    connection invalidated, never pooled) and the publisher has nothing to
+    resend."""
+
+    from src.api.routes import webhook
+    from src.repositories.database import get_db_session_factory
+
+    _no_app_publisher(monkeypatch)
+    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
+    monkeypatch.setattr(credit_metering, "SENDING_LEASE_SECONDS", 1)
+    phone = "5511900019001"
+    sends: list[str] = []
+    ready, release = asyncio.Event(), asyncio.Event()
+    holder: asyncio.Task[None] | None = None
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _seed_patient(enforced_pg.url, world.zapi_tenant, phone)
+        sid = await _patient_session(enforced_direct, world.zapi_tenant, phone)
+
+        async def hold() -> None:
+            async with enforced_direct.connect() as connection:
+                transaction = await connection.begin()
+                await connection.execute(
+                    text("SELECT 1 FROM sessions WHERE id = :s FOR UPDATE"), {"s": sid}
+                )
+                ready.set()
+                await release.wait()
+                await transaction.rollback()
+
+        async def provider(
+            _inst: str, _tok: str, to: str, body: str, *, client_token: str = ""
+        ) -> dict[str, Any]:
+            nonlocal holder
+            sends.append(body)
+            if holder is None:
+                holder = asyncio.create_task(hold())
+                await ready.wait()
+            return {"messageId": f"pg-accepted-{len(sends)}"}
+
+        with monkeypatch.context() as patch:
+            patch.setattr(webhook, "send_text_message", provider)
+            async with asyncio.timeout(_TURN_SECONDS):
+                answer = await client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi_message(world, "pg-bookkeeping-1", phone, "Olá"),
+                )
+                await asyncio.sleep(1.2)  # past the patched sending lease
+                tick = await credit_metering.CreditResponsePublisher(
+                    webhook.CREDIT_REPLY_SENDER,
+                    session_factory=get_db_session_factory(),
+                ).run_once()
+                release.set()
+                if holder is not None:
+                    await holder
+                # The pool is healthy afterwards: the next decision is served.
+                after = await client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi_message(world, "pg-bookkeeping-2", phone, "Mais uma"),
+                )
+    assert answer.json() == {"ok": True, "replied": True}
+    assert after.json() == {"ok": True, "replied": True}
+    assert tick is not None  # (rows of other tests may be in this database)
+    assert len(sends) == 2  # one per decision, never a resend
+    seen = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+    assert seen.entries == {"debt": 2_000}
+    assert [s for _e, s, _p, _a in seen.outbox] == ["delivered", "delivered"]
+
+
+async def test_a_failed_inline_send_is_never_resent_even_after_a_takeover(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """Review probe B (OD-1): the inline send fails (a provider 5xx); the
+    clinic then takes over.  Like main the reply is lost -- ``failed`` at
+    once, PII erased -- and the publisher sends nothing, ever."""
+
+    from src.api.routes import webhook
+    from src.repositories.database import get_db_session_factory
+
+    _no_app_publisher(monkeypatch)
+    monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
+    phone = "5511900019002"
+    calls: list[str] = []
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _seed_patient(enforced_pg.url, world.zapi_tenant, phone)
+
+        async def provider(
+            _inst: str, _tok: str, to: str, body: str, *, client_token: str = ""
+        ) -> dict[str, Any]:
+            calls.append(body)
+            raise RuntimeError("provider 502")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(webhook, "send_text_message", provider)
+            async with asyncio.timeout(_TURN_SECONDS):
+                first = await client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi_message(world, "pg-takeover-1", phone, "Olá"),
+                )
+                async with enforced_direct.begin() as connection:
+                    await connection.execute(
+                        text(
+                            "UPDATE sessions SET is_paused = true, paused_until = "
+                            "clock_timestamp() + interval '1 hour' WHERE tenant_id = "
+                            ":t AND user_id = :p"
+                        ),
+                        {"t": UUID(world.zapi_tenant), "p": phone},
+                    )
+                tick = await credit_metering.CreditResponsePublisher(
+                    webhook.CREDIT_REPLY_SENDER,
+                    session_factory=get_db_session_factory(),
+                ).run_once()
+    assert first.json()["reason"] == "send_failed"
+    assert tick is not None
+    assert len(calls) == 1  # never resent
+    seen = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+    [(_effect, state, payload, _attempts)] = seen.outbox
+    assert state == "failed" and "phone" not in payload and "text" not in payload
+    assert seen.entries == {"debt": 1_000}  # OD-4: the decision stays charged
+
+
+async def _crash_after_the_final_commit(
+    client: Any, world: Any, message_id: str, phone: str
+) -> None:
+    """The inline send never runs: the process dies right after the final
+    commit (the row stays ``pending`` for the publisher)."""
+
+    async def crashed(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("the process died after the final commit")
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(credit_metering, "deliver_reply_inline", crashed)
+    try:
+        with pytest.raises(RuntimeError, match="the process died"):
+            await client.post(
+                f"/v1/webhook/zapi/{world.zapi_token}",
+                json=_zapi_message(world, message_id, phone, "Olá"),
+            )
+    finally:
+        patch.undo()
+
+
+async def test_a_recovered_reply_is_refused_after_a_takeover(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """OD-2 on the publisher: the inline send crashed; before the recovery
+    the clinic took over -- the publisher re-reads the session and marks
+    the row ``failed`` without sending."""
+
+    from src.api.routes import webhook
+    from src.repositories.database import get_db_session_factory
+
+    _no_app_publisher(monkeypatch)
+    monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
+    phone = "5511900019006"
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _seed_patient(enforced_pg.url, world.zapi_tenant, phone)
+        async with asyncio.timeout(_TURN_SECONDS):
+            await _crash_after_the_final_commit(client, world, "pg-recover-1", phone)
+            async with enforced_direct.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE sessions SET is_paused = true, paused_until = "
+                        "clock_timestamp() + interval '1 hour' WHERE tenant_id = "
+                        ":t AND user_id = :p"
+                    ),
+                    {"t": UUID(world.zapi_tenant), "p": phone},
+                )
+            tick = await credit_metering.CreditResponsePublisher(
+                webhook.CREDIT_REPLY_SENDER, session_factory=get_db_session_factory()
+            ).run_once()
+        replies = _sent_to(webhook.send_text_message, phone)
+    assert tick is not None and "failed" in tick.outcomes
+    assert replies == []
+    seen = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+    [(_effect, state, payload, _attempts)] = seen.outbox
+    assert state == "failed" and "phone" not in payload
+
+
+async def test_the_publisher_holds_no_lock_nor_transaction_across_the_provider(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """Review probe C: through the real send adapter, while the recovered
+    reply's provider call is in flight, its row is ``sending`` (committed),
+    neither it nor the patient's session row is locked, and no backend is
+    idle in transaction."""
+
+    from src.api.routes import webhook
+    from src.repositories.database import get_db_session_factory
+
+    _no_app_publisher(monkeypatch)
+    monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
+    phone = "5511900019003"
+    entered, leave = asyncio.Event(), asyncio.Event()
+    probes: dict[str, Any] = {}
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _seed_patient(enforced_pg.url, world.zapi_tenant, phone)
+        sid = await _patient_session(enforced_direct, world.zapi_tenant, phone)
+
+        async def provider(
+            _inst: str, _tok: str, to: str, body: str, *, client_token: str = ""
+        ) -> dict[str, Any]:
+            entered.set()
+            await leave.wait()
+            return {"messageId": "pg-slow"}
+
+        async with asyncio.timeout(_TURN_SECONDS):
+            await _crash_after_the_final_commit(client, world, "pg-nolock-1", phone)
+            [row] = (
+                await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+            ).outbox
+            with monkeypatch.context() as patch:
+                patch.setattr(webhook, "send_text_message", provider)
+                tick_task = asyncio.create_task(
+                    credit_metering.CreditResponsePublisher(
+                        webhook.CREDIT_REPLY_SENDER,
+                        session_factory=get_db_session_factory(),
+                    ).run_once()
+                )
+                await entered.wait()
+                async with enforced_direct.connect() as connection:
+                    transaction = await connection.begin()
+                    probes["row"] = (
+                        await connection.execute(
+                            text(
+                                "SELECT state FROM credit_response_outbox WHERE "
+                                "effect_id = :e FOR UPDATE NOWAIT"
+                            ),
+                            {"e": row[0]},
+                        )
+                    ).scalar_one()
+                    probes["session"] = (
+                        await connection.execute(
+                            text(
+                                "SELECT 1 FROM sessions WHERE id = :s FOR UPDATE NOWAIT"
+                            ),
+                            {"s": sid},
+                        )
+                    ).scalar_one()
+                    await transaction.rollback()
+                    probes["idle_in_tx"] = (
+                        await connection.execute(
+                            text(
+                                "SELECT count(*) FROM pg_stat_activity WHERE datname "
+                                "= current_database() AND pid <> pg_backend_pid() AND "
+                                "state LIKE 'idle in transaction%'"
+                            )
+                        )
+                    ).scalar_one()
+                leave.set()
+                tick = await tick_task
+    assert probes == {"row": "sending", "session": 1, "idle_in_tx": 0}
+    assert tick is not None and "delivered" in tick.outcomes
+    after = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+    assert [state for _e, state, _p, _a in after.outbox] == ["delivered"]
+
+
+async def test_concurrent_file_handoff_redeliveries_hand_off_once(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """Review probe D: two route sessions run the forward-on-request file
+    handoff of the SAME Meta message at once (Redis down): one handoff, one
+    trace, one confirmation, one ``duplicate_message``."""
+
+    from src.api.routes import webhook
+
+    _no_app_publisher(monkeypatch)
+    phone = "5511900019004"
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        async with asyncio.timeout(_TURN_SECONDS):
+            raw, headers = _signed_meta(
+                world,
+                {
+                    "from": phone,
+                    "id": "wamid.pg-concurrent-doc",
+                    "type": "document",
+                    "document": {"id": "pg-doc", "mime_type": "application/pdf"},
+                },
+            )
+            ack = await client.post("/v1/webhook/meta", content=raw, headers=headers)
+            raw, headers = _signed_meta(
+                world,
+                {
+                    "from": phone,
+                    "id": "wamid.pg-concurrent-forward",
+                    "type": "text",
+                    "text": {"body": "Pode encaminhar para a equipe"},
+                },
+            )
+            answers = await asyncio.gather(
+                *(
+                    client.post("/v1/webhook/meta", content=raw, headers=headers)
+                    for _ in range(2)
+                )
+            )
+        confirmations = [
+            text_
+            for text_ in _sent_to(webhook.send_meta_cloud_text, phone)
+            if text_ in (webhook._FILE_FORWARDED_MSG_PT, webhook._FILE_FORWARDED_MSG_EN)
+        ]
+    assert ack.json()["action"] == "file_ack"
+    assert sorted(json.dumps(a.json(), sort_keys=True) for a in answers) == sorted(
+        [
+            json.dumps(
+                {"ok": True, "replied": True, "action": "file_handoff"}, sort_keys=True
+            ),
+            json.dumps({"ok": True, "skipped": "duplicate_message"}, sort_keys=True),
+        ]
+    )
+    seen = await _webhook_rows(enforced_direct, UUID(world.meta_tenant))
+    assert len(seen.handoffs) == 1 and seen.handoff_requests == 1
+    assert seen.entries == {"debt": 1_000}
+    assert len(confirmations) == 1
+
+
+async def test_a_clinic_delete_during_the_webhook_final_transaction(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """Review probe E: ``DELETE`` of the tenant while the webhook final
+    transaction holds the tenant ``FOR SHARE`` (paused at its fence): no
+    deadlock; the delete waits for the commit and then removes everything
+    (``send_queued``: the reply row went with the tenant)."""
+
+    _no_app_publisher(monkeypatch)
+    gate = _Gate()
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "hold_webhook_claim_final_fence",
+        gate,
+        calls=frozenset({1}),
+    )
+    phone = "5511900019005"
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _seed_patient(enforced_pg.url, world.zapi_tenant, phone)
+        async with asyncio.timeout(_TURN_SECONDS):
+            post = asyncio.create_task(
+                client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi_message(world, "pg-delete-1", phone, "Olá"),
+                )
+            )
+            await gate.reached.wait()
+
+            async def delete() -> str:
+                async with enforced_direct.begin() as connection:
+                    await connection.execute(text("SET LOCAL lock_timeout = '20s'"))
+                    await connection.execute(
+                        text("DELETE FROM tenants WHERE id = :t"),
+                        {"t": UUID(world.zapi_tenant)},
+                    )
+                return "deleted"
+
+            deleter = asyncio.create_task(delete())
+            await _until_lock_waiters(enforced_direct, 1, query="%DELETE FROM tenants%")
+            gate.opened.set()
+            answer = await post
+            outcome = await deleter
+    assert outcome == "deleted"
+    assert answer.status_code == 200
+    assert answer.json() in (
+        {"ok": True, "replied": True},
+        {"ok": True, "replied": False, "reason": "send_queued"},
+        {"ok": True, "replied": False, "reason": "session_gone"},
+    )
+    seen = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
+    assert seen.claims == [] and seen.outbox == []

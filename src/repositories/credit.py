@@ -32,9 +32,10 @@ two writers never wait on each other crosswise:
    concurrent reparent waits.  A standalone tenant (``builder_id`` NULL) has
    no account and stops after its per-tenant rows;
 2. the ``sessions`` row: ``FOR UPDATE`` in the enforced phase 1
-   (``run_pipeline``), ``FOR KEY SHARE`` through the foreign keys of the
-   final transaction's event bundle and of the phase 1 handoff -- no credit
-   lock is held while waiting on it;
+   (``run_pipeline``) and in the Meta file handoff transaction
+   (:meth:`~CreditRepository.lock_session`), ``FOR KEY SHARE`` through the
+   foreign keys of the final transaction's event bundle and of the phase 1
+   handoff -- no credit lock is held while waiting on it;
 3. :meth:`~CreditRepository.lock_account` -- the builder's
    ``credit_accounts`` row ``FOR UPDATE``, the serialization point of the
    builder's credits (create it first with
@@ -45,9 +46,12 @@ two writers never wait on each other crosswise:
    the response-outbox row, the claim fences.
 
 Single-row UPDATEs -- the claim takeover, the lease release, the phase 1
-marker and the final fence of a claim, and the response-outbox transitions --
-are exempt from this order: none of them waits on another credit lock while
-it holds its row (Group 3b-1, LOW-14).
+marker and the final fence of a claim (with or without a lease), and the
+response-outbox transitions (the inline claim, the publisher's claim,
+``delivered``/``failed``) -- are exempt from this order:
+none of them waits on another credit lock while it holds its row (Group
+3b-1, LOW-14).  The retention sweep of the outbox takes only outbox rows,
+``FOR UPDATE SKIP LOCKED``: it never waits.
 
 One transaction locks one tenant and one builder's account; should two ever
 be needed, they are locked in ascending id order.  No lock is held across an
@@ -102,6 +106,24 @@ lease arithmetic and ``lock_timeout`` go through a dialect switch, like
 ``_insert``: the Python clock (UTC, never going back within the process)
 evaluates the lease against the pinned ``:observed`` and no lock timeout
 exists.
+
+Enforced webhooks (Group 3b-2).  A Z-API/Meta claim
+(:meth:`~CreditRepository.insert_webhook_claim`,
+``UNIQUE(tenant_id, source, provider_message_id)``) has the same fences
+WITHOUT the lease clause -- a webhook has no takeover and no
+``event_failed`` (LOW-1): the phase 1 marker
+(:meth:`~CreditRepository.mark_webhook_claim_phase1`) and the final check
+(:meth:`~CreditRepository.hold_webhook_claim_final_fence`) pin only
+``id``, ``created_at = :observed`` and the phase.  The response outbox rows
+of webhooks are born ``pending``; their transitions
+(:meth:`~CreditRepository.claim_outbox_inline`,
+:meth:`~CreditRepository.claim_outbox_for_publish`,
+:meth:`~CreditRepository.mark_outbox_delivered`,
+:meth:`~CreditRepository.mark_outbox_failed`) are single-row UPDATEs fenced
+by ``state = 'sending' AND created_at = :observed`` once claimed, and the
+publisher never holds a row lock across a provider call (it commits the
+claim first).  :meth:`~CreditRepository.sweep_outbox_payloads` is the
+retention sweep.
 """
 
 from __future__ import annotations
@@ -232,6 +254,22 @@ class ResponseOutboxRow:
     payload: Mapping[str, Any]
     state: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class OutboxClaim:
+    """One response-outbox row its claimer moved to ``sending`` (Group 3b-2).
+
+    ``observed`` is the row's ``created_at`` exactly as ``RETURNING`` gave it
+    -- the ``:observed`` of every transition out of ``sending``.
+    """
+
+    id: UUID
+    tenant_id: UUID
+    effect_id: str
+    payload: dict[str, Any]
+    attempts: int
+    observed: datetime
 
 
 _SQLITE_CLOCK_LOCK: Final = threading.Lock()
@@ -1017,6 +1055,355 @@ class CreditRepository:
             state=str(row.state),
             created_at=_as_utc(row.created_at),
         )
+
+    # -- enforced webhook claims (Group 3b-2) ---------------------------------
+
+    async def provider_claim(
+        self, tenant_id: UUID, *, source: str, provider_message_id: str
+    ) -> ClaimRow | None:
+        """The provider claim of this tenant, source and message (a plain
+        read, no lock)."""
+
+        row = (
+            await self.session.execute(
+                select(*self._CLAIM_COLUMNS).where(
+                    CreditIngressClaim.tenant_id == tenant_id,
+                    CreditIngressClaim.source == source,
+                    CreditIngressClaim.provider_message_id == provider_message_id,
+                )
+            )
+        ).one_or_none()
+        return None if row is None else self._claim_row(row)
+
+    async def insert_webhook_claim(
+        self,
+        *,
+        tenant_id: UUID,
+        builder_id: UUID | None,
+        source: str,
+        principal_id: str,
+        provider_message_id: str,
+        interaction_id: UUID,
+        payload_sha256: str,
+        decision_version: int,
+        session_version: int | None = None,
+    ) -> ClaimRow | None:
+        """Claim a provider message for an enforced decision; ``None`` on a
+        conflict (``uq_credit_ingress_claims_provider_message``: a redelivery,
+        whatever the state of the first claim).
+
+        ``mode='enforced'`` and ``created_at = clock_timestamp()``.  A webhook
+        claim has no lease (no takeover, no ``event_failed``): its
+        ``created_at`` never changes after the insert.  ``session_version`` is
+        NULL until the phase 1 marker, or given at the insert when the claim
+        commits together with its decision (the Meta file handoff).  Call
+        after the tenant row ``FOR SHARE`` (lock order step 1).
+        """
+
+        row = (
+            await self.session.execute(
+                self._insert(CreditIngressClaim)
+                .values(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    builder_id=builder_id,
+                    source=source,
+                    principal_id=principal_id,
+                    idempotency_key=None,
+                    provider_message_id=provider_message_id,
+                    interaction_id=interaction_id,
+                    payload_sha256=payload_sha256,
+                    decision_version=decision_version,
+                    session_version=session_version,
+                    mode="enforced",
+                    created_at=self._clock(),
+                )
+                .on_conflict_do_nothing()
+                .returning(*self._CLAIM_COLUMNS)
+            )
+        ).one_or_none()
+        return None if row is None else self._claim_row(row)
+
+    async def _webhook_fence(
+        self, claim_id: UUID, observed: datetime, values: Mapping[str, Any], *where: Any
+    ) -> bool:
+        """A webhook fence: the claim it observed, in the expected phase, with
+        NO lease clause (a webhook claim is never taken over, LOW-1).  The
+        row lock is kept to the end of the transaction."""
+
+        row = (
+            await self.session.execute(
+                update(CreditIngressClaim)
+                .where(
+                    CreditIngressClaim.id == claim_id,
+                    CreditIngressClaim.created_at == observed,
+                    *where,
+                )
+                .values(**values)
+                .returning(CreditIngressClaim.id)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        return row is not None
+
+    async def mark_webhook_claim_phase1(
+        self, claim_id: UUID, *, observed: datetime, session_version: int
+    ) -> bool:
+        """The webhook phase 1 marker, LAST statement of phase 1: ``UPDATE ...
+        SET session_version = :sv WHERE id = :id AND created_at = :observed
+        AND session_version IS NULL``."""
+
+        return await self._webhook_fence(
+            claim_id,
+            observed,
+            {"session_version": session_version},
+            CreditIngressClaim.session_version.is_(None),
+        )
+
+    async def hold_webhook_claim_final_fence(
+        self, claim_id: UUID, *, observed: datetime, session_version: int
+    ) -> bool:
+        """The webhook final check: ``UPDATE ... SET decision_version =
+        decision_version WHERE id = :id AND created_at = :observed AND
+        session_version = :sv`` -- it keeps the row lock to the commit."""
+
+        return await self._webhook_fence(
+            claim_id,
+            observed,
+            {"decision_version": CreditIngressClaim.decision_version},
+            CreditIngressClaim.session_version == session_version,
+        )
+
+    async def lock_session(self, tenant_id: UUID, session_id: UUID) -> int | None:
+        """The tenant's ``sessions`` row ``FOR UPDATE`` (lock order step 2);
+        its ``message_count``, or ``None`` when the session is not the
+        tenant's.  A Core read: no ORM entity enters the identity map."""
+
+        value = (
+            await self.session.execute(
+                select(SessionRow.message_count)
+                .where(SessionRow.id == session_id, SessionRow.tenant_id == tenant_id)
+                .with_for_update()
+            )
+        ).one_or_none()
+        if value is None:
+            return None
+        return int(value.message_count or 0)
+
+    @staticmethod
+    def _pause_state(is_paused: Any, paused_until: Any) -> list[Any]:
+        """``[is_paused, paused_until]`` in one canonical, JSON-storable form
+        (an ISO instant in UTC, or ``None``)."""
+
+        until = None if paused_until is None else _as_utc(paused_until).isoformat()
+        return [bool(is_paused), until]
+
+    async def session_pause_state(
+        self, tenant_id: UUID, session_id: UUID
+    ) -> list[Any] | None:
+        """The tenant's session pause state (``is_paused``, ``paused_until``),
+        a plain read; ``None`` when the session is not the tenant's."""
+
+        row = (
+            await self.session.execute(
+                select(SessionRow.is_paused, SessionRow.paused_until).where(
+                    SessionRow.id == session_id, SessionRow.tenant_id == tenant_id
+                )
+            )
+        ).one_or_none()
+        return None if row is None else self._pause_state(*row)
+
+    async def reply_guard_state(
+        self, tenant_id: UUID, session_id: UUID
+    ) -> tuple[bool, list[Any]] | None:
+        """What a stored reply re-checks before any send (OD-2): the tenant's
+        ``bot_active`` (``NULL`` is on, like ``_check_bot_active``) and the
+        session's pause state; ``None`` when the tenant or session is gone."""
+
+        row = (
+            await self.session.execute(
+                select(Tenant.bot_active, SessionRow.is_paused, SessionRow.paused_until)
+                .join(SessionRow, SessionRow.tenant_id == Tenant.id)
+                .where(Tenant.id == tenant_id, SessionRow.id == session_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        bot_active, is_paused, paused_until = row
+        return bot_active is None or bool(bot_active), self._pause_state(
+            is_paused, paused_until
+        )
+
+    # -- the response outbox: inline send, publisher and retention (3b-2) ----
+    #
+    # ``created_at`` of a webhook row is the instant of its LAST transition
+    # (no migration, OWNER-4).  Every transition out of ``sending`` is fenced
+    # by ``state = 'sending' AND created_at = :observed``: whoever claimed the
+    # row last owns it; a stale owner (its claim timed out and someone else
+    # reclaimed the row) changes nothing.
+
+    _OUTBOX_COLUMNS: Final = (
+        CreditResponseOutbox.id,
+        CreditResponseOutbox.tenant_id,
+        CreditResponseOutbox.effect_id,
+        CreditResponseOutbox.payload,
+        CreditResponseOutbox.state,
+        CreditResponseOutbox.attempts,
+        CreditResponseOutbox.created_at,
+    )
+
+    @staticmethod
+    def _outbox_claim(row: Any) -> OutboxClaim:
+        payload = row.payload if isinstance(row.payload, Mapping) else {}
+        return OutboxClaim(
+            id=UUID(str(row.id)),
+            tenant_id=UUID(str(row.tenant_id)),
+            effect_id=str(row.effect_id),
+            payload=dict(payload),
+            attempts=int(row.attempts),
+            observed=row.created_at,
+        )
+
+    async def claim_outbox_inline(self, row_id: UUID) -> OutboxClaim | None:
+        """The inline send's claim (LOW-2): ``UPDATE ... SET state =
+        'sending', created_at = clock_timestamp() WHERE id = :id AND state =
+        'pending' RETURNING created_at``.  ``None``: the publisher took the
+        row first, the inline send must not happen."""
+
+        row = (
+            await self.session.execute(
+                update(CreditResponseOutbox)
+                .where(
+                    CreditResponseOutbox.id == row_id,
+                    CreditResponseOutbox.state == "pending",
+                )
+                .values(state="sending", created_at=self._clock())
+                .returning(*self._OUTBOX_COLUMNS)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        return None if row is None else self._outbox_claim(row)
+
+    async def claim_outbox_for_publish(
+        self, *, min_age: timedelta, sending_lease: timedelta
+    ) -> OutboxClaim | None:
+        """The publisher's claim of ONE row: ``SELECT ... FOR UPDATE SKIP
+        LOCKED`` of the oldest ``pending`` row older than ``min_age`` or
+        ``sending`` row older than ``sending_lease``, then ``UPDATE state =
+        'sending', attempts = attempts + 1, created_at = clock_timestamp()``.
+        The caller commits before any provider call."""
+
+        clock = self._clock()
+        candidate = (
+            await self.session.execute(
+                select(CreditResponseOutbox.id)
+                .where(
+                    or_(
+                        and_(
+                            CreditResponseOutbox.state == "pending",
+                            CreditResponseOutbox.created_at < clock - min_age,
+                        ),
+                        and_(
+                            CreditResponseOutbox.state == "sending",
+                            CreditResponseOutbox.created_at < clock - sending_lease,
+                        ),
+                    )
+                )
+                .order_by(CreditResponseOutbox.created_at, CreditResponseOutbox.id)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if candidate is None:
+            return None
+        row = (
+            await self.session.execute(
+                update(CreditResponseOutbox)
+                .where(CreditResponseOutbox.id == candidate)
+                .values(
+                    state="sending",
+                    attempts=CreditResponseOutbox.attempts + 1,
+                    created_at=self._clock(),
+                )
+                .returning(*self._OUTBOX_COLUMNS)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        return None if row is None else self._outbox_claim(row)
+
+    async def _outbox_transition(
+        self, row_id: UUID, observed: datetime, values: Mapping[str, Any]
+    ) -> bool:
+        row = (
+            await self.session.execute(
+                update(CreditResponseOutbox)
+                .where(
+                    CreditResponseOutbox.id == row_id,
+                    CreditResponseOutbox.state == "sending",
+                    CreditResponseOutbox.created_at == observed,
+                )
+                .values(**values)
+                .returning(CreditResponseOutbox.id)
+                .execution_options(synchronize_session=False)
+            )
+        ).one_or_none()
+        return row is not None
+
+    async def mark_outbox_delivered(
+        self, row_id: UUID, *, observed: datetime, payload: Mapping[str, Any]
+    ) -> bool:
+        """``sending -> delivered`` with the PII-free ``payload`` (phone and
+        text erased), fenced by ``created_at = :observed``."""
+
+        return await self._outbox_transition(
+            row_id, observed, {"state": "delivered", "payload": dict(payload)}
+        )
+
+    async def mark_outbox_failed(
+        self, row_id: UUID, *, observed: datetime, payload: Mapping[str, Any]
+    ) -> bool:
+        """``sending -> failed`` with the PII-free ``payload`` (OWNER-3)."""
+
+        return await self._outbox_transition(
+            row_id, observed, {"state": "failed", "payload": dict(payload)}
+        )
+
+    async def sweep_outbox_payloads(self, *, retention: timedelta, limit: int) -> int:
+        """Retention (OWNER-d): ``payload = '{}'`` on up to ``limit`` rows that
+        are not ``sending`` and older than ``retention`` -- ``delivered``,
+        ``failed`` and abandoned ``pending`` ones, of webhooks and of ``POST
+        /v1/events`` alike.  Rows already ``{}`` are not rewritten; rows
+        another transaction holds are skipped (the next sweep takes them).
+        Returns how many rows were emptied."""
+
+        conditions: list[Any] = [
+            CreditResponseOutbox.state != "sending",
+            CreditResponseOutbox.created_at < self._clock() - retention,
+        ]
+        if self._postgresql():
+            conditions.append(
+                CreditResponseOutbox.payload.op("<>")(text("'{}'::jsonb"))
+            )
+        rows = (
+            await self.session.execute(
+                select(CreditResponseOutbox.id, CreditResponseOutbox.payload)
+                .where(*conditions)
+                .order_by(CreditResponseOutbox.created_at, CreditResponseOutbox.id)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        # SQLite (unit tests) cannot compare JSON: the empty ones drop here.
+        ids = [row.id for row in rows if row.payload]
+        if not ids:
+            return 0
+        await self.session.execute(
+            update(CreditResponseOutbox)
+            .where(CreditResponseOutbox.id.in_(ids))
+            .values(payload={})
+            .execution_options(synchronize_session=False)
+        )
+        return len(ids)
 
     # -- global reads ----------------------------------------------------
 

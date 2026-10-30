@@ -36,6 +36,13 @@ enforcement row -- every existing suite -- the forced runs must show only
 ``main`` captures, so no enforced sibling ever ran; only the suites that set
 ``credit_enforcement_at`` themselves (``tests/api/test_events_credit_enforced.py``)
 show ``enforced`` ones.
+
+Group 3b-2: every Z-API and Meta message reaching the pause check runs its
+adapter's pre-check (``credit_metering.precheck_webhook``: switch on,
+authenticated ``production`` and ``credit_enforcement_at`` set).  The
+plugin wraps it the same way and counts its verdicts (``enforced``,
+``credit_pending`` or ``main``): every existing webhook suite must show only
+``main`` ones -- no enforced claim, debit, hold or outbox ever ran there.
 """
 
 from __future__ import annotations
@@ -53,6 +60,8 @@ _writer_outcomes: Counter[str] = Counter()
 _ORIGINAL_WRITER: Any = None
 _captures: Counter[str] = Counter()
 _ORIGINAL_CAPTURE: Any = None
+_webhook_prechecks: Counter[str] = Counter()
+_ORIGINAL_WEBHOOK_PRECHECK: Any = None
 
 
 def _forced_effective(_self: Any) -> bool:
@@ -81,8 +90,23 @@ async def _counted_capture(*args: Any, **kwargs: Any) -> Any:
     return enforcement
 
 
+async def _counted_webhook_precheck(*args: Any, **kwargs: Any) -> Any:
+    try:
+        verdict = await _ORIGINAL_WEBHOOK_PRECHECK(*args, **kwargs)
+    except BaseException as error:
+        _webhook_prechecks[f"raised {type(error).__name__}"] += 1
+        raise
+    if verdict is None:
+        _webhook_prechecks["main"] += 1
+    elif verdict == "credit_pending":
+        _webhook_prechecks["credit_pending"] += 1
+    else:
+        _webhook_prechecks["enforced"] += 1
+    return verdict
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE
+    global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE, _ORIGINAL_WEBHOOK_PRECHECK
     from src.services import credit_metering
     from src.services.credit_switch import CreditSwitch
 
@@ -92,6 +116,8 @@ def pytest_configure(config: pytest.Config) -> None:
     patcher.setattr(credit_metering, "record_observational_trace", _counted_writer)
     _ORIGINAL_CAPTURE = credit_metering.capture_events_enforcement
     patcher.setattr(credit_metering, "capture_events_enforcement", _counted_capture)
+    _ORIGINAL_WEBHOOK_PRECHECK = credit_metering.precheck_webhook
+    patcher.setattr(credit_metering, "precheck_webhook", _counted_webhook_precheck)
     config.stash[_PATCHER] = patcher
 
 
@@ -122,6 +148,13 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
         f"credit enforced-path captures: {sum(_captures.values())}"
         f" ({captures or 'none'})"
     )
+    prechecks = ", ".join(
+        f"{name}={count}" for name, count in sorted(_webhook_prechecks.items())
+    )
+    terminalreporter.write_line(
+        f"credit webhook pre-checks: {sum(_webhook_prechecks.values())}"
+        f" ({prechecks or 'none'})"
+    )
 
 
 def _assert_forced() -> None:
@@ -136,6 +169,9 @@ def _assert_forced() -> None:
     assert (
         credit_metering.capture_events_enforcement is _counted_capture
     ), "the enforced-path capture counter was swapped and not restored"
+    assert (
+        credit_metering.precheck_webhook is _counted_webhook_precheck
+    ), "the webhook pre-check counter was swapped and not restored"
     _self_checks += 1
     assert credit_switch_effective() is True, "the forced switch does not read True"
 

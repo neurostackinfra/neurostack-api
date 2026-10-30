@@ -1,6 +1,6 @@
 {
   "schema_version": "credit_dominance_corpus.v1",
-  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run.",
+  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at 038, with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run. Group 3b-2 appends a Meta file attachment (its fixed ack, free) and the patient's forward-on-request reply, a Meta file handoff: before the enforcement they answer like main; in the enforced run the Z-API and Meta decisions -- the file handoff included -- are claimed and charged once each, with the same answers.",
   "masked_fields": [
     "event_id",
     "timestamp",
@@ -526,6 +526,74 @@
           "channel": "whatsapp",
           "user_id": "credit-dominance-user"
         }
+      }
+    },
+    {
+      "id": "meta-file-document",
+      "ingress": "meta",
+      "method": "POST",
+      "path": "/v1/webhook/meta",
+      "auth": "meta/meta_tenant",
+      "json": {
+        "object": "whatsapp_business_account",
+        "entry": [
+          {
+            "id": "credit-dominance-waba",
+            "changes": [
+              {
+                "field": "messages",
+                "value": {
+                  "messaging_product": "whatsapp",
+                  "metadata": {"display_phone_number": "5511900000200", "phone_number_id": "{meta_phone}"},
+                  "contacts": [{"profile": {"name": "Paciente F"}, "wa_id": "5511900000202"}],
+                  "messages": [
+                    {
+                      "from": "5511900000202",
+                      "id": "wamid.credit-dominance-meta-document",
+                      "timestamp": "1761480003",
+                      "type": "document",
+                      "document": {"id": "credit-dominance-media-document", "mime_type": "application/pdf", "filename": "exame.pdf"}
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "meta-file-forward",
+      "ingress": "meta",
+      "method": "POST",
+      "path": "/v1/webhook/meta",
+      "auth": "meta/meta_tenant",
+      "json": {
+        "object": "whatsapp_business_account",
+        "entry": [
+          {
+            "id": "credit-dominance-waba",
+            "changes": [
+              {
+                "field": "messages",
+                "value": {
+                  "messaging_product": "whatsapp",
+                  "metadata": {"display_phone_number": "5511900000200", "phone_number_id": "{meta_phone}"},
+                  "contacts": [{"profile": {"name": "Paciente F"}, "wa_id": "5511900000202"}],
+                  "messages": [
+                    {
+                      "from": "5511900000202",
+                      "id": "wamid.credit-dominance-meta-forward",
+                      "timestamp": "1761480004",
+                      "type": "text",
+                      "text": {"body": "Pode encaminhar para a equipe, por favor"}
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       }
     }
   ]
