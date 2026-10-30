@@ -547,6 +547,23 @@ async def upload_media_asset(
                 object_ids=[asset.id],
                 upload_id=asset.id,
             )
+        # Group 4b's S3/Qdrant work is a post-commit, additive queue.  An
+        # external-store outage must never turn a successful authoritative
+        # PostgreSQL upload into an error or alter its credit reservation.
+        try:
+            await credit_inventory.enqueue_object_copy(
+                session,
+                source_kind="media",
+                source_id=asset.id,
+                tenant_id=asset.tenant_id,
+            )
+        except Exception as error:
+            logger.warning(
+                "credit object-copy enqueue failed",
+                alert="credit_object_copy",
+                error_type=type(error).__name__,
+            )
+            await _rollback(session)
         return asset
     except credit_inventory.CreditPendingError:
         await _rollback(session)
@@ -988,6 +1005,20 @@ async def delete_media_asset(
         if deleted is None:
             raise _media_error(404, "media_asset_not_found")
         await session.commit()
+        try:
+            await credit_inventory.enqueue_source_collection(
+                session,
+                source_kind="media",
+                source_id=deleted.id,
+                tenant_id=target.id,
+            )
+        except Exception as error:
+            logger.warning(
+                "credit object-copy collection enqueue failed",
+                alert="credit_object_copy",
+                error_type=type(error).__name__,
+            )
+            await _rollback(session)
         logger.info(
             "media_asset_delete",
             tenant_id=str(target.id),

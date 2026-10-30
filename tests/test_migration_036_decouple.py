@@ -85,8 +85,8 @@ def test_036_revises_035_and_037_follows_it(migration: ModuleType) -> None:
     # Group 10 E6: 037 (drop the legacy objects) is the only child of 036.
     assert [rev for rev, parent in revisions.values() if parent == "036"] == ["037"]
     # neurostack-credit-system Group 1a: 038 (credit schema) follows 037;
-    # Group 4a: 039 (credit inventory) follows 038.
-    assert current_head() == "039"
+    # Group 4b: 040 (additional object copies) follows 039.
+    assert current_head() == "040"
 
 
 def test_frozen_file_is_pinned_rendered_and_outside_versions(

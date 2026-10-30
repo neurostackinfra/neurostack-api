@@ -3,7 +3,7 @@
 Item 5 (ii) of Group 1b.  The real application (``src.api.main.app``, its
 settings read from the environment, its lifespan, middleware and pool) runs
 against disposable PostgreSQL databases at ``037`` and at the credit-ready
-head (``039`` since Group 4a; ``038`` before it), with
+head (``040`` since Group 4b; ``039`` before it), with
 ``CREDIT_HOT_PATH_ENABLED`` false and true.  Each run replays the fixed corpus
 ``tests/fixtures/credit_dominance/requests.json`` through every ingress (JWT,
 API key, Z-API, Meta, Uazapi, Evolution; the LLM and the providers are faked)
@@ -14,9 +14,9 @@ store crosses runs, and every run starts from a clone of one seeded template.
   revision once the server-generated fields are masked (the corpus' named
   fields plus any UUID the world did not seed and any instant), and the
   stored events are equal by content.  The two config-off runs at ``037`` and
-  ``039`` are equal too: the credit schema alone changes nothing.
+  ``039`` are equal too; the additional-copy migration alone changes nothing.
 * The verdict: config off => off; config on at ``037`` => off
-  (``schema_below_minimum``); config on at ``039`` => on.
+  (``schema_below_minimum``); config on at ``040`` => on.
 * A ``before_cursor_execute`` listener, attached only after start-up, sees no
   SQL touching ``credit_*`` while the switch is not effective; no ``credit_*``
   row exists after a run at ``038`` with the config off.
@@ -62,7 +62,7 @@ store crosses runs, and every run starts from a clone of one seeded template.
   not effective (``037``, config off), 201 with it -- the one corpus case
   left out of the on/off comparison and asserted on its own.
 * In one process, the background refresh turns the switch on after
-  ``upgrade 037 -> 039`` and off again after the downgrade, each within one
+  ``upgrade 037 -> 040`` and off again after the downgrade, each within one
   interval, while requests keep answering.
 
 Groups 3-7 append their surfaces to the corpus and to these runs, always
@@ -948,10 +948,10 @@ async def oracle(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[_Ora
         await _run_alembic(admin_url.set(database=at_037), "upgrade", "037")
         await _seed_world(admin_url.set(database=at_037), world)
         oracle.templates["037"] = at_037
-        # The credit-ready head: 039 (Group 4a; 038 before it).
-        at_039 = await oracle.clone("037")
-        await _run_alembic(admin_url.set(database=at_039), "upgrade", "039")
-        oracle.templates["039"] = at_039
+        # The credit-ready head: 040 (Group 4b; 039 before it).
+        at_040 = await oracle.clone("037")
+        await _run_alembic(admin_url.set(database=at_040), "upgrade", "040")
+        oracle.templates["040"] = at_040
         yield oracle
     finally:
         for name in list(reversed(created)):
@@ -1023,7 +1023,7 @@ def _assert_same(on: dict[str, Any], off: dict[str, Any], world: _World) -> None
     assert actual["events"] == expected["events"]
 
 
-@pytest.mark.parametrize("revision", ["037", "039"])
+@pytest.mark.parametrize("revision", ["037", "040"])
 async def test_config_on_answers_and_stores_like_config_off(
     oracle: _Oracle, revision: str
 ) -> None:
@@ -1045,7 +1045,7 @@ async def test_config_on_answers_and_stores_like_config_off(
         assert on["reading"] == {
             "effective": True,
             "reason": "schema_ready",
-            "revision": "039",
+            "revision": "040",
         }
     _assert_same(on, off, oracle.world)
 
@@ -1137,7 +1137,7 @@ async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None
 
 async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> None:
     _assert_same(
-        await oracle.run("039", enabled=False),
+        await oracle.run("040", enabled=False),
         await oracle.run("037", enabled=False),
         oracle.world,
     )
@@ -1145,7 +1145,7 @@ async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> Non
 
 @pytest.mark.parametrize(
     ("revision", "enabled"),
-    [("037", False), ("037", True), ("039", False)],
+    [("037", False), ("037", True), ("040", False)],
 )
 async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     oracle: _Oracle, revision: str, enabled: bool
@@ -1157,7 +1157,7 @@ async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     assert run["statements"], "the listener saw no SQL at all"
     touching = [s for s in run["statements"] if _CREDIT_SQL.search(s)]
     assert touching == []
-    if revision == "039":
+    if revision == "040":
         assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
     else:
         assert run["credit_rows"] == {}
@@ -1170,7 +1170,7 @@ async def test_the_effective_switch_only_meters_observationally(
     writers' tables are touched, and nothing financial is ever written
     before the enforcement."""
 
-    run = await oracle.run("039", enabled=True)
+    run = await oracle.run("040", enabled=True)
 
     names = {
         match.group(0).lower()
@@ -1198,7 +1198,7 @@ def _event_id(run: dict[str, Any], case: str) -> str:
 async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
     oracle: _Oracle,
 ) -> None:
-    run = await oracle.run("039", enabled=True)
+    run = await oracle.run("040", enabled=True)
     world = oracle.world
     status = {r["id"]: r["status"] for r in run["responses"]}
     claims = run["metering"]["credit_ingress_claims"]
@@ -1319,8 +1319,8 @@ def _bodies(run: dict[str, Any]) -> dict[str, Any]:
     [
         ("037", False, 503),
         ("037", True, 503),
-        ("039", False, 503),
-        ("039", True, 201),
+        ("040", False, 503),
+        ("040", True, 201),
     ],
 )
 async def test_the_multipart_upload_exists_only_with_the_switch_effective(
@@ -1344,7 +1344,7 @@ async def test_uploads_and_downloads_are_metered_observationally_only(
     and download WOULD debit, the window's maintenance once per category,
     the delivery -- and nothing financial."""
 
-    run = await oracle.run("039", enabled=True)
+    run = await oracle.run("040", enabled=True)
     world = oracle.world
     bodies = _bodies(run)
     effects = {
@@ -1449,8 +1449,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
     """``credit_enforcement_at`` set but the switch off: ``main`` exactly,
     no SQL touches a ``credit_*`` table, nothing is claimed or charged."""
 
-    off = await oracle.run("039", enabled=False)
-    enforced = await oracle.run("039", enabled=False, enforced=True)
+    off = await oracle.run("040", enabled=False)
+    enforced = await oracle.run("040", enabled=False, enforced=True)
 
     assert enforced["reading"] == off["reading"]
     _assert_same(enforced, off, oracle.world)
@@ -1463,8 +1463,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
 async def test_the_enforced_run_charges_each_production_decision_once(
     oracle: _Oracle,
 ) -> None:
-    off = await oracle.run("039", enabled=False)
-    run = await oracle.run("039", enabled=True, enforced=True)
+    off = await oracle.run("040", enabled=False)
+    run = await oracle.run("040", enabled=True, enforced=True)
     world = oracle.world
 
     assert run["reading"]["effective"] is True
@@ -1722,9 +1722,9 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
             ) as client:
                 before = await client.post("/v1/events", json={}, headers=unknown_key)
 
-                await _run_alembic(url, "upgrade", "039")
+                await _run_alembic(url, "upgrade", "040")
                 assert await _wait_for(True, bound) <= bound
-                assert credit_switch_reading().revision == "039"
+                assert credit_switch_reading().revision == "040"
                 during = await client.post("/v1/events", json={}, headers=unknown_key)
 
                 await _run_alembic(url, "downgrade", "037")
