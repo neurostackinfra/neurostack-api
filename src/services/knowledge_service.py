@@ -7,13 +7,184 @@ from the vector database. The actual implementation will be completed
 when the Knowledge Service is implemented.
 """
 
-from typing import Optional
+import asyncio
+import io
+import re
+import time
+import zipfile
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Final, Literal, Optional
 from uuid import UUID
 
 from src.config.logging import get_logger
 from src.ctx.models import KnowledgeChunk
 
 logger = get_logger(__name__)
+
+
+# ============================================
+# DOCX / textual PDF extraction (neurostack-credit-system Group 4a)
+# ============================================
+#
+# Parser safety (``pypdf`` and ``python-docx``/``lxml``, pinned in
+# ``poetry.lock``).  Both are pure parsers: no network, no macro or script
+# execution.  The one external program ``pypdf`` may start -- the
+# ``jbig2dec`` binary, for a JBIG2-encoded stream -- is switched off for every
+# extraction (``jbig2dec_binary=None``).  Resources are bounded, whatever the
+# enforcement: ``pypdf``'s own per-stream output limits (75 MB each), a page
+# cap, the declared uncompressed size and entry count of a DOCX archive
+# (``python-docx`` reads every part into memory; ``zipfile`` never inflates
+# an entry beyond its declared size), and one deadline over all the files of
+# a request, checked between pages and files.  The extraction runs in a
+# worker thread (:func:`extract_documents`), never on the event loop.  A file
+# beyond a bound is unreadable (``422``).
+
+KnowledgeFileKind = Literal["pdf", "docx"]
+# Stable 422 codes of ``POST /v1/knowledge/documents/upload``.
+KNOWLEDGE_FILE_UNSUPPORTED = "knowledge_file_unsupported"
+KNOWLEDGE_FILE_UNREADABLE = "knowledge_file_unreadable"
+# Technical bounds of the extraction (not the PDF's commercial limits).
+KNOWLEDGE_EXTRACTION_SECONDS: Final = 30.0
+KNOWLEDGE_PDF_MAX_PAGES: Final = 5_000
+KNOWLEDGE_DOCX_MAX_UNCOMPRESSED_BYTES: Final = 100_000_000
+KNOWLEDGE_DOCX_MAX_ENTRIES: Final = 5_000
+_PDF_SIGNATURE = b"%PDF-"
+_ZIP_SIGNATURE = b"PK\x03\x04"
+_DOCX_MAIN_PART = "word/document.xml"
+_UNPAIRED_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+class KnowledgeFileError(ValueError):
+    """A file the upload cannot ingest; ``code`` is the stable answer."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ExtractedDocument:
+    """The text of one uploaded file and what the PDF's rules look at."""
+
+    kind: KnowledgeFileKind
+    text: str
+    size_bytes: int
+    encrypted: bool
+
+
+def _storable(text: str) -> str:
+    """PostgreSQL ``text`` holds neither NUL nor an unpaired surrogate."""
+
+    return _UNPAIRED_SURROGATE.sub("\ufffd", text.replace("\x00", ""))
+
+
+def _unreadable() -> KnowledgeFileError:
+    return KnowledgeFileError(KNOWLEDGE_FILE_UNREADABLE)
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise _unreadable()
+
+
+def _pdf_text(data: bytes, deadline: float | None) -> tuple[str, bool]:
+    from pypdf import PdfReader, apply_configuration
+
+    try:
+        # Never start the jbig2dec program on an uploaded stream (and let no
+        # legacy module constant of pypdf turn it back on for this reader).
+        with apply_configuration(jbig2dec_binary=None, disable_legacy_handling=True):
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            encrypted = bool(reader.is_encrypted)
+            if encrypted and not reader.decrypt(""):
+                # A password is needed: nothing can be read.
+                raise _unreadable()
+            if len(reader.pages) > KNOWLEDGE_PDF_MAX_PAGES:
+                raise _unreadable()
+            pages: list[str] = []
+            for page in reader.pages:
+                _check_deadline(deadline)
+                pages.append(page.extract_text() or "")
+    except KnowledgeFileError:
+        raise
+    except Exception as error:  # a malformed PDF raises many kinds
+        raise _unreadable() from error
+    return "\n".join(pages), encrypted
+
+
+def _docx_text(data: bytes, deadline: float | None) -> str:
+    from docx import Document
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if _DOCX_MAIN_PART not in {entry.filename for entry in entries}:
+                raise KnowledgeFileError(KNOWLEDGE_FILE_UNSUPPORTED)
+            # python-docx loads every part: refuse an archive that declares
+            # more than the bound (an entry never inflates beyond it).
+            if (
+                len(entries) > KNOWLEDGE_DOCX_MAX_ENTRIES
+                or sum(entry.file_size for entry in entries)
+                > KNOWLEDGE_DOCX_MAX_UNCOMPRESSED_BYTES
+            ):
+                raise _unreadable()
+        _check_deadline(deadline)
+        document = Document(io.BytesIO(data))
+        parts = [paragraph.text for paragraph in document.paragraphs]
+        for table in document.tables:
+            for row in table.rows:
+                parts.extend(cell.text for cell in row.cells)
+    except KnowledgeFileError:
+        raise
+    except Exception as error:  # python-docx/lxml raise many kinds
+        raise _unreadable() from error
+    return "\n".join(parts)
+
+
+def extract_document_text(
+    data: bytes, *, deadline: float | None = None
+) -> ExtractedDocument:
+    """Text of a DOCX or textual PDF, by content signature (never by the
+    declared type).  Unsupported formats, corrupt files, a PDF that needs a
+    password, a document with no extractable text (an OCR-only PDF, owner
+    decision H) and a file beyond a technical bound (``deadline``: a
+    ``time.monotonic()`` instant) raise :class:`KnowledgeFileError` at any
+    time; the PDF's commercial limits are the caller's, after the
+    enforcement.  Blocking: call it through :func:`extract_documents`."""
+
+    if data.startswith(_PDF_SIGNATURE):
+        raw, encrypted = _pdf_text(data, deadline)
+        kind: KnowledgeFileKind = "pdf"
+    elif data.startswith(_ZIP_SIGNATURE):
+        raw, encrypted, kind = _docx_text(data, deadline), False, "docx"
+    else:
+        raise KnowledgeFileError(KNOWLEDGE_FILE_UNSUPPORTED)
+    text = _storable(raw).strip()
+    if not text:
+        raise _unreadable()
+    return ExtractedDocument(
+        kind=kind, text=text, size_bytes=len(data), encrypted=encrypted
+    )
+
+
+def _extract_all(files: Sequence[bytes], deadline: float) -> list[ExtractedDocument]:
+    extracted: list[ExtractedDocument] = []
+    for data in files:
+        _check_deadline(deadline)
+        extracted.append(extract_document_text(data, deadline=deadline))
+    return extracted
+
+
+async def extract_documents(
+    files: Sequence[bytes], *, seconds: float = KNOWLEDGE_EXTRACTION_SECONDS
+) -> list[ExtractedDocument]:
+    """The text of every file of one upload, in a worker thread (never on
+    the event loop), all of them within ``seconds``; the first file that
+    cannot be ingested raises its :class:`KnowledgeFileError`."""
+
+    deadline = time.monotonic() + seconds
+    return await asyncio.to_thread(_extract_all, list(files), deadline)
 
 
 class KnowledgeService:

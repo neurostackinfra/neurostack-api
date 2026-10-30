@@ -138,12 +138,27 @@ def migration() -> ModuleType:
     return _load()
 
 
+# Group 4a: the credit inventory tables of migration 039 (pinned by
+# tests/integration/test_credit_orm_ddl_drift_postgres.py and the 039 part of
+# tests/integration/test_credit_migration_guards_postgres.py).
+_LATER_TABLES = {
+    "credit_inventory_versions",
+    "credit_allocations",
+    "credit_egress_deliveries",
+}
+
+
 def _credit_tables() -> dict[str, sa.Table]:
-    return {
+    """The credit tables of migration 038 (later credit migrations' own
+    tables are pinned by their own suites)."""
+
+    tables = {
         name: table
         for name, table in Base.metadata.tables.items()
         if name.startswith("credit_")
     }
+    assert _LATER_TABLES <= set(tables)
+    return {name: table for name, table in tables.items() if name not in _LATER_TABLES}
 
 
 def _created_columns(statement: str) -> list[str]:
@@ -169,7 +184,8 @@ def _created_columns(statement: str) -> list[str]:
 
 def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("038", "037")
-    assert current_head() == "038"
+    # Group 4a: 039 (the credit inventory) follows 038 and is the head.
+    assert current_head() == "039"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 
@@ -442,7 +458,7 @@ def test_sqlite_create_all_builds_the_credit_tables() -> None:
     finally:
         engine.dispose()
     ddl = dict(rows)
-    assert set(ddl) == _TABLES
+    assert set(ddl) == _TABLES | _LATER_TABLES
     # PostgreSQL-only regex CHECKs stay out of SQLite; portable ones stay in.
     assert "~" not in ddl["credit_fact_inbox"]
     assert "ck_credit_fact_inbox_outcome" in ddl["credit_fact_inbox"]

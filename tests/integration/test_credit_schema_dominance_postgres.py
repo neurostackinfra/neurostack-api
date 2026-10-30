@@ -2,7 +2,8 @@
 
 Item 5 (ii) of Group 1b.  The real application (``src.api.main.app``, its
 settings read from the environment, its lifespan, middleware and pool) runs
-against disposable PostgreSQL databases at ``037`` and at ``038``, with
+against disposable PostgreSQL databases at ``037`` and at the credit-ready
+head (``039`` since Group 4a; ``038`` before it), with
 ``CREDIT_HOT_PATH_ENABLED`` false and true.  Each run replays the fixed corpus
 ``tests/fixtures/credit_dominance/requests.json`` through every ingress (JWT,
 API key, Z-API, Meta, Uazapi, Evolution; the LLM and the providers are faked)
@@ -13,9 +14,9 @@ store crosses runs, and every run starts from a clone of one seeded template.
   revision once the server-generated fields are masked (the corpus' named
   fields plus any UUID the world did not seed and any instant), and the
   stored events are equal by content.  The two config-off runs at ``037`` and
-  ``038`` are equal too: the credit schema alone changes nothing.
+  ``039`` are equal too: the credit schema alone changes nothing.
 * The verdict: config off => off; config on at ``037`` => off
-  (``schema_below_minimum``); config on at ``038`` => on.
+  (``schema_below_minimum``); config on at ``039`` => on.
 * A ``before_cursor_execute`` listener, attached only after start-up, sees no
   SQL touching ``credit_*`` while the switch is not effective; no ``credit_*``
   row exists after a run at ``038`` with the config off.
@@ -50,8 +51,18 @@ store crosses runs, and every run starts from a clone of one seeded template.
   comes one interval (``RETENTION_SWEEP_INTERVAL_SECONDS``) after start-up,
   so it never runs inside a replay (pinned below), and it skips a ``037``
   database (no outbox).
+* Group 4a: the corpus carries a knowledge text upload (JSON), a media
+  upload, a download of a seeded media asset and the multipart DOCX/PDF
+  knowledge upload.  The first three answer like the config-off run in every
+  run; with the switch effective and before the enforcement they leave only
+  observational ``rag``/``media``/``egress``/``maintenance`` effects (and the
+  delivery), with the enforcement set they are reserved and charged
+  (``credit_allocations``, the ledger) with the same answers.  The multipart
+  upload is a credit surface: 503 ``credit_unavailable`` while the switch is
+  not effective (``037``, config off), 201 with it -- the one corpus case
+  left out of the on/off comparison and asserted on its own.
 * In one process, the background refresh turns the switch on after
-  ``upgrade 037 -> 038`` and off again after the downgrade, each within one
+  ``upgrade 037 -> 039`` and off again after the downgrade, each within one
   interval, while requests keep answering.
 
 Groups 3-7 append their surfaces to the corpus and to these runs, always
@@ -104,14 +115,22 @@ _GREETING = re.compile(
     re.IGNORECASE,
 )
 _CREDIT_SQL = re.compile(r"\bcredit_[a-z_]+", re.IGNORECASE)
-# The only credit tables the observational writer (Group 3a) may touch.
+# The only credit tables the observational writers may touch: Group 3a's
+# and Group 4a's (the builder's monthly cycles, read for the accounting
+# window, and the observational egress deliveries).
 _METERING_TABLES = frozenset(
     {
         "credit_enforcement_state",
         "credit_ingress_claims",
         "credit_observational_effects",
+        "credit_lots",
+        "credit_egress_deliveries",
     }
 )
+# Group 4a: the credit surface of the corpus, outside the on/off comparison.
+_CREDIT_SURFACES = frozenset({"knowledge-files-upload"})
+_FIXTURES = _ROOT / "tests" / "fixtures"
+_MULTIPART_BOUNDARY = "credit-dominance-boundary-4a"
 _RUN_TIMEOUT_SECONDS = 300
 # The one statement of ``CreditRepository.enforcement_at()``.
 _ENFORCEMENT_READ = re.compile(
@@ -155,6 +174,8 @@ class _World:
     # Group 3b-1: a session of the API-key tenant that only the synchronous
     # handoff case uses, so its answer does not depend on the earlier turns.
     handoff_session: str
+    # Group 4a: a media asset of the API-key tenant, seeded, downloaded.
+    media_asset: str
 
     @classmethod
     def generate(cls) -> "_World":
@@ -186,6 +207,7 @@ class _World:
             evolution_tenant=str(uuid4()),
             evolution_instance=f"credit-evolution-{uuid4().hex[:8]}",
             handoff_session=str(uuid4()),
+            media_asset=str(uuid4()),
         )
 
     def known_ids(self) -> set[str]:
@@ -196,6 +218,9 @@ class _World:
         }
 
 
+_SEEDED_MEDIA = b"%PDF-1.4\n% credit dominance seeded media\n" + b"0" * 900
+
+
 async def _seed_world(url: Any, world: _World) -> None:
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
     from sqlalchemy.pool import NullPool
@@ -203,6 +228,7 @@ async def _seed_world(url: Any, world: _World) -> None:
     from src.api.middleware.auth import pwd_context
     from src.models.builder import Builder
     from src.models.clinic_config_table import ClinicConfigTable
+    from src.models.media_asset import MediaAsset
     from src.models.session import Session
     from src.models.tenant import Tenant
 
@@ -253,6 +279,19 @@ async def _seed_world(url: Any, world: _World) -> None:
                     session(world.api_session, world.api_tenant),
                     session(world.handoff_session, world.api_tenant),
                     session(world.jwt_session, world.jwt_tenant),
+                    MediaAsset(
+                        id=UUID(world.media_asset),
+                        tenant_id=UUID(world.api_tenant),
+                        display_name="Cardápio",
+                        original_filename="cardapio.pdf",
+                        category="pdf",
+                        mime_type="application/pdf",
+                        size_bytes=len(_SEEDED_MEDIA),
+                        sha256=hashlib.sha256(_SEEDED_MEDIA).digest(),
+                        payload=_SEEDED_MEDIA,
+                        usage_trigger=None,
+                        auto_suggest=False,
+                    ),
                     ClinicConfigTable(
                         tenant_id=UUID(world.meta_tenant),
                         api_credentials={
@@ -464,13 +503,41 @@ def _resolve(value: Any, world: dict[str, str]) -> Any:
     return value
 
 
+def _multipart(spec: dict[str, Any]) -> tuple[bytes, str]:
+    """A ``multipart/form-data`` body (fixed boundary): ``fields`` then
+    ``files``, each file's bytes read from its ``fixture``."""
+
+    boundary = _MULTIPART_BOUNDARY.encode("ascii")
+    body = bytearray()
+    for name, value in spec.get("fields", {}).items():
+        body += b"--" + boundary + b"\r\n"
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += str(value).encode("utf-8") + b"\r\n"
+    for item in spec.get("files", []):
+        body += b"--" + boundary + b"\r\n"
+        body += (
+            f'Content-Disposition: form-data; name="{item["field"]}"; '
+            f'filename="{item["filename"]}"\r\n'
+            f'Content-Type: {item["content_type"]}\r\n\r\n'
+        ).encode()
+        body += (_FIXTURES / item["fixture"]).read_bytes() + b"\r\n"
+    body += b"--" + boundary + b"--\r\n"
+    return bytes(body), f"multipart/form-data; boundary={_MULTIPART_BOUNDARY}"
+
+
 def _request_for(
     item: dict[str, Any], world: _World
 ) -> tuple[str, bytes, dict[str, str]]:
     names = asdict(world)
     path = _resolve(item["path"], names)
-    raw = json.dumps(_resolve(item["json"], names)).encode("utf-8")
-    headers = {"Content-Type": "application/json", **item.get("headers", {})}
+    if "multipart" in item:
+        raw, content_type = _multipart(_resolve(item["multipart"], names))
+        headers = {"Content-Type": content_type, **item.get("headers", {})}
+    elif "json" in item:
+        raw = json.dumps(_resolve(item["json"], names)).encode("utf-8")
+        headers = {"Content-Type": "application/json", **item.get("headers", {})}
+    else:
+        raw, headers = b"", dict(item.get("headers", {}))
     kind, _, subject = item["auth"].partition("/")
     if kind == "api_key":
         headers["X-API-Key"] = (
@@ -560,6 +627,16 @@ async def _ledger_rows(connection: Any) -> dict[str, list[dict[str, Any]]]:
             "SELECT tenant_id, session_id, context ->> 'credit_effect_id' "
             "AS credit_effect_id FROM handoff_records ORDER BY id"
         ),
+        # Group 4a: the reservations, openings and egress of the run.
+        "credit_allocations": (
+            "SELECT builder_id, category, allocation_kind, units, target_mc, "
+            "charged_mc, effect_id FROM credit_allocations "
+            "ORDER BY category, allocation_kind, source_key"
+        ),
+        "credit_egress_deliveries": (
+            "SELECT tenant_id, builder_id, media_id, bytes, mode "
+            "FROM credit_egress_deliveries ORDER BY recorded_at"
+        ),
     }
     rows: dict[str, list[dict[str, Any]]] = {}
     for table, sql in queries.items():
@@ -625,7 +702,9 @@ async def _read_back(
                 for name in tables
             }
             metering = await _metering_rows(connection) if tables else {}
-            ledger = await _ledger_rows(connection) if tables else {}
+            ledger = (
+                await _ledger_rows(connection) if "credit_allocations" in tables else {}
+            )
     finally:
         await engine.dispose()
     return events, credit_rows, metering, ledger
@@ -789,7 +868,7 @@ class _Oracle:
         self.created.remove(name)
 
     async def enforce(self, name: str) -> None:
-        """Group 3b-1: set ``credit_enforcement_at`` in a ``038`` clone."""
+        """Group 3b-1: set ``credit_enforcement_at`` in a credit-ready clone."""
 
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import create_async_engine
@@ -869,9 +948,10 @@ async def oracle(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[_Ora
         await _run_alembic(admin_url.set(database=at_037), "upgrade", "037")
         await _seed_world(admin_url.set(database=at_037), world)
         oracle.templates["037"] = at_037
-        at_038 = await oracle.clone("037")
-        await _run_alembic(admin_url.set(database=at_038), "upgrade", "038")
-        oracle.templates["038"] = at_038
+        # The credit-ready head: 039 (Group 4a; 038 before it).
+        at_039 = await oracle.clone("037")
+        await _run_alembic(admin_url.set(database=at_039), "upgrade", "039")
+        oracle.templates["039"] = at_039
         yield oracle
     finally:
         for name in list(reversed(created)):
@@ -936,11 +1016,14 @@ def test_the_corpus_covers_every_ingress_accepted_and_rejected() -> None:
 def _assert_same(on: dict[str, Any], off: dict[str, Any], world: _World) -> None:
     expected, actual = _comparable(off, world), _comparable(on, world)
     for want, got in zip(expected["responses"], actual["responses"], strict=True):
+        assert got["id"] == want["id"]
+        if got["id"] in _CREDIT_SURFACES:
+            continue  # asserted on its own (Group 4a)
         assert got == want, got["id"]
     assert actual["events"] == expected["events"]
 
 
-@pytest.mark.parametrize("revision", ["037", "038"])
+@pytest.mark.parametrize("revision", ["037", "039"])
 async def test_config_on_answers_and_stores_like_config_off(
     oracle: _Oracle, revision: str
 ) -> None:
@@ -962,7 +1045,7 @@ async def test_config_on_answers_and_stores_like_config_off(
         assert on["reading"] == {
             "effective": True,
             "reason": "schema_ready",
-            "revision": "038",
+            "revision": "039",
         }
     _assert_same(on, off, oracle.world)
 
@@ -1018,6 +1101,17 @@ async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
     assert status["events-api-key-handoff"] == 200
     assert body["events-api-key-handoff"]["handoff_summary"] is not None
     assert status["events-api-key-enforced-retry"] == 200
+    # Group 4a: the uploads and the download are main's real answers.
+    assert status["knowledge-json-upload"] == 201, body["knowledge-json-upload"]
+    assert status["media-upload-pdf"] == 201, body["media-upload-pdf"]
+    assert body["media-upload-pdf"]["category"] == "pdf"
+    assert status["media-download-seeded"] == 200
+    assert body["media-download-seeded"].startswith("%PDF-1.4")
+    # The multipart upload is a credit surface: off here.
+    assert (status["knowledge-files-upload"], body["knowledge-files-upload"]) == (
+        503,
+        {"code": "credit_unavailable"},
+    )
 
 
 async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None:
@@ -1043,7 +1137,7 @@ async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None
 
 async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> None:
     _assert_same(
-        await oracle.run("038", enabled=False),
+        await oracle.run("039", enabled=False),
         await oracle.run("037", enabled=False),
         oracle.world,
     )
@@ -1051,7 +1145,7 @@ async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> Non
 
 @pytest.mark.parametrize(
     ("revision", "enabled"),
-    [("037", False), ("037", True), ("038", False)],
+    [("037", False), ("037", True), ("039", False)],
 )
 async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     oracle: _Oracle, revision: str, enabled: bool
@@ -1063,7 +1157,7 @@ async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     assert run["statements"], "the listener saw no SQL at all"
     touching = [s for s in run["statements"] if _CREDIT_SQL.search(s)]
     assert touching == []
-    if revision == "038":
+    if revision == "039":
         assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
     else:
         assert run["credit_rows"] == {}
@@ -1072,10 +1166,11 @@ async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
 async def test_the_effective_switch_only_meters_observationally(
     oracle: _Oracle,
 ) -> None:
-    """Config on at 038 (Group 3a): only the writer's three tables are
-    touched, and nothing financial is ever written before the enforcement."""
+    """Config on at the credit-ready head (Groups 3a and 4a): only the
+    writers' tables are touched, and nothing financial is ever written
+    before the enforcement."""
 
-    run = await oracle.run("038", enabled=True)
+    run = await oracle.run("039", enabled=True)
 
     names = {
         match.group(0).lower()
@@ -1103,11 +1198,16 @@ def _event_id(run: dict[str, Any], case: str) -> str:
 async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
     oracle: _Oracle,
 ) -> None:
-    run = await oracle.run("038", enabled=True)
+    run = await oracle.run("039", enabled=True)
     world = oracle.world
     status = {r["id"]: r["status"] for r in run["responses"]}
     claims = run["metering"]["credit_ingress_claims"]
-    effects = run["metering"]["credit_observational_effects"]
+    # The traces (Group 3a); Group 4a's upload effects are asserted below.
+    effects = [
+        effect
+        for effect in run["metering"]["credit_observational_effects"]
+        if effect["effect_kind"] == "trace"
+    ]
 
     # No Idempotency-Key is still main's 200 (observational only).
     assert status["events-api-key-scheduling"] == 200
@@ -1210,6 +1310,97 @@ async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
     }
 
 
+def _bodies(run: dict[str, Any]) -> dict[str, Any]:
+    return {r["id"]: r["body"] for r in run["responses"]}
+
+
+@pytest.mark.parametrize(
+    ("revision", "enabled", "expected"),
+    [
+        ("037", False, 503),
+        ("037", True, 503),
+        ("039", False, 503),
+        ("039", True, 201),
+    ],
+)
+async def test_the_multipart_upload_exists_only_with_the_switch_effective(
+    oracle: _Oracle, revision: str, enabled: bool, expected: int
+) -> None:
+    run = await oracle.run(revision, enabled=enabled)
+    [answer] = [r for r in run["responses"] if r["id"] == "knowledge-files-upload"]
+    assert answer["status"] == expected, answer
+    if expected == 503:
+        assert answer["body"] == {"code": "credit_unavailable"}
+    else:
+        [document] = answer["body"]["documents"]
+        assert document["tenant_id"] == oracle.world.api_tenant
+        assert document["metadata"]["title"] == "horarios.pdf"
+
+
+async def test_uploads_and_downloads_are_metered_observationally_only(
+    oracle: _Oracle,
+) -> None:
+    """Group 4a, switch effective, before the enforcement: what each upload
+    and download WOULD debit, the window's maintenance once per category,
+    the delivery -- and nothing financial."""
+
+    run = await oracle.run("039", enabled=True)
+    world = oracle.world
+    bodies = _bodies(run)
+    effects = {
+        effect["effect_id"]: effect
+        for effect in run["metering"]["credit_observational_effects"]
+        if effect["effect_kind"] != "trace"
+    }
+    tenant = world.api_tenant
+    json_doc = bodies["knowledge-json-upload"]["id"]
+    media_id = bodies["media-upload-pdf"]["id"]
+    rag = effects[f"rag:{tenant}:{json_doc}:reserve"]
+    media = effects[f"media:{tenant}:{media_id}:reserve"]
+    from src.services.credit_allocations import aggregate_target_mc
+
+    [item] = [i for i in _corpus()["requests"] if i["id"] == "knowledge-json-upload"]
+    characters = len(item["json"]["content"])
+    uploaded = (
+        _FIXTURES / "credit_storage_conformance/positive/textual.pdf"
+    ).read_bytes()
+    assert (rag["effect_kind"], rag["builder_id"]) == ("rag", world.builder)
+    # The builder's first RAG content: its whole target, rounded once, up.
+    assert rag["would_debit_mc"] == aggregate_target_mc(characters, "rag") > 0
+    # What the upload adds on top of the seeded asset (rounded once).
+    assert (media["effect_kind"], media["would_debit_mc"]) == (
+        "media",
+        aggregate_target_mc(len(_SEEDED_MEDIA) + len(uploaded), "media")
+        - aggregate_target_mc(len(_SEEDED_MEDIA), "media"),
+    )
+    [egress] = [e for e in effects.values() if e["effect_kind"] == "egress"]
+    assert egress["effect_id"].startswith(f"egress:{tenant}:{world.media_asset}:")
+    assert egress["would_debit_mc"] == 0  # within the included 200 KB per mc
+    maintenance = sorted(
+        e["effect_id"].rsplit(":", 1)[-1]
+        for e in effects.values()
+        if e["effect_kind"] == "maintenance"
+    )
+    assert maintenance == ["media", "rag"]
+    # The multipart upload is measured too (one effect for its batch).
+    batch = [
+        e
+        for e in effects.values()
+        if e["effect_kind"] == "rag" and e["effect_id"] != rag["effect_id"]
+    ]
+    assert len(batch) == 1
+    rows = run["credit_rows"]
+    assert rows["credit_egress_deliveries"] == 1
+    for financial in (
+        "credit_allocations",
+        "credit_inventory_versions",
+        "credit_ledger_entries",
+        "credit_effects",
+        "credit_accounts",
+    ):
+        assert rows[financial] == 0, financial
+
+
 # ---------------------------------------------------------------------------
 # Group 3b-1: the corpus with ``credit_enforcement_at`` set.
 # ---------------------------------------------------------------------------
@@ -1258,8 +1449,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
     """``credit_enforcement_at`` set but the switch off: ``main`` exactly,
     no SQL touches a ``credit_*`` table, nothing is claimed or charged."""
 
-    off = await oracle.run("038", enabled=False)
-    enforced = await oracle.run("038", enabled=False, enforced=True)
+    off = await oracle.run("039", enabled=False)
+    enforced = await oracle.run("039", enabled=False, enforced=True)
 
     assert enforced["reading"] == off["reading"]
     _assert_same(enforced, off, oracle.world)
@@ -1272,8 +1463,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
 async def test_the_enforced_run_charges_each_production_decision_once(
     oracle: _Oracle,
 ) -> None:
-    off = await oracle.run("038", enabled=False)
-    run = await oracle.run("038", enabled=True, enforced=True)
+    off = await oracle.run("039", enabled=False)
+    run = await oracle.run("039", enabled=True, enforced=True)
     world = oracle.world
 
     assert run["reading"]["effective"] is True
@@ -1290,14 +1481,16 @@ async def test_the_enforced_run_charges_each_production_decision_once(
         assert answers[retry]["body"] == answers[first]["body"]  # replayed
     assert answers["events-api-key-handoff"]["body"]["handoff_summary"]
 
-    # Everything else -- the panel JWT (simulator), rejected requests and
-    # the provider webhooks, enforced or not -- answers like the config-off
-    # run.
+    # Everything else -- the panel JWT (simulator), rejected requests, the
+    # provider webhooks, enforced or not, and Group 4a's uploads and
+    # download (reserved and charged below) -- answers like the config-off
+    # run.  The multipart upload is a credit surface (off: 503; here: 201).
     production = set(_KEYLESS) | set(_REPLAYS) | set(_CHARGED.values())
     expected, actual = _comparable(off, world), _comparable(run, world)
     for want, got in zip(expected["responses"], actual["responses"], strict=True):
-        if got["id"] not in production:
+        if got["id"] not in production | _CREDIT_SURFACES:
             assert got == want, got["id"]
+    assert answers["knowledge-files-upload"]["status"] == 201
     # The handoff runs on a session of its own: its enforced answer and its
     # stored events are main's (plus the srm.decision's credit_effect_id).
     [want] = [r for r in expected["responses"] if r["id"] == "events-api-key-handoff"]
@@ -1361,14 +1554,19 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     webhook_effects = {key: trace(claim) for key, claim in by_message.items()}
     every_effect = sorted([*effect_ids.values(), *webhook_effects.values()])
     ledger = run["ledger"]
-    effects = ledger["credit_effects"]
+    # The traces; Group 4a's reservations are asserted below.
+    effects = [e for e in ledger["credit_effects"] if e["effect_kind"] == "trace"]
     assert sorted(e["effect_id"] for e in effects) == every_effect
     assert {(e["effect_kind"], e["builder_id"]) for e in effects} == {
         ("trace", world.builder)
     }
     assert all(len(e["decision_digest"] or "") == 64 for e in effects)
     # No lot was ever granted: each trace is 1 credit of debt, once.
-    entries = ledger["credit_ledger_entries"]
+    entries = [
+        e
+        for e in ledger["credit_ledger_entries"]
+        if e["effect_id"].startswith("trace:")
+    ]
     assert sorted(
         (e["effect_id"], e["entry_type"], e["amount_mc"]) for e in entries
     ) == (sorted((effect, "debt", 1_000) for effect in every_effect))
@@ -1409,6 +1607,52 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     # A file handoff has no srm.decision: its link is the handoff's context.
     assert linked == sorted(set(every_effect) - set(webhook_effects.values()) | replied)
     assert run["credit_rows"]["credit_accounts"] == 1
+
+    # Group 4a: the window open at the enforcement got a free baseline
+    # (nothing stored before it is charged: the seeded media asset); each
+    # RAG upload reserved its aggregate delta, as debt (no lot); the media
+    # upload added nothing above the baseline's coverage (rounded once); the
+    # download was a delivery within the allowance (no egress charge).
+    bodies = {r["id"]: r["body"] for r in run["responses"]}
+    tenant = world.api_tenant
+    allocations = ledger["credit_allocations"]
+    assert sorted((a["category"], a["allocation_kind"]) for a in allocations) == [
+        ("media", "baseline"),
+        ("rag", "baseline"),
+        ("rag", "reservation"),
+        ("rag", "reservation"),
+    ]
+    assert all(
+        a["charged_mc"] == 0 and a["effect_id"] is None
+        for a in allocations
+        if a["allocation_kind"] == "baseline"
+    )
+    reserved = {
+        a["effect_id"]: a for a in allocations if a["allocation_kind"] == "reservation"
+    }
+    json_effect = f"rag:{tenant}:{bodies['knowledge-json-upload']['id']}:reserve"
+    media_effect = f"media:{tenant}:{bodies['media-upload-pdf']['id']}:reserve"
+    assert json_effect in reserved and media_effect not in reserved
+    [baseline] = [
+        a
+        for a in allocations
+        if a["allocation_kind"] == "baseline" and a["category"] == "media"
+    ]
+    assert baseline["units"] == len(_SEEDED_MEDIA)
+    upload_entries = sorted(
+        (e["effect_id"], e["entry_type"], e["amount_mc"])
+        for e in ledger["credit_ledger_entries"]
+        if not e["effect_id"].startswith("trace:")
+    )
+    assert upload_entries == sorted(
+        (effect, "debt", allocation["charged_mc"])
+        for effect, allocation in reserved.items()
+    )
+    assert [
+        (d["tenant_id"], d["media_id"], d["mode"])
+        for d in ledger["credit_egress_deliveries"]
+    ] == [(tenant, world.media_asset, "enforced")]
+    assert {e["effect_kind"] for e in ledger["credit_effects"]} == {"trace", "rag"}
 
 
 # ---------------------------------------------------------------------------
@@ -1478,9 +1722,9 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
             ) as client:
                 before = await client.post("/v1/events", json={}, headers=unknown_key)
 
-                await _run_alembic(url, "upgrade", "038")
+                await _run_alembic(url, "upgrade", "039")
                 assert await _wait_for(True, bound) <= bound
-                assert credit_switch_reading().revision == "038"
+                assert credit_switch_reading().revision == "039"
                 during = await client.post("/v1/events", json={}, headers=unknown_key)
 
                 await _run_alembic(url, "downgrade", "037")

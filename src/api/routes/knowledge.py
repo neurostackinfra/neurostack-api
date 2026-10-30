@@ -33,12 +33,29 @@ issue: free text is never echoed (Pydantic's UUID message quotes one
 character of a malformed UUID). ``metadata.custom`` cannot use a
 reserved key, and every response is built from the stored row, so an upload
 answers exactly what a later read returns.
+
+Credits (neurostack-credit-system Group 4a, :mod:`src.services.credit_inventory`).
+With the credit switch off nothing changes.  With it on, ``POST /documents``
+is measured by ``len(content)``: before ``credit_enforcement_at`` only
+observationally, after its commit; after the enforcement the document's RAG
+reservation is debited in the route's transaction (a standalone tenant or a
+quarantine hold: 402 ``credit_pending``, nothing written).  The PDF's
+500,000-character limit is the multipart route's only (owner decision H):
+here the schema's 100,000 always refuses first.
+``POST /documents/upload`` (multipart DOCX/textual PDF) is a credit surface:
+503 ``credit_unavailable`` with the switch off, before the body is read; an
+unsupported or unreadable file (an OCR-only PDF included) is always a 422
+and the request has a technical size cap; the PDF's commercial limits (20 MB
+per file, 500,000 extracted characters, 10 files, no password) apply only
+after the enforcement.  The request's read transaction ends before the body
+is read, and the files are parsed in a worker thread
+(:func:`~src.services.knowledge_service.extract_documents`).
 """
 
 from collections.abc import Callable, Coroutine
 from datetime import datetime
 from typing import Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -47,6 +64,8 @@ from fastapi.routing import APIRoute
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.api.middleware.auth import (
     TenantContext,
@@ -57,7 +76,9 @@ from src.api.schemas.base import ErrorResponse
 from src.api.schemas.knowledge import (
     KNOWLEDGE_CATEGORY_MAX_LENGTH,
     KNOWLEDGE_RESERVED_METADATA_KEYS,
+    KNOWLEDGE_TITLE_MAX_LENGTH,
     CategoryText,
+    DocumentBatchUploadResponse,
     DocumentListResponse,
     DocumentMetadata,
     DocumentResponse,
@@ -69,6 +90,19 @@ from src.api.schemas.knowledge import (
 from src.models.knowledge import KnowledgeDocument
 from src.models.tenant import Tenant
 from src.repositories import KnowledgeDocumentRepository, get_db_session_dependency
+from src.services import credit_inventory
+from src.services.credit_allocations import (
+    KNOWLEDGE_BATCH_MAX_FILES,
+    KNOWLEDGE_DOCUMENT_MAX_CHARACTERS,
+    KNOWLEDGE_FILE_MAX_BYTES,
+)
+from src.services.credit_metering import (
+    CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
+    CreditEnforcementUnavailable,
+    CreditTenantGone,
+)
+from src.services.credit_switch import CreditSwitchRoute
+from src.services.knowledge_service import KnowledgeFileError, extract_documents
 
 
 def _no_store(response: Response) -> None:
@@ -251,6 +285,90 @@ def _document_not_found(document_id: UUID) -> HTTPException:
 
 
 # ============================================
+# Credits (Group 4a)
+# ============================================
+
+_CREDIT_PENDING = {"code": "credit_pending"}
+_CREDIT_PENDING_RESPONSE: dict[int | str, dict[str, Any]] = {
+    402: {
+        "description": (
+            "After credit_enforcement_at only: the tenant has no credit "
+            "account (standalone) or its builder is on a quarantine hold "
+            "(credit_pending); nothing was stored"
+        ),
+        "model": ErrorResponse,
+    },
+}
+
+
+def _credit_pending() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=_CREDIT_PENDING
+    )
+
+
+def _enforcement_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+    )
+
+
+async def _credit_mode(
+    request: Request, session: AsyncSession
+) -> credit_inventory.CreditMode:
+    try:
+        return await credit_inventory.read_credit_mode(request, session)
+    except CreditEnforcementUnavailable:
+        raise _enforcement_unavailable() from None
+
+
+async def _reserve_or_refuse(
+    session: AsyncSession,
+    mode: credit_inventory.CreditMode,
+    *,
+    tenant_id: UUID,
+    object_ids: list[UUID],
+    upload_id: UUID,
+) -> None:
+    """The enforced RAG reservation, in the route's transaction (before its
+    commit); 402 rolls everything back."""
+
+    assert mode.enforcement_at is not None
+    try:
+        outcome = await credit_inventory.reserve_upload(
+            session,
+            tenant_id=tenant_id,
+            category="rag",
+            object_ids=object_ids,
+            upload_id=upload_id,
+            enforcement_at=mode.enforcement_at,
+        )
+    except CreditTenantGone:
+        await session.rollback()
+        raise _tenant_not_found() from None
+    if outcome.status == "credit_pending":
+        await session.rollback()
+        raise _credit_pending()
+
+
+async def _refuse_standalone(session: AsyncSession, tenant_id: UUID) -> None:
+    """Lock order step 1 before the upload writes anything: a standalone
+    tenant has no account (``credit_pending``)."""
+
+    try:
+        has_builder = await credit_inventory.lock_tenant_for_reservation(
+            session, tenant_id
+        )
+    except CreditTenantGone:
+        await session.rollback()
+        raise _tenant_not_found() from None
+    if not has_builder:
+        await session.rollback()
+        raise _credit_pending()
+
+
+# ============================================
 # Endpoints
 # ============================================
 
@@ -291,6 +409,7 @@ accepted only for a builder that owns the clinic or a super admin.
             "description": "Invalid document content",
             "model": ErrorResponse,
         },
+        **_CREDIT_PENDING_RESPONSE,
         **_TENANT_FORBIDDEN_RESPONSE,
         **_TENANT_NOT_FOUND_RESPONSE,
         **_validation_error_response(
@@ -310,11 +429,17 @@ async def upload_document(
     """
     Upload and index a document.
     """
+    # Credits: read once, before any row is loaded (switch off: no SQL).
+    mode = await _credit_mode(http_request, session)
     # The payload tenant is an override request; authorize it before use.
     effective_tenant_id = await resolve_effective_tenant(
         http_request, tenant, request.tenant_id, session
     )
     await _require_tenant_row(session, effective_tenant_id)
+    if mode.enforced:
+        # The PDF's 500,000-character limit is the multipart route's only
+        # (owner decision H): this schema's 100,000 always refuses first.
+        await _refuse_standalone(session, effective_tenant_id)
     repo = KnowledgeDocumentRepository(session)
 
     # The schema already refused reserved keys in custom, so it cannot
@@ -345,12 +470,288 @@ async def upload_document(
     # TODO: Trigger indexing job (Task 19.0)
     # For now, mark as pending
 
+    if mode.enforced:
+        await _reserve_or_refuse(
+            session,
+            mode,
+            tenant_id=effective_tenant_id,
+            object_ids=[document.id],
+            upload_id=document.id,
+        )
     # Built from the row ``create`` refreshed, never from the request, so the
     # response is exactly what a later read returns.
     response = _document_response(document)
     # Commit only once the write and its response are complete.
     await session.commit()
+    if mode.observational:
+        await credit_inventory.record_observational_upload(
+            session,
+            tenant_id=effective_tenant_id,
+            category="rag",
+            object_ids=[document.id],
+            upload_id=document.id,
+        )
     return response
+
+
+# ``POST /documents/upload``: DOCX / textual PDF, multipart (Group 4a).
+# Technical caps, applied with the switch on whatever the enforcement: the
+# request body (10 files of the PDF's 20 MB plus the multipart framing) and
+# the number of parts.  The PDF's own limits are applied after the
+# enforcement only (``_enforce_upload_limits``).
+KNOWLEDGE_UPLOAD_FIELD = "files"
+KNOWLEDGE_UPLOAD_REQUEST_MAX_BYTES = (
+    KNOWLEDGE_BATCH_MAX_FILES * KNOWLEDGE_FILE_MAX_BYTES + 1_000_000
+)
+KNOWLEDGE_UPLOAD_MAX_PARTS = 100
+
+
+class _UploadTooLarge(Exception):
+    """The multipart body passed the technical request cap."""
+
+
+def _upload_error(status_code: int, code: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code})
+
+
+def _limited_receive(receive: Any, limit: int) -> Any:
+    received = 0
+
+    async def limited() -> Any:
+        nonlocal received
+        message = await receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _UploadTooLarge()
+        return message
+
+    return limited
+
+
+async def _read_upload_files(request: Request) -> list[tuple[str, bytes]]:
+    """``(filename, bytes)`` of every ``files`` part, within the technical
+    caps (413 ``knowledge_request_too_large``; a malformed body, another
+    field or no file: 422 ``knowledge_multipart_invalid``)."""
+
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            too_large = int(declared) > KNOWLEDGE_UPLOAD_REQUEST_MAX_BYTES
+        except ValueError:
+            raise _upload_error(422, "knowledge_multipart_invalid") from None
+        if too_large:
+            raise _upload_error(413, "knowledge_request_too_large")
+    limited = Request(
+        request.scope,
+        receive=_limited_receive(request.receive, KNOWLEDGE_UPLOAD_REQUEST_MAX_BYTES),
+    )
+    uploads: list[Any] = []
+    try:
+        try:
+            form = await limited.form(
+                max_files=KNOWLEDGE_UPLOAD_MAX_PARTS, max_fields=0
+            )
+        except _UploadTooLarge:
+            raise _upload_error(413, "knowledge_request_too_large") from None
+        except (StarletteHTTPException, ValueError, AssertionError) as error:
+            raise _upload_error(422, "knowledge_multipart_invalid") from error
+        files: list[tuple[str, bytes]] = []
+        for key, value in form.multi_items():
+            if key != KNOWLEDGE_UPLOAD_FIELD or not isinstance(value, UploadFile):
+                raise _upload_error(422, "knowledge_multipart_invalid")
+            uploads.append(value)
+            files.append((value.filename or "", await value.read()))
+        if not files:
+            raise _upload_error(422, "knowledge_multipart_invalid")
+        return files
+    finally:
+        for upload in uploads:
+            await upload.close()
+
+
+def _upload_title(filename: str) -> str:
+    """The stored title: the file name without a path, storable, bounded."""
+
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(
+        character for character in name if character >= " " and character != "\x7f"
+    )
+    name = name.encode("utf-8", "replace").decode("utf-8").strip()
+    return (name or "Untitled Document")[:KNOWLEDGE_TITLE_MAX_LENGTH]
+
+
+def _enforce_upload_limits(
+    files: list[tuple[str, bytes]], extracted: list[Any]
+) -> None:
+    """The PDF's limits, after the enforcement only, before any write."""
+
+    if len(files) > KNOWLEDGE_BATCH_MAX_FILES:
+        raise _upload_error(422, "knowledge_too_many_files")
+    for (_name, data), document in zip(files, extracted, strict=True):
+        if len(data) > KNOWLEDGE_FILE_MAX_BYTES:
+            raise _upload_error(413, "knowledge_file_too_large")
+        if document.encrypted:
+            raise _upload_error(422, "knowledge_file_password_protected")
+        if len(document.text) > KNOWLEDGE_DOCUMENT_MAX_CHARACTERS:
+            raise _upload_error(422, "knowledge_document_too_long")
+
+
+class _KnowledgeCreditRoute(CreditSwitchRoute, _KnowledgeValidationRoute):
+    """503 ``credit_unavailable`` with the switch off, before the body is
+    read; otherwise the knowledge routes' 422 shape."""
+
+
+async def upload_document_files(
+    request: Request,
+    tenant_id: Optional[UUID] = Query(
+        default=None, description=_TENANT_OVERRIDE_DESCRIPTION
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> DocumentBatchUploadResponse:
+    """Upload DOCX / textual PDF files as knowledge documents."""
+
+    mode = await _credit_mode(request, session)
+    effective_tenant_id = await resolve_effective_tenant(
+        request, tenant, tenant_id, session
+    )
+    await _require_tenant_row(session, effective_tenant_id)
+    # Authorized: end the read transaction so no pooled connection is held
+    # while the body arrives and its files are parsed (a tenant deleted
+    # meanwhile is caught by the writes below).
+    await session.rollback()
+    files = await _read_upload_files(request)
+    try:
+        extracted = await extract_documents([data for _name, data in files])
+    except KnowledgeFileError as error:
+        raise _upload_error(422, error.code) from None
+    if mode.enforced:
+        _enforce_upload_limits(files, extracted)
+        await _refuse_standalone(session, effective_tenant_id)
+    repo = KnowledgeDocumentRepository(session)
+    documents: list[KnowledgeDocument] = []
+    try:
+        for (name, _data), document in zip(files, extracted, strict=True):
+            title = _upload_title(name)
+            documents.append(
+                await repo.create(
+                    tenant_id=effective_tenant_id,
+                    title=title,
+                    content=document.text,
+                    content_type=document.kind,
+                    document_metadata={
+                        "title": title,
+                        "source": "upload",
+                        "category": None,
+                        "tags": [],
+                    },
+                    is_indexed=False,
+                    chunk_count=0,
+                    size_bytes=len(document.text.encode("utf-8")),
+                )
+            )
+    except IntegrityError as error:
+        await session.rollback()
+        if _is_missing_tenant_violation(error):
+            raise _tenant_not_found() from None
+        raise
+    upload_id = uuid4()
+    if mode.enforced:
+        await _reserve_or_refuse(
+            session,
+            mode,
+            tenant_id=effective_tenant_id,
+            object_ids=[document.id for document in documents],
+            upload_id=upload_id,
+        )
+    response = DocumentBatchUploadResponse(
+        documents=[_document_response(document) for document in documents]
+    )
+    await session.commit()
+    if mode.observational:
+        await credit_inventory.record_observational_upload(
+            session,
+            tenant_id=effective_tenant_id,
+            category="rag",
+            object_ids=[document.id for document in documents],
+            upload_id=upload_id,
+        )
+    return response
+
+
+router.add_api_route(
+    "/documents/upload",
+    upload_document_files,
+    methods=["POST"],
+    response_model=DocumentBatchUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload DOCX/PDF Documents",
+    description="""
+Upload DOCX or textual PDF files (multipart field `files`, one or more) as
+knowledge documents.  A credit surface: `503 {"code": "credit_unavailable"}`
+while the credit switch is not effective, before the body is read.
+
+- An unsupported format or an unreadable file -- corrupt, needing a
+  password, or with no extractable text (OCR-only) -- is a `422`.
+- The request is capped at 201,000,000 bytes (`413`).
+- After `credit_enforcement_at` only: at most 10 files, 20 MB per file,
+  500,000 extracted characters per document and no encrypted PDF; the
+  documents' RAG reservation is debited, and a standalone tenant or a
+  quarantine hold is `402 credit_pending` (nothing stored).
+    """,
+    responses={
+        201: {"description": "Documents stored", "model": DocumentBatchUploadResponse},
+        402: _CREDIT_PENDING_RESPONSE[402],
+        413: {
+            "description": (
+                "Request above the technical cap (knowledge_request_too_large) "
+                "or, after the enforcement, a file above 20 MB "
+                "(knowledge_file_too_large)"
+            ),
+            "model": ErrorResponse,
+        },
+        422: {
+            "description": (
+                "knowledge_multipart_invalid, knowledge_file_unsupported, "
+                "knowledge_file_unreadable or, after the enforcement, "
+                "knowledge_too_many_files, knowledge_document_too_long, "
+                "knowledge_file_password_protected"
+            ),
+            "model": ErrorResponse,
+        },
+        503: {
+            "description": (
+                "credit_unavailable (credit switch off) or "
+                "credit_enforcement_unavailable"
+            ),
+            "model": ErrorResponse,
+        },
+        **_TENANT_FORBIDDEN_RESPONSE,
+        **_TENANT_NOT_FOUND_RESPONSE,
+    },
+    tags=["Knowledge"],
+    route_class_override=_KnowledgeCreditRoute,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": [KNOWLEDGE_UPLOAD_FIELD],
+                        "properties": {
+                            KNOWLEDGE_UPLOAD_FIELD: {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    },
+)
 
 
 @router.post(

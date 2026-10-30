@@ -628,3 +628,214 @@ async def test_upgrade_gives_up_after_the_lock_timeout_and_changes_nothing(
     assert "canceling statement due to lock timeout" in output, output
     assert await _catalog(baseline.cluster, at_037) == before
     assert before["alembic_version"] == [("037",)]
+
+
+# ---------------------------------------------------------------------------
+# Migration 039 (Group 4a): the credit inventory.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_039_PATH = (
+    _ROOT / "alembic" / "versions" / "20261030_000001_039_credit_inventory.py"
+)
+_DOWNGRADE_039_REFUSED = "downgrade of migration 039 refused (nothing was changed): "
+_TABLES_039 = (
+    "credit_inventory_versions",
+    "credit_allocations",
+    "credit_egress_deliveries",
+)
+_ROWS_039 = {
+    "credit_inventory_versions": (
+        "INSERT INTO credit_inventory_versions (id, tenant_id, category, object_id, "
+        "version, units) VALUES (gen_random_uuid(), gen_random_uuid(), 'rag', "
+        "gen_random_uuid(), 1, 10)"
+    ),
+    "credit_allocations": (
+        "INSERT INTO credit_allocations (id, builder_id, account_id, window_start, "
+        "window_end, category, allocation_kind, source_key, units, target_mc, "
+        "charged_mc) VALUES (gen_random_uuid(), gen_random_uuid(), "
+        "gen_random_uuid(), DATE '2026-11-01', DATE '2026-12-01', 'rag', "
+        "'baseline', 'window:2026-11-01:rag:opening', 0, 0, 0)"
+    ),
+    "credit_egress_deliveries": (
+        "INSERT INTO credit_egress_deliveries (id, tenant_id, media_id, delivery_id, "
+        "window_start, bytes, mode) VALUES (gen_random_uuid(), gen_random_uuid(), "
+        "gen_random_uuid(), gen_random_uuid(), DATE '2026-11-01', 1000, 'enforced')"
+    ),
+}
+# What 039 adds on existing (038) tables: PostgreSQL's RI action triggers of
+# the two foreign keys of credit_allocations, on credit_accounts and
+# credit_effects (ON DELETE RESTRICT, ON UPDATE NO ACTION).
+_CREDIT_RI_039 = Counter(
+    {
+        ("credit_accounts", "fk_credit_allocations_account", "RI_FKey_restrict_del"): 1,
+        ("credit_accounts", "fk_credit_allocations_account", "RI_FKey_noaction_upd"): 1,
+        ("credit_effects", "fk_credit_allocations_effect", "RI_FKey_restrict_del"): 1,
+        ("credit_effects", "fk_credit_allocations_effect", "RI_FKey_noaction_upd"): 1,
+    }
+)
+
+
+def _load_039() -> ModuleType:
+    import alembic as alembic_package
+
+    if not hasattr(alembic_package, "op"):
+        setattr(alembic_package, "op", SimpleNamespace())
+    spec = importlib.util.spec_from_file_location("migration_039", _MIGRATION_039_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_MIGRATION_039 = _load_039()
+
+
+@dataclass(frozen=True)
+class _Baseline039:
+    template_039: str
+    catalog_038: dict[str, Any]
+    catalog_039: dict[str, Any]
+    internal_038: list[tuple[Any, ...]]
+    internal_039: list[tuple[Any, ...]]
+
+
+@pytest.fixture(scope="module")
+async def baseline_039(baseline: _Baseline) -> _Baseline039:
+    cluster = baseline.cluster
+    template_039 = await cluster.clone(baseline.template_038)
+    await _migrate(cluster.url(template_039), "upgrade", "039")
+    return _Baseline039(
+        template_039=template_039,
+        catalog_038=baseline.catalog_038,
+        catalog_039=await _catalog(cluster, template_039),
+        internal_038=baseline.internal_038,
+        internal_039=await _internal_triggers(cluster, template_039),
+    )
+
+
+@pytest.fixture
+async def at_039(baseline: _Baseline, baseline_039: _Baseline039) -> AsyncIterator[str]:
+    name = await baseline.cluster.clone(baseline_039.template_039)
+    try:
+        yield name
+    finally:
+        await baseline.cluster.drop(name)
+
+
+def test_039_declares_exactly_its_tables() -> None:
+    assert (_MIGRATION_039.revision, _MIGRATION_039.down_revision) == ("039", "038")
+    assert _MIGRATION_039.CREATED_TABLES == _TABLES_039
+    assert set(_ROWS_039) == set(_TABLES_039)
+
+
+async def test_039_changes_no_existing_object(baseline_039: _Baseline039) -> None:
+    before, after = baseline_039.catalog_038, baseline_039.catalog_039
+    assert before["alembic_version"] == [("038",)]
+    assert after["alembic_version"] == [("039",)]
+    for kind, width in _KEYS.items():
+        old = _keyed(before[kind], width)
+        new = _keyed(after[kind], width)
+        for key, row in old.items():
+            assert new.get(key) == row, (kind, key)
+        added = set(new) - set(old)
+        assert all(str(key[0]).startswith(_TABLES_039) for key in added), (kind, added)
+    for table, order in before["column_order"].items():
+        assert after["column_order"][table] == order, table
+    assert set(after["column_order"]) - set(before["column_order"]) == set(_TABLES_039)
+    # No new function: the triggers reuse 038's.
+    assert {row[0] for row in after["functions"]} == {
+        row[0] for row in before["functions"]
+    }
+    # Every foreign key of a 039 table stays inside the credit schema.
+    targets = {
+        row[3].split("REFERENCES ", 1)[1].split("(", 1)[0]
+        for row in after["constraints"]
+        if row[0].startswith(_TABLES_039) and row[2] == "f"
+    }
+    assert targets == {"credit_accounts", "credit_effects"}
+
+
+async def test_039_adds_only_the_ri_triggers_of_its_foreign_keys(
+    baseline_039: _Baseline039,
+) -> None:
+    existing = {row[0] for row in baseline_039.catalog_038["relations"]}
+    before = _shape(baseline_039.internal_038)
+    after = _shape([row for row in baseline_039.internal_039 if row[0] in existing])
+    assert before - after == Counter()
+    added = after - before
+    assert Counter(key[:3] for key in added.elements()) == _CREDIT_RI_039
+
+
+async def _assert_039_downgrade_refused(
+    cluster: _Cluster, name: str, tables: tuple[str, ...]
+) -> None:
+    before = await _catalog(cluster, name)
+    code, output = await _alembic(cluster.url(name), "downgrade", "038")
+    assert code != 0, output
+    assert _refusal(output, _DOWNGRADE_039_REFUSED) == (
+        f"{_DOWNGRADE_039_REFUSED}tables that have rows: {', '.join(tables)}"
+    )
+    assert await _catalog(cluster, name) == before
+    assert before["alembic_version"] == [("039",)]
+    for table in tables:
+        assert await _scalar(cluster, name, f"SELECT count(*) FROM {table}") == 1
+
+
+@pytest.mark.parametrize("table", _TABLES_039)
+async def test_one_row_in_any_039_table_refuses_its_downgrade(
+    baseline: _Baseline, at_039: str, table: str
+) -> None:
+    await _execute(baseline.cluster, at_039, _PLANT, _ROWS_039[table])
+    await _assert_039_downgrade_refused(baseline.cluster, at_039, (table,))
+
+
+async def test_every_occupied_039_table_is_reported_together(
+    baseline: _Baseline, at_039: str
+) -> None:
+    await _execute(
+        baseline.cluster, at_039, _PLANT, *(_ROWS_039[t] for t in _TABLES_039)
+    )
+    await _assert_039_downgrade_refused(baseline.cluster, at_039, _TABLES_039)
+
+
+async def test_the_039_preflight_refuses_another_revision(
+    baseline: _Baseline, at_039: str
+) -> None:
+    cluster = baseline.cluster
+    await _execute(cluster, at_039, "UPDATE alembic_version SET version_num = '038'")
+    before = await _catalog(cluster, at_039)
+    engine = create_async_engine(cluster.url(at_039), poolclass=NullPool)
+    try:
+        with pytest.raises(DBAPIError) as info:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql(_MIGRATION_039.LOCK_TIMEOUT)
+                await connection.exec_driver_sql(_MIGRATION_039.downgrade_preflight())
+    finally:
+        await engine.dispose()
+    assert _sqlstate(info.value) == "55000"
+    assert f"{_DOWNGRADE_039_REFUSED}alembic_version is 038, not 039" in str(info.value)
+    assert await _catalog(cluster, at_039) == before
+
+
+async def test_the_empty_039_round_trip_restores_038_exactly(
+    baseline: _Baseline, baseline_039: _Baseline039, at_039: str
+) -> None:
+    cluster = baseline.cluster
+    await _migrate(cluster.url(at_039), "downgrade", "038")
+    assert await _catalog(cluster, at_039) == baseline_039.catalog_038
+    assert _shape(await _internal_triggers(cluster, at_039)) == _shape(
+        baseline_039.internal_038
+    )
+    await _migrate(cluster.url(at_039), "upgrade", "039")
+    assert await _catalog(cluster, at_039) == baseline_039.catalog_039
+
+
+async def test_the_039_downgrade_gives_up_after_the_lock_timeout(
+    baseline: _Baseline, at_039: str
+) -> None:
+    before = await _catalog(baseline.cluster, at_039)
+    code, output = await _alembic_while_reading(
+        baseline.cluster, at_039, "credit_allocations", "downgrade", "038"
+    )
+    _assert_lock_timeout_in_the_preflight(code, output)
+    assert await _catalog(baseline.cluster, at_039) == before

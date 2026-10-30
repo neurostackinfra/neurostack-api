@@ -376,6 +376,16 @@ class DocumentListResponse(BaseModel):
     page_size: int = Field(..., description="Items per page")
 
 
+class DocumentBatchUploadResponse(BaseModel):
+    """Response of ``POST /v1/knowledge/documents/upload`` (DOCX/PDF files,
+    neurostack-credit-system Group 4a): one stored document per file, in the
+    order of the upload."""
+
+    documents: list[DocumentResponse] = Field(
+        ..., description="The stored documents, one per uploaded file"
+    )
+
+
 class KnowledgeValidationIssue(BaseModel):
     """One request validation issue, without FastAPI's ``input`` field."""
 
@@ -400,6 +410,7 @@ __all__ = [
     "SearchResult",
     "SearchResponse",
     "DocumentListResponse",
+    "DocumentBatchUploadResponse",
     "KnowledgeValidationIssue",
     "KnowledgeValidationErrorResponse",
 ]

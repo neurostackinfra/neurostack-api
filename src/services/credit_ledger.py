@@ -148,6 +148,17 @@ already must for expiries, never from the stored rows alone.
 
 Group 2 never charges RAG or media maintenance, never opens an exhaustion
 episode and never reads ``tests/``.
+
+Group 4a (RAG and media).  A reservation is a DEBIT (owner decision B,
+2026-10-30): :mod:`src.services.credit_inventory` debits ``target -
+coverage`` of an accounting window through this book, so it has already left
+the lots and nothing extra is subtracted from :meth:`LedgerBook.available_trace_mc`.
+The window's opening (its RAG/media maintenance, or the free baseline of the
+window open at ``credit_enforcement_at``) runs lazily at the first metered
+effect of the window: :meth:`CreditLedger.debit` (every trace debit of
+Groups 3b-1/3b-2) opens it first, after the deadline sweep and the start
+catch-up, before its own debit; a grant never does ("nunca na concessão").
+The fact consumer is unchanged.
 """
 
 from __future__ import annotations
@@ -850,7 +861,9 @@ class LedgerBook:
         return sum(lot.spendable_mc(at) for lot in self._lots.values())
 
     def available_trace_mc(self, at: datetime) -> int:
-        """Usable capacity net of open debt (reservations: Group 4a)."""
+        """Usable capacity net of open debt.  The RAG/media reservations of
+        Group 4a are debits of this book (owner decision B): they already
+        left the lots, so nothing more is subtracted here."""
 
         return max(self.available_mc(at) - self.open_debt_mc, 0)
 
@@ -1822,9 +1835,34 @@ class CreditLedger:
         A refused (``credit_pending``) or replayed debit persists nothing --
         not even the expiries the book's deadline sweep recorded: the ledger
         does not change (the next accepted writer sweeps instead).
+
+        Group 4a: once ``credit_enforcement_at`` is set, an accepted debit
+        first opens its accounting window (the RAG/media maintenance, or the
+        free baseline of the window open at the enforcement), in this book,
+        after the sweep and before its own consumption; a readback that
+        cannot be trusted answers ``credit_pending`` (nothing written).
         """
 
         book = await self.open_book(builder_id, at=at, effect_ids=(effect_id,))
+        opening = None
+        if (
+            book.spend_hold.enforced
+            and not book.spend_hold.active
+            and not book.has_effect(effect_id)
+        ):
+            # Lazy import: credit_inventory builds on this module.
+            from src.services import credit_inventory
+
+            try:
+                opening = await credit_inventory.open_window_for_debit(self, book)
+            except credit_inventory.InventoryReadbackFailed as error:
+                logger.warning(
+                    "credit ledger refused a debit: inventory readback failed",
+                    builder_id=str(builder_id),
+                    effect_id=effect_id,
+                    error=str(error),
+                )
+                return DebitResult("credit_pending", at=book.clock)
         result = book.debit(
             effect_id,
             amount_mc,
@@ -1835,6 +1873,8 @@ class CreditLedger:
         )
         if result.status == "applied":
             await self.persist(book)
+            if opening is not None:
+                await opening.write_pending()
         return result
 
 

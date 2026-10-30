@@ -159,7 +159,8 @@ def test_credit_modules_import_without_a_tests_tree(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "credit tables: 15" in completed.stdout
+    # 15 of migration 038 and 3 of Group 4a's 039 (the credit inventory).
+    assert "credit tables: 18" in completed.stdout
 
 
 def test_the_probe_detects_a_read_under_tests(tmp_path: Path) -> None:

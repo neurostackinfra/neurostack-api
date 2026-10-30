@@ -49,6 +49,10 @@ _EXPECTED_TABLES = {
     "credit_observational_effects",
     "credit_response_outbox",
     "credit_revision_gaps",
+    # Group 4a, migration 039.
+    "credit_inventory_versions",
+    "credit_allocations",
+    "credit_egress_deliveries",
 }
 
 
@@ -177,7 +181,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "038"
+    assert version == "039"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 
