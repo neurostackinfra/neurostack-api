@@ -3037,8 +3037,8 @@ async def test_a_session_lock_during_the_bookkeeping_never_multiplies_a_reply(
     from src.repositories.database import get_db_session_factory
 
     _no_app_publisher(monkeypatch)
-    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 2)
-    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
     monkeypatch.setattr(credit_metering, "SENDING_LEASE_SECONDS", 1)
     phone = "5511900019001"
@@ -3417,3 +3417,99 @@ async def test_a_clinic_delete_during_the_webhook_final_transaction(
     )
     seen = await _webhook_rows(enforced_direct, UUID(world.zapi_tenant))
     assert seen.claims == [] and seen.outbox == []
+
+
+async def test_a_credentials_lock_past_the_lease_never_duplicates_a_reply(
+    enforced_direct: AsyncEngine,
+    enforced_pool: _Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real adapter's clinic_configs read stalls; the live inline sender
+    must give up before recovery can send, even after the lock is released."""
+    from src.api.routes.webhook import CreditReplySender
+    from src.models.clinic_config_table import ClinicConfigTable
+
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: True)
+    monkeypatch.setattr(credit_metering, "SENDING_LEASE_SECONDS", 0.6)
+    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
+    seeded = await _tenant(enforced_direct)
+    async with enforced_pool.sessions() as session, session.begin():
+        session.add(
+            ClinicConfigTable(
+                tenant_id=seeded.tenant_id,
+                api_credentials={"zapi_instance_id": "instance", "zapi_token": "token"},
+            )
+        )
+    row = await _outbox_row(enforced_direct, seeded)
+    sends: list[UUID] = []
+
+    class Sender(CreditReplySender):
+        async def send(self, prepared: Any) -> Any:
+            sends.append(prepared.session_id)
+            return {"messageId": "accepted"}
+
+        async def record(self, prepared: Any, sent: Any, db: AsyncSession) -> None:
+            return None
+
+    sender = Sender()
+    async with asyncio.timeout(_TURN_SECONDS):
+        async with enforced_direct.connect() as blocker:
+            transaction = await blocker.begin()
+            await blocker.execute(
+                text("LOCK TABLE clinic_configs IN ACCESS EXCLUSIVE MODE")
+            )
+            inline = asyncio.create_task(
+                credit_metering.deliver_reply_inline(
+                    row,
+                    sender=sender,
+                    session_factory=enforced_pool.sessions,
+                )
+            )
+            try:
+                await _until_lock_waiters(enforced_direct, 1, query="%clinic_configs%")
+                await asyncio.sleep(0.8)  # longer than the sending lease
+                publisher = asyncio.create_task(
+                    credit_metering.CreditResponsePublisher(
+                        sender,
+                        session_factory=enforced_pool.sessions,
+                    ).run_once()
+                )
+                await asyncio.sleep(0.1)
+            finally:
+                await transaction.rollback()
+            delivery, tick = await asyncio.gather(inline, publisher)
+    assert delivery.outcome == "failed" and tick is not None
+    assert seeded.session_id not in sends
+    state, payload, _attempts = await _outbox_state(enforced_direct, row)
+    assert state == "failed" and "phone" not in payload
+    # A cancelled credentials statement did not poison the application pool.
+    async with enforced_pool.sessions() as session:
+        assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
+
+
+async def test_a_pending_reply_of_an_ended_session_never_reaches_the_provider(
+    enforced_direct: AsyncEngine,
+    enforced_pool: _Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.repositories.session import SessionRepository
+
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: True)
+    seeded = await _tenant(enforced_direct)
+    row = await _outbox_row(enforced_direct, seeded)
+    async with enforced_pool.sessions() as session, session.begin():
+        assert await SessionRepository(session).end_for_tenant(
+            seeded.session_id,
+            seeded.tenant_id,
+        )
+    sender = _Recorded()
+    tick = await credit_metering.CreditResponsePublisher(
+        sender,
+        session_factory=enforced_pool.sessions,
+    ).run_once()
+    assert tick is not None and "failed" in tick.outcomes
+    assert str(row) not in sender.sent
+    state, payload, _attempts = await _outbox_state(enforced_direct, row)
+    assert state == "failed" and "phone" not in payload

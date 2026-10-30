@@ -52,6 +52,7 @@ from src.models.session import Session
 from src.models.tenant import Tenant
 from src.repositories.credit import CreditRepository
 from src.repositories.database import _patch_jsonb_for_sqlite
+from src.repositories.session import SessionRepository
 from src.services import credit_metering
 from src.services.credit_metering import (
     PUBLISHER_MAX_ATTEMPTS,
@@ -584,6 +585,7 @@ async def test_one_row_at_a_time_each_claim_committed_before_its_send(
         ("bot_off", "bot_inactive"),
         ("expired", "reply_expired"),
         ("session_gone", "session_gone"),
+        ("session_ended", "session_gone"),
     ],
 )
 async def test_a_reply_is_never_sent_once_the_conversation_moved_on(
@@ -606,6 +608,11 @@ async def test_a_reply_is_never_sent_once_the_conversation_moved_on(
         async with db.sessions() as session, session.begin():
             await session.execute(
                 update(Tenant).where(Tenant.id == db.tenant).values(bot_active=False)
+            )
+    elif change == "session_ended":
+        async with db.sessions() as session, session.begin():
+            assert await SessionRepository(session).end_for_tenant(
+                db.session, db.tenant
             )
     elif change == "expired":
         payload = _reply(db, decided=timedelta(seconds=REPLY_MAX_AGE_SECONDS + 1))
@@ -1073,3 +1080,73 @@ async def test_the_outbox_rows_carry_no_credential(db: _Db) -> None:
     async with db.sessions() as session:
         rows = (await session.execute(select(CreditResponseOutbox))).scalars().all()
     assert rows == []
+
+
+@pytest.mark.parametrize("path", ["inline", "publisher"])
+async def test_preparation_cannot_consume_the_sends_lease_budget(
+    db: _Db, switch: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    monkeypatch.setattr(credit_metering, "SENDING_LEASE_SECONDS", 0.2)
+    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 0.1)
+    await _enforce(db)
+    row = await _row(db, age=timedelta(hours=1))
+
+    class SlowPreparation(_Sender):
+        async def prepare(self, payload: Mapping[str, Any], db: AsyncSession) -> Any:
+            await asyncio.sleep(0.3)
+            return await super().prepare(payload, db)
+
+    sender = SlowPreparation()
+    if path == "inline":
+        result = await _inline(db, row, sender)
+        assert result.outcome == "failed"
+    else:
+        tick = await _publisher(db, sender).run_once()
+        assert tick is not None and tick.outcomes == ["failed"]
+    assert sender.sent == []
+    stored = await _get(db, row)
+    assert stored.state == "failed" and "phone" not in stored.payload
+
+
+async def test_a_claim_delayed_before_preparation_has_no_fresh_lease_budget(
+    db: _Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(credit_metering, "SENDING_LEASE_SECONDS", 0.1)
+    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 0.05)
+    row = await _row(db)
+    async with db.sessions() as session:
+        claim = await CreditRepository(session).claim_outbox_inline(row)
+        await session.commit()
+    assert claim is not None
+    await asyncio.sleep(0.15)  # e.g. a slow claim COMMIT, before preparation
+    sender = _Sender()
+    delivery = await credit_metering._deliver_claimed(claim, sender, db.sessions)
+    assert delivery.outcome == "failed"
+    assert sender.prepared == [] and sender.sent == []
+
+
+async def test_preparation_cleanup_cannot_spend_the_reserved_send_budget(
+    db: _Db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(credit_metering, "SENDING_LEASE_SECONDS", 0.2)
+    monkeypatch.setattr(credit_metering, "REPLY_SEND_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(credit_metering, "REPLY_RECORD_TIMEOUT_SECONDS", 0.01)
+    sender = _Sender()
+    close = AsyncSession.close
+    stalled = False
+
+    async def slow_close(session: AsyncSession) -> None:
+        nonlocal stalled
+        if sender.prepared and not sender.sent and not stalled:
+            stalled = True
+            await asyncio.sleep(0.3)
+        await close(session)
+
+    row = await _row(db)
+    monkeypatch.setattr(AsyncSession, "close", slow_close)
+    delivery = await _inline(db, row, sender)
+    assert stalled and delivery.outcome == "failed"
+    assert sender.sent == []
+    assert (await _get(db, row)).state == "failed"

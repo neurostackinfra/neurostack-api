@@ -2627,6 +2627,67 @@ async def _finish_delivered(
     return _Delivery("delivered")
 
 
+async def _prepare_claimed(
+    claim: OutboxClaim,
+    sender: ReplySender,
+    factory: Callable[[], AsyncSession],
+) -> tuple[str | None, Any]:
+    """Read guards and credentials, then close, within the claim's remaining
+    lease minus a full send and bookkeeping budget.  The database clock
+    accounts for a slow claim commit; monotonic time bounds every later
+    await without depending on the application clock matching PostgreSQL.
+    """
+
+    loop = asyncio.get_running_loop()
+    reserve = REPLY_SEND_TIMEOUT_SECONDS + REPLY_RECORD_TIMEOUT_SECONDS
+    deadline = loop.time() + SENDING_LEASE_SECONDS - reserve
+    session = factory()
+    held: list[AsyncConnection] = []
+    single = _single_connection_pool(session)
+
+    def due() -> None:
+        if loop.time() >= deadline:
+            raise TimeoutError
+
+    # Never interrupt a statement on SQLite's single shared connection;
+    # still refuse to send if a step or its cleanup has consumed the budget.
+    async with asyncio.timeout_at(None if single else deadline) as budget:
+        try:
+            due()
+            held.append(await session.connection())
+            repository = CreditRepository(session)
+            started = loop.time()
+            now = await repository.lease_clock()
+            observed = claim.observed
+            if observed.tzinfo is None:  # SQLite stores UTC without its zone
+                observed = observed.replace(tzinfo=timezone.utc)
+            remaining = (observed - now).total_seconds() + SENDING_LEASE_SECONDS
+            deadline = min(deadline, started + remaining - reserve)
+            due()  # reject an expired claim before scheduling its cancellation
+            if not single:
+                budget.reschedule(deadline)
+            refusal = await _reply_refusal(repository, claim.payload)
+            due()
+            prepared = None
+            if refusal is None:
+                prepared = await sender.prepare(claim.payload, session)
+            due()
+            await session.rollback()
+        except BaseException:
+            # Invalidation must finish: a pending timer must not interrupt
+            # it after a synchronous refusal or an already-expired claim.
+            if not budget.expired():
+                budget.reschedule(None)
+            if not single:
+                for connection in held:
+                    await _invalidate_connection(connection)
+            raise
+        finally:
+            await _close_within_budget(session, held)
+    due()  # cleanup must also leave the reserved provider budget intact
+    return refusal, prepared
+
+
 async def _deliver_claimed(
     claim: OutboxClaim,
     sender: ReplySender,
@@ -2635,7 +2696,8 @@ async def _deliver_claimed(
     """One send of a claimed (``sending``) row, inline or recovered.
 
     OD-2 first (:func:`_reply_refusal`) and the sender's preparation (the
-    credentials), in a short read; then the PROVIDER CALL alone under
+    credentials), bounded by the remaining lease with send and bookkeeping
+    time reserved; then the PROVIDER CALL alone under
     :data:`REPLY_SEND_TIMEOUT_SECONDS` (OD-5).  A refusal, a failure or a
     timeout -- an UNCERTAIN result -- turns the row ``failed`` at once with
     its PII erased and is never resent (OD-1).  Once the provider returned
@@ -2644,12 +2706,9 @@ async def _deliver_claimed(
     """
 
     try:
-        async with factory() as session:
-            refusal = await _reply_refusal(CreditRepository(session), claim.payload)
-            prepared: Any = None
-            if refusal is None:
-                prepared = await sender.prepare(claim.payload, session)
-            await session.rollback()
+        refusal, prepared = await _prepare_claimed(claim, sender, factory)
+    except TimeoutError:
+        return await _mark_failed(factory, claim, "prepare_timeout")
     except CreditReplyUndeliverable as refused:
         refusal = refused.reason
     if refusal is not None:

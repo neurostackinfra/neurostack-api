@@ -1218,13 +1218,17 @@ class CreditRepository:
     ) -> tuple[bool, list[Any]] | None:
         """What a stored reply re-checks before any send (OD-2): the tenant's
         ``bot_active`` (``NULL`` is on, like ``_check_bot_active``) and the
-        session's pause state; ``None`` when the tenant or session is gone."""
+        session's pause state; ``None`` when the tenant or active session is gone."""
 
         row = (
             await self.session.execute(
                 select(Tenant.bot_active, SessionRow.is_paused, SessionRow.paused_until)
                 .join(SessionRow, SessionRow.tenant_id == Tenant.id)
-                .where(Tenant.id == tenant_id, SessionRow.id == session_id)
+                .where(
+                    Tenant.id == tenant_id,
+                    SessionRow.id == session_id,
+                    SessionRow.is_active.is_(True),
+                )
             )
         ).one_or_none()
         if row is None:
