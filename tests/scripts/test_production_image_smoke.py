@@ -53,6 +53,14 @@ EXPECTED_CHECKS = {
         "/app",
         SITE_PACKAGES_DIR,
     ),
+    # Pinned literally: the probe must call the function, not echo the pin.
+    "bundle-digest": (
+        "python",
+        "-c",
+        "from src.services.billing_outbox import billing_fact_bundle_digest; "
+        "from src.services.credit_fact_consumer import PINNED_BUNDLE_DIGEST; "
+        "print(billing_fact_bundle_digest(), PINNED_BUNDLE_DIGEST)",
+    ),
     "alembic-heads": ("alembic", "heads"),
     "spa-index": ("test", "-f", "/app/spa/index.html"),
     "alembic-offline-sql": ("alembic", "upgrade", "032:035", "--sql"),
@@ -145,6 +153,7 @@ def test_required_checks_run_the_exact_commands() -> None:
         "no-world-writable",
         "src-imports",
         "kms-signers",
+        "bundle-digest",
         "alembic-heads",
         "spa-index",
         "alembic-offline-sql",
@@ -174,7 +183,7 @@ def test_scanned_site_packages_is_where_the_dockerfile_copies_them() -> None:
 
 def test_runbook_lists_every_check_in_the_order_the_smoke_runs_them() -> None:
     text = " ".join(RUNBOOK.read_text(encoding="utf-8").split())
-    listed = text.split("The smoke runs eleven checks, in this order: ", 1)[1]
+    listed = text.split("The smoke runs twelve checks, in this order: ", 1)[1]
     names = re.findall(r"`([a-z-]+)`", listed.split("(see", 1)[0])
     assert names == [*_checks(), "serve"]
     # The image's head is a parameter, never the window's 035 written in.
@@ -279,6 +288,9 @@ def test_offline_sql_check_fails_on_a_nonzero_exit() -> None:
     assert validate(_completed(_sql(*WINDOW), returncode=1)) is not None
 
 
+_BUNDLE_OUTPUT = f"{smoke.BUNDLE_DIGEST} {smoke.BUNDLE_DIGEST}"
+
+
 @pytest.mark.parametrize(
     ("name", "completed", "ok"),
     [
@@ -289,6 +301,10 @@ def test_offline_sql_check_fails_on_a_nonzero_exit() -> None:
         ("kms-signers", _completed(smoke.KMS_SIGNERS_OUTPUT + "\n"), True),
         ("kms-signers", _completed("Boto3KmsDigestSigner\n"), False),
         ("kms-signers", _completed(smoke.KMS_SIGNERS_OUTPUT, returncode=1), False),
+        ("bundle-digest", _completed(_BUNDLE_OUTPUT + "\n"), True),
+        ("bundle-digest", _completed(smoke.BUNDLE_DIGEST + " " + "0" * 64), False),
+        ("bundle-digest", _completed(smoke.BUNDLE_DIGEST), False),
+        ("bundle-digest", _completed(_BUNDLE_OUTPUT, returncode=1), False),
         ("src-imports", _completed("22 top-level modules resolve\n"), True),
         ("src-imports", _completed("0 top-level modules resolve\n"), False),
         ("src-imports", _completed("boto3 (src/x.py)\n", returncode=1), False),
@@ -299,6 +315,27 @@ def test_exit_status_and_output_checks(
     name: str, completed: subprocess.CompletedProcess[str], ok: bool
 ) -> None:
     assert (_checks()[name].validate(completed) is None) is ok
+
+
+def test_bundle_digest_check_pins_the_consumer_and_contract_digest() -> None:
+    """Issue #137: the smoke's digest is the one the consumer and CI pin."""
+
+    from src.services.credit_fact_consumer import PINNED_BUNDLE_DIGEST
+
+    assert smoke.BUNDLE_DIGEST == PINNED_BUNDLE_DIGEST
+    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    completed = subprocess.run(
+        [sys.executable, "-c", smoke.BUNDLE_DIGEST_PROBE],
+        cwd=ROOT,
+        env={**environment, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert _checks()["bundle-digest"].validate(completed) is None, (
+        completed.stdout + completed.stderr
+    )
 
 
 def test_src_import_scan_flags_a_missing_lazy_import(tmp_path: Path) -> None:
@@ -1990,6 +2027,7 @@ def _passing_outputs() -> dict[str, subprocess.CompletedProcess[str]]:
         "no-world-writable": _completed(_modes()),
         "src-imports": _completed("22 top-level modules resolve\n"),
         "kms-signers": _completed(smoke.KMS_SIGNERS_OUTPUT + "\n"),
+        "bundle-digest": _completed(_BUNDLE_OUTPUT + "\n"),
         "alembic-heads": _completed("035 (head)\n"),
         "spa-index": _completed(),
         "alembic-offline-sql": _completed(_sql(*WINDOW)),
@@ -2050,6 +2088,10 @@ def test_full_smoke_passes_only_when_every_check_passes(
         ("site-packages", _completed()),
         ("src-imports", _completed("boto3 (src/x.py)\n")),
         ("kms-signers", _completed("Boto3KmsDigestSigner\n")),
+        (
+            "bundle-digest",
+            _completed(returncode=1, stderr="BillingFactViolation: unavailable"),
+        ),
         ("alembic-heads", _completed("034 (head)\n")),
         ("alembic-offline-sql", _completed(_sql(*WINDOW[1:]))),
         ("imports", _completed(returncode=1, stderr="ModuleNotFoundError")),

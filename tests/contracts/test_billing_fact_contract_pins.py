@@ -13,7 +13,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from src.services.billing_outbox import (
+    BillingFactViolation,
     billing_fact_bundle_digest,
     billing_fact_schema_digest,
 )
@@ -21,6 +24,8 @@ from src.services.billing_outbox import (
 _ROOT = Path(__file__).parents[2]
 _SCHEMA = "src/contracts/billing_fact_v1.schema.json"
 _MANIFEST = "tests/fixtures/contracts/billing_fact_v1/SHA256SUMS"
+# The copy the runtime image ships (issue #137): the image never contains tests/.
+_PACKAGED_MANIFEST = "src/contracts/billing_fact_v1/SHA256SUMS"
 _SCHEMA_SHA256 = "9d441e6c6a63a83a8955f981989ab5160da3466b8b2771a5cee1151647a5ff79"
 _MANIFEST_SHA256 = "af630b3ea567ff68ddd4f6a0b3aae236b316d244a80ca9ac2c795c14051f4e77"
 
@@ -51,3 +56,29 @@ def test_every_manifest_entry_matches_its_file_and_nothing_is_unlisted() -> None
     }
     assert on_disk == listed
     assert _SCHEMA in entries
+
+
+def test_packaged_manifest_is_the_fixture_manifest_byte_for_byte() -> None:
+    packaged = (_ROOT / _PACKAGED_MANIFEST).read_bytes()
+    assert packaged == (_ROOT / _MANIFEST).read_bytes()
+    assert _sha256(_PACKAGED_MANIFEST) == _MANIFEST_SHA256
+
+
+def test_bundle_digest_defaults_to_the_packaged_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read: list[Path] = []
+    original = Path.read_bytes
+
+    def recording(path: Path) -> bytes:
+        read.append(path)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", recording)
+    assert billing_fact_bundle_digest() == _MANIFEST_SHA256
+    assert read == [(_ROOT / _PACKAGED_MANIFEST).resolve()]
+
+
+def test_an_explicit_unreadable_manifest_still_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(BillingFactViolation, match="manifest is unavailable"):
+        billing_fact_bundle_digest(tmp_path / "missing" / "SHA256SUMS")

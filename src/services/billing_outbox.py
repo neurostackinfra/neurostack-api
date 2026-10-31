@@ -354,11 +354,15 @@ def payload_digest(value: Mapping[str, object]) -> str:
 def billing_fact_bundle_digest(
     manifest: Path | None = None,
 ) -> str:
-    """Hash the exact, versioned manifest bytes rather than a reconstructed list."""
+    """Hash the exact, versioned manifest bytes rather than a reconstructed list.
+
+    The default is the copy packaged under ``src/contracts`` (the runtime image
+    never ships ``tests/``, issue #137); it is byte-identical to the fixture
+    manifest the bundle verifier checks, which a contract pin test enforces.
+    """
 
     path = manifest or (
-        Path(__file__).resolve().parents[2]
-        / "tests/fixtures/contracts/billing_fact_v1/SHA256SUMS"
+        Path(__file__).resolve().parents[2] / "src/contracts/billing_fact_v1/SHA256SUMS"
     )
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()

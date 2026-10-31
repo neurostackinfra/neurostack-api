@@ -42,6 +42,10 @@ the summary reports. Push that image ID; never rebuild it for the push.
   included, resolves in the image.
 * ``kms-signers``: the KMS receipt and grant signer factories build their
   clients (they fail closed when the AWS SDK is missing). No KMS call is made.
+* ``bundle-digest``: ``billing_fact_bundle_digest()`` returns the pinned
+  ``billing.fact.v1`` bundle digest from what the image ships (it never ships
+  ``tests/``, issue #137), and the consumer's ``PINNED_BUNDLE_DIGEST`` is the
+  same value.
 * ``alembic-heads``: ``alembic heads`` prints exactly one line, the head
   named by ``--expected-head``: the head of the migrations the image contains
   (035 on main today, 036 once PR #121 is merged), not the production window
@@ -107,6 +111,13 @@ KMS_SIGNERS = (
     "print(type(_receipt_signer()).__name__, type(_grant_signer()).__name__)"
 )
 KMS_SIGNERS_OUTPUT = "Boto3KmsDigestSigner Boto3KmsDigestSigner"
+# The billing.fact.v1 manifest digest (tests/contracts pins the same bytes).
+BUNDLE_DIGEST = "af630b3ea567ff68ddd4f6a0b3aae236b316d244a80ca9ac2c795c14051f4e77"
+BUNDLE_DIGEST_PROBE = (
+    "from src.services.billing_outbox import billing_fact_bundle_digest; "
+    "from src.services.credit_fact_consumer import PINNED_BUNDLE_DIGEST; "
+    "print(billing_fact_bundle_digest(), PINNED_BUNDLE_DIGEST)"
+)
 # Every absolute top-level import anywhere under src/ (also the lazy ones, like
 # the signers' boto3) must resolve in the image.
 SRC_IMPORTS = """
@@ -647,6 +658,13 @@ def checks(expected_head: str, lock: Mapping[str, Any]) -> list[Check]:
             problem = f"unexpected signer types: {completed.stdout.strip()!r}"
         return problem
 
+    def bundle_digest(completed: subprocess.CompletedProcess[str]) -> str | None:
+        problem = _exit_zero(completed)
+        expected = f"{BUNDLE_DIGEST} {BUNDLE_DIGEST}"
+        if problem is None and completed.stdout.strip() != expected:
+            problem = f"unexpected bundle digests: {completed.stdout.strip()!r}"
+        return problem
+
     def site_packages(completed: subprocess.CompletedProcess[str]) -> str | None:
         return _exit_zero(completed) or site_packages_problem(completed.stdout, lock)
 
@@ -681,6 +699,12 @@ def checks(expected_head: str, lock: Mapping[str, Any]) -> list[Check]:
         ),
         Check("src-imports", ("python", "-c", SRC_IMPORTS), src_imports),
         Check("kms-signers", ("python", "-c", KMS_SIGNERS), signers, OFFLINE_AWS_ENV),
+        Check(
+            "bundle-digest",
+            ("python", "-c", BUNDLE_DIGEST_PROBE),
+            bundle_digest,
+            OFFLINE_AWS_ENV,
+        ),
         Check("alembic-heads", ("alembic", "heads"), heads),
         Check("spa-index", ("test", "-f", f"{SPA_DIST_DIR}/index.html"), _exit_zero),
         Check(

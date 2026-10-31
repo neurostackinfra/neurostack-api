@@ -2,8 +2,9 @@
 
 The production image copies only what its final stage names (``src``,
 ``config``, ``alembic.ini``, ``alembic``, ``scripts/bootstrap_admin.py``) --
-never ``tests/`` (issue #137: ``billing_fact_bundle_digest()`` reads
-``tests/fixtures`` and raises there).  Credit code must never read ``tests/``
+never ``tests/`` (issue #137: ``billing_fact_bundle_digest()`` read
+``tests/fixtures`` and raised there; it now hashes the identical copy of the
+manifest packaged under ``src/contracts``).  Credit code must never read ``tests/``
 at import or start-up.  This copies exactly the repository paths the final
 stage copies into a scratch tree and, in a subprocess whose ``sys.path``
 starts there, imports ``src.models`` and every credit module and builds the
@@ -36,7 +37,7 @@ CREDIT_MODULES = (
     "src.repositories.credit_fact_ack",
 )
 
-_PROBE = r"""
+_HOOKS = r"""
 import importlib
 import os
 import sys
@@ -76,6 +77,9 @@ def refuse_reads():
 
 sys.addaudithook(audit)
 sys.meta_path.insert(0, RefuseTests())
+"""
+
+_PROBE = _HOOKS + r"""
 for name in modules:
     module = importlib.import_module(name)
     origin = os.path.realpath(module.__file__)
@@ -135,21 +139,24 @@ def test_the_image_never_ships_tests() -> None:
     )
 
 
-def test_credit_modules_import_without_a_tests_tree(tmp_path: Path) -> None:
+def _image_tree(tmp_path: Path) -> Path:
     image = tmp_path / "app"
     for source in _image_sources():
         _copy_tree(ROOT / source, image / source)
     assert not (image / "tests").exists()
     assert (image / "src" / "models" / "credit.py").is_file()
+    return image
 
+
+def _run_in(image: Path, probe: str, *args: str) -> subprocess.CompletedProcess[str]:
     environment = {
         key: value
         for key, value in os.environ.items()
         if key not in {"PYTHONPATH", "PYTHONSTARTUP"}
     }
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    completed = subprocess.run(
-        [sys.executable, "-c", _PROBE, str(image), *CREDIT_MODULES],
+    return subprocess.run(
+        [sys.executable, "-c", probe, str(image), *args],
         cwd=image,
         env=environment,
         capture_output=True,
@@ -158,11 +165,38 @@ def test_credit_modules_import_without_a_tests_tree(tmp_path: Path) -> None:
         timeout=120,
     )
 
+
+def test_credit_modules_import_without_a_tests_tree(tmp_path: Path) -> None:
+    completed = _run_in(_image_tree(tmp_path), _PROBE, *CREDIT_MODULES)
+
     assert completed.returncode == 0, completed.stdout + completed.stderr
     # 15 of migration 038, three 039 inventory, three 040 copy tables and
     # thirteen 041 lifecycle/hold/purge/role tables (Group 5).
     # Migration 042 adds the immutable cutoff-acceptance table.
     assert "credit tables: 35" in completed.stdout
+
+
+_DIGEST_PROBE = _HOOKS + r"""
+from src.services.billing_outbox import billing_fact_bundle_digest
+from src.services.credit_fact_consumer import PINNED_BUNDLE_DIGEST
+
+origin = os.path.realpath(sys.modules["src.services.billing_outbox"].__file__)
+if not origin.startswith(root + os.sep):
+    raise SystemExit("billing_outbox was imported from " + origin)
+digest = billing_fact_bundle_digest()
+refuse_reads()
+print("bundle digest:", digest, "pinned:", PINNED_BUNDLE_DIGEST)
+"""
+
+
+def test_bundle_digest_is_the_pin_without_a_tests_tree(tmp_path: Path) -> None:
+    """Issue #137: the image computes the pinned digest from what it ships."""
+
+    completed = _run_in(_image_tree(tmp_path), _DIGEST_PROBE)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    pinned = "af630b3ea567ff68ddd4f6a0b3aae236b316d244a80ca9ac2c795c14051f4e77"
+    assert f"bundle digest: {pinned} pinned: {pinned}" in completed.stdout
 
 
 def test_the_probe_detects_a_read_under_tests(tmp_path: Path) -> None:
