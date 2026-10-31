@@ -2,18 +2,79 @@
 
 Target of the `runbook_url` on the three `neurostack_billing_facts` alerts.
 
-**The worker has no transport and delivers nothing today.** No credit consumer
-exists, production wires `transport=None`, and the code guard
-`PRESENTATION_PRECONDITIONS_OPEN` in `src/services/billing_outbox.py` makes any
-attempt to wire one raise. Facts stay `pending` and retriable. With the worker
-enabled, a stale alert is the expected steady state until a consumer ships.
+## The real transport
+
+The consumer of every `billing.fact.v1` fact is the credit system, **in the
+same process**. There is no queue, broker or network hop.
+
+**Status (read first).** The `BILLING_FACT_TRANSPORT_ENABLED` wiring in
+`main.py` and the two-phase attempt record ship with Groups 2c and 2a of the
+`asaas-rollout-opening` wish; an image without them (`main` today) wires
+`transport=None`.
+The code guard `PRESENTATION_PRECONDITIONS_OPEN` in
+`src/services/billing_outbox.py` makes every presenting entry point raise
+while it is `True`. Check the image's flag value and that guard before you
+read a presentation failure as a consumer fault. The rollout turns the
+transport on last, after the credit switch (`CREDIT_HOT_PATH_ENABLED`).
+Items tagged "(Group 2c)" or "(Group 2a)" below describe the design once that
+group has landed, not `main` today.
+
+The path of a fact:
+
+1. Each API worker process with `BILLING_FACT_WORKER_ENABLED=true` runs one
+   `BillingFactWorker` loop (`src/services/billing_fact_worker.py`).
+   (Group 2c) With `BILLING_FACT_TRANSPORT_ENABLED=true`, `src/api/main.py`
+   hands it the transport `handle_billing_fact`
+   (`src/services/credit_fact_consumer.py`).
+   With the flag `false` (the default) the loop gets `transport=None`:
+   nothing is presented, no attempt is counted, facts stay `pending` and the
+   stale alert fires after the threshold.
+2. A tick claims at most `BILLING_FACT_WORKER_BATCH_SIZE` due deliveries, one
+   per short transaction, `FOR UPDATE OF billing_fact_deliveries SKIP
+   LOCKED`. A delivery with **any** row in `billing_fact_acks` is never
+   claimed. The presentation is bounded by `TRANSPORT_TIMEOUT_SECONDS`
+   (10 s). (Group 2a) With the two-phase attempt record, the attempt is
+   committed before the fact is presented, so a crash after a send still
+   counts against the cap.
+3. `handle_billing_fact` runs in **its own** session and transaction. On
+   success it appends the credit inbox row and the consumer-owned ack
+   (`accepted`, or `rejected` for a problem in the fact itself) in that
+   transaction. A replay of a fact already in the inbox is a no-op.
+4. Any exception raised by the consumer is a **failed attempt**, except
+   `TransportNotReady` (Group 2a), which is not counted (the API log
+   `billing fact presentation failed` carries only `failure_class` and
+   `attempt_count`). The fact is presented again after an exponential backoff
+   of 60 s doubling to at most 1 h. After `BILLING_FACT_WORKER_MAX_ATTEMPTS`
+   (default 10, about 5 h in total) the delivery becomes `blocked` with the
+   alert row `retry cap exhausted`. The fact is never deleted.
+5. The maintenance phase (one process at a time, advisory lock) reads the
+   ack: a valid one moves the delivery to `acknowledged`; a mismatching or
+   `rejected` one moves it to `blocked` with `collision`, `digest_mismatch` or
+   `schema_mismatch` evidence.
+
+Failure classes the consumer raises, and what fixes them:
+
+| `failure_class` | Cause | Fix |
+|---|---|---|
+| `CreditSwitchOff` | the credit dominance switch is not effective (`CREDIT_HOT_PATH_ENABLED` off, or the schema is not at `042`) | turn the switch on **before** the transport (the rollout order puts the transport last). From Groups 2a/2c, `main.py` turns this into `TransportNotReady`: no attempt is counted, the fact stays `pending` and only the stale alert fires; it never leads to `blocked`. |
+| `ConsumerContractDivergence` | the consumer's bundle, schema or catalog pins differ from the image's, or from the fact's handoff | a deploy that aligns the pins; until then every attempt fails |
+| `UnresolvableFact` | no outbox row or handoff for the presented event id | lineage gap: see the `gap` alerts below |
+| `FactCollision` | the event id, or the aggregate revision, is already held by other bytes in the inbox | consumer contract bug: escalate, never edit the inbox |
+| `CycleIdentityConflict` | a second settled cycle with the same subscription period | billing data bug: escalate to the owner |
+| `LedgerClockAhead` | the builder's ledger clock is beyond the database clock plus tolerance | wait for the clocks to converge; check host time |
+| `TimeoutError` / `CancelledError` | the consumer exceeded 10 s, or raised a stray cancellation | database health, lock waits |
+
+`main` today wires `transport=None`, so none of these is raised yet (see
+Status). From Groups 2a/2c, each of them except `CreditSwitchOff` ends, if it
+lasts more than about 5 h, in a `blocked` delivery **without an ack**: that
+is the only case the requeue below may reopen.
 
 ## What each alert means
 
 | Alert | Source | Meaning |
 |---|---|---|
-| `BillingFactDeliveryStale` | `max(neurostack_billing_fact_backlog{condition="stale"}) > 0` | At least one `pending`/`awaiting_ack` fact older than `BILLING_FACT_WORKER_STALE_AFTER_SECONDS` has no valid consumer ack. Today, with no consumer, every fact reaches this state. |
-| `BillingFactDeliveryBlocked` | `max(neurostack_billing_fact_backlog{condition="blocked"}) > 0` | At least one delivery reached the terminal `blocked` state: the retry cap ran out, or the consumer ack does not match the fact. The fact is kept. |
+| `BillingFactDeliveryStale` | `max(neurostack_billing_fact_backlog{condition="stale"}) > 0` | At least one `pending`/`awaiting_ack` fact older than `BILLING_FACT_WORKER_STALE_AFTER_SECONDS` has no valid consumer ack. With the transport off, every fact reaches this state. A requeued fact counts here at once (its `created_at` is old) until its ack arrives. |
+| `BillingFactDeliveryBlocked` | `max(neurostack_billing_fact_backlog{condition="blocked"}) > 0` | At least one delivery reached the terminal `blocked` state: the retry cap ran out (no ack), or the consumer ack does not match the fact. The fact is kept. |
 | `BillingFactWorkerStalled` | last-tick timestamp > 0 and older than 600 s | An enabled worker has not completed a tick in over 10 minutes, counting from its start. This covers a worker that has failed every tick since boot. A disabled worker exports `0` and never fires it. |
 
 The backlog gauge is recomputed from the database by every loop, so whichever
@@ -30,6 +91,7 @@ Their detail is stored only as SHA-256, so match it with `sha256()`:
 SELECT a.outbox_event_id, a.kind,
        CASE a.detail_sha256
          WHEN encode(sha256('retry cap exhausted'::bytea), 'hex') THEN 'retry cap exhausted'
+         WHEN encode(sha256('operator requeue'::bytea), 'hex')    THEN 'operator requeue'
          WHEN encode(sha256('ack overdue'::bytea), 'hex')         THEN 'ack overdue'
          WHEN encode(sha256('ack missing'::bytea), 'hex')         THEN 'ack missing'
          WHEN encode(sha256('ack schema'::bytea), 'hex')          THEN 'ack schema'
@@ -37,7 +99,9 @@ SELECT a.outbox_event_id, a.kind,
          WHEN encode(sha256('ack digest'::bytea), 'hex')          THEN 'ack digest'
          WHEN encode(sha256('missing lineage'::bytea), 'hex')     THEN 'missing lineage'
          ELSE 'other (gap effect:<id>)'
-       END AS detail, a.observed_at, d.state, d.attempt_count
+       END AS detail, a.observed_at, d.state, d.attempt_count,
+       EXISTS (SELECT 1 FROM billing_fact_acks k
+               WHERE k.outbox_event_id = a.outbox_event_id) AS has_ack
 FROM billing_fact_reconciliation_alerts a
 LEFT JOIN billing_fact_deliveries d ON d.outbox_event_id = a.outbox_event_id
 ORDER BY a.observed_at DESC
@@ -45,55 +109,245 @@ LIMIT 50;
 ```
 
 - **Cap exhaustion:** `kind = 'backlog'`, detail `retry cap exhausted`,
-  `attempt_count = BILLING_FACT_WORKER_MAX_ATTEMPTS`, and no ack row. The
-  consumer never acknowledged the fact.
-- **Ack mismatch:** an ack row exists, and the `kind` is `schema_mismatch`
+  `state = 'blocked'` and `has_ack = false`. The consumer never acknowledged
+  the fact. Find the `failure_class` in the API logs, fix the cause (table
+  above), then requeue (below).
+- **Ack mismatch:** `has_ack = true`, and the `kind` is `schema_mismatch`
   (`ack schema`), `collision` (`ack collision`: a different `event_id`, or
   `outcome = 'rejected'`) or `digest_mismatch` (`ack digest`). The consumer
-  answered, but with the wrong contract.
+  answered, but with the wrong contract. **Never requeue it**: see
+  "Investigating a `blocked` delivery that has an ack".
 - **Overdue / missing:** `backlog` with `ack overdue` or `ack missing` on a
-  fact that is still `pending`. This is the normal no-consumer state, not a
-  fault.
+  fact that is still `pending`. With the transport off this is the normal
+  state, not a fault.
+- **Requeued:** `backlog` with `operator requeue`: an operator reopened the
+  delivery (one row per reopen, see the audit gap below).
 - **Gap:** `kind = 'gap'` means either a payment effect has no fact
   (`effect:<id>`) or a fact has no delivery/handoff (`missing lineage`). Bounded
   ticks alert only the first page of gaps and orphans, ordered by id; gaps
   beyond that page are not alerted until earlier ones are repaired. The full
   `BillingFactReconciler.reconcile()` pass sees all of them.
 
-## `blocked` has no requeue path yet
+`python -m src.ops.billing_fact_requeue plan` (below) gives the same
+classification as counts, without SQL access.
 
-Only two things move a delivery out of `blocked`:
+## Requeueing deliveries that exhausted their retries
 
-1. A **late valid ack** from the consumer. The reconciler then converges the
-   fact to `acknowledged`.
-2. **Manual SQL**, reviewed by a second person, that resets the delivery row
-   (`state`, `attempt_count`, `last_attempt_at`). Never touch
-   `billing_outbox`, `billing_fact_handoffs` or `billing_fact_acks`: they are
-   append-only evidence.
+`src/ops/billing_fact_requeue.py` reopens **only** deliveries that are
+`blocked`, have **no ack row at all**, and carry the publisher's
+`retry cap exhausted` alert. Everything else blocked is reported and left
+alone:
 
-No operator endpoint or script requeues a `blocked` fact. Building one is a
-binding precondition before a transport may be wired.
+- `blocked_with_ack`: blocked by a divergent or `rejected` ack, or blocked
+  by exhaustion and then given a late, valid ack the reconciler has not read
+  yet. The publisher never claims a delivery that has an ack, so reopening it
+  would never present the fact again. Investigate it (the section on a
+  `blocked` delivery that has an ack).
+- `blocked_without_evidence`: blocked, no ack, and no `retry cap exhausted`
+  row. This code never produces that state (manual SQL or an unknown writer
+  did). The classification query above is driven by alert rows, so it does
+  not show such a delivery: use the listing below. Escalate to the owner;
+  there is no sanctioned reopen for it. The command refuses it.
+
+Reopening sets `state = 'pending'`, `attempt_count = 0` and
+`last_attempt_at = NULL`, and appends one alert row `kind = 'backlog'`,
+detail `'operator requeue'`, `observed_at` = the run's time, in the same
+transaction. The fact, its handoff, its earlier alerts and its event id are
+unchanged, so a consumer that already holds the fact treats it as a replay.
+The worker presents it on its next tick with a full
+`BILLING_FACT_WORKER_MAX_ATTEMPTS` budget. The command is idempotent: a
+reopened row is no longer `blocked`, so a second run reopens nothing and
+writes nothing; candidate rows are locked `SKIP LOCKED`, and every condition
+is re-checked by the `UPDATE` itself.
+
+### Listing every `blocked` delivery
+
+Unlike the classification query, this one starts from the deliveries, so a
+`blocked` delivery with no alert row at all still shows up. `has_ack = false`
+and `exhausted = true` is what the requeue may reopen; `has_ack = true` is
+`blocked_with_ack`; `has_ack = false` and `exhausted = false` is
+`blocked_without_evidence`.
+
+```sql
+SELECT d.outbox_event_id, d.attempt_count, d.updated_at,
+       EXISTS (SELECT 1 FROM billing_fact_acks k
+               WHERE k.outbox_event_id = d.outbox_event_id) AS has_ack,
+       EXISTS (SELECT 1 FROM billing_fact_reconciliation_alerts a
+               WHERE a.outbox_event_id = d.outbox_event_id AND a.kind = 'backlog'
+                 AND a.detail_sha256 = encode(sha256('retry cap exhausted'::bytea), 'hex'))
+         AS exhausted
+FROM billing_fact_deliveries d
+WHERE d.state = 'blocked'
+ORDER BY d.updated_at;
+```
+
+### Procedure
+
+Two named people: one runs the task, one reviews the plan output and the
+result. Record both names in the incident log (see the audit gap).
+
+1. **Fix the cause first.** Classify with the query above and the API logs.
+   Requeueing while the consumer still fails only burns another ~5 h of
+   attempts and ends `blocked` again. Check that the credit switch is
+   effective, the image's contract pins match, and the worker runs with
+   `BILLING_FACT_TRANSPORT_ENABLED=true` (Group 2c; the setting exists only
+   once that group lands, and a requeue before it is never presented).
+2. **Plan (read-only).** Run a one-off ECS task on the service's own task
+   definition, so the database credentials stay inside the task, with the
+   command:
+
+   ```
+   python -m src.ops.billing_fact_requeue plan
+   ```
+
+   It prints one JSON line on stdout (`schema`
+   `neurostack.billing_fact_requeue.v1`) with only counts:
+   `eligible_before`, `requeued`, `eligible_remaining`, `blocked_with_ack`,
+   `blocked_without_evidence`. The plan runs in a `READ ONLY` transaction.
+   Exit codes: `0` `clean` (nothing to do), `10` `pending` (eligible
+   deliveries exist), `20` `investigate` (a blocked delivery this command
+   must not reopen exists; eligible ones may exist too), `30`
+   `unconfigured` (usage or settings), `40` `error` (database or unexpected;
+   the stderr log line has the exception class only). A `requeue` that exits
+   `40` applied nothing: the whole run is one transaction, rolled back on the
+   error. Run `plan` again before you retry.
+3. **Requeue.** The reviewer confirms the plan counts, then:
+
+   ```
+   python -m src.ops.billing_fact_requeue requeue --limit 50
+   ```
+
+   `--limit` is 1 to 500 (default 50); the oldest eligible deliveries go
+   first. `pending` (exit 10) after a `requeue` means some remain (the limit,
+   or a row another session held): run it again. `investigate` (exit 20)
+   after a `requeue` still reopened what it could (`requeued`); the rest
+   needs the next section.
+4. **Verify.** Within a few ticks the requeued facts should be
+   `acknowledged`. If one is `blocked` again, stop: the cause was not fixed.
+   List what was reopened, and when:
+
+   ```sql
+   SELECT a.outbox_event_id, a.observed_at, d.state, d.attempt_count
+   FROM billing_fact_reconciliation_alerts a
+   JOIN billing_fact_deliveries d ON d.outbox_event_id = a.outbox_event_id
+   WHERE a.kind = 'backlog'
+     AND a.detail_sha256 = encode(sha256('operator requeue'::bytea), 'hex')
+   ORDER BY a.observed_at DESC;
+   ```
+
+The `operator requeue` row closes the same way as the fact's other `backlog`
+rows: once the fact has an `accepted` ack, the credit reconciliation stops
+counting it as open.
+
+### Audit gap: no actor column (owner decision)
+
+`billing_fact_reconciliation_alerts` has **no actor column**, and no other
+table records who reopened a delivery. The database proves *that* and *when*
+a delivery was requeued, never *who*. The only trace of the person is outside
+the database: the ECS `RunTask` call in CloudTrail (the principal, the task
+definition and the command override) and the task's log stream (the result
+line). CloudTrail Event history keeps `RunTask` records for only 90 days
+unless a trail persists them, so the incident log must also record the
+CloudTrail `eventID` of the `RunTask` and the task ARN. Until the owner
+decides, every requeue needs the incident-log entry with the two names, the
+time of the `RunTask`, that `eventID` and that task ARN.
+
+**Owner decision pending:** either accept this gap (the CloudTrail trail and
+the incident log are the actor record), or authorize a migration that adds
+an operator-identity column or table for requeues. This change ships no
+migration.
+
+## Investigating a `blocked` delivery that has an ack
+
+Acks are consumer-owned, append-only (`trg_billing_fact_acks_immutable`) and
+unique per fact (`uq_billing_fact_acks_outbox`). A fact with a divergent or
+`rejected` ack can therefore **never** get a second, valid ack, and no code
+path moves its delivery out of `blocked`: `BillingFactDeliveryBlocked` keeps
+firing for it. Do not requeue it, do not delete or edit the ack, and do not
+set the delivery to `acknowledged` by hand.
+
+While any such dead-end delivery exists, `BillingFactDeliveryBlocked`
+(`max > 0`) fires permanently and hides every new block. Silence it with an
+expiry and the incident reference, and detect new exhaustion with `plan`
+(`eligible_before > 0`) or the listing query ("Listing every `blocked`
+delivery").
+
+Read the ack against its fact:
+
+```sql
+SELECT k.outcome, k.schema_version,
+       k.event_id = d.event_id                AS same_event,
+       k.fact_sha256 = o.payload_sha256       AS same_fact,
+       k.bundle_digest = h.bundle_digest      AS same_bundle,
+       k.deployment_digest = h.deployment_digest AS same_deployment,
+       k.acknowledged_at, o.aggregate_kind, o.financial_revision
+FROM billing_fact_acks k
+JOIN billing_fact_deliveries d ON d.outbox_event_id = k.outbox_event_id
+JOIN billing_outbox o ON o.id = k.outbox_event_id
+JOIN billing_fact_handoffs h ON h.outbox_event_id = k.outbox_event_id
+WHERE d.state = 'blocked'
+ORDER BY k.acknowledged_at DESC;
+```
+
+- `outcome = 'rejected'` (`ack collision`): the consumer found a problem in
+  the fact itself (the payload digest differs from the outbox row, a
+  `validate_fact` violation, or a disagreement with the outbox row or the
+  pinned catalog) and applied **no** credit effect. The API logs show
+  `credit fact rejected`. This is a producer/billing data bug: escalate to the
+  owner with the outbox id. In the credit readiness the rejection is closed
+  only by an `accepted` ack of a **later** `financial_revision` of the same
+  aggregate; the delivery itself stays `blocked`.
+- `same_bundle = false` with `outcome = 'accepted'` (`ack digest`): the
+  consumer recorded another contract bundle. Deploy skew between pins cannot
+  cause it: the consumer raises `ConsumerContractDivergence` before it writes
+  anything when its bundle digest differs from the handoff's. It is a
+  consumer code bug or a non-current consumer version. The credit effects
+  **were written**: escalate.
+- `same_fact = false` or `same_deployment = false` with
+  `outcome = 'accepted'` (`ack digest`): the consumer recomputed another fact
+  digest, or copied another deployment digest. That is a consumer code bug:
+  escalate, with the credit inbox row for the event id.
+- `same_event = false` (`ack collision`): the ack names another event id for
+  this fact. The schema prevents it in normal operation; treat it as data
+  corruption and escalate.
+- `schema_version` is not the producer's ack schema (`ack schema`): the
+  consumer wrote an ack the producer cannot read. Escalate.
+- All `same_*` true and `outcome = 'accepted'`: a late, valid ack on a
+  delivery blocked by exhaustion. It is not a dead end: the reconciler
+  converges it to `acknowledged` on its next page. Re-run `plan`.
+
+A real repair of any of these is a code change or a reviewed migration that
+the owner authorizes, not an operator action.
 
 ## Safe first steps
 
 1. Do not delete facts, deliveries, acks or alert rows, and do not mark a
    delivery `acknowledged` by hand. Only a valid consumer ack may do that.
 2. Check that the worker is enabled where you expect it
-   (`BILLING_FACT_WORKER_ENABLED`) and that the API logs show
-   `billing fact worker started` and no repeated
-   `billing fact worker tick failed`. The `failure_class` field carries only an
-   exception class name.
+   (`BILLING_FACT_WORKER_ENABLED`, and `BILLING_FACT_TRANSPORT_ENABLED`
+   (Group 2c) once that group lands) and that
+   the API logs show `billing fact worker started` and no repeated
+   `billing fact worker tick failed`. The `failure_class` field carries only
+   an exception class name.
 3. For `BillingFactWorkerStalled`, check database reachability and the pool
    first. A loop that fails every tick never updates the gauge after its start
    stamp. A stray cancellation is logged in ERROR and the loop continues.
    `billing fact worker loop was not running` at shutdown means the loop had
    already died.
-4. For `BillingFactDeliveryStale` with no consumer deployed, confirm the
-   backlog matches the facts produced. Then acknowledge the alert as expected;
-   there is nothing to deliver.
-5. For `BillingFactDeliveryBlocked`, classify every blocked fact with the query
-   above before you change anything. A mismatch is a consumer contract bug. Cap
-   exhaustion needs the consumer to be healthy before any reviewed manual reset.
+4. For `BillingFactDeliveryStale` with the transport off, confirm the
+   backlog matches the facts produced, then acknowledge the alert as
+   expected. `main` today wires `transport=None`: nothing is presented, so
+   no fact becomes `blocked` this way yet. From Groups 2a/2c, with the
+   transport on, read `billing fact presentation failed` in the API logs: a
+   stale fact is being retried and, for every failure class except
+   `CreditSwitchOff`, will be `blocked` in about 5 h unless the cause is
+   fixed; under `CreditSwitchOff` it stays `pending` and no attempt is
+   counted.
+5. For `BillingFactDeliveryBlocked`, run the `plan` (or the classification
+   query) before you change anything. Cap exhaustion: fix the cause, then
+   requeue. An ack mismatch: investigate, never requeue. The old manual
+   `UPDATE` of a delivery row is replaced by the requeue command; do not use
+   hand-written SQL for it.
 
 ## Card captures, funds receipts and payment drift
 
@@ -354,11 +608,20 @@ payments. Do not clear them by editing `paid_at`.
 
 - Alert de-duplication is check-then-insert, with no unique constraint. It
   relies on the maintenance advisory lock (and the delivery row lock for the
-  retry-cap row), not on the schema.
-- Once a transport exists, a crash or lost commit after a consumer-visible send
-  is not counted. It is re-presented without limit, bypassing the backoff and
-  the cap, until the attempt is leased before presentation (see
+  retry-cap row), not on the schema. The `operator requeue` row is not
+  de-duplicated on purpose: it is written once per reopen that actually
+  happened, under the delivery row lock. A delivery exhausted again after a
+  requeue keeps its single `retry cap exhausted` row.
+- A requeue resets `attempt_count`: the earlier attempt count survives only
+  in the `retry cap exhausted` row's existence and the API logs, not in the
+  delivery row.
+- Without the two-phase attempt record (an image that predates it), a crash
+  or lost commit after a consumer-visible send is not counted. It is
+  re-presented without limit, bypassing the backoff and the cap (see
   `PRESENTATION_PRECONDITIONS_OPEN`).
+- A `blocked` delivery with a divergent or `rejected` ack has no exit path
+  in code and keeps `BillingFactDeliveryBlocked` firing (see the
+  investigation section).
 - Label only, money is right: a fully reversed payment whose read reports
   `CONFIRMED`/`RECEIVED` with the full `DONE` refund (an unrealistic provider
   state, which would say `REFUNDED`) is relabelled `partially_reversed`. The
