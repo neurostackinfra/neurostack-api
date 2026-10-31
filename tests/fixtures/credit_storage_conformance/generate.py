@@ -124,6 +124,11 @@ def main(root: Path) -> None:
         b"PK\x03\x04\x14\x00\x00\x00 this is not a zip archive \x00\xff"
     )
 
+    # Group 5: an invalid format (a PNG signature: neither PDF nor DOCX).
+    (root / "negative" / "invalid-format.bin").write_bytes(
+        b"\x89PNG\r\n\x1a\nthis is neither a PDF nor a DOCX"
+    )
+
 
 if __name__ == "__main__":
     main(Path(sys.argv[1]))

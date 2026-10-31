@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -74,6 +75,64 @@ async def test_derived_chunks_are_rebuilt_and_deleted() -> None:
             limit=10,
         )
         assert absent == []
+    finally:
+        await client.delete_collection(config.qdrant_collection_name)
+        await client.close()
+
+
+async def test_group5_tombstone_drops_points_and_rebuild_restores_the_same_ids() -> (
+    None
+):
+    """The retention adapter's tombstone removes only derived points; a
+    restore's rebuild recreates exactly the same point ids and chunks
+    (``derived_point_ids`` is the identity a tombstone records)."""
+
+    from types import SimpleNamespace
+
+    from src.storage.credit_retention_adapter import (
+        CreditRetentionAdapter,
+        derived_point_ids,
+    )
+
+    config = _config()
+    tenant_id, source_id = uuid4(), uuid4()
+    content = "C" * 2500
+    expected_ids = derived_point_ids(source_id, content)
+    assert len(expected_ids) == 3
+    adapter = CreditRetentionAdapter(lambda: None, qdrant_config=config)  # type: ignore[arg-type, return-value]
+    item: Any = SimpleNamespace(
+        source_kind="knowledge", tenant_id=tenant_id, source_id=source_id
+    )
+    client = AsyncQdrantClient(url=f"http://{config.qdrant_host}:{config.qdrant_port}")
+    selector = Filter(
+        must=[
+            FieldCondition(key="tenant_id", match=MatchValue(value=str(tenant_id))),
+            FieldCondition(key="source_id", match=MatchValue(value=str(source_id))),
+        ]
+    )
+
+    async def ids() -> list[str]:
+        points, _ = await client.scroll(
+            collection_name=config.qdrant_collection_name,
+            scroll_filter=selector,
+            limit=10,
+            with_payload=True,
+        )
+        return sorted(str(point.id) for point in points)
+
+    try:
+        await replace_derived_chunks(
+            tenant_id=tenant_id, source_id=source_id, content=content, config=config
+        )
+        assert await ids() == sorted(expected_ids)
+        assert await adapter._qdrant_points(item) == 3
+        await adapter.tombstone(item)
+        assert await ids() == []
+        assert await adapter._qdrant_points(item) == 0
+        await replace_derived_chunks(
+            tenant_id=tenant_id, source_id=source_id, content=content, config=config
+        )
+        assert await ids() == sorted(expected_ids)
     finally:
         await client.delete_collection(config.qdrant_collection_name)
         await client.close()

@@ -2,3 +2,4 @@
 # a required space, which a whitespace check of text would reject.
 *.pdf binary
 *.docx binary
+*.bin binary

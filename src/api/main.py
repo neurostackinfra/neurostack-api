@@ -42,12 +42,14 @@ from src.api.middleware.tracing import (
 )
 from src.api.routes import (
     admin,
+    admin_credits,
     auth,
     billing,
     billing_producer,
     billing_producer_setup,
     builder,
     config,
+    credit_export,
     demo_leads,
     events,
     handoff,
@@ -74,6 +76,10 @@ from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
 from src.services.credit_inventory import (
     start_credit_object_workers,
     stop_credit_object_workers,
+)
+from src.services.credit_lifecycle import (
+    start_credit_lifecycle_worker,
+    stop_credit_lifecycle_worker,
 )
 from src.services.credit_metering import (
     start_credit_response_publisher,
@@ -203,6 +209,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     credit_publisher: asyncio.Task[None] | None = None
     credit_sweeper: asyncio.Task[None] | None = None
     credit_object_workers: asyncio.Task[None] | None = None
+    credit_lifecycle_worker: asyncio.Task[None] | None = None
     webhook_refresher = _start_webhook_readiness_refresher()
     fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
@@ -221,6 +228,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # remains inert unless the effective switch and dev/test store config
         # are both present; it is cancelled before the shared pool closes.
         credit_object_workers = start_credit_object_workers()
+        # Group 5: the exhaustion lifecycle worker (72 h / 30 d transitions,
+        # reactivation at an allowance's start).  Only with the credit config
+        # on; every tick claims nothing while the switch is not effective or
+        # before credit_enforcement_at.
+        credit_lifecycle_worker = start_credit_lifecycle_worker()
         fact_worker = _start_billing_fact_worker()
         if settings.environment == "staging":
             redis_client = Redis.from_url(
@@ -240,6 +252,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await stop_credit_response_publisher(credit_publisher)
         await stop_credit_retention_sweeper(credit_sweeper)
         await stop_credit_object_workers(credit_object_workers)
+        await stop_credit_lifecycle_worker(credit_lifecycle_worker)
         if webhook_refresher is not None:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):
@@ -723,6 +736,20 @@ def create_app() -> FastAPI:
         privacy.public_router,
         prefix="/api/public",
         tags=["Privacy"],
+    )
+    # Credit Group 5: the tenant export (a credit surface: 503
+    # credit_unavailable while the switch is off).
+    app.include_router(
+        credit_export.router,
+        prefix=f"{settings.api_prefix}/credits",
+        tags=["Credits"],
+    )
+    # Credit Group 5: operational roles, signed authorizations, legal hold
+    # and the (disabled) purge.
+    app.include_router(
+        admin_credits.router,
+        prefix=f"{settings.api_prefix}/admin/credits",
+        tags=["Credits Admin"],
     )
 
     # Credit surfaces (neurostack-credit-system Group 1b): a refusal raised by
