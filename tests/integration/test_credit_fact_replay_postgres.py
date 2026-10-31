@@ -609,6 +609,267 @@ async def test_the_untouched_reconciler_accepts_the_ack_of_a_produced_fact(
         assert (await CreditReconciliation(session).report()).ready
 
 
+async def test_effect_alert_closes_when_its_effect_gets_an_accepted_fact(
+    consumer: _Harness,
+) -> None:
+    """An effect-only alert is closed by the accepted fact for that effect."""
+
+    outbox_id = await _seed_fact(consumer)
+    ((effect_id,),) = await _rows(
+        consumer,
+        "SELECT payment_effect_id FROM billing_outbox WHERE id = :id",
+        id=outbox_id,
+    )
+    digest = hashlib.sha256(f"effect:{effect_id}".encode("utf-8")).hexdigest()
+
+    async with consumer.engine.begin() as connection:
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_reconciliation_alerts
+                    (id, outbox_event_id, kind, detail_sha256, observed_at)
+                VALUES (:id, NULL, 'gap', :digest, now())
+            """),
+            {"id": uuid4(), "digest": digest},
+        )
+    async with consumer.sessions() as session:
+        assert (await CreditReconciliation(session).report()).open_alerts == 1
+
+    (payload,) = (
+        row[0]
+        for row in await _rows(
+            consumer, "SELECT payload FROM billing_outbox WHERE id = :id", id=outbox_id
+        )
+    )
+    await handle_billing_fact(dict(payload))
+    assert await _rows(
+        consumer,
+        "SELECT payment_effect_id FROM billing_outbox o JOIN billing_fact_acks a "
+        "ON a.outbox_event_id = o.id WHERE o.id = :id AND a.outcome = 'accepted'",
+        id=outbox_id,
+    ) == [(effect_id,)]
+
+    async with consumer.engine.begin() as connection:
+        # Re-alerting the same repaired effect must remain closed.
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_reconciliation_alerts
+                    (id, outbox_event_id, kind, detail_sha256, observed_at)
+                VALUES (:id, NULL, 'gap', :digest, now())
+            """),
+            {"id": uuid4(), "digest": digest},
+        )
+    async with consumer.sessions() as session:
+        assert (await CreditReconciliation(session).report()).open_alerts == 0
+
+    # A digest that cannot name an effect is deliberately never inferred closed.
+    malformed_digest = hashlib.sha256(b"effect:not-a-payment-effect").hexdigest()
+    async with consumer.engine.begin() as connection:
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_reconciliation_alerts
+                    (id, outbox_event_id, kind, detail_sha256, observed_at)
+                VALUES (:id, NULL, 'gap', :digest, now())
+            """),
+            {"id": uuid4(), "digest": malformed_digest},
+        )
+    async with consumer.sessions() as session:
+        assert (await CreditReconciliation(session).report()).open_alerts == 1
+
+
+async def test_effect_alert_closes_on_accepted_successor_revision_only(
+    consumer: _Harness,
+) -> None:
+    """A real no-outbox effect closes only after a later aggregate revision."""
+
+    outbox_id = await _seed_fact(consumer)
+    ((prior_effect_id,),) = await _rows(
+        consumer,
+        "SELECT payment_effect_id FROM billing_outbox WHERE id = :id",
+        id=outbox_id,
+    )
+    (prior_payload,) = (
+        row[0]
+        for row in await _rows(
+            consumer, "SELECT payload FROM billing_outbox WHERE id = :id", id=outbox_id
+        )
+    )
+    await handle_billing_fact(dict(prior_payload))
+
+    missing_effect, missing_delivery = uuid4(), uuid4()
+    async with consumer.engine.begin() as connection:
+        # This is the producer's actual alert state: a payment effect exists,
+        # shares the aggregate's projection, and has no billing_outbox row.
+        await connection.execute(
+            text("""
+                INSERT INTO billing_webhook_deliveries (
+                    id, builder_id, provider, event_id, event_name,
+                    provider_created_at, body_bytes, body_sha256
+                )
+                SELECT :delivery, builder_id, 'asaas', :event, 'PAYMENT_RECEIVED',
+                       now(), 2, :sha
+                FROM billing_payment_effects WHERE id = :effect
+            """),
+            {
+                "delivery": missing_delivery,
+                "event": f"missing-{missing_delivery}",
+                "sha": "c" * 64,
+                "effect": prior_effect_id,
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_payment_effects (
+                    id, builder_id, projection_id, delivery_id, provider, payment_id,
+                    effect_kind, source_revision, amount_cents
+                )
+                SELECT :id, builder_id, projection_id, :delivery, provider, payment_id,
+                       effect_kind, source_revision || '-missing', amount_cents
+                FROM billing_payment_effects WHERE id = :effect
+            """),
+            {
+                "id": missing_effect,
+                "delivery": missing_delivery,
+                "effect": prior_effect_id,
+            },
+        )
+        digest = hashlib.sha256(f"effect:{missing_effect}".encode("utf-8")).hexdigest()
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_reconciliation_alerts
+                    (id, outbox_event_id, kind, detail_sha256, observed_at)
+                VALUES (:id, NULL, 'gap', :digest, now())
+            """),
+            {"id": uuid4(), "digest": digest},
+        )
+
+    # An accepted fact for another aggregate cannot close this effect alert.
+    other_outbox_id = await _seed_fact(consumer)
+    (other_payload,) = (
+        row[0]
+        for row in await _rows(
+            consumer,
+            "SELECT payload FROM billing_outbox WHERE id = :id",
+            id=other_outbox_id,
+        )
+    )
+    await handle_billing_fact(dict(other_payload))
+    async with consumer.sessions() as session:
+        assert (await CreditReconciliation(session).report()).open_alerts == 1
+
+    successor_id, successor_effect, successor_delivery = uuid4(), uuid4(), uuid4()
+    successor_handoff, successor_ack = uuid4(), uuid4()
+    async with consumer.engine.begin() as connection:
+        await connection.execute(
+            text("""
+                INSERT INTO billing_webhook_deliveries (
+                    id, builder_id, provider, event_id, event_name,
+                    provider_created_at, body_bytes, body_sha256
+                )
+                SELECT :delivery, e.builder_id, 'asaas', :event, 'PAYMENT_RECEIVED',
+                       now(), 2, :sha
+                FROM billing_payment_effects e WHERE e.id = :effect
+            """),
+            {
+                "delivery": successor_delivery,
+                "event": f"successor-{successor_delivery}",
+                "sha": "b" * 64,
+                "effect": missing_effect,
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_payment_effects (
+                    id, builder_id, projection_id, delivery_id, provider, payment_id,
+                    effect_kind, source_revision, amount_cents
+                )
+                SELECT :id, builder_id, projection_id, :delivery, provider, payment_id,
+                       effect_kind, source_revision || '-successor', amount_cents
+                FROM billing_payment_effects WHERE id = :effect
+            """),
+            {
+                "id": successor_effect,
+                "delivery": successor_delivery,
+                "effect": missing_effect,
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_outbox (
+                    id, builder_id, schema_version, event_type, aggregate_kind,
+                    aggregate_id, subscription_id, topup_order_id,
+                    subscription_cycle_id, payment_effect_id, financial_revision,
+                    payload, payload_sha256, bundle_digest, deployment_digest
+                )
+                SELECT :id, builder_id, schema_version, event_type, aggregate_kind,
+                       aggregate_id, subscription_id, topup_order_id,
+                       subscription_cycle_id, :effect, financial_revision + 2,
+                       payload, payload_sha256, bundle_digest, deployment_digest
+                FROM billing_outbox WHERE id = :source
+            """),
+            {"id": successor_id, "effect": successor_effect, "source": outbox_id},
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_deliveries (id, outbox_event_id, event_id, state)
+                VALUES (:id, :outbox, :outbox, 'acknowledged')
+            """),
+            {"id": successor_delivery, "outbox": successor_id},
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_handoffs (
+                    id, outbox_event_id, delivery_id, schema_version, bundle_digest,
+                    deployment_digest, handed_off_at
+                )
+                SELECT :id, :outbox, :delivery, schema_version, bundle_digest,
+                       deployment_digest, now()
+                FROM billing_fact_handoffs WHERE outbox_event_id = :source
+            """),
+            {
+                "id": successor_handoff,
+                "outbox": successor_id,
+                "delivery": successor_delivery,
+                "source": outbox_id,
+            },
+        )
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_acks (
+                    id, outbox_event_id, event_id, schema_version, outcome,
+                    inbox_event_id, fact_sha256, bundle_digest, deployment_digest,
+                    effects_digest, acknowledged_at
+                )
+                SELECT :id, :outbox, :outbox, 'billing.fact.ack.v1', 'accepted',
+                       :inbox, o.payload_sha256, h.bundle_digest,
+                       h.deployment_digest, :effects, now()
+                FROM billing_outbox o
+                JOIN billing_fact_handoffs h ON h.outbox_event_id = o.id
+                WHERE o.id = :outbox
+            """),
+            {
+                "id": successor_ack,
+                "outbox": successor_id,
+                "inbox": uuid4(),
+                "effects": EMPTY,
+            },
+        )
+    async with consumer.sessions() as session:
+        assert (await CreditReconciliation(session).report()).open_alerts == 0
+
+    # Re-alerting remains closed after the valid successor reconciliation.
+    async with consumer.engine.begin() as connection:
+        await connection.execute(
+            text("""
+                INSERT INTO billing_fact_reconciliation_alerts
+                    (id, outbox_event_id, kind, detail_sha256, observed_at)
+                VALUES (:id, NULL, 'gap', :digest, now())
+            """),
+            {"id": uuid4(), "digest": digest},
+        )
+    async with consumer.sessions() as session:
+        assert (await CreditReconciliation(session).report()).open_alerts == 0
+
+
 async def test_the_worker_presents_through_the_handler(consumer: _Harness) -> None:
     outbox_id = await _seed_fact(consumer)
     clock = _Clock()

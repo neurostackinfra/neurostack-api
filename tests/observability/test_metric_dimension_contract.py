@@ -34,6 +34,7 @@ _APPLICATION_METRIC_MODULES = (
     "src.observability.price_gate",
     "src.observability.scheduling_gate",
     "src.services.credit_switch",
+    "src.services.credit_rollout",
     "src.services.handoff_service",
 )
 
@@ -129,7 +130,7 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
     # control-plane families (Group 10 E7 retired the two migration families)
     # + 4 Group 9 billing fact worker families + 1 Group 6b billing summary
     # family + 1 credit-system Group 1b switch family.
-    assert len(METRIC_DIMENSION_CONTRACTS) == 76
+    assert len(METRIC_DIMENSION_CONTRACTS) == 79
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 

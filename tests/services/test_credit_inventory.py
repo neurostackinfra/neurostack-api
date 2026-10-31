@@ -68,6 +68,7 @@ from src.services.credit_ledger import (
     topup_lot_expires_at,
 )
 from src.services.credit_metering import CreditEnforcementUnavailable
+from src.services.credit_rollout import BindingCoverage, CreditRolloutService
 
 SUB = UUID("00000000-0000-4000-8000-0000000a4a01")
 
@@ -94,7 +95,18 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
 
 
 @pytest.fixture(autouse=True)
-def _forget() -> Iterator[None]:
+def _forget(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # This Group 4 inventory suite models an already-reconciled capacity
+    # source.  Binding truth itself is exercised by the Group 7 rollout
+    # service tests; keeping it explicit here preserves the suite's focus on
+    # allocation and lifecycle arithmetic.
+    async def covered(
+        _self: CreditRolloutService, _builder_id: UUID, *, at: datetime | None = None
+    ) -> BindingCoverage:
+        del at
+        return BindingCoverage(monthly_binding=True)
+
+    monkeypatch.setattr(CreditRolloutService, "binding_coverage", covered)
     credit_inventory.forget_enforcement_seen()
     yield
     credit_inventory.forget_enforcement_seen()
@@ -317,6 +329,34 @@ async def _available(builder: UUID, at: datetime) -> tuple[int, int]:
         return result
     finally:
         await session.close()
+
+
+def test_unreconciled_binding_is_credit_pending_before_inventory_debit(
+    client: Any, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Group 7 capacity fence also protects enforced RAG/media work."""
+
+    async def unreconciled(
+        _self: CreditRolloutService, _builder_id: UUID, *, at: datetime | None = None
+    ) -> BindingCoverage:
+        del at
+        return BindingCoverage(reconciliation_failure=True)
+
+    monkeypatch.setattr(CreditRolloutService, "binding_coverage", unreconciled)
+
+    async def scenario() -> None:
+        document = _document(world.tenant, 128)
+        await _store(document)
+        outcome = await _reserve(
+            world.tenant,
+            "rag",
+            [document.id],
+            _instant(date(2026, 11, 1)),
+        )
+        assert outcome.status == "credit_pending"
+        assert await _ledger(world.builder) == {}
+
+    run(client, scenario())
 
 
 # ---------------------------------------------------------------------------

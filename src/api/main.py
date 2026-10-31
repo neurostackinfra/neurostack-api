@@ -88,6 +88,10 @@ from src.services.credit_metering import (
     stop_credit_response_publisher,
     stop_credit_retention_sweeper,
 )
+from src.services.credit_rollout import (
+    start_credit_orphan_reconciliation_worker,
+    stop_credit_orphan_reconciliation_worker,
+)
 from src.services.credit_switch import (
     CreditUnavailableError,
     credit_unavailable_exception_handler,
@@ -211,6 +215,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     credit_sweeper: asyncio.Task[None] | None = None
     credit_object_workers: asyncio.Task[None] | None = None
     credit_lifecycle_worker: asyncio.Task[None] | None = None
+    credit_orphan_worker: asyncio.Task[None] | None = None
     webhook_refresher = _start_webhook_readiness_refresher()
     fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
@@ -234,6 +239,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # on; every tick claims nothing while the switch is not effective or
         # before credit_enforcement_at.
         credit_lifecycle_worker = start_credit_lifecycle_worker()
+        # Group 7: post-enforcement reconciliation exposes only bounded
+        # orphan evidence.  It remains dormant until the immutable fence is
+        # set and cannot activate that fence or any ASAAS rollout control.
+        credit_orphan_worker = start_credit_orphan_reconciliation_worker()
         fact_worker = _start_billing_fact_worker()
         if settings.environment == "staging":
             redis_client = Redis.from_url(
@@ -254,6 +263,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await stop_credit_retention_sweeper(credit_sweeper)
         await stop_credit_object_workers(credit_object_workers)
         await stop_credit_lifecycle_worker(credit_lifecycle_worker)
+        await stop_credit_orphan_reconciliation_worker(credit_orphan_worker)
         if webhook_refresher is not None:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):

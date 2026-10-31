@@ -676,7 +676,7 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
         # Head: 041, Group 5's lifecycle/hold/purge tables on top of G4b's 040.
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "041"
+            == "042"
         )
         legacy = (
             await connection.execute(

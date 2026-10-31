@@ -71,6 +71,8 @@ _EXPECTED_TABLES = {
     "credit_purge_jobs",
     "credit_purge_results",
     "credit_purge_receipts",
+    # Group 7, migration 042.
+    "credit_cutoff_acceptances",
 }
 
 
@@ -199,7 +201,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "041"
+    assert version == "042"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 

@@ -883,6 +883,12 @@ async def record_observational_trace(
         tenant_id=str(ingress.tenant_id),
         error_type=error_type,
     )
+    # Group 7: the original per-tenant warning stays diagnostic-only.  The
+    # exported counter deliberately accepts only the closed technical reason
+    # vocabulary and is itself inert while the credit switch is ineffective.
+    from src.services.credit_rollout import record_observational_write_drop
+
+    record_observational_write_drop(outcome)
     return outcome
 
 
@@ -1368,6 +1374,20 @@ async def precheck_events(
             return "credit_pending"
         await repository.ensure_account(scope.builder_id)
         if await repository.quarantine_hold(scope.builder_id):
+            await db.rollback()
+            return "credit_pending"
+        # Group 7: a monthly allowance participates only through an exact
+        # current binding (or bounded active grace); a reconciled unexpired
+        # top-up is still independently usable after cancellation.  A
+        # missing coverage is a reconciliation boundary, not exhaustion --
+        # exhaustion itself continues through the normal debt lifecycle.
+        from src.services.credit_rollout import CreditRolloutService
+
+        if not (
+            await CreditRolloutService(db).binding_coverage(
+                scope.builder_id, quarantine_checked=True
+            )
+        ).usable:
             await db.rollback()
             return "credit_pending"
         # Group 5: the agent gate -- past the 72 h deadline the episode is
@@ -2118,6 +2138,15 @@ async def precheck_webhook(
             return "credit_pending"
         await repository.ensure_account(scope.builder_id)
         if await repository.quarantine_hold(scope.builder_id):
+            await db.rollback()
+            return "credit_pending"
+        from src.services.credit_rollout import CreditRolloutService
+
+        if not (
+            await CreditRolloutService(db).binding_coverage(
+                scope.builder_id, quarantine_checked=True
+            )
+        ).usable:
             await db.rollback()
             return "credit_pending"
         # Group 5: the agent gate (see ``precheck_events``).

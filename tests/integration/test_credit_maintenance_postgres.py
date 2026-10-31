@@ -51,6 +51,7 @@ from src.models.billing import BillingTopupOrder
 from src.models.builder import Builder
 from src.models.credit import CreditEnforcementState, CreditLedgerEntry, CreditLot
 from src.models.credit_inventory import CreditAllocation
+from src.models.event import Event
 from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
@@ -65,6 +66,7 @@ from src.services.credit_ledger import (
     topup_grant_effect_id,
     topup_lot_expires_at,
 )
+from src.services.credit_rollout import CreditRolloutService
 from src.services.media_assets import media_payload_sha256, media_storage_capacity_guard
 from tests.integration.test_asaas_billing_postgres import (
     _sqlstate,
@@ -110,7 +112,7 @@ async def harness() -> AsyncIterator[_Harness]:
         async with engine.connect() as connection:
             assert (
                 await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "041"
+                == "042"
             )
         yield _Harness(
             engine=engine,
@@ -223,6 +225,35 @@ async def _grant(
             )
         book.grant(spec, at=at)
         await ledger.persist(book)
+
+
+async def test_cutoff_report_blocks_recent_builder_traffic_without_capacity(
+    harness: _Harness, world: _World
+) -> None:
+    """Debt eligibility is not capacity coverage for enforcement rollout."""
+
+    instant = _instant(date(2026, 11, 2))
+    async with harness.session() as session, session.begin():
+        session.add(
+            Event(
+                id=uuid4(),
+                tenant_id=world.tenant,
+                session_id=None,
+                event_type="message.in",
+                event_data={},
+                event_metadata={},
+                created_at=instant,
+            )
+        )
+    async with harness.session() as session:
+        report = await CreditRolloutService(session).cutoff_report(now=instant)
+
+    assert any(
+        finding.tenant_id == world.tenant
+        and finding.reason == "builder_without_coverage"
+        for finding in report.findings
+    )
+    assert not report.accepted
 
 
 def _document(tenant: UUID, characters: int) -> KnowledgeDocument:

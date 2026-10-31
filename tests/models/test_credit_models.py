@@ -162,6 +162,8 @@ _LATER_TABLES = {
     "credit_purge_jobs",
     "credit_purge_results",
     "credit_purge_receipts",
+    # Group 7, migration 042: immutable tenant cutoff acceptances.
+    "credit_cutoff_acceptances",
 }
 
 
@@ -201,9 +203,9 @@ def _created_columns(statement: str) -> list[str]:
 
 def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("038", "037")
-    # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
-    # (lifecycle, legal hold, purge and roles) follows 040 and is the head.
-    assert current_head() == "041"
+    # Group 4b: 040 follows 039; Group 5: 041 follows 040; Group 7: 042
+    # (enforcement cutoff acceptances) follows 041 and is the head.
+    assert current_head() == "042"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 

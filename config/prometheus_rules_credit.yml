@@ -1,0 +1,19 @@
+groups:
+  - name: neurostack-credit-readiness
+    rules:
+      # This file is deliberately not mounted by this group.  Group 8 owns
+      # production wiring after the operational opening decision.
+      - alert: NeurostackCreditReconciliationUnavailable
+        expr: neurostack_credit_reconciliation_ready < 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Credit reconciliation is not ready
+      - alert: NeurostackCreditOrphanEffects
+        expr: neurostack_credit_orphan_effects > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Credit effect reconciliation found an orphan
