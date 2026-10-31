@@ -50,6 +50,7 @@ from src.api.routes import (
     builder,
     config,
     credit_export,
+    credits,
     demo_leads,
     events,
     handoff,
@@ -741,6 +742,13 @@ def create_app() -> FastAPI:
     # credit_unavailable while the switch is off).
     app.include_router(
         credit_export.router,
+        prefix=f"{settings.api_prefix}/credits",
+        tags=["Credits"],
+    )
+    # Credit Group 6: the read API (catalog, balance, lots, expiries, debt,
+    # reservations, thresholds, state, consumption); a credit surface too.
+    app.include_router(
+        credits.router,
         prefix=f"{settings.api_prefix}/credits",
         tags=["Credits"],
     )

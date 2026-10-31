@@ -61,6 +61,16 @@ store crosses runs, and every run starts from a clone of one seeded template.
   upload is a credit surface: 503 ``credit_unavailable`` while the switch is
   not effective (``037``, config off), 201 with it -- the one corpus case
   left out of the on/off comparison and asserted on its own.
+* Group 6: the corpus ends with the credit read API (``GET
+  /v1/credits/*``) read by the builder's JWT, by the same JWT for a tenant
+  outside its builder and for an absent tenant, and by an API key.  Credit
+  surfaces: 503 ``credit_unavailable`` while the switch is not effective
+  (``037``, config off) -- and then no SQL at all --, with it the builder
+  reads its figures (observational before the enforcement: zero balance,
+  the would-be consumption), the two foreign reads get the same 403 and
+  the API key ``credit_scope_forbidden``; the reads write nothing (the
+  no-write check below) and, in the enforced run, show exactly the debt the
+  corpus charged, the open exhaustion episode and its export deadline.
 * In one process, the background refresh turns the switch on after
   ``upgrade 037 -> 040`` and off again after the downgrade, each within one
   interval, while requests keep answering.
@@ -130,7 +140,23 @@ _METERING_TABLES = frozenset(
 # Group 5: read (never written) by the export with the switch effective: it
 # names the S3 VersionId of a registered copy; the no-write check below still
 # requires zero rows in it.
-_READ_ONLY_TABLES = frozenset({"credit_object_copies"})
+_READ_ONLY_TABLES = frozenset(
+    {
+        "credit_object_copies",
+        # Group 6: the credit read API's one snapshot (account, lots, ledger,
+        # debts, settlements, ledger effect ids, the open episode and its
+        # transitions, the arm's threshold alerts, the window's allocations).
+        "credit_accounts",
+        "credit_ledger_entries",
+        "credit_debts",
+        "credit_debt_settlements",
+        "credit_effects",
+        "credit_lifecycle_episodes",
+        "credit_lifecycle_transitions",
+        "credit_threshold_alerts",
+        "credit_allocations",
+    }
+)
 # Group 5: the corpus uploads of the enforced run that need NEW capacity.
 # Its builder has no lot: the first charged decision's debt opens its
 # exhaustion episode, so an upload whose reservation charges above the
@@ -145,7 +171,23 @@ _CATEGORY_GATED = (
 # Group 4a: the credit surface of the corpus, outside the on/off comparison.
 _CREDIT_SURFACES = frozenset(
     {"knowledge-files-upload", "credits-export", "credits-admin-purge"}
+) | frozenset(
+    {
+        # Group 6: the credit read API.
+        "credits-summary-builder",
+        "credits-lots-builder",
+        "credits-catalog-builder",
+        "credits-summary-foreign-tenant",
+        "credits-summary-absent-tenant",
+        "credits-balance-api-key",
+    }
 )
+_GROUP6_READS = (
+    "credits-summary-builder",
+    "credits-lots-builder",
+    "credits-catalog-builder",
+)
+_GROUP6_FOREIGN = ("credits-summary-foreign-tenant", "credits-summary-absent-tenant")
 _FIXTURES = _ROOT / "tests" / "fixtures"
 _MULTIPART_BOUNDARY = "credit-dominance-boundary-4a"
 _RUN_TIMEOUT_SECONDS = 300
@@ -510,6 +552,29 @@ def _jwt_for(world: _World, *, tampered: bool = False) -> str:
     )
 
 
+def _builder_jwt_for(world: _World, tenant: str) -> str:
+    """Group 6: the seeded builder's panel JWT (role ``builder`` with its
+    ``builder_id`` claim) on one of its tenants."""
+
+    import jwt
+
+    from src.config.settings import settings
+
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "sub": world.jwt_subject,
+            "tenant_id": tenant,
+            "role": "builder",
+            "builder_id": world.builder,
+            "iat": now,
+            "exp": now + timedelta(hours=1),
+        },
+        settings.secret_key,
+        algorithm="HS256",
+    )
+
+
 def _resolve(value: Any, world: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {key: _resolve(item, world) for key, item in value.items()}
@@ -564,6 +629,9 @@ def _request_for(
         headers["Authorization"] = f"Bearer {_jwt_for(world)}"
     elif kind == "jwt_invalid":
         headers["Authorization"] = f"Bearer {_jwt_for(world, tampered=True)}"
+    elif kind == "jwt_builder":
+        tenant = names[subject]
+        headers["Authorization"] = f"Bearer {_builder_jwt_for(world, tenant)}"
     elif kind in {"meta", "meta_bad_signature"}:
         secret = world.meta_secret if kind == "meta" else world.wrong_meta_secret
         digest = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -1132,6 +1200,9 @@ async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
     # Group 5: the export and the admin routes are credit surfaces too.
     for case in ("credits-export", "credits-admin-purge"):
         assert (status[case], body[case]) == (503, {"code": "credit_unavailable"})
+    # Group 6: so is the credit read API, whoever asks.
+    for case in (*_GROUP6_READS, *_GROUP6_FOREIGN, "credits-balance-api-key"):
+        assert (status[case], body[case]) == (503, {"code": "credit_unavailable"})
 
 
 async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None:
@@ -1378,6 +1449,86 @@ async def test_group5_surfaces_exist_only_with_the_switch_effective(
     if export == 503:
         assert answers["credits-export"]["body"] == {"code": "credit_unavailable"}
         assert answers["credits-admin-purge"]["body"] == {"code": "credit_unavailable"}
+
+
+_GROUP6_CASES = (*_GROUP6_READS, *_GROUP6_FOREIGN, "credits-balance-api-key")
+
+
+@pytest.mark.parametrize(
+    ("revision", "enabled"),
+    [("037", False), ("037", True), ("041", False)],
+)
+async def test_group6_reads_answer_unavailable_without_the_switch(
+    oracle: _Oracle, revision: str, enabled: bool
+) -> None:
+    """Not effective: 503 for every caller, before any credit SQL (the run's
+    statement listener is asserted empty of credit_* by the test above)."""
+
+    run = await oracle.run(revision, enabled=enabled)
+    answers = {r["id"]: r for r in run["responses"]}
+    for case in _GROUP6_CASES:
+        assert (answers[case]["status"], answers[case]["body"]) == (
+            503,
+            {"code": "credit_unavailable"},
+        ), case
+
+
+async def test_group6_reads_observe_without_charging_before_the_enforcement(
+    oracle: _Oracle,
+) -> None:
+    """Effective, before the enforcement: the builder reads zero capacity,
+    no debt, an active state in observational mode and the would-be
+    consumption of its tenants' metered decisions; the foreign reads get the
+    same 403; the API key is refused; nothing is written (the no-write check
+    of ``test_the_effective_switch_only_meters_observationally``)."""
+
+    run = await oracle.run("041", enabled=True)
+    world = oracle.world
+    answers = {r["id"]: r for r in run["responses"]}
+    for case in _GROUP6_READS:
+        assert answers[case]["status"] == 200, answers[case]
+    summary = answers["credits-summary-builder"]["body"]
+    assert summary["state"]["state"] == "active"
+    assert summary["state"]["mode"] == "observational"
+    assert summary["state"]["enforcement_at"] is None
+    assert summary["balance"]["available_mc"] == 0
+    assert summary["debt"]["open_debt_mc"] == 0
+    assert summary["consumption"]["charged_mc"] == 0
+    observed = {
+        effect["effect_kind"]: 0
+        for effect in run["metering"]["credit_observational_effects"]
+        if effect["builder_id"] == world.builder
+    }
+    for effect in run["metering"]["credit_observational_effects"]:
+        if effect["builder_id"] == world.builder:
+            observed[effect["effect_kind"]] += effect["would_debit_mc"]
+    assert summary["consumption"]["observed_mc"] == sum(observed.values()) > 0
+    assert {
+        item["kind"]: item["amount_mc"] for item in summary["consumption"]["observed"]
+    } == {kind: total for kind, total in observed.items() if total}
+    assert answers["credits-lots-builder"]["body"]["lots"] == []
+    catalog = answers["credits-catalog-builder"]["body"]
+    assert [p["credits"] for p in catalog["packages"]] == [500, 1_000, 2_000, 4_000]
+    assert catalog["subscription_payment_methods"] == ["credit_card"]
+    foreign, absent = (answers[case] for case in _GROUP6_FOREIGN)
+    assert foreign["status"] == absent["status"] == 403
+    assert (
+        foreign["body"]
+        == absent["body"]
+        == {"detail": {"code": "tenant_override_forbidden"}}
+    )
+    assert (
+        answers["credits-balance-api-key"]["status"],
+        answers["credits-balance-api-key"]["body"],
+    ) == (403, {"detail": {"code": "credit_scope_forbidden"}})
+    # Each read ran in one REPEATABLE READ, READ ONLY snapshot.
+    snapshots = [
+        statement
+        for statement in run["statements"]
+        if statement.strip()
+        == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    ]
+    assert len(snapshots) == len(_GROUP6_READS) - 1  # the catalog reads nothing
 
 
 async def test_uploads_and_downloads_are_metered_observationally_only(
@@ -1697,6 +1848,40 @@ async def test_the_enforced_run_charges_each_production_decision_once(
         for d in ledger["credit_egress_deliveries"]
     ] == [(tenant, world.media_asset, "enforced")]
     assert {e["effect_kind"] for e in ledger["credit_effects"]} == {"trace"}
+
+
+async def test_group6_reads_show_the_debt_the_enforced_run_charged(
+    oracle: _Oracle,
+) -> None:
+    """With the enforcement: the builder (no lot) owes exactly what the
+    corpus charged as debt, its first charged decision opened the exhaustion
+    episode (``grace``, with the export deadline), nothing is usable and all
+    the consumption was charged."""
+
+    run = await oracle.run("041", enabled=True, enforced=True)
+    world = oracle.world
+    answers = {r["id"]: r for r in run["responses"]}
+    summary = answers["credits-summary-builder"]
+    assert summary["status"] == 200, summary
+    body = summary["body"]
+    debt = sum(
+        entry["amount_mc"]
+        for entry in run["ledger"]["credit_ledger_entries"]
+        if entry["builder_id"] == world.builder and entry["entry_type"] == "debt"
+    )
+    assert debt > 0
+    assert body["debt"]["open_debt_mc"] == debt
+    assert sum(item["open_mc"] for item in body["debt"]["debts"]) == debt
+    assert body["balance"]["available_mc"] == 0
+    assert body["balance"]["net_available_mc"] == 0
+    assert body["consumption"]["mode"] == "enforced"
+    assert body["consumption"]["charged_mc"] == debt
+    state = body["state"]
+    assert (state["mode"], state["state"]) == ("enforced", "grace")
+    assert state["export_deadline_at"] == state["deletion_due_at"] is not None
+    assert body["thresholds"]["reached"] == [50, 90, 100]
+    for case in _GROUP6_FOREIGN:
+        assert answers[case]["status"] == 403
 
 
 async def test_the_enforced_run_refuses_only_uploads_that_need_capacity(

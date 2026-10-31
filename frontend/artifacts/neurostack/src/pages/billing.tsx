@@ -21,8 +21,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useI18n } from "@/context/i18n";
 import {
+  CreditBalancePanel,
   PlanUsageSummary,
+  isCreditSummary,
+  readCredit,
   type BillingUsage,
+  type CreditLoad,
+  type CreditSummary,
 } from "@/components/plan-usage-summary";
 import { navigateToHostedCheckout } from "./billing-navigation";
 
@@ -41,6 +46,9 @@ interface BillingSummary {
   discount_pct: number;
   subscription_status: string;
   billing_cycle: string;
+  // Group 6b read contract: true only when the server read back that
+  // detached top-ups are commercially open (never set by the browser).
+  topup_commercial_enabled?: boolean;
 }
 
 // `CheckoutResponse` in `src/api/schemas/billing.py`.
@@ -65,6 +73,22 @@ const SUBSCRIPTION_PLANS: readonly SubscriptionPlan[] = [
   { offerId: "plan_pro_monthly_v1", name: "Pro" },
   { offerId: "plan_max_monthly_v1", name: "Max" },
 ];
+
+interface TopupPackage {
+  offerId: string;
+  credits: number;
+}
+
+// Detached top-ups of the same immutable catalog (card or PIX). Only
+// `offer_id` and `method` are sent: price, credits, validity and the builder
+// are resolved by the server; the amount is shown on the hosted checkout.
+const TOPUP_PACKAGES: readonly TopupPackage[] = [
+  { offerId: "package_credits_500_v1", credits: 500 },
+  { offerId: "package_credits_1000_v1", credits: 1000 },
+  { offerId: "package_credits_2000_v1", credits: 2000 },
+  { offerId: "package_credits_4000_v1", credits: 4000 },
+];
+type TopupMethod = "credit_card" | "pix";
 
 // `_LIVE_STATES` in `src/services/billing_checkout.py`: the session is still open.
 const LIVE_CHECKOUT_STATES = new Set([
@@ -191,6 +215,30 @@ function checkoutStateLabel(state: string, txt: Txt) {
     : txt(`Estado informado pelo servidor: ${state}`, `Server-reported state: ${state}`);
 }
 
+/** Top-up outcomes that differ from the subscription copy. */
+function topupErrorMessage(status: number, detail: string | null, txt: Txt) {
+  if (status === 409 || status === 503) {
+    return txt(
+      "Recargas estão indisponíveis no momento. Nenhuma cobrança foi criada.",
+      "Top-ups are unavailable right now. No charge was created.",
+    );
+  }
+  if (status === 202) {
+    return txt(
+      "O servidor não conseguiu confirmar se o checkout foi criado no provedor. Não pague novamente; aguarde alguns minutos e atualize a página.",
+      "The server could not confirm whether the checkout was created with the provider. Do not pay again; wait a few minutes and refresh the page.",
+    );
+  }
+  return checkoutErrorMessage(status, detail, txt);
+}
+
+/** `attachment; filename="..."` of the export, or a fixed fallback. */
+function exportFilename(disposition: string | null): string {
+  const match = disposition?.match(/filename="([^"]+)"/);
+  const name = match?.[1] ?? "";
+  return /^[A-Za-z0-9._-]+$/.test(name) ? name : "neurostack-export.zip";
+}
+
 /** Simple translated copy per route outcome; backend codes are never shown. */
 function checkoutErrorMessage(status: number, detail: string | null, txt: Txt) {
   switch (status) {
@@ -287,6 +335,17 @@ export default function Billing() {
   // blocked until it is read (or the server says it does not exist).
   const [unreadSessionId, setUnreadSessionId] = useState<string | null>(readStoredSessionId);
   const checkoutRef = useRef<HTMLDivElement>(null);
+  const topupRef = useRef<HTMLDivElement>(null);
+
+  // Credits (Group 6): read from the ledger only; hidden while unavailable.
+  const [credit, setCredit] = useState<CreditLoad<CreditSummary>>({ status: "loading" });
+  const [topupPackage, setTopupPackage] = useState<TopupPackage | null>(null);
+  const [topupMethod, setTopupMethod] = useState<TopupMethod | null>(null);
+  const [topupLoading, setTopupLoading] = useState(false);
+  const [topupError, setTopupError] = useState<string | null>(null);
+  const [exportState, setExportState] = useState<"idle" | "loading" | "unavailable" | "error">(
+    "idle",
+  );
 
   // Fetch summary
   const fetchSummary = useCallback(async () => {
@@ -301,6 +360,11 @@ export default function Billing() {
     } finally {
       setLoading(false);
     }
+  }, [token]);
+
+  // The credit summary: the ledger's figures, never anticipated by the page.
+  const fetchCredit = useCallback(async () => {
+    setCredit(await readCredit("/v1/credits/summary", token, isCreditSummary));
   }, [token]);
 
   // Read (or ask the server to reconcile) one checkout session by its UUID.
@@ -370,9 +434,12 @@ export default function Billing() {
     if (initialReadStarted.current) return;
     initialReadStarted.current = true;
     void fetchSummary();
+    // After a checkout return or a PIX QR code the ledger is re-read like
+    // the order: a grant shows only once the server applied it.
+    void fetchCredit();
     const storedSessionId = readStoredSessionId();
     if (storedSessionId) void fetchSession(storedSessionId);
-  }, [fetchSummary, fetchSession]);
+  }, [fetchSummary, fetchSession, fetchCredit]);
 
   // Plan values are intentionally not displayed until pricing is finalized;
   // the backend computes the checkout amount, shown on the hosted checkout.
@@ -385,6 +452,12 @@ export default function Billing() {
     sessionInProgress ||
     unreadSessionId !== null;
   const trackedCheckoutUrl = hostedCheckoutUrl(trackedSession);
+  // Top-ups are offered only when the credit switch is effective (the
+  // ledger answered) AND the server read back `topup_commercial_enabled`.
+  const topupOffered =
+    credit.status === "ok" && summary?.topup_commercial_enabled === true;
+  const topupBlocked =
+    summary === null || sessionInProgress || unreadSessionId !== null;
 
   // Validate coupon
   const handleApplyCoupon = async () => {
@@ -448,6 +521,71 @@ export default function Billing() {
       setCheckoutLoading(false);
     }
   };
+
+  // Top-up: exactly one POST of `offer_id` and `method`; nothing else.
+  const handleTopup = async () => {
+    if (!topupOffered || topupBlocked || !topupPackage || !topupMethod || topupLoading) return;
+    setTopupLoading(true);
+    setTopupError(null);
+    try {
+      const res = await fetch("/v1/billing/checkout", {
+        method: "POST",
+        headers: authHeaders(token),
+        body: JSON.stringify({ offer_id: topupPackage.offerId, method: topupMethod }),
+      });
+      if (res.status !== 200) {
+        setTopupError(topupErrorMessage(res.status, await readDetail(res), txt));
+        return;
+      }
+      const data: unknown = await res.json();
+      if (!isCheckoutSession(data)) {
+        setTopupError(checkoutErrorMessage(0, null, txt));
+        return;
+      }
+      setTrackedSession(data);
+      storeSessionId(LIVE_CHECKOUT_STATES.has(data.state) ? data.checkout_session_id : null);
+      const url = hostedCheckoutUrl(data);
+      if (url) navigateToHostedCheckout(url);
+    } catch {
+      setTopupError(checkoutErrorMessage(0, null, txt));
+    } finally {
+      setTopupLoading(false);
+    }
+  };
+
+  // Export: the builder session downloads `GET /v1/credits/export`.
+  const handleExport = async () => {
+    if (exportState === "loading" || exportState === "unavailable") return;
+    setExportState("loading");
+    try {
+      const res = await fetch("/v1/credits/export", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 503) {
+        setExportState("unavailable");
+        return;
+      }
+      if (res.status !== 200) {
+        setExportState("error");
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = exportFilename(res.headers.get("Content-Disposition"));
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setExportState("idle");
+    } catch {
+      setExportState("error");
+    }
+  };
+
+  const openTopups = () =>
+    topupRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 
   const openCheckout = (plan: SubscriptionPlan) => {
     if (checkoutBlocked) return;
@@ -541,10 +679,15 @@ export default function Billing() {
           <CardContent className="pt-5 space-y-3 text-sm">
             <p className="font-semibold text-foreground">{checkoutStateLabel(trackedSession.state, txt)}</p>
             <p className="text-xs text-muted-foreground">
-              {txt(
-                "Este estado vem do servidor. A assinatura só aparece como ativa depois da confirmação do provedor.",
-                "This state comes from the server. The subscription only shows as active after the provider confirms.",
-              )}
+              {trackedSession.kind === "topup"
+                ? txt(
+                    "Este estado vem do servidor. Os créditos só entram no saldo depois que o pagamento for confirmado e registrado; o retorno do checkout ou o QR do PIX não adicionam créditos.",
+                    "This state comes from the server. Credits only reach the balance once the payment is confirmed and recorded; returning from checkout or a PIX QR code adds no credits.",
+                  )
+                : txt(
+                    "Este estado vem do servidor. A assinatura só aparece como ativa depois da confirmação do provedor.",
+                    "This state comes from the server. The subscription only shows as active after the provider confirms.",
+                  )}
             </p>
             {trackedSession.state === "reconciliation_required" && (
               <p className="text-xs font-medium text-amber-400">
@@ -570,6 +713,7 @@ export default function Billing() {
                   onClick={() => {
                     void fetchSession(trackedSession.checkout_session_id);
                     void fetchSummary();
+                    void fetchCredit();
                   }}
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
@@ -640,11 +784,103 @@ export default function Billing() {
         )}
       </div>
 
-      {summary?.usage && <PlanUsageSummary usage={summary.usage} locale={locale} />}
+      {summary?.usage && (
+        <PlanUsageSummary
+          usage={summary.usage}
+          locale={locale}
+          {...(topupOffered ? { creditPurchase: { enabled: true, onBuy: openTopups } } : {})}
+        />
+      )}
 
-      {/* ── Section 02: Credits (skeleton) ────────────────────────────────── */}
-      <div className="space-y-3">
+      {/* ── Section 02: Credits ─────────────────────────────────────────── */}
+      <div className="space-y-3" ref={topupRef}>
         <SectionDivider num="02" label={txt("Recarga de Créditos (Add-ons)", "Credit Top-Up (Add-ons)")} />
+        {credit.status === "ok" && (
+          <CreditBalancePanel
+            summary={credit.data}
+            locale={locale}
+            exportAction={{
+              onExport: () => void handleExport(),
+              disabled: exportState === "unavailable",
+              loading: exportState === "loading",
+              message:
+                exportState === "unavailable"
+                  ? txt(
+                      "Exportação indisponível no momento.",
+                      "Export is unavailable right now.",
+                    )
+                  : exportState === "error"
+                    ? txt(
+                        "Não foi possível exportar agora. Tente novamente.",
+                        "The export failed. Try again.",
+                      )
+                    : null,
+            }}
+          />
+        )}
+        {topupOffered ? (
+          <Card className="border-emerald-500/20 bg-card" data-testid="topup-offer">
+            <CardHeader className="pb-3">
+              <div className="flex items-center gap-2">
+                <Wallet className="h-4 w-4 text-emerald-500" />
+                <CardTitle className="text-sm font-semibold text-foreground">
+                  {txt("Recargas de créditos", "Credit top-ups")}
+                </CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <p className="text-xs text-muted-foreground">
+                {txt(
+                  "Recarga avulsa, válida por 6 meses, paga no checkout hospedado do ASAAS. Os créditos entram no saldo somente depois que o pagamento for confirmado.",
+                  "One-off top-up, valid for 6 months, paid on the ASAAS-hosted checkout. Credits reach the balance only after the payment is confirmed.",
+                )}
+              </p>
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4" role="group" aria-label={txt("Pacote", "Package")}>
+                {TOPUP_PACKAGES.map((item) => (
+                  <Button
+                    key={item.offerId}
+                    type="button"
+                    variant={topupPackage?.offerId === item.offerId ? "default" : "outline"}
+                    aria-pressed={topupPackage?.offerId === item.offerId}
+                    disabled={topupBlocked}
+                    onClick={() => setTopupPackage(item)}
+                  >
+                    {txt(
+                      `${item.credits.toLocaleString("pt-BR")} créditos`,
+                      `${item.credits.toLocaleString("en-US")} credits`,
+                    )}
+                  </Button>
+                ))}
+              </div>
+              <div className="flex gap-2" role="group" aria-label={txt("Forma de pagamento", "Payment method")}>
+                {(["credit_card", "pix"] as const).map((method) => (
+                  <Button
+                    key={method}
+                    type="button"
+                    size="sm"
+                    variant={topupMethod === method ? "default" : "outline"}
+                    aria-pressed={topupMethod === method}
+                    disabled={topupBlocked}
+                    onClick={() => setTopupMethod(method)}
+                  >
+                    {method === "pix" ? "PIX" : txt("Cartão de crédito", "Credit card")}
+                  </Button>
+                ))}
+              </div>
+              <Button
+                className="w-full gap-2"
+                disabled={topupBlocked || !topupPackage || !topupMethod || topupLoading}
+                onClick={() => void handleTopup()}
+              >
+                {topupLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                {txt("Comprar recarga", "Buy top-up")}
+              </Button>
+              {topupError && (
+                <p role="alert" className="text-sm text-destructive">{topupError}</p>
+              )}
+            </CardContent>
+          </Card>
+        ) : (
         <Card className="border-border/60 bg-card opacity-80">
           <CardHeader className="pb-3">
             <div className="flex items-center gap-2">
@@ -664,6 +900,7 @@ export default function Billing() {
             </Button>
           </CardContent>
         </Card>
+        )}
       </div>
 
       {/* ── Section 03: Checkout ──────────────────────────────────────────── */}
