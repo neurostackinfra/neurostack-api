@@ -12,6 +12,10 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useI18n } from "@/context/i18n";
+import {
+  CreditAllocationNotice,
+  storedCreditViewer,
+} from "@/components/plan-usage-summary";
 
 const mockDocuments = [
   { id: 1, name: "Protocolo_Pos_Procedimento_Botox.pdf",    type: "PDF",  size: "1.2 MB", status: "syncing" },
@@ -44,6 +48,9 @@ function StatusBadge({ status }: { status: string }) {
 export default function KnowledgeBase() {
   const { locale } = useI18n();
   const txt = <T,>(p: T, e: T): T => (locale === "en" ? e : p);
+  // Credits (Group 6): the selected clinic's builder's RAG allocation, for a
+  // builder or super admin session only; hidden while unavailable.
+  const creditViewer = storedCreditViewer();
 
   return (
     <div className="max-w-2xl mx-auto space-y-6 pb-10 relative">
@@ -91,6 +98,13 @@ export default function KnowledgeBase() {
           </p>
         </div>
       </div>
+
+      <CreditAllocationNotice
+        category="rag"
+        locale={locale}
+        tenantId={creditViewer.tenantId}
+        enabled={creditViewer.canRead}
+      />
 
       {/* ── Upload Dropzone (read-only mockup) ──────────────────────────── */}
       <div className="relative rounded-xl border-2 border-dashed border-slate-600/60 bg-slate-900/40 p-10 text-center pointer-events-none select-none">

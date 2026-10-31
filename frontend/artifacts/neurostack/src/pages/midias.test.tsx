@@ -384,7 +384,13 @@ describe("<Midias /> catalog operations", () => {
       expect(await screen.findByText("Media deleted.")).toBeInTheDocument();
       expect(screen.queryByText("Guia revisado")).not.toBeInTheDocument();
 
-      const mediaCalls = mocks.fetch.mock.calls.map(([input]) => String(input));
+      // Group 6: one read of the clinic's credit allocation (hidden here,
+      // the route is not mocked); every other call is a media operation.
+      const allCalls = mocks.fetch.mock.calls.map(([input]) => String(input));
+      expect(allCalls.filter((url) => url.startsWith("/v1/credits/"))).toEqual([
+        "/v1/credits/reservations?tenant_id=clinic-42",
+      ]);
+      const mediaCalls = allCalls.filter((url) => !url.startsWith("/v1/credits/"));
       expect(mediaCalls).toEqual([
         "/v1/media-assets?tenant_id=clinic-42",
         "/v1/media-assets?tenant_id=clinic-42&cursor=opaque-cursor",
@@ -617,5 +623,72 @@ describe("<Midias /> role and locale guards", () => {
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Arquivo")).toBeInTheDocument();
     expect(screen.getByText("Biblioteca de mídias")).toBeInTheDocument();
+  });
+});
+
+// ── Credits (neurostack-credit-system Group 6) ──────────────────────────────
+
+describe("<Midias /> credit allocation", () => {
+  function routes(credit: () => Promise<Response>) {
+    mocks.fetch.mockImplementation((input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("/v1/credits/")) return credit();
+      if (url.startsWith("/v1/media-assets")) {
+        return jsonResponse({ items: [asset({ tenant_id: "clinic-42" })], next_cursor: null, has_more: false });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+  }
+
+  it("shows a builder the selected clinic's media allocation", async () => {
+    setRole("builder", "clinic-42");
+    routes(() =>
+      jsonResponse({
+        as_of: "2026-10-30T15:00:00Z",
+        window: { start: "2026-10-25", end: "2026-11-25", kind: "cycle" },
+        reservations: [
+          { category: "rag", units: 0, coverage_mc: 0, charged_mc: 0 },
+          { category: "media", units: 40_000_000, coverage_mc: 2_000, charged_mc: 0 },
+          { category: "egress", units: 0, coverage_mc: 0, charged_mc: 0 },
+        ],
+        egress_allowance_bytes: 400_000_000,
+        egress_delivered_bytes: 0,
+      }),
+    );
+    renderPage();
+
+    const notice = await screen.findByTestId("credit-allocation-media");
+    expect(notice).toHaveTextContent(/Media credits/);
+    expect(notice).toHaveTextContent(/Allocated this cycle:\s*2 credits/);
+    expect(notice).toHaveTextContent(/0 \/ 400 MB/);
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      "/v1/credits/reservations?tenant_id=clinic-42",
+      expect.objectContaining({ headers: { Authorization: "Bearer media-token" } }),
+    );
+  });
+
+  it("hides the allocation on 503 and keeps the catalog as on main", async () => {
+    setRole("super_admin", "clinic-42");
+    routes(() => jsonResponse({ code: "credit_unavailable" }, 503));
+    renderPage();
+
+    expect(await screen.findByText("Orientações Pós-Botox")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        mocks.fetch.mock.calls.filter(([input]) => String(input).startsWith("/v1/credits/")),
+      ).toHaveLength(1),
+    );
+    expect(screen.queryByTestId("credit-allocation-media")).not.toBeInTheDocument();
+  });
+
+  it("reads no credit for a clinic admin", async () => {
+    routes(() => jsonResponse({ code: "unexpected" }, 500));
+    renderPage();
+
+    expect(await screen.findByText("Orientações Pós-Botox")).toBeInTheDocument();
+    expect(
+      mocks.fetch.mock.calls.filter(([input]) => String(input).startsWith("/v1/credits/")),
+    ).toHaveLength(0);
+    expect(screen.queryByTestId("credit-allocation-media")).not.toBeInTheDocument();
   });
 });

@@ -52,6 +52,13 @@ inventory writers (``credit_inventory.record_observational_upload`` and
 and counts their verdicts and outcomes: every existing media and knowledge
 suite must show no ``enforced`` mode, so no reservation, maintenance or
 egress debit ever ran there.
+
+Group 6: every credit read route (``/v1/credits/*``) loads its one ledger
+snapshot through ``credits.CreditSnapshot._load_book`` (assembled from the
+stored rows and swept in memory, never persisted).  The plugin wraps that
+method the same way and counts its outcomes (``builder``, ``standalone``):
+the existing suites never call a credit read, so their forced runs must
+show none, while the Group 6 suites exercise it under the forced switch.
 """
 
 from __future__ import annotations
@@ -76,6 +83,8 @@ _inventory_writes: Counter[str] = Counter()
 _ORIGINAL_MODE: Any = None
 _ORIGINAL_UPLOAD_WRITER: Any = None
 _ORIGINAL_EGRESS_WRITER: Any = None
+_credit_reads: Counter[str] = Counter()
+_ORIGINAL_SNAPSHOT_BOOK: Any = None
 
 
 def _forced_effective(_self: Any) -> bool:
@@ -154,9 +163,21 @@ async def _counted_egress_writer(*args: Any, **kwargs: Any) -> Any:
     return outcome
 
 
+async def _counted_snapshot_book(self: Any, *args: Any, **kwargs: Any) -> Any:
+    try:
+        book = await _ORIGINAL_SNAPSHOT_BOOK(self, *args, **kwargs)
+    except BaseException as error:
+        _credit_reads[f"raised {type(error).__name__}"] += 1
+        raise
+    _credit_reads["standalone" if book is None else "builder"] += 1
+    return book
+
+
 def pytest_configure(config: pytest.Config) -> None:
     global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE, _ORIGINAL_WEBHOOK_PRECHECK
     global _ORIGINAL_MODE, _ORIGINAL_UPLOAD_WRITER, _ORIGINAL_EGRESS_WRITER
+    global _ORIGINAL_SNAPSHOT_BOOK
+    from src.api.routes import credits
     from src.services import credit_inventory, credit_metering
     from src.services.credit_switch import CreditSwitch
 
@@ -178,6 +199,8 @@ def pytest_configure(config: pytest.Config) -> None:
     patcher.setattr(
         credit_inventory, "record_observational_egress", _counted_egress_writer
     )
+    _ORIGINAL_SNAPSHOT_BOOK = credits.CreditSnapshot._load_book
+    patcher.setattr(credits.CreditSnapshot, "_load_book", _counted_snapshot_book)
     config.stash[_PATCHER] = patcher
 
 
@@ -229,10 +252,17 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
         f"credit inventory writer: {sum(_inventory_writes.values())} calls"
         f" ({writes or 'none'})"
     )
+    reads = ", ".join(
+        f"{name}={count}" for name, count in sorted(_credit_reads.items())
+    )
+    terminalreporter.write_line(
+        f"credit read snapshots: {sum(_credit_reads.values())}" f" ({reads or 'none'})"
+    )
 
 
 def _assert_forced() -> None:
     global _self_checks
+    from src.api.routes import credits
     from src.services import credit_inventory, credit_metering
     from src.services.credit_switch import CreditSwitch, credit_switch_effective
 
@@ -251,6 +281,9 @@ def _assert_forced() -> None:
         and credit_inventory.record_observational_upload is _counted_upload_writer
         and credit_inventory.record_observational_egress is _counted_egress_writer
     ), "a credit inventory counter was swapped and not restored"
+    assert (
+        credits.CreditSnapshot._load_book is _counted_snapshot_book
+    ), "the credit read snapshot counter was swapped and not restored"
     _self_checks += 1
     assert credit_switch_effective() is True, "the forced switch does not read True"
 

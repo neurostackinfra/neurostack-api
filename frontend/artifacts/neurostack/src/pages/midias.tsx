@@ -39,6 +39,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { CreditAllocationNotice } from "@/components/plan-usage-summary";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
 
@@ -674,6 +675,16 @@ export default function Midias() {
         <strong>{t("media_catalog_only_title")}</strong>{" "}
         {t("media_catalog_only_description")}
       </div>
+
+      {/* Credits (Group 6): the clinic's builder's media allocation, read
+          only by a builder or super admin viewing a clinic; hidden while
+          the credit API is unavailable. */}
+      <CreditAllocationNotice
+        category="media"
+        locale={locale}
+        tenantId={viewingClinicId}
+        enabled={canManage && requiresSelectedClinic}
+      />
 
       <Card>
         <CardHeader>

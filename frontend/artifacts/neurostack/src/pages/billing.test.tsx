@@ -10,6 +10,9 @@ vi.mock("./billing-navigation", () => ({ navigateToHostedCheckout: vi.fn() }));
 const SESSION_KEY = "ns_billing_checkout_session";
 const SESSION_ID = "0b6f1f0e-3c1a-4e7b-9d55-2f1f6f3f9a10";
 const HOSTED_URL = "https://asaas.com/checkoutSession/show?id=chk_abc123";
+// Group 6: the page reads the credit ledger once per visit (hidden on any
+// answer but a valid 200); the counts below include that one read.
+const CREDIT_SUMMARY = "/v1/credits/summary";
 
 const summary = {
   plan: null,
@@ -282,7 +285,8 @@ describe("Billing", () => {
 
     expect(await screen.findByText(/Você voltou do checkout hospedado/i)).toBeInTheDocument();
     await waitFor(() => expect(calls(fetchMock, "GET", "/v1/billing/summary")).toHaveLength(1));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(screen.queryByText("Assinatura Ativa")).not.toBeInTheDocument();
   });
 
@@ -305,7 +309,8 @@ describe("Billing", () => {
     renderBilling();
 
     await waitFor(() => expect(calls(fetchMock, "GET", "/v1/billing/summary")).toHaveLength(1));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("lets the user ask the server to reconcile a session under verification", async () => {
@@ -687,7 +692,8 @@ describe("Billing", () => {
 
       expect(calls(fetchMock, "GET", "/v1/billing/summary")).toHaveLength(1);
       expect(calls(fetchMock, "GET", `/v1/billing/checkout/${SESSION_ID}`)).toHaveLength(1);
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
     it("does not poll the summary after a return without a stored session", async () => {
@@ -698,7 +704,473 @@ describe("Billing", () => {
       await waitFor(() => expect(calls(fetchMock, "GET", "/v1/billing/summary")).toHaveLength(1));
       await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
 
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+// ── Credits (neurostack-credit-system Group 6) ──────────────────────────────
+// The page shows only what `GET /v1/credits/summary` read from the ledger;
+// with `503 credit_unavailable` every credit panel is hidden and the page is
+// the `main` page. Top-ups are offered only when the ledger answered AND the
+// server read back `topup_commercial_enabled`; they send `offer_id` and
+// `method` only. The export downloads `GET /v1/credits/export`.
+
+const CREDIT_UNAVAILABLE = () => response({ code: "credit_unavailable" }, 503);
+const AS_OF = "2026-10-30T15:00:00Z";
+
+function creditSummary(overrides: Record<string, unknown> = {}) {
+  const state = {
+    as_of: AS_OF,
+    mode: "enforced",
+    enforcement_at: "2026-10-01T00:00:00Z",
+    state: "active",
+    pending_reasons: [],
+    exhausted_at: null,
+    suspension_due_at: null,
+    deletion_due_at: null,
+    export_deadline_at: null,
+    ...((overrides.state as Record<string, unknown>) ?? {}),
+  };
+  return {
+    as_of: AS_OF,
+    state,
+    balance: {
+      as_of: AS_OF,
+      monthly_available_mc: 10_000,
+      monthly_not_started_mc: 25_000,
+      topup_available_mc: 496_000,
+      available_mc: 506_000,
+      open_debt_mc: 0,
+      net_available_mc: 506_000,
+      reserved_mc: 2_000,
+      next_expiry: null,
+      ...((overrides.balance as Record<string, unknown>) ?? {}),
+    },
+    expiries: [
+      { lot_id: "lot-1", kind: "monthly", expires_at: "2026-11-25T03:00:00Z", available_mc: 10_000 },
+      { lot_id: "lot-2", kind: "topup", expires_at: "2027-04-20T03:00:00Z", available_mc: 496_000 },
+    ],
+    debt: {
+      as_of: AS_OF,
+      open_debt_mc: 0,
+      debts: [],
+      ...((overrides.debt as Record<string, unknown>) ?? {}),
+    },
+    reservations: {
+      as_of: AS_OF,
+      window: { start: "2026-10-25", end: "2026-11-25", kind: "cycle" },
+      reservations: [
+        { category: "rag", units: 15_000, coverage_mc: 3_000, charged_mc: 2_000 },
+        { category: "media", units: 40_000_000, coverage_mc: 2_000, charged_mc: 0 },
+        { category: "egress", units: 0, coverage_mc: 0, charged_mc: 0 },
+      ],
+      egress_allowance_bytes: 400_000_000,
+      egress_delivered_bytes: 0,
+    },
+    thresholds: {
+      as_of: AS_OF,
+      capacity_mc: 510_000,
+      available_mc: 506_000,
+      used_mc: 4_000,
+      used_percent: 0,
+      reached: [],
+      alerts: [],
+      ...((overrides.thresholds as Record<string, unknown>) ?? {}),
+    },
+    consumption: {
+      as_of: AS_OF,
+      mode: state.mode,
+      window: { start: "2026-10-25", end: "2026-11-25", kind: "cycle" },
+      charged_mc: 14_000,
+      charged: [
+        { kind: "rag", amount_mc: 2_000 },
+        { kind: "trace", amount_mc: 12_000 },
+      ],
+      observed_mc: 1_500,
+      observed: [{ kind: "trace", amount_mc: 1_500 }],
+    },
+  };
+}
+
+function metric(name: string) {
+  return screen.getByRole("group", { name });
+}
+
+describe("Billing credits", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    Element.prototype.scrollIntoView = vi.fn();
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    fetchMock.mockReset();
+    vi.mocked(navigateToHostedCheckout).mockReset();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("hides every credit panel and keeps the main page when the credit API answers 503", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, topup_commercial_enabled: true }),
+      [`GET ${CREDIT_SUMMARY}`]: CREDIT_UNAVAILABLE,
+    });
+    renderBilling();
+
+    expect(await screen.findByText("NeuroStack Plus")).toBeInTheDocument();
+    await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1));
+    expect(screen.queryByTestId("credit-panel")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Saldo de créditos/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Exportar dados/i })).not.toBeInTheDocument();
+    // Top-ups stay unavailable even with the commercial flag on: no balance
+    // can be shown, so nothing is sold.
+    expect(screen.queryByTestId("topup-offer")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Recargas indisponíveis/i })).toBeDisabled();
+    expect(screen.queryAllByText(/\bpix\b/i)).toHaveLength(0);
+    expect(document.body.textContent ?? "").not.toMatch(/créditos?\s+\d/i);
+  });
+
+  it("shows the balance by origin, debt, reservations, expiries and consumption from the ledger", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () =>
+        response(
+          creditSummary({
+            balance: { open_debt_mc: 1_500, net_available_mc: 504_500 },
+            debt: {
+              open_debt_mc: 1_500,
+              debts: [
+                {
+                  debt_id: "debt-1",
+                  source_kind: "consumption",
+                  amount_mc: 1_500,
+                  settled_mc: 0,
+                  open_mc: 1_500,
+                  created_at: "2026-10-29T12:00:00Z",
+                },
+              ],
+            },
+          }),
+        ),
+    });
+    renderBilling();
+
+    expect(await screen.findByTestId("credit-panel")).toBeInTheDocument();
+    expect(metric("Franquia mensal")).toHaveTextContent("10 créditos");
+    expect(metric("Recargas")).toHaveTextContent("496 créditos");
+    expect(metric("Dívida")).toHaveTextContent("1,5 créditos");
+    expect(metric("Reservas do ciclo")).toHaveTextContent("2 créditos");
+    expect(metric("Disponível líquido")).toHaveTextContent("504,5 créditos");
+    expect(metric("Franquia do próximo ciclo")).toHaveTextContent("25 créditos");
+    expect(screen.getByTestId("credit-expiries")).toHaveTextContent(/Recarga.*496 créditos/);
+    expect(screen.getByTestId("credit-debts")).toHaveTextContent(/Consumo acima do saldo.*1,5 créditos/);
+    expect(screen.getByTestId("credit-reservations")).toHaveTextContent(/Base de conhecimento\s*3 créditos/);
+    expect(screen.getByTestId("credit-reservations")).toHaveTextContent(/Mídias\s*2 créditos/);
+    expect(screen.getByTestId("credit-consumption")).toHaveTextContent(/Consumo cobrado no ciclo/);
+    expect(screen.getByTestId("credit-consumption")).toHaveTextContent(/Decisões\s*12 créditos/);
+    // Enforced: no observational notice.
+    expect(screen.queryByTestId("credit-mode")).not.toBeInTheDocument();
+  });
+
+  it("marks consumption as not charged while the mode is observational", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () =>
+        response(creditSummary({ state: { mode: "observational", enforcement_at: null } })),
+    });
+    renderBilling();
+
+    expect(await screen.findByTestId("credit-mode")).toHaveTextContent(/Modo observacional/);
+    expect(screen.getByTestId("credit-consumption")).toHaveTextContent(
+      /Consumo estimado no ciclo \(não cobrado\)\s*Decisões\s*1,5 créditos/,
+    );
+  });
+
+  it.each([
+    [
+      "pending",
+      { pending_reasons: ["quarantine"] },
+      /Pendência financeira: um pagamento está em verificação/,
+      false,
+    ],
+    [
+      "grace",
+      {
+        exhausted_at: "2026-10-29T12:00:00Z",
+        suspension_due_at: "2026-11-01T12:00:00Z",
+        deletion_due_at: "2026-11-28T12:00:00Z",
+        export_deadline_at: "2026-11-28T12:00:00Z",
+      },
+      /serviço continua como dívida até 01\/11\/2026/,
+      true,
+    ],
+    [
+      "suspended",
+      {
+        exhausted_at: "2026-10-20T12:00:00Z",
+        suspension_due_at: "2026-10-23T12:00:00Z",
+        deletion_due_at: "2026-11-19T12:00:00Z",
+        export_deadline_at: "2026-11-19T12:00:00Z",
+      },
+      /Serviço suspenso por falta de créditos/,
+      true,
+    ],
+    [
+      "deletion_due",
+      {
+        exhausted_at: "2026-09-20T12:00:00Z",
+        suspension_due_at: "2026-09-23T12:00:00Z",
+        deletion_due_at: "2026-10-20T12:00:00Z",
+        export_deadline_at: "2026-10-20T12:00:00Z",
+      },
+      /Prazo de retenção encerrado/,
+      true,
+    ],
+  ])("shows the %s state from the server", async (state, fields, message, deadline) => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary({ state: { state, ...fields } })),
+    });
+    renderBilling();
+
+    const notice = await screen.findByTestId("credit-state");
+    expect(notice).toHaveAttribute("data-state", state);
+    expect(notice).toHaveTextContent(message);
+    if (deadline) {
+      expect(notice).toHaveTextContent(/Exporte seus dados até \d{2}\/\d{2}\/\d{4}/);
+    } else {
+      expect(notice).not.toHaveTextContent(/Exporte seus dados/);
+    }
+  });
+
+  it("shows no state notice for an active account", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+    });
+    renderBilling();
+
+    expect(await screen.findByTestId("credit-panel")).toBeInTheDocument();
+    expect(screen.queryByTestId("credit-state")).not.toBeInTheDocument();
+  });
+
+  it("downloads the export with the builder session", async () => {
+    const blob = new Blob(["PK\u0003\u0004"], { type: "application/zip" });
+    const createObjectURL = vi.fn(() => "blob:credit-export");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+      "GET /v1/credits/export": () =>
+        ({
+          ok: true,
+          status: 200,
+          headers: new Headers({
+            "Content-Disposition": 'attachment; filename="neurostack-export-tenant.zip"',
+          }),
+          blob: async () => blob,
+        }) as Response,
+    });
+    renderBilling();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Exportar dados/i }));
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledWith(blob));
+    const [exportCall] = calls(fetchMock, "GET", "/v1/credits/export");
+    expect((exportCall[1] as RequestInit).headers).toEqual({ Authorization: "Bearer test-token" });
+    expect(click).toHaveBeenCalledTimes(1);
+    const anchor = click.mock.instances[0] as unknown as HTMLAnchorElement;
+    expect(anchor.download).toBe("neurostack-export-tenant.zip");
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:credit-export");
+    expect(screen.getByRole("button", { name: /Exportar dados/i })).toBeEnabled();
+  });
+
+  it("makes the export unavailable when the export answers 503", async () => {
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+      "GET /v1/credits/export": CREDIT_UNAVAILABLE,
+    });
+    renderBilling();
+
+    const button = await screen.findByRole("button", { name: /Exportar dados/i });
+    fireEvent.click(button);
+
+    expect(await screen.findByText(/Exportação indisponível no momento/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Exportar dados/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /Exportar dados/i }));
+    expect(calls(fetchMock, "GET", "/v1/credits/export")).toHaveLength(1);
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("keeps top-ups unavailable while the server says they are closed", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, topup_commercial_enabled: false }),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+    });
+    renderBilling();
+
+    expect(await screen.findByTestId("credit-panel")).toBeInTheDocument();
+    expect(screen.queryByTestId("topup-offer")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Recargas indisponíveis/i })).toBeDisabled();
+  });
+
+  it("sells a package by card or PIX sending only offer_id and method", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, topup_commercial_enabled: true }),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+      "POST /v1/billing/checkout": () =>
+        response({ ...session("active", HOSTED_URL), kind: "topup" }),
+    });
+    renderBilling();
+
+    const offer = await screen.findByTestId("topup-offer");
+    const packages = screen.getByRole("group", { name: "Pacote" });
+    expect(
+      Array.from(packages.querySelectorAll("button")).map((b) => b.textContent),
+    ).toEqual(["500 créditos", "1.000 créditos", "2.000 créditos", "4.000 créditos"]);
+    const methods = screen.getByRole("group", { name: "Forma de pagamento" });
+    expect(Array.from(methods.querySelectorAll("button")).map((b) => b.textContent)).toEqual([
+      "Cartão de crédito",
+      "PIX",
+    ]);
+    const buy = screen.getByRole("button", { name: /Comprar recarga/i });
+    expect(buy).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "2.000 créditos" }));
+    fireEvent.click(screen.getByRole("button", { name: "PIX" }));
+    fireEvent.click(buy);
+    fireEvent.click(buy);
+
+    await waitFor(() => expect(navigateToHostedCheckout).toHaveBeenCalledWith(HOSTED_URL));
+    const posts = calls(fetchMock, "POST", "/v1/billing/checkout");
+    expect(posts).toHaveLength(1);
+    expect(JSON.parse(String((posts[0][1] as RequestInit).body))).toEqual({
+      offer_id: "package_credits_2000_v1",
+      method: "pix",
+    });
+    expect(offer).toHaveTextContent(/válida por 6 meses/);
+    // The purchase anticipated nothing: the balance is still the ledger's.
+    expect(metric("Recargas")).toHaveTextContent("496 créditos");
+    expect(sessionStorage.getItem(SESSION_KEY)).toBe(SESSION_ID);
+  });
+
+  it("keeps the subscription a monthly card subscription, apart from the top-ups", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, topup_commercial_enabled: true }),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+      "POST /v1/billing/checkout": () => response(session("active", HOSTED_URL)),
+    });
+    renderBilling();
+
+    await screen.findByTestId("topup-offer");
+    await startCheckout("Plus");
+    await waitFor(() => expect(calls(fetchMock, "POST", "/v1/billing/checkout")).toHaveLength(1));
+    const [post] = calls(fetchMock, "POST", "/v1/billing/checkout");
+    expect(JSON.parse(String((post[1] as RequestInit).body))).toEqual({
+      offer_id: "plan_plus_monthly_v1",
+      method: "credit_card",
+    });
+    // PIX is offered only inside the top-up card; the subscription cards and
+    // checkout offer no PIX, Pix Automático, annual cycle or installments.
+    const topup = screen.getByTestId("topup-offer");
+    for (const element of screen.queryAllByText(/\bpix\b/i)) {
+      expect(topup.contains(element)).toBe(true);
+    }
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/pix autom|anual|annual|parcel|installment/i);
+  });
+
+  it.each([
+    [409, "billing_checkout_not_eligible"],
+    [503, "billing_checkout_unavailable"],
+  ])("maps a %s top-up refusal without creating anything", async (status, detail) => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, topup_commercial_enabled: true }),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+      "POST /v1/billing/checkout": () => response({ detail }, status),
+    });
+    renderBilling();
+
+    await screen.findByTestId("topup-offer");
+    fireEvent.click(screen.getByRole("button", { name: "500 créditos" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cartão de crédito" }));
+    fireEvent.click(screen.getByRole("button", { name: /Comprar recarga/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/Recargas estão indisponíveis no momento/);
+    expect(alert).not.toHaveTextContent(detail);
+    expect(navigateToHostedCheckout).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+  });
+
+  it("re-reads the order and the ledger after a return and never anticipates the grant", async () => {
+    sessionStorage.setItem(SESSION_KEY, SESSION_ID);
+    window.history.replaceState({}, "", "/billing?checkout=success");
+    let ledger = creditSummary({ balance: { topup_available_mc: 0, available_mc: 10_000 } });
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, topup_commercial_enabled: true }),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(ledger),
+      [`GET /v1/billing/checkout/${SESSION_ID}`]: () =>
+        response({ ...session("active", HOSTED_URL), kind: "topup" }),
+    });
+    renderBilling();
+
+    expect(await screen.findByText(/o QR do PIX não adicionam créditos/i)).toBeInTheDocument();
+    await screen.findByTestId("credit-panel");
+    // The return marker activates nothing: the top-up is not in the balance.
+    expect(metric("Recargas")).toHaveTextContent("0 créditos");
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1);
+    expect(calls(fetchMock, "GET", `/v1/billing/checkout/${SESSION_ID}`)).toHaveLength(1);
+    // Buying is blocked while that checkout is live.
+    expect(screen.getByRole("button", { name: /Comprar recarga/i })).toBeDisabled();
+    expect(navigateToHostedCheckout).not.toHaveBeenCalled();
+
+    // The server applied the grant: only a re-read shows it.
+    ledger = creditSummary({ balance: { topup_available_mc: 500_000 } });
+    fireEvent.click(screen.getByRole("button", { name: /Atualizar estado/i }));
+    await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(2));
+    await waitFor(() => expect(metric("Recargas")).toHaveTextContent("500 créditos"));
+    expect(calls(fetchMock, "GET", `/v1/billing/checkout/${SESSION_ID}`)).toHaveLength(2);
+  });
+
+  it("enables the plan usage purchase button only when top-ups are offered", async () => {
+    const usage = {
+      plan: "plus",
+      as_of: AS_OF,
+      trace_period: { start: "2026-10-01T00:00:00Z", end: "2026-11-01T00:00:00Z", timezone: "UTC" },
+      traces: { used: 0, included: 0, extra_credits: 0, available: 0, overage: 0, percent_used: 0 },
+      storage: {
+        rag: { used_bytes: 0, used_mb: 0, limit_bytes: 0, limit_mb: 0, available_bytes: 0, available_mb: 0, overage_bytes: 0, overage_mb: 0, percent_used: 0 },
+        media: { used_bytes: 0, used_mb: 0, limit_bytes: 0, limit_mb: 0, available_bytes: 0, available_mb: 0, overage_bytes: 0, overage_mb: 0, percent_used: 0 },
+      },
+      credits: { purchase_enabled: false, coming_soon: true },
+    };
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response({ ...summary, usage, topup_commercial_enabled: true }),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+    });
+    renderBilling();
+
+    await screen.findByTestId("topup-offer");
+    const buy = screen.getByRole("button", { name: /Comprar créditos/i });
+    expect(buy).toBeEnabled();
+    fireEvent.click(buy);
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
   });
 });

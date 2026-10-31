@@ -1,7 +1,14 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { PlanUsageSummary, type BillingUsage } from "./plan-usage-summary";
+import {
+  CreditAllocationNotice,
+  PlanUsageSummary,
+  formatCredits,
+  isCreditSummary,
+  readCredit,
+  type BillingUsage,
+} from "./plan-usage-summary";
 
 const usage: BillingUsage = {
   plan: "builder_pro",
@@ -122,5 +129,125 @@ describe("<PlanUsageSummary />", () => {
       screen.getByRole("button", { name: /comprar créditos/i }),
     ).toBeDisabled();
     expect(screen.getByText("Em breve")).toBeInTheDocument();
+  });
+});
+
+// ── Credits (neurostack-credit-system Group 6) ──────────────────────────────
+
+describe("<PlanUsageSummary /> credit purchase", () => {
+  it("enables the purchase only when the page passes an enabled purchase", () => {
+    const onBuy = vi.fn();
+    render(
+      <PlanUsageSummary
+        usage={usage}
+        locale="pt"
+        creditPurchase={{ enabled: true, onBuy }}
+      />,
+    );
+
+    const buy = screen.getByRole("button", { name: /comprar créditos/i });
+    expect(buy).toBeEnabled();
+    expect(screen.queryByText("Em breve")).not.toBeInTheDocument();
+    fireEvent.click(buy);
+    expect(onBuy).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    render(
+      <PlanUsageSummary
+        usage={usage}
+        locale="pt"
+        creditPurchase={{ enabled: false, onBuy }}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /comprar créditos/i })).toBeDisabled();
+    expect(screen.getByText("Em breve")).toBeInTheDocument();
+  });
+});
+
+const reservations = {
+  as_of: "2026-10-30T15:00:00Z",
+  window: { start: "2026-10-25", end: "2026-11-25", kind: "cycle" },
+  reservations: [
+    { category: "rag", units: 15_000, coverage_mc: 3_000, charged_mc: 2_000 },
+    { category: "media", units: 40_000_000, coverage_mc: 2_500, charged_mc: 500 },
+    { category: "egress", units: 0, coverage_mc: 0, charged_mc: 0 },
+  ],
+  egress_allowance_bytes: 500_000_000,
+  egress_delivered_bytes: 12_000_000,
+};
+
+function reply(data: unknown, status = 200): Response {
+  return { ok: status === 200, status, json: async () => data } as Response;
+}
+
+describe("credit reads", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
+
+  it("formats integer millicredits as credits", () => {
+    expect(formatCredits(1_500, "pt")).toBe("1,5");
+    expect(formatCredits(496_000, "en")).toBe("496");
+    expect(formatCredits(1, "pt")).toBe("0,001");
+  });
+
+  it.each([
+    [503, { code: "credit_unavailable" }],
+    [403, { detail: { code: "credit_scope_forbidden" } }],
+    [500, { error: "internal_server_error" }],
+    [200, { balance: "not a summary" }],
+  ])("hides a credit read answered %s", async (status, body) => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(body, status)));
+    expect(await readCredit("/v1/credits/summary", "t", isCreditSummary)).toEqual({
+      status: "hidden",
+    });
+  });
+
+  it("hides a credit read whose request fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("network");
+      }),
+    );
+    expect(await readCredit("/v1/credits/summary", "t", isCreditSummary)).toEqual({
+      status: "hidden",
+    });
+  });
+
+  it("shows a category's allocation only when the server answers", async () => {
+    const fetchMock = vi.fn(async () => reply(reservations));
+    vi.stubGlobal("fetch", fetchMock);
+    localStorage.setItem("ns_auth", JSON.stringify({ token: "builder-token" }));
+    render(
+      <CreditAllocationNotice category="media" locale="pt" tenantId="clinic-9" enabled />,
+    );
+
+    const notice = await screen.findByTestId("credit-allocation-media");
+    expect(notice).toHaveTextContent(/Alocado no ciclo:\s*2,5 créditos/);
+    expect(notice).toHaveTextContent(/Debitado:\s*0,5 créditos/);
+    expect(notice).toHaveTextContent(/Downloads incluídos:\s*12 \/ 500 MB/);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/credits/reservations?tenant_id=clinic-9",
+      expect.objectContaining({ headers: { Authorization: "Bearer builder-token" } }),
+    );
+  });
+
+  it("renders nothing and reads nothing while disabled, and nothing on 503", async () => {
+    const fetchMock = vi.fn(async () => reply({ code: "credit_unavailable" }, 503));
+    vi.stubGlobal("fetch", fetchMock);
+    const { container, rerender } = render(
+      <CreditAllocationNotice category="rag" locale="pt" tenantId="clinic-9" enabled={false} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    rerender(
+      <CreditAllocationNotice category="rag" locale="pt" tenantId="clinic-9" enabled />,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(container).toBeEmptyDOMElement();
   });
 });
