@@ -34,7 +34,8 @@ builder) has no account: zeros, state ``pending`` (``standalone``).
 ``state`` precedence: ``deletion_due`` > ``suspended`` > ``grace`` (the
 recorded transitions of the open exhaustion episode; episodes exist only
 after ``credit_enforcement_at``) > ``pending`` (``credit_pending``: a
-quarantined ASAAS order or cycle, or a standalone tenant) > ``active``.
+quarantined ASAAS order or cycle, a standalone tenant, or -- once enforced --
+a binding coverage that is not usable: ``reconciliation``) > ``active``.
 ``mode`` is ``observational`` until ``credit_enforcement_at``: nothing is
 charged then, and the consumption shows what WOULD have been debited.
 """
@@ -121,6 +122,7 @@ from src.services.credit_lifecycle import (
     thresholds_reached,
 )
 from src.services.credit_metering import TRACE_COST_MC
+from src.services.credit_rollout import CreditRolloutService
 from src.services.credit_switch import credit_router
 
 router = credit_router()
@@ -418,6 +420,20 @@ class CreditSnapshot:
             deletion_marked="deletion_due" in recorded,
         )
         reasons: list[Any] = ["quarantine"] if quarantined else []
+        # Once enforced, a request is answered ``credit_pending`` whenever the
+        # binding coverage is not usable (identity conflict, an unbound
+        # current cycle outside grace, an unreconciled top-up); the quarantine
+        # is checked first, exactly as on the enforced path.  Read-only.
+        if (
+            not quarantined
+            and mode == "enforced"
+            and not (
+                await CreditRolloutService(self.session).binding_coverage(
+                    builder_id, at=as_of, quarantine_checked=True
+                )
+            ).usable
+        ):
+            reasons.append("reconciliation")
         state: Any = lifecycle
         if lifecycle == "active" and reasons:
             state = "pending"

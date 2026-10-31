@@ -12,7 +12,8 @@ debt), never as hand-made balances.  Pinned here:
   pending purchase: a lot shows only once its grant is in the ledger;
 * lots, expiries (an expiry due is applied to the VIEW, never persisted),
   debt, reservations, thresholds and consumption (charged vs observed);
-* the states ``active``, ``pending`` (quarantine, standalone), ``grace``,
+* the states ``active``, ``pending`` (quarantine, standalone, an enforced
+  binding coverage that is not usable: reconciliation), ``grace``,
   ``suspended``, ``deletion_due`` with their deadlines and the export
   deadline, and the mode ``observational`` until ``credit_enforcement_at``;
 * the routes are read-only: no row, no effect, nothing persisted by a read;
@@ -34,6 +35,7 @@ from sqlalchemy import func, select
 
 from src.api.middleware.auth import pwd_context
 from src.config.settings import settings
+from src.models.billing import BillingSubscription, BillingSubscriptionCycle
 from src.models.builder import Builder
 from src.models.content_retention import (
     CreditLifecycleEpisode,
@@ -43,6 +45,7 @@ from src.models.content_retention import (
 from src.models.credit import (
     CreditAccount,
     CreditEffect,
+    CreditEnforcementBinding,
     CreditEnforcementState,
     CreditLedgerEntry,
     CreditObservationalEffect,
@@ -802,6 +805,140 @@ def test_a_standalone_tenant_is_pending_without_an_account(
     assert (state["state"], state["pending_reasons"]) == ("pending", ["standalone"])
     balance = _ok(client, "balance", world.super_admin, tenant_id=str(world.standalone))
     assert balance["available_mc"] == 0
+
+
+async def _current_cycle(world: Builders, binding: str) -> None:
+    """An active ASAAS subscription of the rich builder with its current
+    cycle, bound ``exact``-ly, bound with a conflicting identity
+    (``conflict``), or not bound at all (``missing``)."""
+
+    assert world.cycle_start is not None and world.cycle_end is not None
+    start, end = world.cycle_start, world.cycle_end
+    cycle_id = uuid4()
+
+    async def work(database: Any) -> None:
+        database.add(
+            BillingSubscription(
+                id=world.subscription,
+                builder_id=world.rich,
+                provider="asaas",
+                external_subscription_id=f"sub_{world.subscription.hex}",
+                is_active=True,
+                plan="credits",
+                billing_cycle="monthly",
+                status="active",
+            )
+        )
+        await database.flush()
+        database.add(
+            BillingSubscriptionCycle(
+                id=cycle_id,
+                builder_id=world.rich,
+                subscription_id=world.subscription,
+                payment_id=f"pay_{cycle_id.hex}",
+                catalog_version_id="test",
+                offer_id="test",
+                cycle_start=start,
+                cycle_end=end,
+                amount_cents=10_000,
+                credit_grant_mc=10_000,
+                pricing_snapshot={},
+                financial_snapshot={},
+                state="settled",
+                financial_revision=1,
+                settled_cents=10_000,
+            )
+        )
+        await database.flush()
+        if binding == "missing":
+            return
+        database.add(
+            CreditEnforcementBinding(
+                builder_id=world.rich,
+                subscription_id=world.subscription,
+                subscription_cycle_id=cycle_id,
+                cycle_start=start,
+                # A conflict: the binding of this cycle names other dates.
+                cycle_end=end + timedelta(days=1) if binding == "conflict" else end,
+                financial_revision=1,
+                grant_effect_id=monthly_grant_effect_id(world.subscription, start, end),
+                status="active",
+            )
+        )
+
+    await _plain(work)
+
+
+@pytest.mark.parametrize("binding", ["conflict", "missing"])
+def test_an_unusable_binding_coverage_is_pending_once_enforced(
+    client: Any, world: Builders, switch: Callable[[bool], None], binding: str
+) -> None:
+    """The enforced path answers ``credit_pending`` when the binding coverage
+    is not usable; the state must say so instead of an optimistic ``active``."""
+
+    client._submit(_current_cycle(world, binding))
+    # Observational: no enforced request is gated, nothing is pending.
+    state = _ok(client, "state", world.rich_jwt)
+    assert (state["state"], state["pending_reasons"]) == ("active", [])
+    client._submit(_enforce())
+    state = _ok(client, "state", world.rich_jwt)
+    assert (state["mode"], state["state"], state["pending_reasons"]) == (
+        "enforced",
+        "pending",
+        ["reconciliation"],
+    )
+    assert _without_as_of(_ok(client, "summary", world.rich_jwt)["state"]) == (
+        _without_as_of(state)
+    )
+
+
+def test_an_exact_binding_stays_active_once_enforced(
+    client: Any, world: Builders, switch: Callable[[bool], None]
+) -> None:
+    client._submit(_current_cycle(world, "exact"))
+    client._submit(_enforce())
+    state = _ok(client, "state", world.rich_jwt)
+    assert (state["mode"], state["state"], state["pending_reasons"]) == (
+        "enforced",
+        "active",
+        [],
+    )
+
+
+def test_a_quarantine_is_checked_before_the_binding_coverage(
+    client: Any,
+    world: Builders,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """As on the enforced request path, a quarantine excludes the coverage
+    check: the reason is ``quarantine`` alone, never also ``reconciliation``."""
+
+    async def quarantined(_self: Any, builder_id: UUID) -> bool:
+        return True
+
+    client._submit(_current_cycle(world, "conflict"))
+    client._submit(_enforce())
+    monkeypatch.setattr(CreditRepository, "quarantine_hold", quarantined)
+    state = _ok(client, "state", world.rich_jwt)
+    assert (state["mode"], state["state"], state["pending_reasons"]) == (
+        "enforced",
+        "pending",
+        ["quarantine"],
+    )
+
+
+def test_a_lifecycle_state_outranks_a_reconciliation_pending(
+    client: Any, world: Builders, switch: Callable[[bool], None]
+) -> None:
+    client._submit(_current_cycle(world, "conflict"))
+    client._submit(_enforce())
+    client._submit(_episode(world.rich, transitions=("suspended",)))
+    state = _ok(client, "state", world.rich_jwt)
+    assert (state["state"], state["pending_reasons"]) == (
+        "suspended",
+        ["reconciliation"],
+    )
 
 
 # ---------------------------------------------------------------------------
