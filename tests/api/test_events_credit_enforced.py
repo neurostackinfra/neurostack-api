@@ -56,6 +56,7 @@ from src.config.settings import Settings, settings
 from src.core.pipeline import CognitivePipeline
 from src.interaction_context import InteractionOrigin
 from src.memory.event_store import EventStore
+from src.models.billing import BillingFactAck, BillingOutboxEvent, BillingTopupOrder
 from src.models.builder import Builder
 from src.models.credit import (
     CreditAccount,
@@ -568,6 +569,14 @@ def test_a_decision_is_charged_once_with_its_bundle_and_replayed_identically(
 
 
 async def _grant(builder_id: UUID, granted_mc: int) -> None:
+    """Seed the complete reconciled top-up source used by enforced fixtures.
+
+    Group 7 rejects the old ledger-only convenience grant: capacity is usable
+    after enforcement only if its top-up order and accepted fact are present.
+    The helper keeps pre-existing debit/lifecycle tests focused on their
+    intended behavior while using the production identity boundary.
+    """
+
     database = get_db_session()
     try:
         async with database.begin():
@@ -576,6 +585,57 @@ async def _grant(builder_id: UUID, granted_mc: int) -> None:
             book = await ledger.open_book(builder_id, at=now)
             order = uuid4()
             paid = date.today()
+            outbox_id = uuid4()
+            event_id = uuid4()
+            digest = "0" * 64
+            database.add(
+                BillingTopupOrder(
+                    id=order,
+                    builder_id=builder_id,
+                    payment_method="pix",
+                    catalog_version_id="payment-2026-10-03",
+                    offer_id="package_credits_500_v1",
+                    amount_cents=10_000,
+                    credit_grant_mc=granted_mc,
+                    pricing_snapshot={},
+                    financial_snapshot={},
+                    state="settled",
+                    financial_revision=1,
+                    settled_cents=10_000,
+                )
+            )
+            database.add(
+                BillingOutboxEvent(
+                    id=outbox_id,
+                    builder_id=builder_id,
+                    schema_version="billing.fact.v1",
+                    event_type="topup.payment_settled.v1",
+                    aggregate_kind="topup_order",
+                    aggregate_id=order,
+                    subscription_id=None,
+                    topup_order_id=order,
+                    subscription_cycle_id=None,
+                    payment_effect_id=None,
+                    financial_revision=1,
+                    payload={},
+                    payload_sha256=digest,
+                )
+            )
+            database.add(
+                BillingFactAck(
+                    id=uuid4(),
+                    outbox_event_id=outbox_id,
+                    event_id=event_id,
+                    schema_version="billing.fact.ack.v1",
+                    outcome="accepted",
+                    inbox_event_id=uuid4(),
+                    fact_sha256=digest,
+                    bundle_digest=digest,
+                    deployment_digest=digest,
+                    effects_digest=digest,
+                    acknowledged_at=now,
+                )
+            )
             book.grant(
                 GrantSpec(
                     lot_kind="topup",

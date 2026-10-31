@@ -1033,10 +1033,10 @@ async def oracle(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[_Ora
         await _run_alembic(admin_url.set(database=at_037), "upgrade", "037")
         await _seed_world(admin_url.set(database=at_037), world)
         oracle.templates["037"] = at_037
-        # The credit-ready head: 041 (Group 5; 040 and 039 before it).
-        at_041 = await oracle.clone("037")
-        await _run_alembic(admin_url.set(database=at_041), "upgrade", "041")
-        oracle.templates["041"] = at_041
+        # The credit-ready head: 042 (Group 5; 040 and 039 before it).
+        at_042 = await oracle.clone("037")
+        await _run_alembic(admin_url.set(database=at_042), "upgrade", "042")
+        oracle.templates["042"] = at_042
         yield oracle
     finally:
         for name in list(reversed(created)):
@@ -1108,7 +1108,7 @@ def _assert_same(on: dict[str, Any], off: dict[str, Any], world: _World) -> None
     assert actual["events"] == expected["events"]
 
 
-@pytest.mark.parametrize("revision", ["037", "041"])
+@pytest.mark.parametrize("revision", ["037", "042"])
 async def test_config_on_answers_and_stores_like_config_off(
     oracle: _Oracle, revision: str
 ) -> None:
@@ -1130,7 +1130,7 @@ async def test_config_on_answers_and_stores_like_config_off(
         assert on["reading"] == {
             "effective": True,
             "reason": "schema_ready",
-            "revision": "041",
+            "revision": "042",
         }
     _assert_same(on, off, oracle.world)
 
@@ -1228,7 +1228,7 @@ async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None
 
 async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> None:
     _assert_same(
-        await oracle.run("041", enabled=False),
+        await oracle.run("042", enabled=False),
         await oracle.run("037", enabled=False),
         oracle.world,
     )
@@ -1236,7 +1236,7 @@ async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> Non
 
 @pytest.mark.parametrize(
     ("revision", "enabled"),
-    [("037", False), ("037", True), ("041", False)],
+    [("037", False), ("037", True), ("042", False)],
 )
 async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     oracle: _Oracle, revision: str, enabled: bool
@@ -1248,7 +1248,7 @@ async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     assert run["statements"], "the listener saw no SQL at all"
     touching = [s for s in run["statements"] if _CREDIT_SQL.search(s)]
     assert touching == []
-    if revision == "041":
+    if revision == "042":
         assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
     else:
         assert run["credit_rows"] == {}
@@ -1261,7 +1261,7 @@ async def test_the_effective_switch_only_meters_observationally(
     writers' tables are touched, and nothing financial is ever written
     before the enforcement."""
 
-    run = await oracle.run("041", enabled=True)
+    run = await oracle.run("042", enabled=True)
 
     names = {
         match.group(0).lower()
@@ -1289,7 +1289,7 @@ def _event_id(run: dict[str, Any], case: str) -> str:
 async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
     oracle: _Oracle,
 ) -> None:
-    run = await oracle.run("041", enabled=True)
+    run = await oracle.run("042", enabled=True)
     world = oracle.world
     status = {r["id"]: r["status"] for r in run["responses"]}
     claims = run["metering"]["credit_ingress_claims"]
@@ -1410,8 +1410,8 @@ def _bodies(run: dict[str, Any]) -> dict[str, Any]:
     [
         ("037", False, 503),
         ("037", True, 503),
-        ("041", False, 503),
-        ("041", True, 201),
+        ("042", False, 503),
+        ("042", True, 201),
     ],
 )
 async def test_the_multipart_upload_exists_only_with_the_switch_effective(
@@ -1432,8 +1432,8 @@ async def test_the_multipart_upload_exists_only_with_the_switch_effective(
     ("revision", "enabled", "export", "purge"),
     [
         ("037", True, 503, 503),
-        ("041", False, 503, 503),
-        ("041", True, 200, 403),
+        ("042", False, 503, 503),
+        ("042", True, 200, 403),
     ],
 )
 async def test_group5_surfaces_exist_only_with_the_switch_effective(
@@ -1456,7 +1456,7 @@ _GROUP6_CASES = (*_GROUP6_READS, *_GROUP6_FOREIGN, "credits-balance-api-key")
 
 @pytest.mark.parametrize(
     ("revision", "enabled"),
-    [("037", False), ("037", True), ("041", False)],
+    [("037", False), ("037", True), ("042", False)],
 )
 async def test_group6_reads_answer_unavailable_without_the_switch(
     oracle: _Oracle, revision: str, enabled: bool
@@ -1482,7 +1482,7 @@ async def test_group6_reads_observe_without_charging_before_the_enforcement(
     same 403; the API key is refused; nothing is written (the no-write check
     of ``test_the_effective_switch_only_meters_observationally``)."""
 
-    run = await oracle.run("041", enabled=True)
+    run = await oracle.run("042", enabled=True)
     world = oracle.world
     answers = {r["id"]: r for r in run["responses"]}
     for case in _GROUP6_READS:
@@ -1538,7 +1538,7 @@ async def test_uploads_and_downloads_are_metered_observationally_only(
     and download WOULD debit, the window's maintenance once per category,
     the delivery -- and nothing financial."""
 
-    run = await oracle.run("041", enabled=True)
+    run = await oracle.run("042", enabled=True)
     world = oracle.world
     bodies = _bodies(run)
     effects = {
@@ -1643,8 +1643,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
     """``credit_enforcement_at`` set but the switch off: ``main`` exactly,
     no SQL touches a ``credit_*`` table, nothing is claimed or charged."""
 
-    off = await oracle.run("041", enabled=False)
-    enforced = await oracle.run("041", enabled=False, enforced=True)
+    off = await oracle.run("042", enabled=False)
+    enforced = await oracle.run("042", enabled=False, enforced=True)
 
     assert enforced["reading"] == off["reading"]
     _assert_same(enforced, off, oracle.world)
@@ -1657,8 +1657,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
 async def test_the_enforced_run_charges_each_production_decision_once(
     oracle: _Oracle,
 ) -> None:
-    off = await oracle.run("041", enabled=False)
-    run = await oracle.run("041", enabled=True, enforced=True)
+    off = await oracle.run("042", enabled=False)
+    run = await oracle.run("042", enabled=True, enforced=True)
     world = oracle.world
 
     assert run["reading"]["effective"] is True
@@ -1858,7 +1858,7 @@ async def test_group6_reads_show_the_debt_the_enforced_run_charged(
     episode (``grace``, with the export deadline), nothing is usable and all
     the consumption was charged."""
 
-    run = await oracle.run("041", enabled=True, enforced=True)
+    run = await oracle.run("042", enabled=True, enforced=True)
     world = oracle.world
     answers = {r["id"]: r for r in run["responses"]}
     summary = answers["credits-summary-builder"]
@@ -1894,7 +1894,7 @@ async def test_the_enforced_run_refuses_only_uploads_that_need_capacity(
     the media upload, which fits the baseline's coverage (zero delta), is
     accepted (201) with the episode open."""
 
-    run = await oracle.run("041", enabled=True, enforced=True)
+    run = await oracle.run("042", enabled=True, enforced=True)
     answers = {r["id"]: r for r in run["responses"]}
     for case in _CATEGORY_GATED:
         assert (answers[case]["status"], answers[case]["body"]) == (
@@ -1972,9 +1972,9 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
             ) as client:
                 before = await client.post("/v1/events", json={}, headers=unknown_key)
 
-                await _run_alembic(url, "upgrade", "041")
+                await _run_alembic(url, "upgrade", "042")
                 assert await _wait_for(True, bound) <= bound
-                assert credit_switch_reading().revision == "041"
+                assert credit_switch_reading().revision == "042"
                 during = await client.post("/v1/events", json={}, headers=unknown_key)
 
                 await _run_alembic(url, "downgrade", "037")

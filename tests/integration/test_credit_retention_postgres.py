@@ -1,9 +1,9 @@
 """Credit lifecycle and retention rules on real PostgreSQL (Group 5).
 
 PostgreSQL only -- no S3, no Qdrant.  A fresh child database at ``head``
-(041) of the smoke cluster.  Pinned here:
+(042) of the smoke cluster.  Pinned here:
 
-* every append-only table of 041 (transitions, threshold alerts, roles,
+* every append-only table of 042 (transitions, threshold alerts, roles,
   authorizations and their receipts, hold events, purge fences, tombstones,
   jobs, results and receipts) refuses UPDATE and DELETE with SQLSTATE 23000
   -- and the same statement succeeds with triggers disabled, so the refusal
@@ -99,7 +99,7 @@ async def harness() -> AsyncIterator[_Harness]:
         async with engine.connect() as connection:
             assert (
                 await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "041"
+                == "042"
             )
         async with engine.begin() as connection:
             await connection.execute(

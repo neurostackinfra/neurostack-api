@@ -158,13 +158,15 @@ class _Transaction:
     [
         ("2020-01-01T00:00:00Z", False),
         ("not-a-timestamp", False),
-        ((datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(), True),
+        (None, True),
     ],
 )
 def test_preflight_requires_unexpired_build_attestation(
-    expires_at: str, expected: bool
+    expires_at: str | None, expected: bool
 ) -> None:
     now = datetime.now(timezone.utc)
+    if expires_at is None:
+        expires_at = (now + timedelta(minutes=1)).isoformat()
 
     assert (
         route._attestation_is_unexpired({"expires_at": expires_at}, now=now) is expected

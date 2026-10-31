@@ -34,6 +34,10 @@ from src.api.middleware.auth import TenantContext, get_tenant_context
 from src.api.schemas.admin_credits import (
     AuthorizationCreate,
     AuthorizationResponse,
+    CreditBindingStatus,
+    CreditCapabilityStatus,
+    CreditReconciliationStatus,
+    CreditRolloutStatus,
     HoldEventCreate,
     HoldEventResponse,
     RefusalResponse,
@@ -44,6 +48,7 @@ from src.api.schemas.admin_credits import (
 )
 from src.config.settings import settings
 from src.repositories.content_retention import ContentRetentionRepository
+from src.repositories.credit import CreditRepository
 from src.repositories.database import get_db_session_dependency
 from src.services import content_retention
 from src.services.content_retention import (
@@ -52,6 +57,7 @@ from src.services.content_retention import (
     PresentedAuthorization,
     RetentionRefused,
 )
+from src.services.credit_rollout import CreditRolloutService
 from src.services.credit_switch import credit_router
 
 router = credit_router()
@@ -89,6 +95,95 @@ def _jwt_actor(tenant: TenantContext = Depends(get_tenant_context)) -> Actor:
 
 def _refusal(error: RetentionRefused) -> JSONResponse:
     return JSONResponse(status_code=error.status, content={"code": error.code})
+
+
+@router.get(
+    "/rollout/reconciliation",
+    response_model=CreditReconciliationStatus,
+    responses=_REFUSALS,
+)
+async def credit_reconciliation_status(
+    actor: Actor = Depends(_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> CreditReconciliationStatus:
+    """Technical evidence only; never presents facts or changes ASAAS state."""
+
+    del actor
+    report = await CreditRolloutService(session).reconciliation_report()
+    await session.rollback()
+    return CreditReconciliationStatus(**report.counts(), ready=report.ready)
+
+
+@router.get(
+    "/rollout/bindings/{builder_id}",
+    response_model=CreditBindingStatus,
+    responses=_REFUSALS,
+)
+async def credit_binding_status(
+    builder_id: UUID,
+    actor: Actor = Depends(_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> CreditBindingStatus:
+    """Read a builder's non-authoritative credit source coverage only."""
+
+    del actor
+    coverage = await CreditRolloutService(session).binding_coverage(builder_id)
+    await session.rollback()
+    return CreditBindingStatus(
+        builder_id=builder_id, **coverage.__dict__, usable=coverage.usable
+    )
+
+
+@router.get(
+    "/rollout/status",
+    response_model=CreditRolloutStatus,
+    responses=_REFUSALS,
+)
+async def credit_capability_status(
+    actor: Actor = Depends(_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> CreditRolloutStatus:
+    """Read code readiness; neither records a receipt nor arms enforcement."""
+
+    del actor
+    rollout = CreditRolloutService(session)
+    readiness = await rollout.capability_ready()
+    orphan = await rollout.orphan_report()
+    enforcement_at = await CreditRepository(session).enforcement_at()
+    await session.rollback()
+    return CreditRolloutStatus(
+        enforcement_at=enforcement_at,
+        capability_ready=readiness.ready,
+        reconciliation_ready=readiness.reconciliation_complete,
+        orphan_effects=orphan.open_count,
+    )
+
+
+@router.get(
+    "/rollout/readiness",
+    response_model=CreditCapabilityStatus,
+    responses=_REFUSALS,
+)
+async def credit_capability_readiness(
+    actor: Actor = Depends(_super_admin),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> CreditCapabilityStatus:
+    """Detailed code-only capability calculation, intentionally not recorded."""
+
+    del actor
+    readiness = await CreditRolloutService(session).capability_ready()
+    await session.rollback()
+    return CreditCapabilityStatus(
+        environment=readiness.environment,
+        billing_fact_schema_digest=readiness.billing_fact_schema_digest,
+        inbox_high_watermark=readiness.inbox_high_watermark,
+        reconciliation_complete=readiness.reconciliation_complete,
+        readback_complete=readiness.readback_complete,
+        has_open_gap=readiness.has_open_gap,
+        has_backlog=readiness.has_backlog,
+        has_alert=readiness.has_alert,
+        ready=readiness.ready,
+    )
 
 
 @router.post(

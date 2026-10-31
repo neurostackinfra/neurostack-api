@@ -140,6 +140,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
     BillingOutboxEvent,
+    BillingRolloutControl,
     BillingSubscriptionCycle,
     BillingTopupOrder,
 )
@@ -163,6 +164,7 @@ from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
 from src.models.handoff import HandoffRecord
 from src.models.session import Session as SessionRow
 from src.models.tenant import Tenant
+from src.repositories.billing import billing_advisory_key
 
 # Direction of each entry type on a lot's available balance and on the
 # builder's open debt.  ``debt_settlement`` moves both: the settling lot pays
@@ -1410,6 +1412,27 @@ class CreditRepository:
         return len(ids)
 
     # -- global reads ----------------------------------------------------
+
+    async def lock_rollout_control(self, *, environment: str) -> None:
+        """Take billing's existing advisory and rollout-row locks, read-only.
+
+        The code-only credit fence must serialize behind the same lock as an
+        ASAAS rollout change, but it cannot construct a billing repository or
+        mutate the control plane.  This narrow bridge is deliberately a
+        locking read; the caller owns the transaction and never receives the
+        control row as rollout authority.
+        """
+
+        await self.session.execute(
+            select(func.pg_advisory_xact_lock(billing_advisory_key(environment)))
+        )
+        row = await self.session.scalar(
+            select(BillingRolloutControl.environment)
+            .where(BillingRolloutControl.environment == environment)
+            .with_for_update()
+        )
+        if row is None:
+            raise RuntimeError("billing rollout control is unavailable")
 
     async def enforcement_at(self) -> datetime | None:
         """``credit_enforcement_at``; ``None`` while no row or no instant."""

@@ -497,6 +497,15 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
         # ``neurostack_credit_*`` family is declared here, without identity
         # labels.  The switch gauge is 0 whenever the switch is not effective.
         "neurostack_credit_switch_effective": _NONE,
+        # Group 7: readiness remains a consumer-local technical signal; it
+        # never carries a builder, tenant, subscription or receipt identity.
+        "neurostack_credit_reconciliation_ready": _NONE,
+        "neurostack_credit_orphan_effects": _NONE,
+        "neurostack_credit_observational_write_dropped": _contract(
+            reason=_enum(
+                "route_busy", "pool_exhausted", "timeout", "failed", "tenant_gone"
+            )
+        ),
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(
             intent_category=_INTENT, funnel_stage=_FUNNEL_STAGE, mode=_FLOW_MODE

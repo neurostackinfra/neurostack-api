@@ -161,7 +161,8 @@ def test_credit_modules_import_without_a_tests_tree(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
     # 15 of migration 038, three 039 inventory, three 040 copy tables and
     # thirteen 041 lifecycle/hold/purge/role tables (Group 5).
-    assert "credit tables: 34" in completed.stdout
+    # Migration 042 adds the immutable cutoff-acceptance table.
+    assert "credit tables: 35" in completed.stdout
 
 
 def test_the_probe_detects_a_read_under_tests(tmp_path: Path) -> None:

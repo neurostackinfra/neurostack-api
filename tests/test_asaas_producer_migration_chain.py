@@ -41,4 +41,4 @@ def test_asaas_producer_migrations_extend_026_through_037_linearly() -> None:
     # an ASAAS producer migration) follows 037; Group 4a's credit inventory
     # Group 4b's additive object-copy revision (040) follows 039; Group 5's
     # retention revision (041) follows 040 and is head.
-    assert heads(revisions) == ["041"]
+    assert heads(revisions) == ["042"]

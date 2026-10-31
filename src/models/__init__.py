@@ -68,6 +68,7 @@ from src.models.credit import (
     CreditObservationalEffect,
     CreditResponseOutbox,
 )
+from src.models.credit_enforcement import CreditCutoffAcceptance
 from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
 from src.models.credit_inventory import (
     CreditAllocation,
@@ -144,6 +145,7 @@ __all__ = [
     "CreditEnforcementState",
     "CreditEnforcementBinding",
     "CreditObservationalEffect",
+    "CreditCutoffAcceptance",
     # Credit inventory (neurostack-credit-system Group 4a, migration 039)
     "CreditInventoryVersion",
     "CreditAllocation",

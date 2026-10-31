@@ -3004,8 +3004,8 @@ poetry run python scripts/production_image_smoke.py --expected-head <head of the
 ```
 
 `--expected-head` is the head of the migrations CONTAINED in the image, that
-is of `alembic/versions` in the checkout being built: `041` on `main` today
-(migrations 036, 037, the credit schema 038, inventory 039, object copies 040 and retention 041 are merged). It is not the production
+is of `alembic/versions` in the checkout being built: `042` on `main` today
+(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041 and enforcement 042 are merged). It is not the production
 migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
 checked offline as `032:035` whatever the image's head is.
 
@@ -3033,7 +3033,7 @@ tkinter); no file or directory under `/app` or site-packages is
 world-writable; every top-level import under `src/` resolves; both KMS
 signer factories build their clients (no KMS call); `alembic heads` prints
 exactly one line, `<expected head> (head)`, the head of the migrations in
-the image given with `--expected-head` (`041` on `main` today);
+the image given with `--expected-head` (`042` on `main` today);
 `/app/spa/index.html` exists; and `alembic upgrade
 032:035 --sql` emits the production migration window, which stays `032:035`
 whatever the image's head, as one transaction. The window

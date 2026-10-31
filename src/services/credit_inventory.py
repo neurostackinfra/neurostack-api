@@ -596,14 +596,27 @@ async def _enforced_book(
     at: datetime,
     effect_ids: tuple[str, ...],
 ) -> tuple[TenantScope, CreditLedger, LedgerBook] | None:
-    """Lock order steps 1-4; ``None`` is ``credit_pending`` (a standalone
-    tenant or a quarantine hold): nothing was written."""
+    """Lock order steps 1-4; ``None`` is ``credit_pending``.
+
+    Once the immutable enforcement fence is set, RAG, media, maintenance and
+    egress are subject to the same builder binding evidence as message
+    ingress.  The coverage check is deliberately before opening a ledger
+    book: a reconciliation failure may not create a debit, debt, allocation
+    or lifecycle row.  A genuinely empty but reconciled source remains
+    usable and reaches the existing debt lifecycle.
+    """
 
     repository = CreditRepository(session)
     scope = await repository.tenant_scope(tenant_id, lock=True)
     if scope is None:
         raise CreditTenantGone("the tenant vanished before its reservation")
     if scope.builder_id is None:
+        return None
+    from src.services.credit_rollout import CreditRolloutService
+
+    if not (
+        await CreditRolloutService(session).binding_coverage(scope.builder_id, at=at)
+    ).usable:
         return None
     ledger = CreditLedger(session)
     book = await ledger.open_book(scope.builder_id, at=at, effect_ids=effect_ids)

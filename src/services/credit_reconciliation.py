@@ -21,6 +21,8 @@ alerts (a log line with counts, no identities) and feeds
   already produces, accepted as permanent until an ASAAS repair wish;
 * a settled, non-quarantined cycle is ahead of its enforcement binding
   (consumer lag): missing binding or a lower ``financial_revision``.
+* an append-only ASAAS reconciliation alert has neither a direct accepted
+  acknowledgement nor an accepted later revision of its aggregate.
 
 Group 7 adds, on top of this report, closure rule (b) for ASAAS alert rows
 and the subscription readback of the enforcement gate.
@@ -28,6 +30,7 @@ and the subscription readback of the enforcement gate.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -40,8 +43,10 @@ from src.models.billing import (
     BillingFactAck,
     BillingFactDelivery,
     BillingFactHandoff,
+    BillingFactReconciliationAlert,
     BillingOutboxEvent,
     BillingPaymentEffect,
+    BillingPaymentProjection,
     BillingSubscriptionCycle,
     BillingTopupOrder,
 )
@@ -64,6 +69,7 @@ class CreditReconciliationReport:
     effects_without_outbox: int = 0
     quarantined_lines: int = 0
     binding_lag: int = 0
+    open_alerts: int = 0
 
     @property
     def ready(self) -> bool:
@@ -94,6 +100,117 @@ class CreditReconciliation:
     async def _count(self, statement: Any) -> int:
         return int(await self.session.scalar(statement) or 0)
 
+    async def _open_effect_alert_count(self) -> int:
+        """Count effect-gap alerts whose repaired effect still lacks an ack.
+
+        Effect alerts deliberately have no outbox foreign key: they are
+        emitted precisely when the producer finds an ASAAS effect without an
+        outbox row.  Their only durable correlation is the SHA-256 of the
+        sanitized ``effect:<uuid>`` detail.  Once that effect acquires an
+        accepted consumer fact, the alert is closed just like an accepted
+        outbox-scoped alert.  Any non-effect or unmatched digest remains an
+        open alert.
+        """
+
+        alert = BillingFactReconciliationAlert
+        digests = list(
+            await self.session.scalars(
+                select(alert.detail_sha256).where(alert.outbox_event_id.is_(None))
+            )
+        )
+        if not digests:
+            return 0
+
+        digest_to_effect = {
+            hashlib.sha256(f"effect:{effect_id}".encode("utf-8")).hexdigest(): effect_id
+            for effect_id in await self.session.scalars(select(BillingPaymentEffect.id))
+        }
+        effect_ids = {
+            digest_to_effect[digest] for digest in digests if digest in digest_to_effect
+        }
+        if not effect_ids:
+            return len(digests)
+
+        accepted_effect_ids = set(
+            await self.session.scalars(
+                select(BillingOutboxEvent.payment_effect_id)
+                .join(
+                    BillingFactAck,
+                    BillingFactAck.outbox_event_id == BillingOutboxEvent.id,
+                )
+                .where(
+                    BillingOutboxEvent.payment_effect_id.in_(effect_ids),
+                    BillingFactAck.outcome == "accepted",
+                )
+            )
+        )
+        # The alert means this effect has *no* outbox, so the aggregate and
+        # its missing revision must come from the effect's payment projection,
+        # not an impossible join back to that absent outbox.  The next
+        # revision after the latest fact that predates the effect is the
+        # missing revision; only an accepted fact strictly after it closes the
+        # alert.  This keeps same/lower revisions and another aggregate open.
+        effects = list(
+            await self.session.scalars(
+                select(BillingPaymentEffect).where(
+                    BillingPaymentEffect.id.in_(effect_ids)
+                )
+            )
+        )
+        for effect in effects:
+            projection = await self.session.scalar(
+                select(BillingPaymentProjection).where(
+                    BillingPaymentProjection.id == effect.projection_id,
+                    BillingPaymentProjection.builder_id == effect.builder_id,
+                    BillingPaymentProjection.provider == effect.provider,
+                    BillingPaymentProjection.payment_id == effect.payment_id,
+                )
+            )
+            if projection is None:
+                continue
+            if projection.aggregate_kind == "topup" and projection.topup_order_id:
+                aggregate_kind, aggregate_id = "topup_order", projection.topup_order_id
+            elif (
+                projection.aggregate_kind == "subscription"
+                and projection.subscription_cycle_id
+            ):
+                aggregate_kind, aggregate_id = (
+                    "subscription_cycle",
+                    projection.subscription_cycle_id,
+                )
+            else:
+                continue
+            prior_revision = await self.session.scalar(
+                select(
+                    func.coalesce(func.max(BillingOutboxEvent.financial_revision), 0)
+                ).where(
+                    BillingOutboxEvent.aggregate_kind == aggregate_kind,
+                    BillingOutboxEvent.aggregate_id == aggregate_id,
+                    BillingOutboxEvent.created_at < effect.created_at,
+                )
+            )
+            missing_revision = int(prior_revision or 0) + 1
+            has_accepted_successor = await self.session.scalar(
+                select(
+                    exists().where(
+                        BillingOutboxEvent.aggregate_kind == aggregate_kind,
+                        BillingOutboxEvent.aggregate_id == aggregate_id,
+                        BillingOutboxEvent.financial_revision > missing_revision,
+                        exists().where(
+                            BillingFactAck.outbox_event_id == BillingOutboxEvent.id,
+                            BillingFactAck.outcome == "accepted",
+                        ),
+                    )
+                )
+            )
+            if has_accepted_successor:
+                accepted_effect_ids.add(effect.id)
+        return sum(
+            1
+            for digest in digests
+            if digest_to_effect.get(digest) not in accepted_effect_ids
+        )
+
     async def report(self) -> CreditReconciliationReport:
         outbox = BillingOutboxEvent
         ack = BillingFactAck
@@ -111,6 +228,34 @@ class CreditReconciliation:
             .exists()
         )
         delivered_event = func.coalesce(BillingFactDelivery.event_id, outbox.id)
+        alert = BillingFactReconciliationAlert
+        direct_accepted = (
+            select(BillingFactAck.id)
+            .where(
+                BillingFactAck.outbox_event_id == alert.outbox_event_id,
+                BillingFactAck.outcome == "accepted",
+            )
+            .exists()
+        )
+        alert_outbox = aliased(BillingOutboxEvent)
+        alert_later_outbox = aliased(BillingOutboxEvent)
+        alert_later_ack = aliased(BillingFactAck)
+        alert_closed_by_later = (
+            select(alert_later_ack.id)
+            .select_from(alert_later_ack)
+            .join(
+                alert_later_outbox,
+                alert_later_outbox.id == alert_later_ack.outbox_event_id,
+            )
+            .join(alert_outbox, alert_outbox.id == alert.outbox_event_id)
+            .where(
+                alert_later_ack.outcome == "accepted",
+                alert_later_outbox.aggregate_kind == alert_outbox.aggregate_kind,
+                alert_later_outbox.aggregate_id == alert_outbox.aggregate_id,
+                alert_later_outbox.financial_revision > alert_outbox.financial_revision,
+            )
+            .exists()
+        )
         report = CreditReconciliationReport(
             facts_without_ack=await self._count(
                 select(func.count())
@@ -196,6 +341,18 @@ class CreditReconciliation:
                         )
                     ),
                 )
+            ),
+            open_alerts=(
+                await self._count(
+                    select(func.count())
+                    .select_from(alert)
+                    .where(
+                        alert.outbox_event_id.is_not(None),
+                        ~direct_accepted,
+                        ~alert_closed_by_later,
+                    )
+                )
+                + await self._open_effect_alert_count()
             ),
         )
         if not report.ready:

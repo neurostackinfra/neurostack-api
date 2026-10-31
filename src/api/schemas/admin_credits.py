@@ -88,9 +88,55 @@ class RefusalResponse(BaseModel):
     code: str
 
 
+class CreditReconciliationStatus(_Strict):
+    facts_without_ack: int = Field(ge=0)
+    facts_without_inbox: int = Field(ge=0)
+    rejected_open: int = Field(ge=0)
+    digest_mismatches: int = Field(ge=0)
+    open_revision_gaps: int = Field(ge=0)
+    effects_without_outbox: int = Field(ge=0)
+    quarantined_lines: int = Field(ge=0)
+    binding_lag: int = Field(ge=0)
+    open_alerts: int = Field(ge=0)
+    ready: bool
+
+
+class CreditCapabilityStatus(_Strict):
+    environment: str
+    billing_fact_schema_digest: str = Field(min_length=64, max_length=64)
+    inbox_high_watermark: int = Field(ge=0)
+    reconciliation_complete: bool
+    readback_complete: bool
+    has_open_gap: bool
+    has_backlog: bool
+    has_alert: bool
+    ready: bool
+
+
+class CreditBindingStatus(_Strict):
+    builder_id: UUID
+    monthly_binding: bool
+    usable_topup: bool
+    quarantined: bool
+    identity_conflict: bool
+    reconciliation_failure: bool
+    usable: bool
+
+
+class CreditRolloutStatus(_Strict):
+    enforcement_at: Optional[datetime]
+    capability_ready: bool
+    reconciliation_ready: bool
+    orphan_effects: int = Field(ge=0)
+
+
 __all__ = [
     "AuthorizationCreate",
     "AuthorizationResponse",
+    "CreditBindingStatus",
+    "CreditCapabilityStatus",
+    "CreditReconciliationStatus",
+    "CreditRolloutStatus",
     "HoldEventCreate",
     "HoldEventResponse",
     "RefusalResponse",
