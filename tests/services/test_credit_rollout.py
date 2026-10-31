@@ -78,6 +78,50 @@ def test_current_binding_requires_the_exact_cycle_revision() -> None:
     assert not CreditRolloutService._binding_matches_cycle(binding, cycle)
 
 
+def test_identity_is_split_from_revision_and_status() -> None:
+    """Identity ignores revision and status (request coverage: lag serves);
+    the strict predicate of readiness/arming requires both."""
+
+    builder_id, subscription_id, cycle_id = uuid4(), uuid4(), uuid4()
+    start, end = datetime(2026, 10, 1).date(), datetime(2026, 11, 1).date()
+    cycle = SimpleNamespace(
+        id=cycle_id,
+        builder_id=builder_id,
+        subscription_id=subscription_id,
+        cycle_start=start,
+        cycle_end=end,
+        financial_revision=3,
+    )
+
+    def binding(**changes: object) -> SimpleNamespace:
+        values: dict[str, object] = {
+            "status": "active",
+            "builder_id": builder_id,
+            "subscription_id": subscription_id,
+            "subscription_cycle_id": cycle_id,
+            "cycle_start": start,
+            "cycle_end": end,
+            "financial_revision": 3,
+        }
+        values.update(changes)
+        return SimpleNamespace(**values)
+
+    identity = CreditRolloutService._binding_identity_matches
+    strict = CreditRolloutService._binding_matches_cycle
+    assert identity(binding(), cycle) and strict(binding(), cycle)
+    for lagging in (binding(financial_revision=2), binding(status="reversed")):
+        assert identity(lagging, cycle) and not strict(lagging, cycle)
+    for drift in (
+        binding(builder_id=uuid4()),
+        binding(subscription_id=uuid4()),
+        binding(subscription_cycle_id=uuid4()),
+        binding(cycle_start=datetime(2026, 9, 30).date()),
+        binding(cycle_end=datetime(2026, 11, 2).date()),
+    ):
+        assert not identity(drift, cycle) and not strict(drift, cycle)
+    assert not identity(None, cycle) and not strict(None, cycle)
+
+
 @pytest.mark.asyncio
 async def test_record_capability_readiness_keeps_all_receipt_fields_null(
     monkeypatch: pytest.MonkeyPatch,

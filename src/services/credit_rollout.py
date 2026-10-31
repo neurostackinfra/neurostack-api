@@ -13,11 +13,11 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
-from typing import Final
+from typing import Final, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, case, exists, func, select
+from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.logging import get_logger
@@ -76,6 +76,22 @@ ORPHAN_EFFECT_KINDS: Final = frozenset(
     }
 )
 UNKNOWN_INGRESS_SOURCES: Final = frozenset({"uazapi", "evolution"})
+# Non-terminal ASAAS subscription statuses (``ck_billing_subscriptions_status``
+# of ``src/models/billing.py``; terminal are ``inactive`` and ``cancelled``).
+# Named here rather than imported: the readback must not depend on producer
+# code.
+OPEN_SUBSCRIPTION_STATUSES: Final = (
+    "active",
+    "active_linked",
+    "readback_required",
+    "non_billable_pending_readback",
+)
+# Open statuses that themselves await a provider readback: with a current
+# cycle they are ambiguous and block the enforcement gate.
+AMBIGUOUS_SUBSCRIPTION_STATUSES: Final = frozenset(
+    {"readback_required", "non_billable_pending_readback"}
+)
+PRODUCTION_SERVING: Final = "production-serving"
 OBSERVATIONAL_DROP_REASONS: Final = frozenset(
     {"route_busy", "pool_exhausted", "timeout", "failed", "tenant_gone"}
 )
@@ -244,10 +260,18 @@ class CreditRolloutService:
         return report
 
     async def readback_report(self, *, now: datetime | None = None) -> ReadbackReport:
-        """Require an exact active binding only for a current candidate cycle.
+        """Require an exact active binding for every OPEN subscription's
+        current candidate cycle.
 
-        A subscription with no candidate current cycle is deliberately not a
-        global failure; it is handled by the tenant cutoff report/grace rule.
+        Open is ``is_active`` or any non-terminal ASAAS status
+        (:data:`OPEN_SUBSCRIPTION_STATUSES`), so an inactivated subscription
+        still awaiting its readback stays inside the gate.  A subscription
+        whose status itself awaits a provider readback
+        (:data:`AMBIGUOUS_SUBSCRIPTION_STATUSES`) and that has a current
+        cycle is ambiguous, as are two candidate cycles: both block until
+        reconciled.  A subscription with no candidate current cycle is
+        deliberately not a global failure; it is handled by the tenant cutoff
+        report/grace rule.
         """
 
         today = self.current_civil_date(now)
@@ -260,21 +284,26 @@ class CreditRolloutService:
                 )
                 .where(
                     BillingSubscription.provider == "asaas",
-                    BillingSubscription.is_active.is_(True),
+                    or_(
+                        BillingSubscription.is_active.is_(True),
+                        BillingSubscription.status.in_(OPEN_SUBSCRIPTION_STATUSES),
+                    ),
                     BillingSubscriptionCycle.cycle_start <= today,
                     BillingSubscriptionCycle.cycle_end > today,
                 )
                 .order_by(BillingSubscription.id, BillingSubscriptionCycle.id)
             )
         ).all()
-        by_subscription: dict[UUID, list[BillingSubscriptionCycle]] = {}
+        by_subscription: dict[UUID, tuple[str, list[BillingSubscriptionCycle]]] = {}
         for subscription, cycle in rows:
-            by_subscription.setdefault(subscription.id, []).append(cycle)
+            by_subscription.setdefault(subscription.id, (subscription.status, []))[
+                1
+            ].append(cycle)
 
         missing = 0
         ambiguous = 0
-        for cycles in by_subscription.values():
-            if len(cycles) != 1:
+        for status, cycles in by_subscription.values():
+            if len(cycles) != 1 or status in AMBIGUOUS_SUBSCRIPTION_STATUSES:
                 ambiguous += 1
                 continue
             cycle = cycles[0]
@@ -287,16 +316,8 @@ class CreditRolloutService:
             ).scalar_one_or_none()
             if (
                 binding is None
-                or binding.status != "active"
-                or binding.builder_id != cycle.builder_id
-                or binding.subscription_id != cycle.subscription_id
-                or binding.cycle_start != cycle.cycle_start
-                or binding.cycle_end != cycle.cycle_end
-                or binding.financial_revision != cycle.financial_revision
-                or not await self._effect_exists(
-                    binding.builder_id, binding.grant_effect_id
-                )
-                or not await self._monthly_lot_exists(binding)
+                or not self._binding_matches_cycle(binding, cycle)
+                or not await self._grant_exists(binding)
             ):
                 missing += 1
         return ReadbackReport(missing, ambiguous)
@@ -330,22 +351,53 @@ class CreditRolloutService:
         )
 
     @staticmethod
-    def _binding_matches_cycle(
+    def _binding_identity_matches(
         binding: CreditEnforcementBinding | None,
         cycle: BillingSubscriptionCycle,
     ) -> bool:
-        """The binding must name this exact cycle, revision and grant effect."""
+        """The binding names this cycle: builder, subscription, id and period.
+
+        Identity only -- neither ``status`` nor ``financial_revision``.  The
+        grant effect half of the identity is checked against the ledger by
+        the callers (:meth:`_grant_exists`).
+        """
 
         return bool(
             binding is not None
-            and binding.status == "active"
             and binding.builder_id == cycle.builder_id
             and binding.subscription_id == cycle.subscription_id
             and binding.subscription_cycle_id == cycle.id
             and binding.cycle_start == cycle.cycle_start
             and binding.cycle_end == cycle.cycle_end
+        )
+
+    @classmethod
+    def _binding_matches_cycle(
+        cls,
+        binding: CreditEnforcementBinding | None,
+        cycle: BillingSubscriptionCycle,
+    ) -> bool:
+        """Strict readback: identity, ``active`` and the EXACT revision.
+
+        This is the predicate of readiness and of :meth:`arm_enforcement`.
+        A request uses the looser rule of :meth:`binding_coverage`, where an
+        identity-matched active binding behind its cycle (consumer lag) still
+        serves.
+        """
+
+        return bool(
+            cls._binding_identity_matches(binding, cycle)
+            and binding is not None
+            and binding.status == "active"
             and binding.financial_revision == cycle.financial_revision
         )
+
+    async def _grant_exists(self, binding: CreditEnforcementBinding) -> bool:
+        """The binding's grant effect and monthly lot are in the ledger."""
+
+        return await self._effect_exists(
+            binding.builder_id, binding.grant_effect_id
+        ) and await self._monthly_lot_exists(binding)
 
     async def binding_coverage(
         self,
@@ -356,11 +408,26 @@ class CreditRolloutService:
     ) -> BindingCoverage:
         """Read the only capacity sources an enforced request may use.
 
-        This is deliberately a *read-only* gate.  Consumer lag makes the
-        capability readiness false but is not itself a request denial if a
-        reconciled, unexpired top-up covers the builder.  A true identity
-        conflict or an ASAAS quarantine is different: it blocks both source
-        classes until reconciliation has repaired the data.
+        This is deliberately a *read-only* gate.  For each current cycle of
+        an active subscription the binding is classified by IDENTITY first
+        (builder, subscription, cycle id, period, grant effect and lot):
+
+        * identity matched, ``active``, revision equal to the cycle's or
+          BEHIND it (consumer lag): monthly coverage.  Lag keeps readiness
+          and readback false and alerts (``binding_lag``) but never denies
+          the request;
+        * identity matched, ``reversed`` (a full chargeback of the plan
+          line): no monthly coverage and NOT a reconciliation failure, so an
+          uncovered request follows the 72-hour debt lifecycle;
+        * identity matched, revision AHEAD of the cycle: not usable (the
+          binding names a fact the producer does not have) -- treated like a
+          missing binding;
+        * identity divergent: a conflict that blocks both source classes.
+
+        ``reconciliation_failure`` (``credit_pending``) is therefore only an
+        identity conflict, a current cycle with no usable binding outside the
+        previous binding's grace, or an unreconciled top-up source.  An ASAAS
+        quarantine also blocks both source classes.
         """
 
         instant = at or datetime.now(timezone.utc)
@@ -402,24 +469,32 @@ class CreditRolloutService:
                 )
             )
         ).all()
-        identity_conflict = any(
-            binding is not None
-            and (
-                binding.builder_id != cycle.builder_id
-                or binding.subscription_id != subscription.id
-                or binding.subscription_cycle_id != cycle.id
-                or binding.cycle_start != cycle.cycle_start
-                or binding.cycle_end != cycle.cycle_end
-            )
-            for subscription, cycle, binding in current_rows
-        )
+        identity_conflict = False
+        unbound_current = False
         monthly = False
-        for _subscription, cycle, binding in current_rows:
-            if self._binding_matches_cycle(binding, cycle) and binding is not None:
-                if await self._effect_exists(
-                    builder_id, binding.grant_effect_id
-                ) and await self._monthly_lot_exists(binding):
-                    monthly = True
+        for subscription, cycle, binding in current_rows:
+            if binding is None:
+                unbound_current = True
+                continue
+            if not (
+                self._binding_identity_matches(binding, cycle)
+                and binding.subscription_id == subscription.id
+                and await self._grant_exists(binding)
+            ):
+                identity_conflict = True
+                continue
+            if binding.financial_revision > cycle.financial_revision:
+                # Ahead of the producer's row (whatever its status): it names
+                # a fact the producer does not have -- unusable, like no
+                # binding.
+                unbound_current = True
+                continue
+            if binding.status != "active":
+                # Reversed: no monthly capacity, but a reconciled state.
+                continue
+            # Exact, or behind the cycle (consumer lag): the request is
+            # served; readiness stays false through the strict readback.
+            monthly = True
 
         # A previous active binding remains usable only for its subscription's
         # bounded civil-time grace.  A following binding commit cuts it off;
@@ -566,7 +641,7 @@ class CreditRolloutService:
         )
         reconciliation_failure = bool(
             identity_conflict
-            or (bool(current_rows) and not monthly and not usable_topup)
+            or (unbound_current and not monthly and not usable_topup)
             or (has_unreconciled_topup_source and not monthly and not usable_topup)
         )
         return BindingCoverage(
@@ -579,7 +654,14 @@ class CreditRolloutService:
     async def capability_ready(
         self, *, now: datetime | None = None
     ) -> CapabilityReadiness:
-        """Calculate readiness only; this function has no persistence side effect."""
+        """Calculate readiness only; this function has no persistence side effect.
+
+        ``has_alert`` is broader than an open ASAAS reconciliation alert: it
+        is also true while an ASAAS line is ``quarantined`` (quarantine), while
+        a settled cycle's binding is missing or behind its revision (consumer
+        binding lag -- requests are still served), for an open ``rejected``
+        ack or digest mismatch, and while an orphan effect is open.
+        """
 
         reconciliation = await self.reconciliation_report()
         readback = await self.readback_report(now=now)
@@ -600,6 +682,7 @@ class CreditRolloutService:
             readback_complete=readback.complete,
             has_open_gap=reconciliation.has_open_gap,
             has_backlog=reconciliation.has_backlog,
+            # Also true for quarantine and binding lag (see the docstring).
             has_alert=bool(
                 reconciliation.rejected_open
                 or reconciliation.digest_mismatches
@@ -673,6 +756,8 @@ class CreditRolloutService:
         traffic: dict[UUID, dict[str, UUID | None | bool]] = {}
 
         def seen(tenant_id: UUID, builder_id: UUID | None, field: str) -> None:
+            # ``builder_id`` here is only the builder RECORDED with the
+            # evidence; it is resolved against the current tenant row below.
             row = traffic.setdefault(
                 tenant_id,
                 {
@@ -682,9 +767,6 @@ class CreditRolloutService:
                     "unknown": False,
                 },
             )
-            # A tenant can have an old observation after a re-parent.  The
-            # current Tenant row wins when it exists; an absent tenant keeps
-            # the evidence's builder as a diagnostic only.
             if row["builder_id"] is None and builder_id is not None:
                 row["builder_id"] = builder_id
             row[field] = True
@@ -735,6 +817,25 @@ class CreditRolloutService:
         ).all()
         for tenant_id, builder_id in unknown_ingress_rows:
             seen(tenant_id, builder_id, "unknown")
+
+        # A tenant can carry old observations/claims recorded under a builder
+        # it no longer belongs to (re-parent, or detached to standalone).  The
+        # CURRENT tenants.builder_id wins whenever the tenant row exists, even
+        # when it is NULL; only a deleted tenant keeps the recorded builder.
+        if traffic:
+            current = {
+                tenant_id: builder_id
+                for tenant_id, builder_id in (
+                    await self.session.execute(
+                        select(Tenant.id, Tenant.builder_id).where(
+                            Tenant.id.in_(list(traffic))
+                        )
+                    )
+                ).all()
+            }
+            for tenant_id, evidence in traffic.items():
+                if tenant_id in current:
+                    evidence["builder_id"] = current[tenant_id]
 
         findings: list[CutoffFinding] = []
         for tenant_id in sorted(traffic, key=str):
@@ -1047,24 +1148,48 @@ class CreditRolloutService:
         The Group 8 operational process may call this only after its own
         independent owner decision.  A second call is rejected rather than
         moving the boundary and charging history.
+
+        ``credit_enforcement_at`` is the database clock (``clock_timestamp``,
+        read through :meth:`CreditRepository.database_now` once the rollout
+        lock is held) -- the instant of this transaction, never another one:
+
+        * earlier would retroact over events already stored as observational;
+        * later would not delay anything (every hot-path reader treats any
+          non-NULL ``credit_enforcement_at`` as enforced from the commit), so
+          events before the published boundary would stop being
+          observational, and the gate would be evaluated at a future date
+          with no current cycle and no traffic -- vacuously.
+
+        An explicit ``at`` is therefore accepted only when it IS that clock.
+        Readiness and the cutoff report are evaluated at the database clock,
+        never at ``at``.  Tests control the instant by patching
+        ``CreditRepository.database_now``.
         """
 
-        when = at or datetime.now(timezone.utc)
-        if when.tzinfo is None or not set_by:
+        if (at is not None and at.tzinfo is None) or not set_by:
             raise ValueError("enforcement needs an aware timestamp and actor")
+        repository = CreditRepository(self.session)
         # Same lock as ASAAS subscription writers.  No Billing control fields
         # are read or written as authority by this service.
-        await CreditRepository(self.session).lock_rollout_control(
-            environment=settings.environment
-        )
+        await repository.lock_rollout_control(environment=settings.environment)
+        database_now = await repository.database_now()
+        when = database_now if at is None else at.astimezone(timezone.utc)
+        if when < database_now:
+            raise CreditEnforcementRejected(
+                "credit_enforcement_at cannot be backdated before the database clock"
+            )
+        if when > database_now:
+            raise CreditEnforcementRejected(
+                "credit_enforcement_at cannot be future-dated past the database clock"
+            )
         if (await self.reconcile_orphans()).open_count:
             raise CreditEnforcementRejected(
                 "credit orphan reconciliation is incomplete"
             )
-        ready = await self.capability_ready(now=when)
+        ready = await self.capability_ready(now=database_now)
         if not ready.ready:
             raise CreditEnforcementRejected("credit readiness is incomplete")
-        cutoff = await self.cutoff_report(now=when)
+        cutoff = await self.cutoff_report(now=database_now)
         if not cutoff.ready:
             raise CreditEnforcementRejected("tenant cutoff report is unaccepted")
         state = await self.session.get(CreditEnforcementState, 1, with_for_update=True)
@@ -1076,9 +1201,9 @@ class CreditRolloutService:
             await self.session.flush()
         if state.credit_enforcement_at is not None:
             raise CreditEnforcementRejected("credit enforcement is already armed")
-        state.credit_enforcement_at = when.astimezone(timezone.utc)
+        state.credit_enforcement_at = when
         state.set_by = set_by
-        state.set_at = when.astimezone(timezone.utc)
+        state.set_at = database_now
         await self.session.flush()
         return state
 
@@ -1176,6 +1301,32 @@ def record_observational_write_drop(reason: str) -> None:
     CREDIT_OBSERVATIONAL_WRITE_DROPPED_TOTAL.labels(reason=reason).inc()
 
 
+def derive_operational_role(
+    environment: str,
+    cluster_arn: str | None,
+    service_arn: str | None,
+    *,
+    allowlist: tuple[tuple[str, str, str], ...],
+) -> Literal["production-serving"] | None:
+    """``production-serving`` only for an EXACT allowlisted triple.
+
+    Deliverable 9: the role is derived from the deployment's environment and
+    its ECS cluster/service ARNs against the allowlist injected by
+    configuration (``settings.credit_production_serving_allowlist``, passed in
+    by the caller so the function stays pure).  It never reads
+    ``settings.is_production`` (false in real production, which runs
+    ``ENVIRONMENT=staging``) nor AppConfig, and there is no parameter through
+    which a caller could assert a role or target: anything else derives
+    ``None``.
+    """
+
+    if not (environment and cluster_arn and service_arn):
+        return None
+    if (environment, cluster_arn, service_arn) in allowlist:
+        return PRODUCTION_SERVING
+    return None
+
+
 def cutoff_digest(rows: list[dict[str, object]]) -> str:
     """Stable digest for a tenant-scoped cutoff report, never including PII."""
 
@@ -1195,11 +1346,15 @@ __all__ = [
     "CREDIT_OBSERVATIONAL_WRITE_DROPPED_TOTAL",
     "CREDIT_ORPHAN_EFFECTS",
     "CREDIT_RECONCILIATION_READY",
+    "AMBIGUOUS_SUBSCRIPTION_STATUSES",
     "OBSERVATIONAL_DROP_REASONS",
+    "OPEN_SUBSCRIPTION_STATUSES",
     "ORPHAN_EFFECT_KINDS",
     "OrphanReport",
+    "PRODUCTION_SERVING",
     "ReadbackReport",
     "cutoff_digest",
+    "derive_operational_role",
     "record_observational_write_drop",
     "run_credit_orphan_reconciliation_once",
     "run_credit_orphan_reconciliation_worker",

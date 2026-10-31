@@ -1134,3 +1134,154 @@ async def test_the_041_downgrade_gives_up_after_the_lock_timeout(
     )
     _assert_lock_timeout_in_the_preflight(code, output)
     assert await _catalog(baseline.cluster, at_041) == before
+
+
+# ---------------------------------------------------------------------------
+# Migration 042 (Group 7): tenant cutoff acceptances.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_042_PATH = (
+    _ROOT / "alembic" / "versions" / "20261031_000001_042_credit_enforcement.py"
+)
+_DOWNGRADE_042_REFUSED = "downgrade of migration 042 refused (nothing was changed): "
+_TABLES_042 = ("credit_cutoff_acceptances",)
+_ROWS_042 = {
+    "credit_cutoff_acceptances": (
+        "INSERT INTO credit_cutoff_acceptances (id, tenant_id, builder_id, reason, "
+        "report_digest, author_user_id, accepted_at, accepted_on) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), NULL, 'standalone', "
+        f"{_SHA}, gen_random_uuid(), now(), current_date)"
+    ),
+}
+
+
+def _load_042() -> ModuleType:
+    import alembic as alembic_package
+
+    if not hasattr(alembic_package, "op"):
+        setattr(alembic_package, "op", SimpleNamespace())
+    spec = importlib.util.spec_from_file_location("migration_042", _MIGRATION_042_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_MIGRATION_042 = _load_042()
+
+
+@pytest.fixture
+async def at_042(baseline: _Baseline, baseline_039: _Baseline039) -> AsyncIterator[str]:
+    name = await baseline.cluster.clone(baseline_039.template_039)
+    await _migrate(baseline.cluster.url(name), "upgrade", "042")
+    try:
+        yield name
+    finally:
+        await baseline.cluster.drop(name)
+
+
+async def _run_042_preflight(cluster: _Cluster, name: str) -> DBAPIError:
+    engine = create_async_engine(cluster.url(name), poolclass=NullPool)
+    try:
+        with pytest.raises(DBAPIError) as info:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql(_MIGRATION_042.LOCK_TIMEOUT)
+                await connection.exec_driver_sql(_MIGRATION_042.downgrade_preflight())
+    finally:
+        await engine.dispose()
+    return info.value
+
+
+def test_042_declares_exactly_its_tables() -> None:
+    assert (_MIGRATION_042.revision, _MIGRATION_042.down_revision) == ("042", "041")
+    assert _MIGRATION_042.CREATED_TABLES == _TABLES_042
+    assert set(_ROWS_042) == set(_TABLES_042)
+    # The preflight shape of 041: lock first, every alembic_version row read.
+    preflight = _MIGRATION_042.downgrade_preflight()
+    assert "LOCK TABLE credit_cutoff_acceptances IN ACCESS EXCLUSIVE MODE" in preflight
+    assert "IS DISTINCT FROM '042'" in preflight
+
+
+@pytest.mark.parametrize("table", _TABLES_042)
+async def test_one_row_in_any_042_table_refuses_its_downgrade(
+    baseline: _Baseline, at_042: str, table: str
+) -> None:
+    await _execute(baseline.cluster, at_042, _PLANT, _ROWS_042[table])
+    before = await _catalog(baseline.cluster, at_042)
+    code, output = await _alembic(baseline.cluster.url(at_042), "downgrade", "041")
+    assert code != 0, output
+    # _refusal pins the SQLSTATE 55000 exception line, never the echoed block.
+    assert _refusal(output, _DOWNGRADE_042_REFUSED) == (
+        f"{_DOWNGRADE_042_REFUSED}tables that have rows: {table}"
+    )
+    assert await _catalog(baseline.cluster, at_042) == before
+    assert before["alembic_version"] == [("042",)]
+    assert await _scalar(baseline.cluster, at_042, f"SELECT count(*) FROM {table}") == 1
+
+
+async def test_the_042_preflight_refuses_another_revision(
+    baseline: _Baseline, at_042: str
+) -> None:
+    cluster = baseline.cluster
+    await _execute(cluster, at_042, "UPDATE alembic_version SET version_num = '041'")
+    before = await _catalog(cluster, at_042)
+    error = await _run_042_preflight(cluster, at_042)
+    assert _sqlstate(error) == "55000"
+    assert f"{_DOWNGRADE_042_REFUSED}alembic_version is 041, not 042" in str(error)
+    assert await _catalog(cluster, at_042) == before
+
+
+async def test_the_042_preflight_refuses_an_empty_alembic_version(
+    baseline: _Baseline, at_042: str
+) -> None:
+    """``(SELECT version_num ...) <> '042'`` is NULL on an empty table and
+    would let the downgrade through; the guard must name it."""
+
+    cluster = baseline.cluster
+    await _execute(cluster, at_042, "DELETE FROM alembic_version")
+    before = await _catalog(cluster, at_042)
+    error = await _run_042_preflight(cluster, at_042)
+    assert _sqlstate(error) == "55000"
+    assert f"{_DOWNGRADE_042_REFUSED}alembic_version is empty, not 042" in str(error)
+    assert await _catalog(cluster, at_042) == before
+
+
+async def test_the_042_preflight_refuses_two_alembic_version_rows(
+    baseline: _Baseline, at_042: str
+) -> None:
+    cluster = baseline.cluster
+    await _execute(cluster, at_042, "INSERT INTO alembic_version VALUES ('041')")
+    error = await _run_042_preflight(cluster, at_042)
+    assert _sqlstate(error) == "55000"
+    assert f"{_DOWNGRADE_042_REFUSED}alembic_version is 041, 042, not 042" in str(error)
+
+
+async def test_the_empty_042_round_trip_restores_041_exactly(
+    baseline: _Baseline, baseline_039: _Baseline039, at_042: str
+) -> None:
+    cluster = baseline.cluster
+    reference = await cluster.clone(baseline_039.template_039)
+    try:
+        await _migrate(cluster.url(reference), "upgrade", "041")
+        catalog_041 = await _catalog(cluster, reference)
+    finally:
+        await cluster.drop(reference)
+    await _migrate(cluster.url(at_042), "downgrade", "041")
+    assert await _catalog(cluster, at_042) == catalog_041
+    await _migrate(cluster.url(at_042), "upgrade", "042")
+    assert (await _catalog(cluster, at_042))["alembic_version"] == [("042",)]
+
+
+async def test_the_042_downgrade_gives_up_after_the_lock_timeout(
+    baseline: _Baseline, at_042: str
+) -> None:
+    """A reader of the acceptances holds ACCESS SHARE: the preflight's
+    ACCESS EXCLUSIVE lock gives up (55P03) before anything changes -- an
+    acceptance being written cannot slip in behind the emptiness check."""
+
+    before = await _catalog(baseline.cluster, at_042)
+    code, output = await _alembic_while_reading(
+        baseline.cluster, at_042, "credit_cutoff_acceptances", "downgrade", "041"
+    )
+    _assert_lock_timeout_in_the_preflight(code, output)
+    assert await _catalog(baseline.cluster, at_042) == before
