@@ -2662,23 +2662,62 @@ that reads the new value (new tasks read the secret at start) and wait for
 `ready` with `action: none` under the flag is `force_rewrite_not_applied`.
 ASAAS deliveries fail with 401 between that deploy and the run.
 
-### AppConfig and opening financial egress (follow-up F2, not written)
+<a id="appconfig-and-opening-financial-egress-follow-up-f2-not-written"></a>
+
+### AppConfig and opening financial egress (follow-up F2)
 
 A third AppConfig Agent container would break the evidence validators, which
-require exactly the containers `app` and `otel`. The smallest design that
-keeps them true reads AppConfig from inside the `app` container:
+require exactly the containers `app` and `otel`. The design that keeps them
+true reads AppConfig from inside the `app` container.
 
-- **Code:** add an `AppConfigDataFlagReader` to
-  `src/infrastructure/appconfig.py`. It uses `appconfigdata`
-  `StartConfigurationSession` and `GetLatestConfiguration`, and a
-  per-process background refresher modelled on the webhook readiness gate.
-  The refresher honours `NextPollIntervalInSeconds` (minimum 15 s). The reader
-  returns false for any error, before the first successful read, and when the
-  last success is older than a hard bound (for example 3 poll intervals). An
-  empty `Configuration` means unchanged. Parsing reuses the current
-  duplicate-rejecting flag parser. A setting selects the source (`agent` or
-  `sdk`), and the lifespan starts and stops the refresher. `boto3` and
-  `botocore` are locked main dependencies (added for the KMS signers).
+**Code (written, wish `asaas-rollout-opening` Group 4).**
+`AppConfigDataFlagReader` in `src/infrastructure/appconfig.py` reads the
+egress flags with `appconfigdata` `StartConfigurationSession` and
+`GetLatestConfiguration` (region `us-east-1`, the locked `boto3`/`botocore`
+main dependencies, the task role's credentials). `APPCONFIG_SOURCE` selects
+the source: `agent` (the default, today's localhost Agent client) or `sdk`
+(this reader). `src/services/egress_policy.py` chooses the reader for both
+`financial_egress_enabled` and `uazapi_egress_enabled`; `billing_checkout.py`
+and `uazapi_service.py` only consume the result.
+
+- One reader and one background refresher per process: the lifespan of
+  `src/api/main.py` starts the refresher only when `APPCONFIG_ENABLED=true`
+  and `APPCONFIG_SOURCE=sdk`, and stopping it closes the flags of that
+  process. Request-time reads never call AWS.
+- The session requests a 15 s minimum poll interval; after a success the
+  refresher sleeps `NextPollIntervalInSeconds` clamped to 15 s at least and
+  60 s at most (a larger answer, even 86400, polls every 60 s), and backs off
+  from 15 s to 300 s after a failure.
+- A flag reads true only when the requested flag's `enabled` member is
+  exactly the boolean `true` (other attributes in the flag are allowed; the
+  same duplicate-rejecting parser as the Agent client), the last poll
+  succeeded, and that success is younger than three clamped poll intervals
+  (45 s at 15 s, never more than 180 s). It reads false before the first success,
+  after any failed poll (AWS error, timeout, missing credentials, invalid
+  token or interval, a payload over 16 KiB, a document that is not one JSON
+  object), when stale, and when the flag is absent, false or not a boolean.
+  A failed poll also discards the session token, so the next poll starts a
+  new session.
+- An empty `Configuration` means unchanged: the cached document stays and
+  its freshness is renewed. An empty first answer stays closed.
+- State transitions (not every poll) are logged as
+  `appconfig_egress_flags_changed` with `poll_ok`, both flag booleans, the
+  `VersionLabel` and, on failure, only `error_type` (the exception type) and
+  `error_code` (for an AWS `ClientError`, its error code such as
+  `AccessDeniedException`, restricted to `[A-Za-z0-9_.-]`, else `unknown`;
+  `null` for other failures). Tokens, payloads and error messages are never
+  logged.
+- `APPCONFIG_ORIGIN` and `APPCONFIG_TOKEN` are unused with `sdk`. The boot
+  check that requires `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` and
+  `APPCONFIG_PROFILE` when `APPCONFIG_ENABLED=true` runs only under
+  `ENVIRONMENT=production`, so it does **not** run in the real production
+  service (`ENVIRONMENT=staging`): a blank ID boots, the reader makes no AWS
+  call, every flag stays false, and the refresher logs one
+  `appconfig_egress_flags_changed` line with `poll_ok=false` and
+  `error_type=configuration_incomplete`.
+
+**Infrastructure (designed, not created).**
+
 - **IAM:** a separately named task-role policy that allows
   `appconfig:StartConfigurationSession` and
   `appconfig:GetLatestConfiguration` on the exact
@@ -2686,11 +2725,123 @@ keeps them true reads AppConfig from inside the `app` container:
 - **AppConfig resources:** an application, an environment, a configuration
   profile of type `AWS.AppConfig.FeatureFlags` with a hosted version where
   `financial_egress_enabled.enabled` is false, and a deployment strategy with
-  no bake time, so that containment (deploying `false`) is fast.
-- **Evidence validators:** the new `APPCONFIG_*` names join the F1 allowlist
-  change.
+  no bake time and no growth duration (a custom strategy:
+  `DeploymentDurationInMinutes` 0, `FinalBakeTimeInMinutes` 0,
+  `GrowthFactor` 100, `ReplicateTo` `NONE`), so that containment (deploying
+  `false`) is fast. The profile carries **both** flags: with `sdk`, a flag
+  absent from the profile reads false, so `uazapi_egress_enabled` is present
+  with its current value, `false` (Uazapi egress is closed by absence today;
+  opening it is a separate owner decision, not part of L7).
+  Use only basic flags (no variants) in this profile. A profile with any
+  multi-variant flag is served in Amazon Ion, not JSON: the reader cannot
+  parse it, so every process closes both flags and logs
+  `appconfig_egress_flags_changed` with `poll_ok=false` and
+  `error_type=_PollFailed` (`error_code` null), retrying with backoff;
+  recover by deploying a version with only basic flags. A retrieved document
+  that still carries the hosted `version`/`flags`/`values` envelope (for
+  example a freeform profile holding the hosted JSON) logs `poll_ok=true`
+  with both flags false: it reads closed as well.
+- **Hosted content (closed).** The hosted version is created with content
+  type `application/json` in the `AWS.AppConfig.FeatureFlags` format:
+
+  ```json
+  {
+    "version": "1",
+    "flags": {
+      "financial_egress_enabled": {"name": "financial_egress_enabled"},
+      "uazapi_egress_enabled": {"name": "uazapi_egress_enabled"}
+    },
+    "values": {
+      "financial_egress_enabled": {"enabled": false},
+      "uazapi_egress_enabled": {"enabled": false}
+    }
+  }
+  ```
+
+  `GetLatestConfiguration` does not return that document: AppConfig returns
+  only the flag values, keyed by flag name, and that is what the reader
+  parses (`tests/infrastructure/test_appconfig.py` feeds both blocks of this
+  section to the parser):
+
+  <!-- appconfig-retrieved-flags-example -->
+
+  ```json
+  {
+    "financial_egress_enabled": {"enabled": false},
+    "uazapi_egress_enabled": {"enabled": false}
+  }
+  ```
+
+  To open financial egress (step 5) only
+  `values.financial_egress_enabled.enabled` changes to `true`.
+- **Evidence validators:** the `APPCONFIG_*` names enter the task definition
+  only at L7 and all together (Decision 12 of the wish): `APPCONFIG_ENABLED`,
+  `APPCONFIG_SOURCE`, `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` and
+  `APPCONFIG_PROFILE`. The planner allowlist and the
+  `financial_egress_closed` step are Group 5.
 - **Network:** the tasks reach AppConfig through the existing NAT gateway.
   There is no AppConfig VPC endpoint.
+
+**Live procedure (step L7).** Every step needs the owner's explicit order at
+the moment of the step; an agent never acts as the operator and never holds
+AWS or user tokens. Preconditions: L6 done, the running image contains this
+reader, and the Group 5 planner accepts the `APPCONFIG_*` set.
+
+1. Create the AppConfig application, environment and `AWS.AppConfig.FeatureFlags`
+   profile, and the no-bake deployment strategy. Create and deploy a hosted
+   version with the closed content above: `financial_egress_enabled.enabled`
+   false and `uazapi_egress_enabled.enabled` false (its value today; L7 never
+   opens Uazapi egress). Read back the three IDs and the deployed version
+   label.
+2. Attach the separately named IAM policy to the task role, with the exact
+   ARN built from those IDs. Read it back.
+3. Render, through the planner, a task definition revision that adds exactly
+   `APPCONFIG_ENABLED='true'`, `APPCONFIG_SOURCE='sdk'` and the three IDs
+   (`APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT`, `APPCONFIG_PROFILE`; use
+   the IDs, which match the IAM ARN), with no `APPCONFIG_ORIGIN` or
+   `APPCONFIG_TOKEN`. Deploy it.
+4. Verify closed and fresh on every task. Each worker process runs its own
+   refresher and logs its own line: the image starts
+   `uvicorn --workers 4`, so expect 4 lines per task (8 with the service's
+   2 tasks), each `appconfig_egress_flags_changed` with `poll_ok=true`,
+   `financial_egress_enabled=false`, `uazapi_egress_enabled=false` and the
+   step 1 version label (`$DEPLOY_START_MS` as defined above (the
+   deployment's `createdAt` in epoch milliseconds from `DescribeServices`)):
+
+   ```bash
+   aws logs filter-log-events --region us-east-1 \
+     --log-group-name /ecs/neurostack-staging/app \
+     --start-time "$DEPLOY_START_MS" \
+     --filter-pattern '"appconfig_egress_flags_changed"'
+   ```
+
+   A process that logs `poll_ok=false` stays closed; fix the cause before
+   going on: `error_code` `AccessDeniedException` (or another AWS code) means
+   IAM or the ARN, `ResourceNotFoundException` or `BadRequestException` means
+   the IDs, and `error_type=configuration_incomplete` means an
+   `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` or `APPCONFIG_PROFILE`
+   value is blank in the task definition (no AWS call was made). **No line at
+   all** from a process means its refresher never started: the task does not
+   have `APPCONFIG_SOURCE=sdk` or `APPCONFIG_ENABLED=true`, and its flags are
+   closed.
+5. Open: create and deploy a hosted version with
+   `financial_egress_enabled.enabled` true, after the owner's order. Within
+   one poll interval (at most 60 s) each worker process logs
+   `financial_egress_enabled=true` with the new version label, and
+   `uazapi_egress_enabled` stays false: rerun the same query with
+   `--start-time` set to the time of the hosted deployment. That is the L7 success criterion (a fresh open read).
+   Checkout creation is still gated by the rollout state (`disabled` until
+   L8).
+
+**Containment and rollback.** Deploy a hosted version with
+`financial_egress_enabled.enabled` false: each worker process closes at its
+next poll (at most one clamped poll interval: 15 s by default, never more
+than 60 s). If AppConfig itself is unreachable or denied, every process
+closes on the failed poll, and a process whose refresher stalls closes after
+three clamped poll intervals, a hard maximum of 3 x 60 s = 180 s whatever
+`NextPollIntervalInSeconds` the service answers. Removing the
+`APPCONFIG_*` set (the previous task definition revision) returns to
+"closed by absence".
 
 An alternative is to run the AWS AppConfig Agent binary inside the `app`
 image. That keeps today's loopback client unchanged, but adds a second process

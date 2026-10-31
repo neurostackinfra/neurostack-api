@@ -99,6 +99,10 @@ from src.services.credit_switch import (
     start_credit_switch_refresher,
     stop_credit_switch,
 )
+from src.services.egress_policy import (
+    start_egress_flag_refresher,
+    stop_egress_flag_refresher,
+)
 
 # Configure logging on module load
 configure_logging()
@@ -217,6 +221,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     credit_lifecycle_worker: asyncio.Task[None] | None = None
     credit_orphan_worker: asyncio.Task[None] | None = None
     webhook_refresher = _start_webhook_readiness_refresher()
+    # F2: per-process AppConfig Data refresher (APPCONFIG_SOURCE=sdk only);
+    # the egress flags read false until its first successful poll.
+    egress_flag_refresher = start_egress_flag_refresher()
     fact_worker: BillingFactWorker | None = None
     redis_client: Redis | None = None
     try:
@@ -268,6 +275,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             webhook_refresher.cancel()
             with suppress(asyncio.CancelledError):
                 await webhook_refresher
+        # Never raises; closes this process's egress flags.
+        await stop_egress_flag_refresher(egress_flag_refresher)
         if fact_worker is not None:
             # Before the pool closes: the in-flight fact commits or rolls back.
             await fact_worker.stop()

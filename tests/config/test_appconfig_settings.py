@@ -158,3 +158,57 @@ def test_complete_appconfig_fixture_does_not_mask_billing_production_gates(
 ) -> None:
     with pytest.raises(error, match=message):
         _production_settings(appconfig_enabled=False, **overrides)
+
+
+def test_appconfig_source_defaults_to_the_agent() -> None:
+    assert Settings(_env_file=None).appconfig_source == "agent"
+
+
+@pytest.mark.parametrize("source", ["agent", "sdk"])
+def test_appconfig_source_is_read_from_its_fixed_environment_name(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    monkeypatch.setenv("APPCONFIG_SOURCE", source)
+
+    assert Settings(_env_file=None).appconfig_source == source
+
+
+@pytest.mark.parametrize("source", ["", "SDK ", "aws", "http"])
+def test_appconfig_source_rejects_anything_but_agent_or_sdk(source: str) -> None:
+    with pytest.raises(ValidationError, match="appconfig_source"):
+        Settings(_env_file=None, appconfig_source=source)  # type: ignore[arg-type]
+
+
+def test_production_accepts_complete_sdk_configuration_without_origin_or_token() -> (
+    None
+):
+    configured = _production_settings(
+        appconfig_enabled=True,
+        appconfig_source="sdk",
+        appconfig_application="neurostack",
+        appconfig_environment="production",
+        appconfig_profile="egress-flags",
+    )
+
+    assert configured.appconfig_source == "sdk"
+    assert configured.appconfig_token.get_secret_value() == ""
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["appconfig_application", "appconfig_environment", "appconfig_profile"],
+)
+def test_production_sdk_source_still_requires_all_exact_identifiers(
+    missing: str,
+) -> None:
+    values: dict[str, Any] = {
+        "appconfig_enabled": True,
+        "appconfig_source": "sdk",
+        "appconfig_application": "neurostack",
+        "appconfig_environment": "production",
+        "appconfig_profile": "egress-flags",
+    }
+    values[missing] = ""
+
+    with pytest.raises(ConfigurationError, match=missing.upper()):
+        _production_settings(**values)

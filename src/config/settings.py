@@ -228,6 +228,9 @@ class Settings(BaseSettings):
     appconfig_environment: str = ""
     appconfig_profile: str = ""
     appconfig_token: SecretStr = SecretStr("")
+    # Where the egress flags are read: ``agent`` is the localhost Agent above;
+    # ``sdk`` reads AppConfig Data in-process (F2; ORIGIN and TOKEN unused).
+    appconfig_source: Literal["agent", "sdk"] = "agent"
 
     # ============================================
     # Security
