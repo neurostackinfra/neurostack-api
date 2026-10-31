@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 CreditMode = Literal["observational", "enforced"]
 CreditState = Literal["active", "pending", "grace", "suspended", "deletion_due"]
-PendingReason = Literal["quarantine", "standalone"]
+PendingReason = Literal["quarantine", "standalone", "reconciliation"]
 LotKind = Literal["monthly", "topup"]
 LotStatus = Literal["active", "not_started", "exhausted", "expired"]
 ReservationCategory = Literal["rag", "media", "egress"]
@@ -88,8 +88,11 @@ class CreditStateResponse(_Frozen):
 
     ``state``: ``deletion_due`` > ``suspended`` > ``grace`` (an exhaustion
     episode, recorded only after ``credit_enforcement_at``) > ``pending``
-    (``credit_pending``: a quarantined ASAAS order or cycle, or a standalone
-    tenant without an account) > ``active``.  ``export_deadline_at`` is the
+    (``credit_pending``: a quarantined ASAAS order or cycle, a standalone
+    tenant without an account, or -- once enforced -- a binding coverage
+    that is not usable, ``reconciliation``: an identity conflict, a current
+    cycle without a binding outside grace, an unreconciled top-up) >
+    ``active``.  ``export_deadline_at`` is the
     retention deadline of the open episode (export before it); ``mode`` is
     ``observational`` until ``credit_enforcement_at``: nothing is charged.
     """

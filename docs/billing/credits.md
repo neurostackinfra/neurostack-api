@@ -88,7 +88,17 @@ no-store`. They are documented in the OpenAPI under the `Credits` tag.
 - `state` precedence: `deletion_due` > `suspended` > `grace` (the recorded
   transitions of the open episode; episodes exist only after
   `credit_enforcement_at`) > `pending` (`credit_pending`: a quarantined ASAAS
-  order or cycle, or a standalone tenant) > `active`. A deadline already
+  order or cycle, a standalone tenant, or once enforced an unusable binding
+  coverage (`reconciliation`)) > `active`. `pending_reasons` is a
+  closed list: `quarantine`, `standalone` and, once enforced, `reconciliation`
+  -- the binding coverage the enforced request path checks is not usable (an
+  identity conflict between a current cycle and its binding, a current cycle
+  without a binding outside its grace, or a top-up without an accepted
+  fact -- the last two only when the builder has neither a monthly binding
+  nor a usable top-up), so an
+  enforced request answers `credit_pending` and the state is never an
+  optimistic `active`. The reason is listed under a lifecycle state too; the
+  quarantine is checked first and excludes it. A deadline already
   passed but not yet recorded by the lifecycle worker or the request gate is
   not anticipated: the state changes when the transition is recorded.
 - The export deadline is the open episode's `deletion_due_at` (30 civil

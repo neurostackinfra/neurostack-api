@@ -132,6 +132,11 @@ def test_the_state_and_mode_are_closed_enumerations(schema: dict[str, Any]) -> N
         "deletion_due",
     ]
     assert state["mode"]["enum"] == ["observational", "enforced"]
+    assert state["pending_reasons"]["items"]["enum"] == [
+        "quarantine",
+        "standalone",
+        "reconciliation",
+    ]
     assert "export_deadline_at" in state
 
 
