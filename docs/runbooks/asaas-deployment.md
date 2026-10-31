@@ -2886,10 +2886,12 @@ this stage included, and the offline image smoke below passed on 2026-10-19
 (not the protected workflow); the browser CSP check is still open. With the
 compiler-free production stage, a local `linux/amd64` build and the extended
 smoke passed on 2026-10-20, again not the protected workflow and not
-`linux/arm64`. The smoke runs eleven checks, in this order: `imports`,
+`linux/arm64`. The smoke runs twelve checks, in this order: `imports`,
 `site-packages`, `no-build-toolchain`, `native-libraries`,
-`no-world-writable`, `src-imports`, `kms-signers`, `alembic-heads`,
-`spa-index`, `alembic-offline-sql` and `serve` (see "Image smoke" below).
+`no-world-writable`, `src-imports`, `kms-signers`, `bundle-digest`,
+`alembic-heads`, `spa-index`, `alembic-offline-sql` and `serve` (see "Image
+smoke" below). `bundle-digest` (issue #137) was added afterwards and has not
+yet run against a built image.
 
 Network access the image build needs (from the Dockerfile; the 2026-10-19
 build succeeded with it, the exact hosts were not captured):
@@ -3031,7 +3033,9 @@ does ldd itself failing), the only exception being CPython's `_tkinter`
 missing Tk and Tcl (they are not in python:slim and nothing imports
 tkinter); no file or directory under `/app` or site-packages is
 world-writable; every top-level import under `src/` resolves; both KMS
-signer factories build their clients (no KMS call); `alembic heads` prints
+signer factories build their clients (no KMS call);
+`billing_fact_bundle_digest()` and the consumer pin both return the pinned
+digest; `alembic heads` prints
 exactly one line, `<expected head> (head)`, the head of the migrations in
 the image given with `--expected-head` (`042` on `main` today);
 `/app/spa/index.html` exists; and `alembic upgrade
