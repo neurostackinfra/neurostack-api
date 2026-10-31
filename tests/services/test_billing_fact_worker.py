@@ -56,6 +56,7 @@ from src.services.billing_outbox import (
     BillingFactPublisher,
     BillingFactReconciler,
     FactRetryPolicy,
+    TransportNotReady,
     _detail_digest,
 )
 
@@ -128,12 +129,13 @@ def presentation_preconditions_waived(monkeypatch: pytest.MonkeyPatch) -> None:
 class _LogRecorder:
     def __init__(self) -> None:
         self.errors: list[tuple[str, dict[str, Any]]] = []
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
 
     def error(self, event: str, **fields: Any) -> None:
         self.errors.append((event, fields))
 
     def warning(self, event: str, **fields: Any) -> None:
-        pass
+        self.warnings.append((event, fields))
 
     def info(self, event: str, **fields: Any) -> None:
         pass
@@ -753,7 +755,7 @@ async def test_graceful_stop_finishes_the_in_flight_fact_and_claims_no_more(
 
 
 @pytest.mark.usefixtures("presentation_preconditions_waived")
-async def test_stop_after_grace_cancels_and_rolls_back_the_stuck_claim(
+async def test_stop_after_grace_cancels_the_stuck_presentation_and_keeps_its_attempt(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     outbox_id = await _seed_fact(factory)
@@ -766,15 +768,17 @@ async def test_stop_after_grace_cancels_and_rolls_back_the_stuck_claim(
     worker = BillingFactWorker(
         factory,
         transport=hanging,
-        config=_config(transport_timeout_seconds=60.0),
+        config=_config(transport_timeout_seconds=30.0),
     )
     task = worker.start()
     await asyncio.wait_for(entered.wait(), timeout=10)
     await worker.stop(grace=0.1)
     assert task.cancelled()
+    # The consumer may have seen the fact: its attempt was committed before
+    # the presentation, so the cancel neither erases it nor bypasses the cap.
     delivery = await _delivery(factory, outbox_id)
-    assert (delivery.state, delivery.attempt_count) == ("pending", 0)
-    assert delivery.last_attempt_at is None
+    assert (delivery.state, delivery.attempt_count) == ("pending", 1)
+    assert delivery.last_attempt_at is not None
 
 
 @pytest.mark.usefixtures("presentation_preconditions_waived")
@@ -1121,7 +1125,7 @@ async def test_a_genuine_cancellation_of_the_loop_is_never_swallowed(
         await asyncio.Event().wait()
 
     in_flight = BillingFactWorker(
-        factory, transport=hanging, config=_config(transport_timeout_seconds=60.0)
+        factory, transport=hanging, config=_config(transport_timeout_seconds=30.0)
     )
     task = in_flight.start()
     await asyncio.wait_for(entered.wait(), timeout=10)
@@ -1129,8 +1133,9 @@ async def test_a_genuine_cancellation_of_the_loop_is_never_swallowed(
     await asyncio.wait({task}, timeout=10)  # never re-cancels on timeout
     assert task.done(), "a genuine cancellation was swallowed"
     assert task.cancelled()
+    # Cancelled mid-presentation: the attempt leased before it stays counted.
     delivery = await _delivery(factory, outbox_id)
-    assert (delivery.state, delivery.attempt_count) == ("pending", 0)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 1)
 
     idle = BillingFactWorker(
         factory, transport=None, config=_config(interval_seconds=60.0)
@@ -1260,6 +1265,431 @@ async def test_no_transport_can_be_wired_while_presentation_preconditions_are_op
     monkeypatch.setattr(main_module, "start_billing_fact_worker", fake_start)
     assert main_module._start_billing_fact_worker() is None
     assert captured == {"transport": None}
+
+
+# ---------------------------------------------------------------------------
+# Two-phase attempt record (asaas-rollout-opening Group 2a)
+# ---------------------------------------------------------------------------
+
+
+class _ProcessDeath(BaseException):
+    """Stands in for the process dying: no ``except Exception`` catches it."""
+
+
+class _NotReady:
+    """A transport whose consumer turns presentations away until ``ready``."""
+
+    def __init__(self) -> None:
+        self.ready = False
+        self.sent: list[str] = []
+
+    async def __call__(self, payload: dict[str, object]) -> None:
+        self.sent.append(str(payload["event_id"]))
+        if not self.ready:
+            raise TransportNotReady("consumer readiness flipped off")
+
+
+def _same_instant(stored: datetime | None, expected: datetime) -> bool:
+    # SQLite drops the UTC annotation the producer stores (see ``_utc``).
+    assert stored is not None
+    return stored.replace(tzinfo=timezone.utc) == expected
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_the_attempt_is_committed_before_the_fact_is_presented(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+    seen: list[tuple[str, int, datetime | None]] = []
+
+    async def observing(payload: dict[str, object]) -> None:
+        # Another connection, mid-presentation: only committed state is seen.
+        delivery = await _delivery(factory, outbox_id)
+        seen.append((delivery.state, delivery.attempt_count, delivery.last_attempt_at))
+
+    worker = BillingFactWorker(
+        factory, transport=observing, config=_config(), now=clock
+    )
+    assert (await worker.run_tick()).presented == 1
+    ((state, count, last),) = seen
+    assert (state, count) == ("pending", 1)
+    assert _same_instant(last, clock.value)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("awaiting_ack", 1)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_death_after_the_send_leaves_exactly_one_attempt_counted(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+    sent: list[str] = []
+
+    async def dies_after_send(payload: dict[str, object]) -> None:
+        sent.append(str(payload["event_id"]))  # consumer-visible
+        raise _ProcessDeath()
+
+    dying = BillingFactWorker(
+        factory, transport=dies_after_send, config=_config(), now=clock
+    )
+    with pytest.raises(_ProcessDeath):
+        await dying.run_tick()
+    assert sent == [str(outbox_id)]
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 1)
+    assert _same_instant(delivery.last_attempt_at, clock.value)
+
+    # The restarted worker honours the backoff of the attempt that was sent.
+    transport = _Transport()
+    restarted = BillingFactWorker(
+        factory, transport=transport, config=_config(), now=clock
+    )
+    assert (await restarted.run_tick()).presented == 0
+    clock.advance(seconds=59)
+    assert (await restarted.run_tick()).presented == 0
+    clock.advance(seconds=2)
+    assert (await restarted.run_tick()).presented == 1
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("awaiting_ack", 2)
+
+
+@pytest.mark.parametrize("timeout", [60.0, 61.0, 3600.0])
+def test_a_transport_timeout_not_shorter_than_the_base_backoff_is_refused(
+    timeout: float,
+) -> None:
+    assert FactRetryPolicy(max_attempts=3).base_backoff == timedelta(seconds=60)
+    with pytest.raises(
+        ValueError,
+        match="^billing fact transport timeout must be shorter than the retry "
+        "base backoff$",
+    ):
+        _config(transport_timeout_seconds=timeout)
+
+
+def test_a_transport_timeout_shorter_than_the_base_backoff_is_accepted() -> None:
+    config = _config(transport_timeout_seconds=59.999)
+    assert timedelta(seconds=config.transport_timeout_seconds) < (
+        config.retry_policy.base_backoff
+    )
+    default = BillingFactWorkerConfig(
+        interval_seconds=30, batch_size=1, max_attempts=1, stale_after_seconds=60
+    )
+    assert default.transport_timeout_seconds == worker_module.TRANSPORT_TIMEOUT_SECONDS
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_publish_next_refuses_a_lease_shorter_than_its_timeout(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    transport = _Transport()
+    short = FactRetryPolicy(max_attempts=3, base_backoff=timedelta(seconds=5))
+    for timeout in (5.0, 6.0):
+        with pytest.raises(
+            ValueError, match="^timeout must be shorter than the retry base backoff$"
+        ):
+            async with factory() as session:
+                await BillingFactPublisher(session).publish_next(
+                    transport, policy=short, timeout=timeout
+                )
+    assert transport.sent == []
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.attempt_count, delivery.last_attempt_at) == (0, None)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_publish_next_owns_its_commits_and_refuses_an_open_transaction(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    transport = _Transport()
+    with pytest.raises(RuntimeError, match="^publish_next commits its own phases"):
+        async with factory() as session, session.begin():
+            await BillingFactPublisher(session).publish_next(
+                transport, policy=FactRetryPolicy(max_attempts=3), timeout=1.0
+            )
+    assert transport.sent == []
+    assert (await _delivery(factory, outbox_id)).attempt_count == 0
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_an_unready_consumer_spends_no_attempt_and_does_not_spin(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock, transport = _Clock(), _NotReady()
+    # One attempt allowed: a spent not-ready attempt would exhaust the fact.
+    worker = BillingFactWorker(
+        factory, transport=transport, config=_config(max_attempts=1), now=clock
+    )
+    turned_away = clock.value
+    first = await worker.run_tick()
+    assert (first.not_ready, first.presented, first.failed) == (1, 0, 0)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 0)
+    assert _same_instant(delivery.last_attempt_at, turned_away)  # kept
+
+    for step in (0, 30, 29):  # up to 59 s later: not due, nothing presented
+        clock.advance(seconds=step)
+        report = await worker.run_tick()
+        assert (report.not_ready, report.presented, report.exhausted) == (0, 0, 0)
+    assert transport.sent == [str(outbox_id)]
+
+    clock.advance(seconds=2)  # base backoff passed: due again, still unspent
+    transport.ready = True
+    due = await worker.run_tick()
+    assert (due.presented, due.exhausted) == (1, 0)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("awaiting_ack", 1)
+    assert transport.sent == [str(outbox_id)] * 2
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_not_ready_re_presentation_keeps_its_state_and_its_backoff(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock, transport = _Clock(), _NotReady()
+    transport.ready = True
+    worker = BillingFactWorker(
+        factory, transport=transport, config=_config(), now=clock
+    )
+    assert (await worker.run_tick()).presented == 1  # attempt 1, ack lost
+    clock.advance(seconds=61)
+    transport.ready = False
+    turned_away = clock.value
+    assert (await worker.run_tick()).not_ready == 1
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("awaiting_ack", 1)
+    assert _same_instant(delivery.last_attempt_at, turned_away)
+    clock.advance(seconds=59)
+    assert (await worker.run_tick()).not_ready == 0  # backoff(1) not over
+    clock.advance(seconds=2)
+    transport.ready = True
+    assert (await worker.run_tick()).presented == 1
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("awaiting_ack", 2)
+    assert len(transport.sent) == 3
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_an_unready_consumer_ends_the_batch_instead_of_touching_every_fact(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ids = [await _seed_fact(factory) for _ in range(3)]
+    clock, transport = _Clock(), _NotReady()
+    worker = BillingFactWorker(
+        factory, transport=transport, config=_config(batch_size=10), now=clock
+    )
+    report = await worker.run_tick()
+    assert (report.outcome, report.not_ready, report.presented) == ("completed", 1, 0)
+    assert len(transport.sent) == 1
+    untouched = [
+        d
+        for d in [await _delivery(factory, i) for i in ids]
+        if d.last_attempt_at is None
+    ]
+    assert len(untouched) == 2
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_not_ready_presentation_is_logged_but_never_counted_as_an_attempt(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _seed_fact(factory)
+    recorder = _LogRecorder()
+    monkeypatch.setattr(worker_module, "logger", recorder)
+    outcomes = ("presented", "failed", "exhausted")
+    before = {
+        outcome: _sample(
+            "neurostack_billing_fact_publish_attempts_total", outcome=outcome
+        )
+        for outcome in outcomes
+    }
+    worker = BillingFactWorker(
+        factory, transport=_NotReady(), config=_config(), now=_Clock()
+    )
+    assert (await worker.run_tick()).not_ready == 1
+    assert {
+        outcome: _sample(
+            "neurostack_billing_fact_publish_attempts_total", outcome=outcome
+        )
+        for outcome in outcomes
+    } == before
+    assert ("billing fact consumer not ready", {"attempt_count": 0}) in (
+        recorder.warnings
+    )
+    # Every emitted label value stays inside the metric dimension contract.
+    assert all(
+        event != "billing fact metric emission failed"
+        for event, _fields in recorder.warnings
+    )
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_running_loop_with_an_unready_consumer_does_not_spin(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    transport = _NotReady()
+    worker = BillingFactWorker(
+        factory,
+        transport=transport,
+        config=_config(interval_seconds=0.01),
+        monotonic=lambda: 0.0,
+    )
+    task = worker.start()
+
+    async def turned_away() -> bool:
+        return bool(transport.sent) or task.done()
+
+    await _wait_until(turned_away, "the unready consumer was never called")
+    await asyncio.sleep(0.3)  # dozens of 10 ms ticks
+    await worker.stop()
+    assert task.done() and not task.cancelled()
+    assert transport.sent == [str(outbox_id)]
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 0)
+    assert delivery.last_attempt_at is not None
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_zero_count_with_a_last_attempt_waits_the_base_backoff(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+    async with factory() as session:
+        await session.execute(
+            update(BillingFactDelivery)
+            .where(BillingFactDelivery.outbox_event_id == outbox_id)
+            .values(attempt_count=0, last_attempt_at=clock.value)
+        )
+        await session.commit()
+    policy = FactRetryPolicy(max_attempts=3)
+    transport = _Transport()
+
+    async def publish() -> Any:
+        async with factory() as session:
+            return await BillingFactPublisher(session, now=clock).publish_next(
+                transport, policy=policy, timeout=1.0
+            )
+
+    assert await publish() is None
+    clock.advance(seconds=59)
+    assert await publish() is None
+    clock.advance(seconds=2)
+    attempt = await publish()
+    assert attempt is not None and (attempt.outcome, attempt.attempt_count) == (
+        "presented",
+        1,
+    )
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.parametrize(
+    "taken_over_count",
+    [
+        pytest.param(2, id="next-count"),
+        # The SAME count as this lease, only ``last_attempt_at`` differs: the
+        # other worker's lease (2) was given back by its not-ready outcome,
+        # or a requeue (0, NULL) was followed by a fresh lease (1).
+        pytest.param(1, id="same-count"),
+    ],
+)
+async def test_phase_two_never_overwrites_a_lease_another_worker_took_over(
+    factory: async_sessionmaker[AsyncSession], ready: bool, taken_over_count: int
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+    taken_over = clock.value + timedelta(seconds=61)
+
+    async def overrun(payload: dict[str, object]) -> None:
+        # This presentation outlived its lease: another worker re-leased it.
+        async with factory() as session:
+            await session.execute(
+                update(BillingFactDelivery)
+                .where(BillingFactDelivery.outbox_event_id == outbox_id)
+                .values(
+                    attempt_count=taken_over_count,
+                    last_attempt_at=taken_over,
+                    state="pending",
+                )
+            )
+            await session.commit()
+        if not ready:
+            raise TransportNotReady("consumer readiness flipped off")
+
+    async with factory() as session:
+        attempt = await BillingFactPublisher(session, now=clock).publish_next(
+            overrun, policy=FactRetryPolicy(max_attempts=3), timeout=1.0
+        )
+        await session.commit()  # whatever publish_next left pending lands too
+    assert attempt is not None
+    assert attempt.outcome == ("presented" if ready else "not_ready")
+    delivery = await _delivery(factory, outbox_id)
+    # Neither its state nor a compensation lands on the other worker's lease.
+    assert (delivery.state, delivery.attempt_count) == ("pending", taken_over_count)
+    assert _same_instant(delivery.last_attempt_at, taken_over)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+@pytest.mark.parametrize(
+    ("attempt_count", "backoff"),
+    [
+        (0, timedelta(seconds=60)),  # a not-ready attempt given back
+        (1, timedelta(seconds=60)),
+        (2, timedelta(seconds=120)),
+    ],
+)
+@pytest.mark.parametrize(
+    ("early", "due"),
+    [
+        pytest.param(timedelta(0), True, id="at-the-instant"),
+        pytest.param(timedelta(microseconds=1), False, id="one-microsecond-before"),
+    ],
+)
+async def test_a_retry_is_due_exactly_when_its_backoff_has_elapsed(
+    factory: async_sessionmaker[AsyncSession],
+    attempt_count: int,
+    backoff: timedelta,
+    early: timedelta,
+    due: bool,
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+    policy = FactRetryPolicy(max_attempts=3)
+    assert policy.backoff(max(attempt_count, 1)) == backoff
+    async with factory() as session:
+        await session.execute(
+            update(BillingFactDelivery)
+            .where(BillingFactDelivery.outbox_event_id == outbox_id)
+            .values(
+                attempt_count=attempt_count,
+                last_attempt_at=clock.value - backoff + early,
+            )
+        )
+        await session.commit()
+    transport = _Transport()
+    async with factory() as session:
+        attempt = await BillingFactPublisher(session, now=clock).publish_next(
+            transport, policy=policy, timeout=1.0
+        )
+    if due:
+        assert attempt is not None
+        assert (attempt.outcome, attempt.attempt_count) == (
+            "presented",
+            attempt_count + 1,
+        )
+        assert transport.sent == [str(outbox_id)]
+    else:
+        assert attempt is None
+        assert transport.sent == []
+        delivery = await _delivery(factory, outbox_id)
+        assert delivery.attempt_count == attempt_count
 
 
 # ---------------------------------------------------------------------------

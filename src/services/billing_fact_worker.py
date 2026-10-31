@@ -5,21 +5,25 @@ true (2 ECS tasks x 4 uvicorn workers in production), so every guarantee here
 is a database guarantee, never a process-local one:
 
 * **Publish phase** (only when a consumer transport is wired): each fact is
-  claimed in its own short transaction ``FOR UPDATE OF billing_fact_deliveries
-  SKIP LOCKED``; the row stays locked until its attempt is committed, so no
-  two loops ever present the same fact concurrently and the persisted
-  backoff stops a re-presentation until it is due (not after a crash
-  between a send and its commit; see the presentation guard below).  At most ``batch_size``
-  facts per tick and no new claim after the tick budget.
+  claimed ``FOR UPDATE OF billing_fact_deliveries SKIP LOCKED`` and its
+  attempt is committed BEFORE it is presented (two-phase record, see
+  ``BillingFactPublisher.publish_next``).  That committed attempt is a lease
+  of at least ``base_backoff``, which the config forces to exceed the
+  transport timeout, so no two loops present the same fact concurrently, and
+  a crash between a send and its outcome still leaves the attempt counted
+  and the backoff and ``max_attempts`` in force.  A consumer that turns a
+  presentation away with ``TransportNotReady`` spends no attempt and ends
+  the batch.  At most ``batch_size`` facts per tick and no new claim after
+  the tick budget.
 * **Maintenance phase** (reconcile + overdue escalation): serialized across
   all processes by ``pg_try_advisory_xact_lock``; a loop that does not get
   the lock skips the phase instead of waiting.  Both steps are bounded pages.
 * **Observation**: every loop recomputes the global backlog gauges from the
   database, so any process a scrape reaches reports the global state.
 
-Presentation is not crash-safe yet (``PRESENTATION_PRECONDITIONS_OPEN`` in
-``billing_outbox``): constructing a worker with a transport raises, so the
-only production wiring is ``transport=None``.
+Presentation stays forbidden while ``PRESENTATION_PRECONDITIONS_OPEN`` (in
+``billing_outbox``) is true: constructing a worker with a transport raises,
+so the only production wiring is ``transport=None``.
 
 Liveness: :meth:`BillingFactWorker.start` stamps the last-tick gauge, so a
 loop that never completes a tick still exports a non-zero timestamp that
@@ -61,6 +65,7 @@ from src.services.billing_outbox import (
     FactBacklog,
     FactRetryPolicy,
     PublishAttempt,
+    TransportNotReady,
     require_presentation_allowed,
 )
 
@@ -70,9 +75,10 @@ FactTransport = Callable[[dict[str, object]], Awaitable[None]]
 TickOutcome = Literal["completed", "deadline", "stopped"]
 
 # A presentation that does not return within this window is a failed attempt.
+# It must stay shorter than the retry ``base_backoff`` (the attempt lease).
 TRANSPORT_TIMEOUT_SECONDS: Final = 10.0
 # Lifespan shutdown waits this long for the in-flight fact before cancelling
-# it (its transaction then rolls back and the fact stays retriable).
+# it (its leased attempt stays counted and the fact stays retriable).
 SHUTDOWN_GRACE_SECONDS: Final = 15.0
 
 
@@ -102,7 +108,15 @@ class BillingFactWorkerConfig:
         ):
             raise ValueError("billing fact worker bounds must be positive")
         # Validates max_attempts with the same rule the claim uses.
-        FactRetryPolicy(max_attempts=self.max_attempts)
+        policy = self.retry_policy
+        # The attempt committed before a presentation is a lease of at least
+        # ``base_backoff``: a presentation that may outlive it could be
+        # claimed and presented again by another worker while in flight.
+        if timedelta(seconds=self.transport_timeout_seconds) >= policy.base_backoff:
+            raise ValueError(
+                "billing fact transport timeout must be shorter than the retry "
+                "base backoff"
+            )
 
     @classmethod
     def from_settings(cls, source: Settings) -> BillingFactWorkerConfig:
@@ -129,6 +143,7 @@ class TickReport:
     exhausted: int
     escalated: int
     backlog: FactBacklog
+    not_ready: int = 0
 
 
 def _set_metric(metric: Any, value: float, **labels: str) -> None:
@@ -190,7 +205,7 @@ class BillingFactWorker:
         deadline = self._monotonic() + self._config.interval_seconds
         maintained, escalated = await self._maintain()
         outcome: TickOutcome = "completed"
-        presented = failed = exhausted = 0
+        presented = failed = exhausted = not_ready = 0
         if self._transport is not None:
             for _ in range(self._config.batch_size):
                 if self._stop.is_set():
@@ -223,6 +238,16 @@ class BillingFactWorker:
                         "billing fact retry cap exhausted",
                         attempt_count=attempt.attempt_count,
                     )
+                elif attempt.outcome == "not_ready":
+                    not_ready += 1
+                    logger.warning(
+                        "billing fact consumer not ready",
+                        attempt_count=attempt.attempt_count,
+                    )
+                if attempt.outcome == "not_ready":
+                    # Not an attempt, so not in the attempts counter (whose
+                    # outcome enum is presented/failed/exhausted).
+                    break  # the next fact would be turned away the same way
                 if attempt.outcome != "skipped":
                     _count(BILLING_FACT_PUBLISH_ATTEMPTS_TOTAL, outcome=attempt.outcome)
         backlog = await self._observe()
@@ -238,6 +263,7 @@ class BillingFactWorker:
             exhausted=exhausted,
             escalated=escalated,
             backlog=backlog,
+            not_ready=not_ready,
         )
 
     async def run_forever(self) -> None:
@@ -284,8 +310,9 @@ class BillingFactWorker:
         """Finish the in-flight fact, then exit; cancel it after ``grace``.
 
         The loop checks the stop request before every claim, so a graceful
-        stop never starts new work.  A cancelled claim's transaction rolls
-        back: the fact keeps its previous state and is presented again later.
+        stop never starts new work.  A presentation cancelled after ``grace``
+        keeps the attempt leased before it (the consumer may have seen the
+        fact) and its previous state: it is presented again after the backoff.
         """
 
         self._stop.set()
@@ -339,13 +366,15 @@ class BillingFactWorker:
         return True, escalated
 
     async def _publish_one(self, transport: FactTransport) -> PublishAttempt | None:
+        # No ``session.begin()``: publish_next commits its lease before the
+        # presentation and its outcome after it; closing the session rolls
+        # back only what an interrupted phase left uncommitted.
         async with self._session_factory() as session:
-            async with session.begin():
-                return await BillingFactPublisher(session, now=self._now).publish_next(
-                    transport,
-                    policy=self._policy,
-                    timeout=self._config.transport_timeout_seconds,
-                )
+            return await BillingFactPublisher(session, now=self._now).publish_next(
+                transport,
+                policy=self._policy,
+                timeout=self._config.transport_timeout_seconds,
+            )
 
     async def _observe(self) -> FactBacklog:
         async with self._session_factory() as session:
@@ -406,6 +435,7 @@ __all__ = [
     "BillingFactWorkerConfig",
     "FactTransport",
     "TickReport",
+    "TransportNotReady",
     "billing_fact_maintenance_advisory_key",
     "start_billing_fact_worker",
 ]
