@@ -724,3 +724,222 @@ def test_the_openapi_documents_the_upload_surface(client: Any) -> None:
     assert {"201", "402", "413", "422", "503"} <= set(operation["responses"])
     assert "multipart/form-data" in operation["requestBody"]["content"]
     assert "402" in schema["paths"][DOCUMENTS]["post"]["responses"]
+
+
+# ---------------------------------------------------------------------------
+# Group 4b: the copy queue is post-commit and best effort.
+# ---------------------------------------------------------------------------
+
+
+def _charges(client: Any, builder: UUID) -> tuple[list[Any], list[Any]]:
+    allocations = sorted(
+        (row.category, row.allocation_kind, row.units, row.target_mc, row.charged_mc)
+        for row in client._submit(
+            _rows(CreditAllocation, CreditAllocation.builder_id == builder)
+        )
+    )
+    entries = sorted(
+        (row.entry_type, row.amount_mc)
+        for row in client._submit(
+            _rows(CreditLedgerEntry, CreditLedgerEntry.builder_id == builder)
+        )
+    )
+    return allocations, entries
+
+
+def _without_ids(body: Any) -> Any:
+    if isinstance(body, list):
+        return [_without_ids(item) for item in body]
+    if isinstance(body, dict):
+        return {
+            key: _without_ids(value)
+            for key, value in body.items()
+            if key not in {"id", "created_at", "updated_at", "tenant_id"}
+        }
+    return body
+
+
+class _Warnings:
+    def __init__(self) -> None:
+        self.fields: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, message: str, **fields: Any) -> None:
+        self.fields.append((message, fields))
+
+    def __getattr__(self, _name: str) -> Any:
+        return lambda *_args, **_kwargs: None
+
+
+def test_a_failing_copy_queue_changes_neither_answer_nor_charge_nor_content(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON upload, multipart upload and delete with both Group 4b enqueues
+    raising answer like the baseline, debit the same, keep the content, and
+    each failure is logged without content."""
+
+    other = World()
+    client._submit(_seed(other))
+    response_cache.invalidate()
+    client._submit(_enforce())
+    for seeded in (world, other):
+        client._submit(_grant(seeded.builder, 100_000))
+    files = [("d.docx", _docx("conteudo " * 200))]
+
+    def scenario(seeded: World) -> tuple[Any, Any, Any, Any]:
+        stored = client.post(
+            DOCUMENTS, json=_json(seeded, "c" * 3_000), headers=seeded.headers()
+        )
+        uploaded = _post_files(client, seeded, files, headers=seeded.headers())
+        assert (stored.status_code, uploaded.status_code) == (201, 201)
+        contents = sorted(
+            row.content
+            for row in client._submit(
+                _rows(KnowledgeDocument, KnowledgeDocument.tenant_id == seeded.tenant)
+            )
+        )
+        return stored, uploaded, _charges(client, seeded.builder), contents
+
+    baseline = scenario(world)
+    baseline_delete = client.delete(
+        f"{DOCUMENTS}/{baseline[0].json()['id']}", headers=world.headers()
+    )
+
+    calls: list[str] = []
+
+    async def broken(*_args: Any, **kwargs: Any) -> None:
+        calls.append(str(kwargs.get("source_kind")))
+        raise RuntimeError("copy queue unavailable: secret document text")
+
+    warnings = _Warnings()
+    monkeypatch.setattr(credit_inventory, "enqueue_object_copy", broken)
+    monkeypatch.setattr(credit_inventory, "enqueue_source_collection", broken)
+    monkeypatch.setattr(knowledge_route, "logger", warnings)
+
+    failed = scenario(other)
+    assert calls == ["knowledge", "knowledge"]
+    assert failed[0].json()["tenant_id"] == str(other.tenant)
+    for got, expected in zip(failed[:2], baseline[:2]):
+        assert got.status_code == expected.status_code
+        assert _without_ids(got.json()) == _without_ids(expected.json())
+    assert failed[2] == baseline[2]
+    assert failed[3] == baseline[3] and "c" * 3_000 in failed[3]
+
+    failed_delete = client.delete(
+        f"{DOCUMENTS}/{failed[0].json()['id']}", headers=other.headers()
+    )
+    assert calls == ["knowledge", "knowledge", "knowledge"]
+    assert (
+        (failed_delete.status_code, failed_delete.content)
+        == (
+            baseline_delete.status_code,
+            baseline_delete.content,
+        )
+        == (204, b"")
+    )
+    assert (
+        client._submit(
+            _rows(
+                KnowledgeDocument,
+                KnowledgeDocument.id == UUID(failed[0].json()["id"]),
+            )
+        )
+        == []
+    )
+    assert _charges(client, other.builder) == failed[2]
+    # Every failure (both uploads and the delete) is logged with its alert
+    # and error type only: never the document content or the error text.
+    assert [
+        (fields.get("alert"), fields.get("error_type"))
+        for _message, fields in warnings.fields
+    ] == [("credit_object_copy", "RuntimeError")] * 3
+    assert "secret document text" not in repr(warnings.fields)
+
+
+def test_the_knowledge_routes_enqueue_with_the_switch_captured_at_entry(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, Any]] = []
+
+    def recorder(name: str) -> Any:
+        async def record(*_args: Any, **kwargs: Any) -> None:
+            seen.append((name, kwargs.get("switch_on")))
+
+        return record
+
+    monkeypatch.setattr(
+        credit_inventory, "enqueue_object_copy", recorder("enqueue_object_copy")
+    )
+    monkeypatch.setattr(
+        credit_inventory,
+        "enqueue_source_collection",
+        recorder("enqueue_source_collection"),
+    )
+    stored = client.post(DOCUMENTS, json=_json(world), headers=world.headers())
+    uploaded = _post_files(client, world, [("d.docx", _docx("texto"))])
+    deleted = client.delete(
+        f"{DOCUMENTS}/{stored.json()['id']}", headers=world.headers()
+    )
+    assert (stored.status_code, uploaded.status_code, deleted.status_code) == (
+        201,
+        201,
+        204,
+    )
+    assert seen == [
+        ("enqueue_object_copy", True),
+        ("enqueue_object_copy", True),
+        ("enqueue_source_collection", True),
+    ]
+
+
+def _open_copy_gate_process_wide(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Everything that could open the Group 4b gate, process-wide, is on:
+    only the switch value the REQUEST captured can keep it closed."""
+
+    from pydantic import SecretStr
+
+    from src.config.settings import settings as config
+
+    monkeypatch.setattr(credit_inventory, "credit_switch_effective", lambda: True)
+    monkeypatch.setattr(config, "environment", "test")
+    monkeypatch.setattr(config, "credit_object_store_endpoint", "http://s3.invalid")
+    monkeypatch.setattr(config, "credit_object_store_bucket", "credit-copies")
+    monkeypatch.setattr(config, "credit_object_store_access_key_id", "key")
+    monkeypatch.setattr(
+        config, "credit_object_store_secret_access_key", SecretStr("secret")
+    )
+
+
+def test_a_knowledge_upload_that_captured_the_switch_off_writes_no_copy_job(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON upload (the multipart upload is 503 with the switch off)."""
+
+    from src.models.credit_object_copy import CreditObjectCopyJob
+
+    _open_copy_gate_process_wide(monkeypatch)
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda *_: False)
+    switch(False)
+    stored = client.post(DOCUMENTS, json=_json(world), headers=world.headers())
+    assert stored.status_code == 201
+    deleted = client.delete(
+        f"{DOCUMENTS}/{stored.json()['id']}", headers=world.headers()
+    )
+    assert deleted.status_code == 204
+    assert client._submit(_rows(CreditObjectCopyJob)) == []
+    switch(True)
+    assert (
+        client.post(DOCUMENTS, json=_json(world), headers=world.headers()).status_code
+        == 201
+    )
+    assert [job.operation for job in client._submit(_rows(CreditObjectCopyJob))] == [
+        "copy"
+    ]

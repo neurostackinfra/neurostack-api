@@ -164,7 +164,9 @@ def _zip_info(path: str) -> zipfile.ZipInfo:
 async def _copy_versions(
     session: AsyncSession, tenant_id: UUID
 ) -> dict[tuple[str, UUID, str], dict[str, str]]:
-    """The ``ready`` additional copies of this tenant, by exact content."""
+    """The live additional copies of this tenant, by exact content: ``ready``
+    and ``held`` (a copy under a credit legal hold is still the same exact
+    version); never a ``deleted`` or ``failed`` one."""
 
     rows = await session.execute(
         select(
@@ -177,7 +179,7 @@ async def _copy_versions(
         )
         .where(
             CreditObjectCopy.tenant_id == tenant_id,
-            CreditObjectCopy.state == "ready",
+            CreditObjectCopy.state.in_(("ready", "held")),
         )
         .order_by(CreditObjectCopy.created_at, CreditObjectCopy.id)
     )

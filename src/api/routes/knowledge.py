@@ -106,7 +106,7 @@ from src.services.credit_metering import (
     CreditEnforcementUnavailable,
     CreditTenantGone,
 )
-from src.services.credit_switch import CreditSwitchRoute
+from src.services.credit_switch import CreditSwitchRoute, request_credit_switch
 from src.services.knowledge_service import KnowledgeFileError, extract_documents
 
 logger = get_logger(__name__)
@@ -118,7 +118,11 @@ def _no_store(response: Response) -> None:
 
 
 async def _enqueue_credit_object_copies(
-    session: AsyncSession, *, tenant_id: UUID, documents: list[KnowledgeDocument]
+    session: AsyncSession,
+    *,
+    tenant_id: UUID,
+    documents: list[KnowledgeDocument],
+    switch_on: bool,
 ) -> None:
     """Schedule only additional copies after authoritative commit.
 
@@ -133,6 +137,7 @@ async def _enqueue_credit_object_copies(
                 source_kind="knowledge",
                 source_id=document.id,
                 tenant_id=tenant_id,
+                switch_on=switch_on,
             )
         except Exception as error:
             logger.warning(
@@ -545,7 +550,10 @@ async def upload_document(
             upload_id=document.id,
         )
     await _enqueue_credit_object_copies(
-        session, tenant_id=effective_tenant_id, documents=[document]
+        session,
+        tenant_id=effective_tenant_id,
+        documents=[document],
+        switch_on=mode.switch_on,
     )
     return response
 
@@ -734,7 +742,10 @@ async def upload_document_files(
             upload_id=upload_id,
         )
     await _enqueue_credit_object_copies(
-        session, tenant_id=effective_tenant_id, documents=documents
+        session,
+        tenant_id=effective_tenant_id,
+        documents=documents,
+        switch_on=mode.switch_on,
     )
     return response
 
@@ -1080,15 +1091,19 @@ async def delete_document(
     # and is best effort; it must not turn an already committed 204 into a
     # storage error.
     try:
-        from src.services.credit_inventory import enqueue_source_collection
-
-        await enqueue_source_collection(
+        await credit_inventory.enqueue_source_collection(
             session,
             source_kind="knowledge",
             source_id=document_id,
             tenant_id=effective_tenant_id,
+            switch_on=request_credit_switch(request),
         )
-    except Exception:
+    except Exception as error:
+        logger.warning(
+            "credit object-copy collection enqueue failed",
+            alert="credit_object_copy",
+            error_type=type(error).__name__,
+        )
         await session.rollback()
     # TODO: Delete from vector database (Task 19.0). It must run only after the
     # commit above, never while the row lock taken by delete_by_id_and_tenant

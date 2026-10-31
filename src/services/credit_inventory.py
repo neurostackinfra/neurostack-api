@@ -63,8 +63,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, delete, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.orm import aliased
 from starlette.requests import HTTPConnection
 
 from src.config.logging import get_logger
@@ -818,15 +820,18 @@ _COPY_BATCH_SIZE: Final = 16
 _OBJECT_JOB_LEASE: Final = timedelta(minutes=5)
 
 
-def object_copy_runtime_enabled() -> bool:
+def object_copy_runtime_enabled(switch_on: bool | None = None) -> bool:
     """Whether Group 4b may touch external stores, fail-closed.
 
     There is no production exception: rollout opening owns that decision.
     Empty settings leave development/test harmless and inert.
+    ``switch_on`` is a request's captured switch verdict; ``None`` (the
+    worker) reads the process-wide verdict.
     """
 
+    effective = credit_switch_effective() if switch_on is None else switch_on
     return bool(
-        credit_switch_effective()
+        effective
         and settings.environment in ("development", "test")
         and settings.credit_object_store_endpoint
         and settings.credit_object_store_bucket
@@ -835,12 +840,12 @@ def object_copy_runtime_enabled() -> bool:
     )
 
 
-def qdrant_runtime_enabled() -> bool:
+def qdrant_runtime_enabled(switch_on: bool | None = None) -> bool:
     """Derived-vector work has the same switch/environment dominance but
     shares the explicit additional-store configuration boundary."""
 
     return bool(
-        object_copy_runtime_enabled()
+        object_copy_runtime_enabled(switch_on)
         and settings.qdrant_host
         and settings.qdrant_collection_name
     )
@@ -852,16 +857,19 @@ async def enqueue_object_copy(
     source_kind: Literal["media", "knowledge"],
     source_id: UUID,
     tenant_id: UUID,
+    switch_on: bool | None = None,
 ) -> None:
     """Persist post-commit work only when the captured switch is effective.
 
-    Callers invoke this after the authoritative route transaction committed.
-    The queue insert is best effort; it never rolls back the primary content
-    write and a repeated enqueue is safe (a completed duplicate does nothing).
+    Callers invoke this after the authoritative route transaction committed,
+    passing the switch verdict their request captured at entry
+    (``request_credit_switch``/``CreditMode.switch_on``).  The queue insert
+    is best effort; it never rolls back the primary content write and a
+    repeated enqueue is safe (a completed duplicate does nothing).
     """
 
-    copy_enabled = object_copy_runtime_enabled()
-    qdrant_enabled = qdrant_runtime_enabled()
+    copy_enabled = object_copy_runtime_enabled(switch_on)
+    qdrant_enabled = qdrant_runtime_enabled(switch_on)
     if not copy_enabled and not qdrant_enabled:
         return
     if copy_enabled:
@@ -912,11 +920,14 @@ async def enqueue_source_collection(
     source_kind: Literal["media", "knowledge"],
     source_id: UUID,
     tenant_id: UUID,
+    switch_on: bool | None = None,
 ) -> None:
-    """Schedule source-GC after its authoritative delete committed."""
+    """Schedule source-GC after its authoritative delete committed.
 
-    copy_enabled = object_copy_runtime_enabled()
-    qdrant_enabled = qdrant_runtime_enabled()
+    ``switch_on`` is the verdict the deleting request captured at entry."""
+
+    copy_enabled = object_copy_runtime_enabled(switch_on)
+    qdrant_enabled = qdrant_runtime_enabled(switch_on)
     if not copy_enabled and not qdrant_enabled:
         return
     jobs: list[tuple[Any, str]] = []
@@ -980,49 +991,80 @@ async def _enqueue_orphan_copy_collection(session: AsyncSession) -> None:
     therefore cannot enqueue per-source work in the request transaction. The
     registry deliberately has no source FK, so this bounded scan is the
     durable recovery path. It does nothing while the Group 4b runtime is off.
+
+    "Source missing" and "no collection job yet" are decided in SQL, before
+    the batch limit: live copies (however many, however old) never occupy a
+    batch, so an orphan is always reachable.  A ``pending``/``running`` job
+    counts as queued; a ``held`` job only while a ``held`` copy of the same
+    source exists (the hold release re-queues it).  A ``held`` job with no
+    ``held`` copy left -- the S3 hold-ON call failed, so the copy stayed
+    ``ready`` -- is re-queued here instead of duplicated.
     """
 
-    copies = list(
-        (
-            await session.execute(
-                select(CreditObjectCopy)
-                .where(CreditObjectCopy.state == "ready")
-                .order_by(CreditObjectCopy.created_at)
-                .limit(_COPY_BATCH_SIZE)
-            )
-        ).scalars()
-    )
-    for copy in copies:
-        model = MediaAsset if copy.source_kind == "media" else KnowledgeDocument
-        source = await session.scalar(
-            select(model.id).where(
-                model.id == copy.source_id, model.tenant_id == copy.tenant_id
-            )
-        )
-        if source is not None:
-            continue
-        exists = await session.scalar(
-            select(CreditObjectCopyJob.id).where(
-                CreditObjectCopyJob.source_kind == copy.source_kind,
-                CreditObjectCopyJob.source_id == copy.source_id,
+    def gc_job(states: tuple[str, ...]) -> Any:
+        return (
+            select(CreditObjectCopyJob.id)
+            .where(
+                CreditObjectCopyJob.source_kind == CreditObjectCopy.source_kind,
+                CreditObjectCopyJob.source_id == CreditObjectCopy.source_id,
                 CreditObjectCopyJob.operation == "gc",
-                CreditObjectCopyJob.state.in_(("pending", "running")),
+                CreditObjectCopyJob.state.in_(states),
             )
+            .exists()
         )
-        if exists is None:
+
+    held_sibling = aliased(CreditObjectCopy)
+    held_copy = (
+        select(held_sibling.id)
+        .where(
+            held_sibling.source_kind == CreditObjectCopy.source_kind,
+            held_sibling.source_id == CreditObjectCopy.source_id,
+            held_sibling.state == "held",
+        )
+        .exists()
+    )
+    gc_queued = or_(gc_job(("pending", "running")), and_(gc_job(("held",)), held_copy))
+    sources: dict[tuple[str, UUID], UUID] = {}
+    for source_kind, model in (
+        ("media", MediaAsset),
+        ("knowledge", KnowledgeDocument),
+    ):
+        source_exists = (
+            select(model.id)
+            .where(
+                model.id == CreditObjectCopy.source_id,
+                model.tenant_id == CreditObjectCopy.tenant_id,
+            )
+            .exists()
+        )
+        rows = await session.execute(
+            select(CreditObjectCopy.source_id, CreditObjectCopy.tenant_id)
+            .where(
+                CreditObjectCopy.state == "ready",
+                CreditObjectCopy.source_kind == source_kind,
+                ~source_exists,
+                ~gc_queued,
+            )
+            .order_by(CreditObjectCopy.created_at, CreditObjectCopy.id)
+            .limit(_COPY_BATCH_SIZE)
+        )
+        for source_id, tenant_id in rows:
+            sources.setdefault((source_kind, source_id), tenant_id)
+    for (source_kind, source_id), tenant_id in sources.items():
+        if not await _requeue_held_collection(session, source_kind, source_id):
             session.add(
                 CreditObjectCopyJob(
-                    source_kind=copy.source_kind,
-                    source_id=copy.source_id,
-                    tenant_id=copy.tenant_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    tenant_id=tenant_id,
                     operation="gc",
                 )
             )
-        if copy.source_kind == "knowledge" and qdrant_runtime_enabled():
+        if source_kind == "knowledge" and qdrant_runtime_enabled():
             qdrant_exists = await session.scalar(
                 select(CreditQdrantJob.id).where(
-                    CreditQdrantJob.source_kind == copy.source_kind,
-                    CreditQdrantJob.source_id == copy.source_id,
+                    CreditQdrantJob.source_kind == source_kind,
+                    CreditQdrantJob.source_id == source_id,
                     CreditQdrantJob.operation == "delete",
                     CreditQdrantJob.state.in_(("pending", "running")),
                 )
@@ -1030,9 +1072,9 @@ async def _enqueue_orphan_copy_collection(session: AsyncSession) -> None:
             if qdrant_exists is None:
                 session.add(
                     CreditQdrantJob(
-                        source_kind=copy.source_kind,
-                        source_id=copy.source_id,
-                        tenant_id=copy.tenant_id,
+                        source_kind=source_kind,
+                        source_id=source_id,
+                        tenant_id=tenant_id,
                         operation="delete",
                     )
                 )
@@ -1042,16 +1084,64 @@ async def _enqueue_orphan_copy_collection(session: AsyncSession) -> None:
 async def _finish_copy_job(
     session: AsyncSession, job_id: UUID, *, state: str, error: str | None = None
 ) -> None:
-    await session.execute(
-        update(CreditObjectCopyJob)
-        .where(CreditObjectCopyJob.id == job_id)
-        .values(
-            state=state,
-            last_error=error,
-            completed_at=_now() if state != "failed" else None,
-        )
-    )
-    await session.commit()
+    """Move one job to its outcome, committed here.
+
+    The job table keys ``(source_kind, source_id, operation, state)``, so a
+    second ``completed``/``failed``/``held`` job of one source cannot take
+    that state as its own row: the existing outcome row is refreshed (the
+    latest error and time) and this job's row is removed -- one outcome row
+    per source and state, never an ``IntegrityError`` leaving the job
+    ``running`` forever.  A concurrent twin committed between the read and
+    the write is retried once through the same merge.
+
+    Callers commit their own writes first: this function may roll back.
+    """
+
+    completed_at = _now() if state != "failed" else None
+    for attempt in range(2):
+        try:
+            job = (
+                await session.execute(
+                    select(
+                        CreditObjectCopyJob.source_kind,
+                        CreditObjectCopyJob.source_id,
+                        CreditObjectCopyJob.operation,
+                    ).where(CreditObjectCopyJob.id == job_id)
+                )
+            ).one_or_none()
+            if job is None:
+                await session.commit()
+                return
+            twin = await session.scalar(
+                select(CreditObjectCopyJob.id).where(
+                    CreditObjectCopyJob.source_kind == job.source_kind,
+                    CreditObjectCopyJob.source_id == job.source_id,
+                    CreditObjectCopyJob.operation == job.operation,
+                    CreditObjectCopyJob.state == state,
+                    CreditObjectCopyJob.id != job_id,
+                )
+            )
+            if twin is None:
+                await session.execute(
+                    update(CreditObjectCopyJob)
+                    .where(CreditObjectCopyJob.id == job_id)
+                    .values(state=state, last_error=error, completed_at=completed_at)
+                )
+            else:
+                await session.execute(
+                    update(CreditObjectCopyJob)
+                    .where(CreditObjectCopyJob.id == twin)
+                    .values(last_error=error, completed_at=completed_at)
+                )
+                await session.execute(
+                    delete(CreditObjectCopyJob).where(CreditObjectCopyJob.id == job_id)
+                )
+            await session.commit()
+            return
+        except IntegrityError:
+            await session.rollback()
+            if attempt:
+                raise
 
 
 async def _claim_qdrant_jobs(session: AsyncSession) -> list[CreditQdrantJob]:
@@ -1227,12 +1317,281 @@ async def _copy_one(
                     content_sha256=stored.content_sha256,
                 )
             )
+            await session.commit()
         await _finish_copy_job(session, job.id, state="completed")
+
+
+@dataclass(frozen=True)
+class _CopyHoldScopes:
+    """The credit legal holds (``credit_hold_events``) folded per scope."""
+
+    held_builders: frozenset[UUID] = frozenset()
+    held_tenants: frozenset[UUID] = frozenset()
+    released_builders: frozenset[UUID] = frozenset()
+    released_tenants: frozenset[UUID] = frozenset()
+
+    @property
+    def empty(self) -> bool:
+        return not (
+            self.held_builders
+            or self.held_tenants
+            or self.released_builders
+            or self.released_tenants
+        )
+
+
+async def _copy_hold_scopes(session: AsyncSession) -> _CopyHoldScopes:
+    """Fold every hold intent with Group 5's own rule (``fold_holds``: a
+    hold counts from its request until its release).  Hold events are rare
+    and append-only, so the whole stream is read once per worker pass."""
+
+    from src.models.content_retention import CreditHoldEvent
+    from src.services.content_retention import fold_holds
+
+    events = list((await session.execute(select(CreditHoldEvent))).scalars())
+    held_builders: set[UUID] = set()
+    held_tenants: set[UUID] = set()
+    released_builders: set[UUID] = set()
+    released_tenants: set[UUID] = set()
+    for state in fold_holds(events).values():
+        origin = state.requested
+        if origin is None:
+            continue
+        if state.effective:
+            builders, tenants = held_builders, held_tenants
+        elif state.released is not None:
+            builders, tenants = released_builders, released_tenants
+        else:  # pragma: no cover - fold_holds: effective or released
+            continue
+        if origin.scope == "builder":
+            builders.add(origin.builder_id)
+        else:
+            tenants.add(UUID(origin.scope.split(":", 1)[1]))
+    return _CopyHoldScopes(
+        frozenset(held_builders),
+        frozenset(held_tenants),
+        frozenset(released_builders),
+        frozenset(released_tenants),
+    )
+
+
+def _copy_covered(builders: Iterable[UUID], tenants: Iterable[UUID]) -> Any:
+    """Copies inside a builder-wide scope (the builder recorded at write
+    time or the tenant's current builder) or a tenant scope.  NULL-safe: a
+    standalone copy is never "not covered" by NULL comparison."""
+
+    builder_ids = list(builders)
+    return or_(
+        and_(
+            CreditObjectCopy.builder_id.is_not(None),
+            CreditObjectCopy.builder_id.in_(builder_ids),
+        ),
+        CreditObjectCopy.tenant_id.in_(list(tenants)),
+        CreditObjectCopy.tenant_id.in_(
+            select(Tenant.id).where(Tenant.builder_id.in_(builder_ids))
+        ),
+    )
+
+
+async def _copy_under_credit_hold(
+    session: AsyncSession, copy: CreditObjectCopy
+) -> bool:
+    """PostgreSQL is the authority of the credit legal hold: a hold on the
+    builder recorded with the copy, on the tenant's current builder, or on
+    the tenant itself protects the copy, whatever the S3 side says."""
+
+    from src.repositories.content_retention import ContentRetentionRepository
+    from src.services.content_retention import hold_effective
+
+    current_builder = await session.scalar(
+        select(Tenant.builder_id).where(Tenant.id == copy.tenant_id)
+    )
+    repository = ContentRetentionRepository(session)
+    scopes = ("builder", f"tenant:{copy.tenant_id}")
+    for builder_id in {copy.builder_id, current_builder} - {None}:
+        assert builder_id is not None
+        if hold_effective(await repository.hold_events(builder_id, scopes)):
+            return True
+    return False
+
+
+async def _set_copy_legal_hold(copy: CreditObjectCopy, *, enabled: bool) -> bool:
+    """``PutObjectLegalHold`` ON/OFF on the registered exact version."""
+
+    from botocore.exceptions import BotoCoreError
+
+    from src.storage.credit_object_store import (
+        ObjectCopyError,
+        StoredCopy,
+        set_legal_hold,
+    )
+
+    try:
+        await asyncio.to_thread(
+            set_legal_hold,
+            copy=StoredCopy(
+                copy.object_key, copy.version_id, copy.etag, copy.content_sha256
+            ),
+            enabled=enabled,
+        )
+    except (ObjectCopyError, BotoCoreError) as error:
+        logger.warning(
+            "credit object copy legal hold update failed",
+            alert="credit_object_copy_hold",
+            enabled=enabled,
+            error_type=type(error).__name__,
+        )
+        return False
+    return True
+
+
+async def _mark_copy(
+    factory: Callable[[], AsyncSession], copy_id: UUID, *, before: str, after: str
+) -> bool:
+    """Compare-and-set one copy's state: ``True`` only for the pass that
+    moved it (two concurrent passes never both act on one copy)."""
+
+    async with factory() as session:
+        moved = await session.scalar(
+            update(CreditObjectCopy)
+            .where(CreditObjectCopy.id == copy_id, CreditObjectCopy.state == before)
+            .values(state=after, updated_at=_now())
+            .returning(CreditObjectCopy.id)
+        )
+        await session.commit()
+    return moved is not None
+
+
+async def _hold_copy(
+    factory: Callable[[], AsyncSession], copy: CreditObjectCopy
+) -> None:
+    """Record ``held`` BEFORE ``PutObjectLegalHold=ON``: a crash in between
+    leaves a ``held`` copy, which the release scan sees (an OFF on a version
+    never set ON is harmless), never a ``ready`` copy with the S3 hold ON.
+    A failed ON reverts to ``ready`` so the next pass retries it."""
+
+    if not await _mark_copy(factory, copy.id, before="ready", after="held"):
+        return
+    if not await _set_copy_legal_hold(copy, enabled=True):
+        await _mark_copy(factory, copy.id, before="held", after="ready")
+
+
+async def _requeue_held_collection(
+    session: AsyncSession, source_kind: str, source_id: UUID
+) -> bool:
+    """Put a source's ``held`` collection job back to ``pending`` (one row
+    per source: the job table's state is part of its key).  ``True`` when a
+    ``held`` job exists (re-queued now, or left because a job of the source
+    is already pending/running).  Not committed here."""
+
+    held_job = await session.scalar(
+        select(CreditObjectCopyJob.id).where(
+            CreditObjectCopyJob.source_kind == source_kind,
+            CreditObjectCopyJob.source_id == source_id,
+            CreditObjectCopyJob.operation == "gc",
+            CreditObjectCopyJob.state == "held",
+        )
+    )
+    if held_job is None:
+        return False
+    active = await session.scalar(
+        select(CreditObjectCopyJob.id).where(
+            CreditObjectCopyJob.source_kind == source_kind,
+            CreditObjectCopyJob.source_id == source_id,
+            CreditObjectCopyJob.operation == "gc",
+            CreditObjectCopyJob.state.in_(("pending", "running")),
+        )
+    )
+    if active is None:
+        # Guarded: a concurrent worker that already claimed this row
+        # (``running``) is never reset to ``pending``.
+        await session.execute(
+            update(CreditObjectCopyJob)
+            .where(
+                CreditObjectCopyJob.id == held_job,
+                CreditObjectCopyJob.state == "held",
+            )
+            .values(
+                state="pending", last_error=None, claimed_at=None, completed_at=None
+            )
+        )
+    return True
+
+
+async def _reconcile_copy_legal_holds(factory: Callable[[], AsyncSession]) -> None:
+    """The legal-hold job of the S3 copies, driven by ``credit_hold_events``.
+
+    A hold in force (from its request, as Group 5 counts it) moves every
+    ``ready`` copy it covers to ``held`` and then puts
+    ``PutObjectLegalHold=ON`` on its version.  A ``held`` copy that no hold
+    in force covers, but that lies in the scope of at least one RELEASED
+    credit hold, gets ``PutObjectLegalHold=OFF``, is ``ready`` again, and a
+    collection held for it is re-queued (a copy whose source is gone and
+    that has no job is found by the orphan scan).  The S3 flag has no owner:
+    the OFF lifts whatever S3 legal hold the version carries, including one
+    placed outside this worker, once a released credit hold covers that
+    scope; a ``held`` copy in a scope no credit hold ever covered is left
+    alone.  Both selections are in SQL, bounded and oldest first; every
+    state change is a compare-and-set.  Runs only under the Group 4b gate.
+    """
+
+    async with factory() as session:
+        scopes = await _copy_hold_scopes(session)
+        if scopes.empty:
+            return
+        protected = _copy_covered(scopes.held_builders, scopes.held_tenants)
+        to_hold = list(
+            (
+                await session.execute(
+                    select(CreditObjectCopy)
+                    .where(CreditObjectCopy.state == "ready", protected)
+                    .order_by(CreditObjectCopy.created_at, CreditObjectCopy.id)
+                    .limit(_COPY_BATCH_SIZE)
+                )
+            ).scalars()
+        )
+        to_release = list(
+            (
+                await session.execute(
+                    select(CreditObjectCopy)
+                    .where(
+                        CreditObjectCopy.state == "held",
+                        ~protected,
+                        _copy_covered(
+                            scopes.released_builders, scopes.released_tenants
+                        ),
+                    )
+                    .order_by(CreditObjectCopy.created_at, CreditObjectCopy.id)
+                    .limit(_COPY_BATCH_SIZE)
+                )
+            ).scalars()
+        )
+    for copy in to_hold:
+        await _hold_copy(factory, copy)
+    for copy in to_release:
+        # OFF first, then the state: a crash in between leaves a ``held``
+        # copy whose OFF the next pass repeats.
+        if not await _set_copy_legal_hold(copy, enabled=False):
+            continue
+        async with factory() as session:
+            released = await session.scalar(
+                update(CreditObjectCopy)
+                .where(CreditObjectCopy.id == copy.id, CreditObjectCopy.state == "held")
+                .values(state="ready", updated_at=_now())
+                .returning(CreditObjectCopy.id)
+            )
+            if released is not None:
+                await _requeue_held_collection(
+                    session, copy.source_kind, copy.source_id
+                )
+            await session.commit()
 
 
 async def _collect_one(
     factory: Callable[[], AsyncSession], job: CreditObjectCopyJob
 ) -> None:
+    from botocore.exceptions import BotoCoreError
+
     from src.storage.credit_object_store import (
         ObjectCopyError,
         ObjectCopyHeld,
@@ -1247,12 +1606,43 @@ async def _collect_one(
                     select(CreditObjectCopy).where(
                         CreditObjectCopy.source_kind == job.source_kind,
                         CreditObjectCopy.source_id == job.source_id,
+                        CreditObjectCopy.tenant_id == job.tenant_id,
                         CreditObjectCopy.state == "ready",
                     )
                 )
             ).scalars()
         )
+    held = False
     for copy in copies:
+        # The PostgreSQL hold is re-checked for EACH copy just before its
+        # delete (a hold requested mid-batch is seen): the S3-side legal
+        # hold may not be placed yet, or may have failed.  Fail closed: an
+        # unreadable hold state deletes nothing.
+        try:
+            async with factory() as session:
+                protected = await _copy_under_credit_hold(session, copy)
+        except Exception as error:
+            logger.warning(
+                "credit object copy hold check failed",
+                alert="credit_object_copy_held",
+                source_kind=copy.source_kind,
+                error_type=type(error).__name__,
+            )
+            async with factory() as session:
+                await _finish_copy_job(
+                    session, job.id, state="failed", error="hold check failed"
+                )
+            return
+        if protected:
+            held = True
+            logger.warning(
+                "credit object copy collection held",
+                alert="credit_object_copy_held",
+                source_kind=copy.source_kind,
+                reason="credit_legal_hold",
+            )
+            await _hold_copy(factory, copy)
+            continue
         try:
             await asyncio.to_thread(
                 delete_exact_copy,
@@ -1266,43 +1656,62 @@ async def _collect_one(
                 alert="credit_object_copy_held",
                 source_kind=copy.source_kind,
             )
+            await _mark_copy(factory, copy.id, before="ready", after="held")
             async with factory() as session:
-                await session.execute(
-                    update(CreditObjectCopy)
-                    .where(CreditObjectCopy.id == copy.id)
-                    .values(state="held")
-                )
                 await _finish_copy_job(
                     session, job.id, state="held", error=str(error)[:500]
                 )
             return
-        except ObjectCopyError as error:
+        except (ObjectCopyError, BotoCoreError) as error:
             async with factory() as session:
                 await _finish_copy_job(
                     session, job.id, state="failed", error=str(error)[:500]
                 )
             return
-        async with factory() as session:
-            await session.execute(
-                update(CreditObjectCopy)
-                .where(CreditObjectCopy.id == copy.id)
-                .values(state="deleted")
-            )
-            await session.commit()
+        await _mark_copy(factory, copy.id, before="ready", after="deleted")
     async with factory() as session:
-        await _finish_copy_job(session, job.id, state="completed")
+        # A copy still ``held`` (now or from an earlier pass) keeps the job
+        # ``held``: the hold release re-queues this same row.
+        still_held = await session.scalar(
+            select(CreditObjectCopy.id)
+            .where(
+                CreditObjectCopy.source_kind == job.source_kind,
+                CreditObjectCopy.source_id == job.source_id,
+                CreditObjectCopy.state == "held",
+            )
+            .limit(1)
+        )
+        if held or still_held is not None:
+            await _finish_copy_job(
+                session, job.id, state="held", error="credit legal hold in force"
+            )
+        else:
+            await _finish_copy_job(session, job.id, state="completed")
 
 
 async def run_credit_object_copy_once(
     session_factory: Callable[[], AsyncSession] | None = None,
 ) -> int:
-    """Claim a bounded batch using ``SKIP LOCKED`` and run no work when off."""
+    """Claim a bounded batch using ``SKIP LOCKED`` and run no work when off.
+
+    Each step is isolated: a legal-hold reconcile or a job that raises is
+    logged (alert, error type only) and the rest of the pass still runs; a
+    job left ``running`` is reclaimed after its lease."""
 
     copy_enabled = object_copy_runtime_enabled()
     qdrant_enabled = qdrant_runtime_enabled()
     if not copy_enabled and not qdrant_enabled:
         return 0
     factory = session_factory or _session_factory()
+    if copy_enabled:
+        try:
+            await _reconcile_copy_legal_holds(factory)
+        except Exception as error:
+            logger.warning(
+                "credit object copy legal hold reconcile failed",
+                alert="credit_object_copy_hold",
+                error_type=type(error).__name__,
+            )
     async with factory() as session:
         if copy_enabled:
             await _enqueue_orphan_copy_collection(session)
@@ -1311,10 +1720,18 @@ async def run_credit_object_copy_once(
             jobs = []
         qdrant_jobs = await _claim_qdrant_jobs(session) if qdrant_enabled else []
     for job in jobs:
-        if job.operation == "copy":
-            await _copy_one(factory, job)
-        else:
-            await _collect_one(factory, job)
+        try:
+            if job.operation == "copy":
+                await _copy_one(factory, job)
+            else:
+                await _collect_one(factory, job)
+        except Exception as error:
+            logger.warning(
+                "credit object copy job failed",
+                alert="credit_object_copy",
+                operation=job.operation,
+                error_type=type(error).__name__,
+            )
     for qdrant_job in qdrant_jobs:
         await _run_qdrant_job(factory, qdrant_job)
     return len(jobs) + len(qdrant_jobs)

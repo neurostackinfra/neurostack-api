@@ -693,3 +693,162 @@ def test_a_foreign_tenant_is_refused_before_any_credit_lock_or_row(
     assert client._submit(_rows(MediaAsset)) == []
     for model in (*_FINANCIAL, CreditEgressDelivery, CreditObservationalEffect):
         assert client._submit(_rows(model)) == []
+
+
+# ---------------------------------------------------------------------------
+# Group 4b: the copy queue is post-commit and best effort.
+# ---------------------------------------------------------------------------
+
+
+def _charges(client: Any, builder: UUID) -> tuple[list[Any], list[Any]]:
+    allocations = sorted(
+        (row.category, row.allocation_kind, row.units, row.target_mc, row.charged_mc)
+        for row in client._submit(
+            _rows(CreditAllocation, CreditAllocation.builder_id == builder)
+        )
+    )
+    entries = sorted(
+        (row.entry_type, row.amount_mc)
+        for row in client._submit(
+            _rows(CreditLedgerEntry, CreditLedgerEntry.builder_id == builder)
+        )
+    )
+    return allocations, entries
+
+
+def test_a_failing_copy_queue_changes_neither_answer_nor_charge_nor_payload(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upload and delete with both Group 4b enqueues raising answer exactly
+    like the baseline, debit exactly the same and keep ``payload``."""
+
+    other = World()
+    client._submit(_seed(other))
+    client._submit(_enforce())
+    for seeded in (world, other):
+        client._submit(_grant(seeded.builder, 100_000))
+
+    baseline = _upload(client, world, _pdf(1_000), "application/pdf")
+    assert baseline.status_code == 201
+    baseline_delete = client.delete(
+        f"{MEDIA}/{baseline.json()['id']}", headers=world.headers()
+    )
+
+    calls: list[str] = []
+
+    async def broken(*_args: Any, **kwargs: Any) -> None:
+        calls.append(str(kwargs.get("source_kind")))
+        raise RuntimeError("copy queue unavailable")
+
+    monkeypatch.setattr(credit_inventory, "enqueue_object_copy", broken)
+    monkeypatch.setattr(credit_inventory, "enqueue_source_collection", broken)
+
+    failed = _upload(client, other, _pdf(1_000), "application/pdf")
+    assert calls == ["media"]
+    assert failed.json()["tenant_id"] == str(other.tenant)
+    assert baseline.json()["tenant_id"] == str(world.tenant)
+    assert _comparable(failed)[0] == _comparable(baseline)[0]
+    assert {
+        key: value
+        for key, value in _comparable(failed)[1].items()
+        if key != "tenant_id"
+    } == {
+        key: value
+        for key, value in _comparable(baseline)[1].items()
+        if key != "tenant_id"
+    }
+    [stored] = client._submit(_rows(MediaAsset, MediaAsset.tenant_id == other.tenant))
+    assert stored.payload == _pdf(1_000)
+    assert _charges(client, other.builder) == _charges(client, world.builder)
+
+    charged = _charges(client, other.builder)
+    failed_delete = client.delete(
+        f"{MEDIA}/{failed.json()['id']}", headers=other.headers()
+    )
+    assert calls == ["media", "media"]
+    assert (
+        (failed_delete.status_code, failed_delete.content)
+        == (
+            baseline_delete.status_code,
+            baseline_delete.content,
+        )
+        == (204, b"")
+    )
+    assert client._submit(_rows(MediaAsset)) == []
+    assert _charges(client, other.builder) == charged
+
+
+def test_the_media_routes_enqueue_with_the_switch_captured_at_entry(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, Any]] = []
+
+    def recorder(name: str) -> Any:
+        async def record(*_args: Any, **kwargs: Any) -> None:
+            seen.append((name, kwargs.get("switch_on")))
+
+        return record
+
+    monkeypatch.setattr(
+        credit_inventory, "enqueue_object_copy", recorder("enqueue_object_copy")
+    )
+    monkeypatch.setattr(
+        credit_inventory,
+        "enqueue_source_collection",
+        recorder("enqueue_source_collection"),
+    )
+    created = _upload(client, world, _pdf(1_000), "application/pdf")
+    assert created.status_code == 201
+    deleted = client.delete(f"{MEDIA}/{created.json()['id']}", headers=world.headers())
+    assert deleted.status_code == 204
+    assert seen == [
+        ("enqueue_object_copy", True),
+        ("enqueue_source_collection", True),
+    ]
+
+
+def _open_copy_gate_process_wide(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Everything that could open the Group 4b gate, process-wide, is on:
+    only the switch value the REQUEST captured can keep it closed."""
+
+    from pydantic import SecretStr
+
+    from src.config.settings import settings as config
+
+    monkeypatch.setattr(credit_inventory, "credit_switch_effective", lambda: True)
+    monkeypatch.setattr(config, "environment", "test")
+    monkeypatch.setattr(config, "credit_object_store_endpoint", "http://s3.invalid")
+    monkeypatch.setattr(config, "credit_object_store_bucket", "credit-copies")
+    monkeypatch.setattr(config, "credit_object_store_access_key_id", "key")
+    monkeypatch.setattr(
+        config, "credit_object_store_secret_access_key", SecretStr("secret")
+    )
+
+
+def test_a_media_upload_that_captured_the_switch_off_writes_no_copy_job(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.models.credit_object_copy import CreditObjectCopyJob
+
+    _open_copy_gate_process_wide(monkeypatch)
+    switch(False)
+    created = _upload(client, world, _pdf(1_000), "application/pdf")
+    assert created.status_code == 201
+    deleted = client.delete(f"{MEDIA}/{created.json()['id']}", headers=world.headers())
+    assert deleted.status_code == 204
+    assert client._submit(_rows(CreditObjectCopyJob)) == []
+    # Control: the same request captured ON writes the copy job.
+    switch(True)
+    assert _upload(client, world, _pdf(1_000), "application/pdf").status_code == 201
+    assert [job.operation for job in client._submit(_rows(CreditObjectCopyJob))] == [
+        "copy"
+    ]

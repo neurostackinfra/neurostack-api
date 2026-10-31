@@ -69,6 +69,7 @@ from src.services.credit_metering import (
     CreditEnforcementUnavailable,
     CreditTenantGone,
 )
+from src.services.credit_switch import request_credit_switch
 from src.services.media_assets import (
     MediaAssetDomainError,
     MediaStorageCapacityExceeded,
@@ -576,6 +577,7 @@ async def upload_media_asset(
                 source_kind="media",
                 source_id=asset.id,
                 tenant_id=asset.tenant_id,
+                switch_on=mode.switch_on,
             )
         except Exception as error:
             logger.warning(
@@ -1041,6 +1043,7 @@ async def delete_media_asset(
                 source_kind="media",
                 source_id=deleted.id,
                 tenant_id=target.id,
+                switch_on=request_credit_switch(request),
             )
         except Exception as error:
             logger.warning(
