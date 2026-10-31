@@ -99,6 +99,10 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from src.config.logging import get_logger
 from src.models.credit import CreditEnforcementBinding
+from src.observability.metric_dimensions import (
+    ContractCounter,
+    precreate_closed_children,
+)
 from src.repositories.credit import CreditRepository, FactOutboxRow
 from src.repositories.credit_fact_ack import CreditFactAckRepository, FactHandoff
 from src.services.billing_catalog import catalog_snapshot_bytes
@@ -191,6 +195,33 @@ RejectionReason = Literal[
     "outbox_identity_mismatch",
     "catalog_mismatch",
 ]
+
+
+# Group 7 deliverable 4: what the inbox took (and which rejected acks were
+# written), counted after the commit and only with the switch effective.
+# Closed vocabularies; no builder, aggregate or event identity.
+CREDIT_FACT_INBOX_TOTAL = precreate_closed_children(
+    ContractCounter(
+        "neurostack_credit_fact_inbox_total",
+        "billing.fact.v1 facts handled by the credit consumer, by outcome",
+        ["outcome"],
+    )
+)
+CREDIT_FACT_REJECTED_TOTAL = precreate_closed_children(
+    ContractCounter(
+        "neurostack_credit_fact_rejected_total",
+        "billing.fact.v1 facts acked rejected by the credit consumer, by reason",
+        ["reason"],
+    )
+)
+
+
+def _count_handling(handling: FactHandling) -> None:
+    if not credit_switch_effective():
+        return
+    CREDIT_FACT_INBOX_TOTAL.labels(outcome=handling.outcome).inc()
+    if handling.outcome == "rejected" and handling.reason is not None:
+        CREDIT_FACT_REJECTED_TOTAL.labels(reason=handling.reason).inc()
 
 
 class CreditFactConsumerError(RuntimeError):
@@ -540,7 +571,9 @@ class CreditFactConsumer:
         digests = consumer_contract_digests()
         factory = self._session_factory or default_session_factory()
         async with asyncio.timeout(self._timeout):
-            return await self._in_own_session(factory, payload, digests)
+            handling = await self._in_own_session(factory, payload, digests)
+        _count_handling(handling)
+        return handling
 
     async def _in_own_session(
         self,

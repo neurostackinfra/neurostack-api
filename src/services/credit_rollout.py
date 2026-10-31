@@ -49,6 +49,7 @@ from src.models.handoff import HandoffRecord
 from src.models.tenant import Tenant
 from src.observability.metric_dimensions import ContractCounter as Counter
 from src.observability.metric_dimensions import ContractGauge as Gauge
+from src.observability.metric_dimensions import precreate_closed_children
 from src.repositories.credit import LOT_DECREASES, LOT_INCREASES, CreditRepository
 from src.services.billing_outbox import authoritative_billing_fact_schema_digest
 from src.services.credit_ledger import start_of_civil_day
@@ -83,19 +84,17 @@ OBSERVATIONAL_DROP_REASONS: Final = frozenset(
 CREDIT_RECONCILIATION_READY = Gauge(
     "neurostack_credit_reconciliation_ready",
     "Whether credit reconciliation is currently ready (1=true).",
-    registry=None,
 )
 CREDIT_ORPHAN_EFFECTS = Gauge(
     "neurostack_credit_orphan_effects",
     "Open credit effects whose durable decision/outbox boundary is incomplete.",
-    registry=None,
 )
 CREDIT_OBSERVATIONAL_WRITE_DROPPED_TOTAL = Counter(
     "neurostack_credit_observational_write_dropped_total",
     "Best-effort observational writes discarded by bounded reason.",
     ["reason"],
-    registry=None,
 )
+precreate_closed_children(CREDIT_OBSERVATIONAL_WRITE_DROPPED_TOTAL)
 
 
 @dataclass(frozen=True)

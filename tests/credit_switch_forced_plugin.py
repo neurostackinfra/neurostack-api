@@ -59,15 +59,54 @@ stored rows and swept in memory, never persisted).  The plugin wraps that
 method the same way and counts its outcomes (``builder``, ``standalone``):
 the existing suites never call a credit read, so their forced runs must
 show none, while the Group 6 suites exercise it under the forced switch.
+
+Group 7: the "must show only ``main``" rules above are enforced, not only
+printed.  Every enforced capture, enforced or ``credit_pending`` webhook
+pre-check and enforced inventory mode is attributed to the test file that
+was running; a file outside :data:`ENFORCED_SUITES` (the suites that set
+``credit_enforcement_at`` themselves) fails the session, and the terminal
+summary names each offending file and verdict.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+# The only suites allowed to record an enforced verdict under this plugin:
+# each sets ``credit_enforcement_at`` (or an enforced mode) itself.
+ENFORCED_SUITES = frozenset(
+    {
+        "tests/api/test_admin_credit_rollout.py",
+        "tests/api/test_credit_category_gate.py",
+        "tests/api/test_credit_media_assets.py",
+        "tests/api/test_credit_principal_authorization.py",
+        "tests/api/test_credit_rag.py",
+        "tests/api/test_credit_suspension_events.py",
+        "tests/api/test_credit_suspension_rag_media.py",
+        "tests/api/test_credit_suspension_webhooks.py",
+        "tests/api/test_credits.py",
+        "tests/api/test_events_credit_enforced.py",
+        "tests/integration/test_credit_enforcement_rollout_fence.py",
+        "tests/integration/test_credit_ledger_postgres.py",
+        "tests/integration/test_credit_maintenance_postgres.py",
+        "tests/integration/test_credit_metering_postgres.py",
+        "tests/integration/test_credit_retention_postgres.py",
+        "tests/integration/test_credit_schema_dominance_postgres.py",
+        "tests/services/test_credit_inventory.py",
+        "tests/services/test_credit_ledger.py",
+        "tests/services/test_credit_lifecycle.py",
+        "tests/services/test_credit_metering.py",
+        "tests/services/test_credit_response_publisher.py",
+    }
+)
+_current_suite = "<outside a test>"
+_unlisted_enforced: Counter[tuple[str, str]] = Counter()
 
 _PATCHER = pytest.StashKey[pytest.MonkeyPatch]()
 _reads = 0
@@ -85,6 +124,35 @@ _ORIGINAL_UPLOAD_WRITER: Any = None
 _ORIGINAL_EGRESS_WRITER: Any = None
 _credit_reads: Counter[str] = Counter()
 _ORIGINAL_SNAPSHOT_BOOK: Any = None
+
+
+def _suite_of(item: pytest.Item) -> str:
+    path = Path(str(item.path)).resolve()
+    try:
+        return path.relative_to(_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _enforced_verdict(kind: str) -> None:
+    if _current_suite not in ENFORCED_SUITES:
+        _unlisted_enforced[(_current_suite, kind)] += 1
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: Any) -> Iterator[None]:
+    global _current_suite
+    _current_suite = _suite_of(item)
+    try:
+        yield
+    finally:
+        _current_suite = "<outside a test>"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if _unlisted_enforced and session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def _forced_effective(_self: Any) -> bool:
@@ -110,6 +178,8 @@ async def _counted_capture(*args: Any, **kwargs: Any) -> Any:
         _captures[f"raised {type(error).__name__}"] += 1
         raise
     _captures["main" if enforcement is None else "enforced"] += 1
+    if enforcement is not None:
+        _enforced_verdict("enforced-path capture")
     return enforcement
 
 
@@ -123,8 +193,10 @@ async def _counted_webhook_precheck(*args: Any, **kwargs: Any) -> Any:
         _webhook_prechecks["main"] += 1
     elif verdict == "credit_pending":
         _webhook_prechecks["credit_pending"] += 1
+        _enforced_verdict("webhook pre-check credit_pending")
     else:
         _webhook_prechecks["enforced"] += 1
+        _enforced_verdict("webhook pre-check enforced")
     return verdict
 
 
@@ -136,6 +208,7 @@ async def _counted_mode(*args: Any, **kwargs: Any) -> Any:
         raise
     if mode.enforced:
         _inventory_modes["enforced"] += 1
+        _enforced_verdict("inventory mode enforced")
     elif mode.observational:
         _inventory_modes["observational"] += 1
     else:
@@ -258,6 +331,14 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:
     terminalreporter.write_line(
         f"credit read snapshots: {sum(_credit_reads.values())}" f" ({reads or 'none'})"
     )
+    if _unlisted_enforced:
+        terminalreporter.write_line(
+            "credit enforced verdicts in unlisted suites (session FAILED):", red=True
+        )
+        for (suite, kind), count in sorted(_unlisted_enforced.items()):
+            terminalreporter.write_line(f"  {suite}: {kind}={count}", red=True)
+    else:
+        terminalreporter.write_line("credit enforced verdicts in unlisted suites: none")
 
 
 def _assert_forced() -> None:

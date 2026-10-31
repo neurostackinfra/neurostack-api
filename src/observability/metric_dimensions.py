@@ -8,6 +8,7 @@ in structured logs; only bounded technical dimensions are accepted here.
 
 from __future__ import annotations
 
+import itertools
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -506,6 +507,38 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
                 "route_busy", "pool_exhausted", "timeout", "failed", "tenant_gone"
             )
         ),
+        # Group 7 deliverable 4: inbox, rejected ack, suspension, balance,
+        # debt and hold/purge -- counters at existing transition points only
+        # (no scrape-time read).  Closed vocabularies; no identity label.
+        "neurostack_credit_fact_inbox": _contract(
+            outcome=_enum("accepted", "rejected", "stale", "replay")
+        ),
+        "neurostack_credit_fact_rejected": _contract(
+            reason=_enum(
+                "payload_digest_mismatch",
+                "partial_credit_line",
+                "ambiguous_line_allocation",
+                "fact_violation",
+                "outbox_identity_mismatch",
+                "catalog_mismatch",
+            )
+        ),
+        "neurostack_credit_lifecycle_transitions": _contract(
+            transition=_enum(
+                "opened", "grace_shortened", "suspended", "deletion_due", "reactivated"
+            )
+        ),
+        "neurostack_credit_balance_thresholds": _contract(
+            threshold=_enum("50", "90", "100")
+        ),
+        "neurostack_credit_debt_recorded_millicredits": _NONE,
+        "neurostack_credit_debt_settled_millicredits": _NONE,
+        "neurostack_credit_retention_operations": _contract(
+            operation=_enum(
+                "hold_requested", "hold_activated", "hold_released", "purge"
+            ),
+            outcome=_enum("recorded", "refused", "disabled"),
+        ),
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(
             intent_category=_INTENT, funnel_stage=_FUNNEL_STAGE, mode=_FLOW_MODE
@@ -658,6 +691,30 @@ def ContractHistogram(*args: Any, **kwargs: Any) -> PrometheusHistogram:
     return enforce_metric_dimensions(PrometheusHistogram(*args, **kwargs))
 
 
+def precreate_closed_children(metric: _MetricT) -> _MetricT:
+    """Create every child of a closed-vocabulary family at its zero value.
+
+    A labeled counter only exports a series after its first ``labels()``
+    call, so ``increase()`` never sees a process's first event for a label.
+    Pre-created zeros keep rare events visible and never report a value
+    above zero.  Only enum vocabularies qualify (no normalizer/template)."""
+
+    contract = metric_dimension_contract(metric._name)
+    if not contract.labels:
+        return metric
+    vocabularies: list[list[str]] = []
+    for label in contract.labels:
+        policy = contract.policies[label]
+        if policy.source != "enum" or policy.vocabulary is None:
+            raise MetricDimensionContractError(
+                f"{metric._name}.{label} has no closed vocabulary to pre-create"
+            )
+        vocabularies.append(sorted(policy.vocabulary))
+    for values in itertools.product(*vocabularies):
+        metric.labels(**dict(zip(contract.labels, values)))
+    return metric
+
+
 def validate_metric_registry(registry: CollectorRegistry) -> None:
     """Validate all collected ``neurostack_*`` families and observed values."""
 
@@ -696,5 +753,6 @@ __all__ = [
     "bounded_metric_labels",
     "enforce_metric_dimensions",
     "metric_dimension_contract",
+    "precreate_closed_children",
     "validate_metric_registry",
 ]

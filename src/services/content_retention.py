@@ -78,11 +78,16 @@ from src.models.media_asset import MediaAsset
 from src.models.operational_capability import CreditOperationalAuthorization
 from src.models.tenant import Tenant
 from src.models.user import User
+from src.observability.metric_dimensions import (
+    ContractCounter,
+    precreate_closed_children,
+)
 from src.repositories.content_retention import (
     ContentRetentionRepository,
     as_utc,
     hold_scope_order,
 )
+from src.services.credit_switch import credit_switch_effective
 from src.storage.credit_retention_adapter import derived_point_ids
 
 logger = get_logger(__name__)
@@ -111,6 +116,24 @@ _EVENT_ROLE: Final[dict[str, str]] = {
     "hold_activated": LEGAL_HOLD_OFFICER,
     "hold_released": LEGAL_HOLD_RELEASE_OFFICER,
 }
+
+
+# Group 7 deliverable 4: hold events and purge requests by closed operation
+# and outcome, only with the switch effective (no builder, scope or actor).
+CREDIT_RETENTION_OPERATIONS_TOTAL = precreate_closed_children(
+    ContractCounter(
+        "neurostack_credit_retention_operations_total",
+        "Legal hold events and purge requests, by operation and outcome",
+        ["operation", "outcome"],
+    )
+)
+
+
+def _count_retention(operation: str, outcome: str) -> None:
+    if credit_switch_effective():
+        CREDIT_RETENTION_OPERATIONS_TOTAL.labels(
+            operation=operation, outcome=outcome
+        ).inc()
 
 
 class RetentionRefused(Exception):
@@ -570,11 +593,22 @@ async def record_hold_event(
             config=config,
         )
         await session.commit()
+        _count_retention(event_type, "recorded")
         return result
     except DBAPIError as error:
         await session.rollback()
         if _serialization_failure(error):
             raise RetentionRefused("hold_conflict", 409) from error
+        raise
+    except RetentionRefused as refusal:
+        await session.rollback()
+        if refusal.status == 409:
+            # A policy refusal of the folded hold state (closed scope, intent
+            # exists, invalid state, reused authorization).  Validation (422),
+            # authorization (403), not-found (404) and the retryable
+            # ``hold_conflict`` are a caller's bad or racing request: logged
+            # by the route, never the hold-refused alert.
+            _count_retention(event_type, "refused")
         raise
     except BaseException:
         await session.rollback()
@@ -752,6 +786,7 @@ async def request_purge(*_args: Any, **_kwargs: Any) -> PurgeOutcome:
     enabling path is Group 8's; nothing here can be switched on."""
 
     logger.info(RETENTION_LOG, outcome=PURGE_DISABLED)
+    _count_retention("purge", "disabled")
     return PurgeOutcome(PURGE_DISABLED)
 
 
