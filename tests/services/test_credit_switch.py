@@ -26,6 +26,7 @@ postgres.py`` repeats the matrix on the real app against 037 and 038):
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -47,6 +48,10 @@ from sqlalchemy.pool import StaticPool
 from src.api.middleware.tenant_identity import TenantIdentityMiddleware
 from src.config.settings import settings
 from src.services import credit_switch
+from src.services.credit_rollout import (
+    start_credit_orphan_reconciliation_worker,
+    stop_credit_orphan_reconciliation_worker,
+)
 from src.services.credit_switch import (
     CREDIT_SCHEMA_MIN_REVISION,
     CREDIT_SWITCH_STATE_KEY,
@@ -1013,21 +1018,108 @@ async def test_the_ui_panel_degrades_to_none_while_off() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _credit_totals() -> dict[str, float]:
-    return {
-        sample.name: sample.value
-        for family in REGISTRY.collect()
-        if family.name.startswith("neurostack_credit_")
-        for sample in family.samples
-        if sample.name.endswith("_total")
-    }
+# A fresh interpreter with the config off: the app's served registry, every
+# credit emitter driven once through its real event point, then the export.
+# In-process, earlier tests that forced the switch on could already have
+# moved a counter, so the absolute "no _total > 0" claim needs its own
+# process.
+_SWITCH_OFF_EXPORT = """
+import asyncio, json
+from uuid import uuid4
+from prometheus_client import REGISTRY
+import src.api.main  # noqa: F401  (the app that serves /metrics)
+
+def credit_families():
+    return sorted(
+        f.name for f in REGISTRY.collect() if f.name.startswith("neurostack_credit_")
+    )
+
+served_by_main = credit_families()
+from src.observability.metric_dimensions import METRIC_DIMENSION_CONTRACTS
+from src.services import content_retention, credit_fact_consumer, credit_lifecycle
+from src.services.credit_ledger import LedgerWrites
+from src.services.credit_rollout import record_observational_write_drop
+from src.services.credit_switch import credit_switch_effective
+
+assert credit_switch_effective() is False
+for reason in ("route_busy", "pool_exhausted", "timeout", "failed", "tenant_gone"):
+    record_observational_write_drop(reason)
+credit_fact_consumer._count_handling(
+    credit_fact_consumer.FactHandling("rejected", uuid4(), reason="fact_violation")
+)
+credit_lifecycle._queue_outcome(
+    None,
+    credit_lifecycle.LifecycleOutcome(transitions=["suspended"], thresholds=[100]),
+    LedgerWrites(debts=[{"amount_mc": 400}], settlements=[{"amount_mc": 250}]),
+)
+asyncio.run(content_retention.request_purge())
+families = {f.name: f for f in REGISTRY.collect() if f.name.startswith("neurostack_credit_")}
+print(json.dumps({
+    "declared": sorted(n for n in METRIC_DIMENSION_CONTRACTS if n.startswith("neurostack_credit_")),
+    "served_by_main": served_by_main,
+    "served": sorted(families),
+    "totals": {
+        s.name: s.value
+        for f in families.values() for s in f.samples if s.name.endswith("_total")
+    },
+    "switch": REGISTRY.get_sample_value("neurostack_credit_switch_effective"),
+}))
+"""
+
+# What ``src.api.main`` serves on its own.  NOT yet served by the app:
+# ``neurostack_credit_fact_inbox`` and ``neurostack_credit_fact_rejected``
+# live in ``src.services.credit_fact_consumer``, which main.py does not import
+# (its wiring into the billing fact transport belongs to another wish); they
+# appear in /metrics only once that module is imported.
+_SERVED_BY_MAIN = [
+    "neurostack_credit_balance_thresholds",
+    "neurostack_credit_debt_recorded_millicredits",
+    "neurostack_credit_debt_settled_millicredits",
+    "neurostack_credit_lifecycle_transitions",
+    "neurostack_credit_observational_write_dropped",
+    "neurostack_credit_orphan_effects",
+    "neurostack_credit_reconciliation_ready",
+    "neurostack_credit_retention_operations",
+    "neurostack_credit_switch_effective",
+]
+_NOT_YET_SERVED_BY_MAIN = [
+    "neurostack_credit_fact_inbox",
+    "neurostack_credit_fact_rejected",
+]
 
 
 def test_switch_off_exports_zero_and_no_credit_total_above_zero() -> None:
-    _publish(False)
+    root = Path(__file__).resolve().parents[2]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONSTARTUP"}
+    }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["CREDIT_HOT_PATH_ENABLED"] = "false"
+    result = subprocess.run(
+        [sys.executable, "-c", _SWITCH_OFF_EXPORT],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    exported = json.loads(result.stdout.strip().splitlines()[-1])
 
-    assert REGISTRY.get_sample_value("neurostack_credit_switch_effective") == 0.0
-    assert all(value == 0 for value in _credit_totals().values())
+    # Exactly what the app alone serves, and what only the consumer adds.
+    assert exported["served_by_main"] == _SERVED_BY_MAIN
+    assert sorted(_SERVED_BY_MAIN + _NOT_YET_SERVED_BY_MAIN) == exported["declared"]
+    # Not vacuous: with the emitters imported every declared credit family is
+    # in the registry, and pre-created and label-free _total samples are there
+    # to be read.
+    assert exported["served"] == exported["declared"]
+    assert "neurostack_credit_debt_recorded_millicredits_total" in exported["totals"]
+    assert "neurostack_credit_fact_inbox_total" in exported["totals"]
+    assert all(value == 0 for value in exported["totals"].values()), exported
+    assert exported["switch"] == 0.0
 
 
 def test_the_gauge_follows_the_verdict_including_a_forced_one(
@@ -1069,9 +1161,36 @@ def test_the_lifespan_with_the_config_off_reads_nothing_and_starts_no_task(
 
     assert response.status_code == 200
     assert reading == CreditSwitchReading(False, "config_disabled")
-    assert "credit-switch-refresher" not in names
+    # The EXACT credit tasks of a config-off lifespan.  The refresher,
+    # response publisher, lifecycle worker and orphan worker are absent.
+    # ``credit-retention-sweep`` is the owner-approved always-on exception
+    # (OD-3); ``credit-object-worker`` is gated on the environment
+    # (development/test only, its loop inert with the switch off), so it runs
+    # under this suite's ``test`` environment.
+    assert {name for name in names if name.startswith("credit-")} == {
+        "credit-retention-sweep",
+        "credit-object-worker",
+    }
     assert REGISTRY.get_sample_value("neurostack_credit_switch_effective") == 0.0
     assert credit_switch_reading() == CreditSwitchReading(False, "stopped")
+
+
+async def test_the_orphan_worker_starts_only_with_the_config_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "credit_hot_path_enabled", False)
+    assert start_credit_orphan_reconciliation_worker() is None
+
+    monkeypatch.setattr(settings, "credit_hot_path_enabled", True)
+    task = start_credit_orphan_reconciliation_worker()
+    assert task is not None
+    try:
+        assert task.get_name() == "credit-orphan-worker"
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        await stop_credit_orphan_reconciliation_worker(task)
+    assert task.cancelled()
 
 
 def test_the_lifespan_with_the_config_on_fails_closed_on_sqlite(
@@ -1188,6 +1307,77 @@ def test_the_forced_plugin_delivers_true_to_request_state(tmp_path: Path) -> Non
         forced.stdout,
     )
     assert reads is not None and int(reads.group(1)) >= 1, forced.stdout
+
+
+_UNLISTED_ENFORCED_PROBE = """
+import asyncio
+
+import pytest
+
+import tests.credit_switch_forced_plugin as plugin
+from src.services import credit_metering
+
+
+@pytest.mark.parametrize("enforced", [ENFORCED])
+def test_an_unlisted_suite_runs_a_capture(monkeypatch, enforced):
+    async def original(*_args, **_kwargs):
+        return object() if enforced else None
+
+    monkeypatch.setattr(plugin, "_ORIGINAL_CAPTURE", original)
+    asyncio.run(credit_metering.capture_events_enforcement())
+"""
+
+
+@pytest.mark.parametrize("enforced", [True, False])
+def test_the_forced_plugin_fails_an_unlisted_suite_with_an_enforced_verdict(
+    tmp_path: Path, enforced: bool
+) -> None:
+    probe = tmp_path / "test_unlisted_enforced_probe.py"
+    probe.write_text(
+        _UNLISTED_ENFORCED_PROBE.replace("ENFORCED", repr(enforced)),
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONSTARTUP"}
+    }
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            "--rootdir",
+            str(tmp_path),
+            "-p",
+            "tests.credit_switch_forced_plugin",
+            str(probe),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert re.search(r"\b1 passed\b", result.stdout), result.stdout + result.stderr
+    if enforced:
+        assert result.returncode == 1, result.stdout
+        assert "credit enforced verdicts in unlisted suites (session FAILED)" in (
+            result.stdout
+        )
+        assert "test_unlisted_enforced_probe.py: enforced-path capture=1" in (
+            result.stdout
+        )
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "credit enforced verdicts in unlisted suites: none" in result.stdout
 
 
 def test_the_forced_probe_fails_without_the_plugin(tmp_path: Path) -> None:

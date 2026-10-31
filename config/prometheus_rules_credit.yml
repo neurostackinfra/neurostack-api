@@ -3,8 +3,11 @@ groups:
     rules:
       # This file is deliberately not mounted by this group.  Group 8 owns
       # production wiring after the operational opening decision.
+      # Every series here is emitted only while the credit switch is
+      # effective; the gauges are gated on it so a switched-off process
+      # (gauge default 0) never alerts.
       - alert: NeurostackCreditReconciliationUnavailable
-        expr: neurostack_credit_reconciliation_ready < 1
+        expr: neurostack_credit_reconciliation_ready < 1 and neurostack_credit_switch_effective == 1
         for: 10m
         labels:
           severity: warning
@@ -17,3 +20,27 @@ groups:
           severity: warning
         annotations:
           summary: Credit effect reconciliation found an orphan
+      - alert: NeurostackCreditFactRejected
+        expr: increase(neurostack_credit_fact_rejected_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The credit consumer acked a billing fact as rejected
+      - alert: NeurostackCreditObservationalWritesDropped
+        expr: increase(neurostack_credit_observational_write_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Credit observational writes were dropped
+      - alert: NeurostackCreditBuilderSuspended
+        expr: increase(neurostack_credit_lifecycle_transitions_total{transition="suspended"}[15m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: A builder was suspended after its debt grace
+      - alert: NeurostackCreditRetentionRefused
+        expr: increase(neurostack_credit_retention_operations_total{outcome="refused"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A legal hold event was refused by the folded hold policy (409)

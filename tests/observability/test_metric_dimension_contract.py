@@ -35,6 +35,9 @@ _APPLICATION_METRIC_MODULES = (
     "src.observability.scheduling_gate",
     "src.services.credit_switch",
     "src.services.credit_rollout",
+    "src.services.credit_fact_consumer",
+    "src.services.credit_lifecycle",
+    "src.services.content_retention",
     "src.services.handoff_service",
 )
 
@@ -129,8 +132,11 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
     # 61 pre-existing families + 7 Group 3 billing families + 2 Group 5
     # control-plane families (Group 10 E7 retired the two migration families)
     # + 4 Group 9 billing fact worker families + 1 Group 6b billing summary
-    # family + 1 credit-system Group 1b switch family.
-    assert len(METRIC_DIMENSION_CONTRACTS) == 79
+    # family + 1 credit-system Group 1b switch family + 3 Group 7 readiness
+    # families + 7 Group 7 deliverable-4 families (inbox, rejected ack,
+    # lifecycle transitions, balance thresholds, debt recorded, debt settled,
+    # hold/purge).
+    assert len(METRIC_DIMENSION_CONTRACTS) == 86
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 
@@ -138,6 +144,31 @@ def test_credit_identity_label_names_are_forbidden_and_unused() -> None:
     assert _CREDIT_IDENTITY_LABELS <= _FORBIDDEN_LABEL_NAMES
     for metric_name, contract in METRIC_DIMENSION_CONTRACTS.items():
         assert not set(contract.labels) & _FORBIDDEN_LABEL_NAMES, metric_name
+
+
+def test_an_undeclared_credit_family_or_identity_label_fails_closed() -> None:
+    with pytest.raises(MetricDimensionContractError, match="unknown"):
+        ContractCounter(
+            "neurostack_credit_undeclared_total",
+            "undeclared credit family",
+            registry=None,
+        )
+    with pytest.raises(MetricDimensionContractError, match="labels"):
+        ContractCounter(
+            "neurostack_credit_fact_rejected_total",
+            "credit family with an identity label",
+            ["builder_id"],
+            registry=None,
+        )
+    registry = CollectorRegistry()
+    Counter(
+        "neurostack_credit_fact_inbox_total",
+        "identity-bearing regression fixture",
+        ["outcome", "tenant_id"],
+        registry=registry,
+    ).labels(outcome="accepted", tenant_id="t").inc()
+    with pytest.raises(MetricDimensionContractError, match="labels"):
+        validate_metric_registry(registry)
 
 
 def test_the_credit_switch_family_is_declared_label_free() -> None:

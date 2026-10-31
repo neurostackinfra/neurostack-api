@@ -75,12 +75,17 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Final, Literal
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from src.config.logging import get_logger
 from src.config.settings import settings
 from src.models.credit import CreditLedgerEntry
+from src.observability.metric_dimensions import (
+    ContractCounter,
+    precreate_closed_children,
+)
 from src.repositories.content_retention import ContentRetentionRepository, as_utc
 from src.services.credit_ledger import (
     CREDIT_TIMEZONE,
@@ -90,7 +95,7 @@ from src.services.credit_ledger import (
     LotState,
     start_of_civil_day,
 )
-from src.services.credit_switch import run_credit_worker_tick
+from src.services.credit_switch import credit_switch_effective, run_credit_worker_tick
 
 if TYPE_CHECKING:
     from src.models.content_retention import CreditLifecycleEpisode
@@ -103,6 +108,36 @@ THRESHOLDS: Final = (50, 90, 100)
 LIFECYCLE_LOG: Final = "credit lifecycle"
 WORKER_BATCH: Final = 50
 _OPENED_EPISODES: Final = "credit_lifecycle_opened_episodes"
+
+# Group 7 deliverable 4: suspension, balance thresholds, debt recorded and
+# debt settled.  Queued by the evaluation that writes them (the same point as
+# ``LIFECYCLE_LOG``, inside the caller's transaction) and emitted only once
+# that transaction COMMITS: a refused request that rolls back (402 of an
+# exhausted builder's upload) counts nothing.  Switch-gated; label-free or
+# closed; never a builder.
+CREDIT_LIFECYCLE_TRANSITIONS_TOTAL = precreate_closed_children(
+    ContractCounter(
+        "neurostack_credit_lifecycle_transitions_total",
+        "Credit exhaustion lifecycle transitions recorded, by transition",
+        ["transition"],
+    )
+)
+CREDIT_BALANCE_THRESHOLDS_TOTAL = precreate_closed_children(
+    ContractCounter(
+        "neurostack_credit_balance_thresholds_total",
+        "Usable-capacity consumption thresholds reached, by threshold percent",
+        ["threshold"],
+    )
+)
+CREDIT_DEBT_RECORDED_MC_TOTAL = ContractCounter(
+    "neurostack_credit_debt_recorded_millicredits_total",
+    "Millicredits of debt recorded by committed ledger writes",
+)
+CREDIT_DEBT_SETTLED_MC_TOTAL = ContractCounter(
+    "neurostack_credit_debt_settled_millicredits_total",
+    "Millicredits of debt settled by committed ledger writes",
+)
+_PENDING_METRICS: Final = "credit_lifecycle_pending_metrics"
 
 LifecycleState = Literal["active", "grace", "suspended", "deletion_due"]
 LifecycleSource = Literal["effect", "worker"]
@@ -287,6 +322,67 @@ class LifecycleOutcome:
 _INERT: Final = LifecycleOutcome()
 
 
+_Increment = tuple[str, str, float]  # (family, label value or "", amount)
+
+
+def _emit_pending(session: Session) -> None:
+    pending: list[_Increment] = session.info.pop(_PENDING_METRICS, [])
+    if not credit_switch_effective():
+        return
+    for family, value, amount in pending:
+        if family == "transition":
+            CREDIT_LIFECYCLE_TRANSITIONS_TOTAL.labels(transition=value).inc(amount)
+        elif family == "threshold":
+            CREDIT_BALANCE_THRESHOLDS_TOTAL.labels(threshold=value).inc(amount)
+        elif family == "debt_recorded":
+            CREDIT_DEBT_RECORDED_MC_TOTAL.inc(amount)
+        elif family == "debt_settled":
+            CREDIT_DEBT_SETTLED_MC_TOTAL.inc(amount)
+
+
+def _discard_pending(session: Session) -> None:
+    session.info.pop(_PENDING_METRICS, None)
+
+
+def _queue_outcome(
+    session: object, outcome: LifecycleOutcome, writes: LedgerWrites | None
+) -> None:
+    """Hold this evaluation's increments until the caller's commit.
+
+    One ``after_commit`` / ``after_rollback`` pair per session (registered
+    on first use); every evaluation of a transaction appends to the same
+    list, emitted once by its commit or dropped by its rollback.  A session
+    that is not a SQLAlchemy session has no commit to observe: nothing is
+    queued."""
+
+    if not credit_switch_effective():
+        return
+    sync = getattr(session, "sync_session", session)
+    if not isinstance(sync, Session):
+        return
+    increments: list[_Increment] = [
+        ("transition", transition, 1.0) for transition in outcome.transitions
+    ]
+    increments += [
+        ("threshold", str(threshold), 1.0) for threshold in outcome.thresholds
+    ]
+    if writes is not None:
+        debt_mc = sum(int(row["amount_mc"]) for row in writes.debts)
+        settled_mc = sum(int(row["amount_mc"]) for row in writes.settlements)
+        if debt_mc > 0:
+            increments.append(("debt_recorded", "", float(debt_mc)))
+        if settled_mc > 0:
+            increments.append(("debt_settled", "", float(settled_mc)))
+    if not increments:
+        return
+    if _PENDING_METRICS not in sync.info:
+        sync.info[_PENDING_METRICS] = []
+        if not event.contains(sync, "after_commit", _emit_pending):
+            event.listen(sync, "after_commit", _emit_pending)
+            event.listen(sync, "after_rollback", _discard_pending)
+    sync.info[_PENDING_METRICS].extend(increments)
+
+
 def _exhaustion_instant(
     book: LedgerBook, writes: LedgerWrites, at: datetime, enforcement: datetime
 ) -> datetime | None:
@@ -402,6 +498,7 @@ class CreditLifecycle:
                 deletion_marked="deletion_due" in recorded,
             )
         await self._thresholds(book, at, closed, available, outcome)
+        _queue_outcome(self.session, outcome, writes)
         if outcome.transitions or outcome.thresholds:
             logger.info(
                 LIFECYCLE_LOG,
