@@ -126,12 +126,13 @@ RETRY_EXHAUSTED_DETAIL: Final = "retry cap exhausted"
 # Presenting a fact to a real consumer is NOT safe yet.  Three binding
 # preconditions must all be met before this may become ``False``:
 #
-# 1. The attempt is counted in a committed lease BEFORE the fact is presented.
-#    Today ``attempt_count``/``last_attempt_at`` are written only after the
-#    transport returns, in the same transaction, so a crash or lost commit
-#    after a consumer-visible send leaves the delivery ``pending`` with no
-#    attempt counted: it is presented again at once, unbounded by the backoff
-#    and by ``max_attempts``.
+# 1. MET by the two-phase record of ``BillingFactPublisher.publish_next``:
+#    the attempt is counted in a committed lease BEFORE the fact is
+#    presented, so a crash or lost commit after a consumer-visible send
+#    leaves exactly that attempt counted, and the backoff and
+#    ``max_attempts`` still bound the re-presentation.  The legacy
+#    ``publish_pending`` is still single-phase and is not a delivery path:
+#    it must never be wired, whatever this flag says.
 # 2. ``blocked`` deliveries have an operator requeue path (today only a late
 #    valid ack or manual SQL leaves ``blocked``).
 # 3. The runbook ``docs/runbooks/asaas-billing-reconciliation.md`` covers the
@@ -144,6 +145,19 @@ PRESENTATION_PRECONDITIONS_OPEN: Final = True
 
 class PresentationPreconditionsOpen(RuntimeError):
     """A consumer transport was used before presentation is crash-safe."""
+
+
+class TransportNotReady(RuntimeError):
+    """The consumer turned the presentation away unread: NOT an attempt.
+
+    A fact transport raises this when the consumer's readiness flipped off
+    during a presentation, before the consumer acted on the fact.  The
+    publisher gives back the attempt it leased (``attempt_count`` is
+    compensated) and keeps ``last_attempt_at``, so the fact is due again
+    only after the backoff: a consumer that stays unready neither spends
+    ``max_attempts`` nor makes the worker spin.  Any other exception from
+    the transport is a failed, counted attempt.
+    """
 
 
 def require_presentation_allowed() -> None:
@@ -248,7 +262,7 @@ class PublishedFact:
     payload: dict[str, object]
 
 
-PublishOutcome = Literal["presented", "failed", "exhausted", "skipped"]
+PublishOutcome = Literal["presented", "failed", "exhausted", "skipped", "not_ready"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +301,20 @@ class PublishAttempt:
     outcome: PublishOutcome
     attempt_count: int
     failure: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Lease:
+    """Phase-1 evidence: the attempt committed before the fact is presented.
+
+    ``attempt_count``/``leased_at`` are the values this publisher wrote; phase
+    2 records the outcome only while the row still carries both.
+    """
+
+    event_id: UUID
+    attempt_count: int
+    leased_at: datetime
+    payload: dict[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1418,32 +1446,81 @@ class BillingFactPublisher:
         policy: FactRetryPolicy,
         timeout: float,
     ) -> PublishAttempt | None:
-        """Claim, present and record at most one due fact; caller commits.
+        """Lease, present and record at most one due fact, in two phases.
 
-        The claim is ``FOR UPDATE OF billing_fact_deliveries SKIP LOCKED`` and
-        the row stays locked until the caller commits the recorded attempt, so
-        concurrent workers never present the same fact at the same time and
-        the next claim by any worker re-reads ``last_attempt_at`` and honours
-        the backoff.  A fact whose ack was committed before the post-lock
-        re-read below is not presented again (the reconciler converges it);
-        an ack committed after that re-read cannot stop the presentation in
-        flight.  When ``policy`` is spent the delivery becomes ``blocked``
-        with alert evidence and no presentation; the fact is retained and a
-        later valid ack still converges it.  ``None`` means nothing is due.
+        **Phase 1** claims the oldest due delivery ``FOR UPDATE OF
+        billing_fact_deliveries SKIP LOCKED``, re-reads its ack, and either
+        blocks a spent delivery or counts the attempt (``attempt_count + 1``,
+        ``last_attempt_at = now``) and COMMITS that before the consumer sees
+        the fact.  The committed attempt is the lease: no row lock is held
+        while the consumer runs, and no worker claims the fact again until
+        its backoff has passed, at least ``policy.base_backoff``, which must
+        exceed ``timeout`` (refused otherwise).  **Phase 2** re-locks the row
+        and records the outcome (``awaiting_ack`` or ``pending``), then
+        commits.  :class:`TransportNotReady` is no attempt: phase 2 gives the
+        leased count back and keeps ``last_attempt_at``, so the fact is not
+        due again before the backoff and the worker cannot spin on it.
 
-        The attempt is counted only after the transport returns, in the
-        caller's transaction: a crash or lost commit after a consumer-visible
-        send is not counted and bypasses the backoff and the cap.  That is
-        why this raises while ``PRESENTATION_PRECONDITIONS_OPEN`` is true.
+        A crash, kill or cancellation between the phases leaves exactly the
+        leased attempt counted and the previous state: the fact is presented
+        again after the backoff and ``max_attempts`` still bounds it (a
+        replayed fact is a no-op for the consumer).  Phase 2 writes nothing
+        when the delivery became terminal or the lease is no longer this
+        call's (a presentation that outlived it was re-leased elsewhere).
+
+        This method owns both commits, so ``db`` must have no transaction
+        open.  A fact whose ack was committed before the post-lock re-read
+        below is not presented (the reconciler converges it); an ack
+        committed later cannot stop the presentation in flight.  When
+        ``policy`` is spent the delivery becomes ``blocked`` with alert
+        evidence and no presentation; the fact is retained and a later valid
+        ack still converges it.  ``None`` means nothing is due.  Wall-clock
+        skew between workers shortens the lease by the same amount.
         """
 
         require_presentation_allowed()
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if timedelta(seconds=timeout) >= policy.base_backoff:
+            raise ValueError("timeout must be shorter than the retry base backoff")
+        if self._db.in_transaction():
+            raise RuntimeError(
+                "publish_next commits its own phases: call it with no open "
+                "transaction"
+            )
+        lease = await self._lease_next(policy)
+        if not isinstance(lease, _Lease):
+            return lease
+        failure: str | None = None
+        try:
+            await asyncio.wait_for(transport(lease.payload), timeout)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                # A real cancellation of this task: the leased attempt stays
+                # counted, so the fact is presented again after the backoff.
+                raise
+            # A stray CancelledError raised by the consumer code itself is a
+            # failed presentation, so the backoff and the cap still apply.
+            failure = "CancelledError"
+        except TransportNotReady:
+            return await self._record_outcome(lease, outcome="not_ready")
+        except Exception as exc:
+            failure = type(exc).__name__
+        return await self._record_outcome(
+            lease, outcome="presented" if failure is None else "failed", failure=failure
+        )
+
+    async def _lease_next(
+        self, policy: FactRetryPolicy
+    ) -> PublishAttempt | _Lease | None:
+        """Phase 1: claim one due delivery and commit its attempt (the lease)."""
+
         row = (
             await self._db.execute(self._due_claim(policy, _utc(self._now())))
         ).first()
         if row is None:
+            await self._db.rollback()
             return None
         delivery, outbox = row
         # Fresh statement, fresh READ COMMITTED snapshot: an ack committed
@@ -1456,9 +1533,11 @@ class BillingFactPublisher:
             )
             is not None
         ):
-            return PublishAttempt(
+            skipped = PublishAttempt(
                 delivery.event_id, "skipped", int(delivery.attempt_count)
             )
+            await self._db.rollback()  # nothing to write; releases the lock
+            return skipped
         if delivery.attempt_count >= policy.max_attempts:
             delivery.state = "blocked"
             await _append_alert_row(
@@ -1468,30 +1547,55 @@ class BillingFactPublisher:
                 detail=RETRY_EXHAUSTED_DETAIL,
                 observed_at=_utc(self._now()),
             )
-            await self._db.flush()
-            return PublishAttempt(
+            exhausted = PublishAttempt(
                 delivery.event_id, "exhausted", int(delivery.attempt_count)
             )
-        failure: str | None = None
-        try:
+            await self._db.commit()
+            return exhausted
+        lease = _Lease(
+            event_id=delivery.event_id,
+            attempt_count=int(delivery.attempt_count) + 1,
+            leased_at=_utc(self._now()),
             # A deep copy: a consumer can never alias the persisted payload.
-            await asyncio.wait_for(transport(copy.deepcopy(outbox.payload)), timeout)
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise  # a real cancellation of this task: roll back, retriable
-            # A stray CancelledError raised by the consumer code itself is a
-            # failed presentation, so the backoff and the cap still apply.
-            failure = "CancelledError"
-        except Exception as exc:
-            failure = type(exc).__name__
-        await self._record_attempt(delivery.event_id, delivered=failure is None)
-        return PublishAttempt(
-            delivery.event_id,
-            "presented" if failure is None else "failed",
-            int(delivery.attempt_count),
-            failure,
+            payload=copy.deepcopy(outbox.payload),
         )
+        delivery.attempt_count = lease.attempt_count
+        delivery.last_attempt_at = lease.leased_at
+        await self._db.commit()  # counted BEFORE the consumer can see it
+        return lease
+
+    async def _record_outcome(
+        self,
+        lease: _Lease,
+        *,
+        outcome: Literal["presented", "failed", "not_ready"],
+        failure: str | None = None,
+    ) -> PublishAttempt:
+        """Phase 2: record the presentation's outcome on the leased row."""
+
+        delivery = await self._db.scalar(
+            select(BillingFactDelivery)
+            .where(BillingFactDelivery.event_id == lease.event_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        attempt_count = lease.attempt_count
+        if (
+            delivery is not None
+            and delivery.state in _PRESENTABLE
+            and delivery.attempt_count == lease.attempt_count
+            and delivery.last_attempt_at is not None
+            and _utc(delivery.last_attempt_at) == lease.leased_at
+        ):
+            if outcome == "not_ready":
+                # Not an attempt: give the count back, keep last_attempt_at
+                # (and the state) so the fact waits its backoff again.
+                delivery.attempt_count = lease.attempt_count - 1
+            else:
+                delivery.state = "awaiting_ack" if outcome == "presented" else "pending"
+            attempt_count = int(delivery.attempt_count)
+        await self._db.commit()
+        return PublishAttempt(lease.event_id, outcome, attempt_count, failure)
 
     @staticmethod
     def _due_claim(
@@ -1502,18 +1606,24 @@ class BillingFactPublisher:
         Backoff is a closed ``CASE`` over ``attempt_count`` with bound cutoffs,
         so PostgreSQL re-checks it against the latest row version when a
         concurrent worker committed an attempt between snapshot and lock.
+        Only a delivery without ``last_attempt_at`` (never tried) is due at
+        once: a count of 0 with ``last_attempt_at`` set (a not-ready attempt
+        given back) waits ``base_backoff``, as after a first presentation.
         """
 
-        def cutoff(attempts: int) -> BindParameter[datetime]:
-            return literal(now - policy.backoff(attempts), DateTime(timezone=True))
+        def cutoff(wait: timedelta) -> BindParameter[datetime]:
+            return literal(now - wait, DateTime(timezone=True))
 
         due_before = case(
             {
-                attempts: cutoff(attempts)
-                for attempts in range(1, policy.max_attempts + 1)
+                0: cutoff(policy.base_backoff),
+                **{
+                    attempts: cutoff(policy.backoff(attempts))
+                    for attempts in range(1, policy.max_attempts + 1)
+                },
             },
             value=BillingFactDelivery.attempt_count,
-            else_=cutoff(policy.max_attempts),
+            else_=cutoff(policy.backoff(policy.max_attempts)),
         )
         return (
             select(BillingFactDelivery, BillingOutboxEvent)
@@ -1530,7 +1640,6 @@ class BillingFactPublisher:
                 )
                 .exists(),
                 or_(
-                    BillingFactDelivery.attempt_count == 0,
                     BillingFactDelivery.last_attempt_at.is_(None),
                     BillingFactDelivery.last_attempt_at <= due_before,
                 ),
@@ -1542,6 +1651,8 @@ class BillingFactPublisher:
         )
 
     async def _record_attempt(self, event_id: UUID, *, delivered: bool) -> None:
+        """Legacy single-phase record, after the send: ``publish_pending`` only."""
+
         delivery = await self._db.scalar(
             select(BillingFactDelivery)
             .where(BillingFactDelivery.event_id == event_id)

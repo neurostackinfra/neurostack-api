@@ -12,8 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import subprocess
+import sys
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import UUID, uuid4
 
@@ -42,7 +47,11 @@ from src.services.billing_outbox import (
     ACK_SCHEMA_VERSION,
     RETRY_EXHAUSTED_DETAIL,
     BillingFactProducer,
+    BillingFactPublisher,
     BillingFactReconciler,
+    FactRetryPolicy,
+    PublishAttempt,
+    TransportNotReady,
     _detail_digest,
 )
 from tests.integration.test_asaas_billing_postgres import (
@@ -54,6 +63,8 @@ from tests.integration.test_asaas_billing_postgres import (
 )
 
 pytestmark = pytest.mark.integration
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -320,7 +331,7 @@ async def _consumer_ack(
 
 
 class _Recorder:
-    """Per-worker fake consumer; the pause keeps the row lock held for a while."""
+    """Per-worker fake consumer; the pause keeps the presentation in flight."""
 
     def __init__(self, name: str, log: list[tuple[str, str]], pause: float) -> None:
         self.name, self.log, self.pause = name, log, pause
@@ -396,7 +407,7 @@ async def test_a_claimed_fact_is_skipped_not_waited_on_by_the_other_worker(
     try:
         holding_tick = asyncio.create_task(holder.run_tick())
         await asyncio.wait_for(held.wait(), timeout=10)
-        # The other backend finishes a whole tick while the row lock is held.
+        # The other backend finishes a whole tick while the lease is held.
         report = await asyncio.wait_for(other.run_tick(), timeout=10)
         assert not holding_tick.done()
         release.set()
@@ -557,7 +568,7 @@ async def test_lost_ack_replay_then_ack_converges_on_postgres(
 
 
 @pytest.mark.usefixtures("presentation_preconditions_waived")
-async def test_shutdown_mid_batch_keeps_committed_work_and_rolls_back_the_rest(
+async def test_shutdown_mid_batch_keeps_committed_work_and_the_in_flight_attempt(
     clean: _Harness,
 ) -> None:
     ids = [await _seed_fact(clean) for _ in range(3)]
@@ -574,7 +585,7 @@ async def test_shutdown_mid_batch_keeps_committed_work_and_rolls_back_the_rest(
     worker = BillingFactWorker(
         sessions,
         transport=second_hangs,
-        config=_config(transport_timeout_seconds=60.0),
+        config=_config(transport_timeout_seconds=30.0),
     )
     try:
         task = worker.start()
@@ -587,7 +598,8 @@ async def test_shutdown_mid_batch_keeps_committed_work_and_rolls_back_the_rest(
     first, in_flight = (UUID(event_id) for event_id in sent)
     (untouched,) = set(ids) - {first, in_flight}
     assert await _delivery(clean, first) == ("awaiting_ack", 1)  # committed
-    assert await _delivery(clean, in_flight) == ("pending", 0)  # rolled back
+    # Leased before it was presented: the cancel keeps the attempt counted.
+    assert await _delivery(clean, in_flight) == ("pending", 1)
     assert await _delivery(clean, untouched) == ("pending", 0)  # never claimed
     async with clean.engine.begin() as connection:
         locked = await connection.execute(
@@ -627,3 +639,488 @@ async def test_acked_unreconciled_facts_are_not_stale_or_escalated_on_postgres(
         assert await _delivery(clean, outbox_id) == ("pending", 0)
         assert await _alert_count(clean, outbox_id, ACK_OVERDUE_DETAIL) == 0
     assert await _alert_count(clean, mismatched, ACK_OVERDUE_DETAIL) == 1
+
+
+# ---------------------------------------------------------------------------
+# Two-phase attempt record (asaas-rollout-opening Group 2a)
+# ---------------------------------------------------------------------------
+
+# A throwaway worker process that is SIGKILLed by its own transport right
+# after the fact reached the consumer: no unwinding, no rollback, no phase 2;
+# PostgreSQL only sees the backend connection vanish.
+_KILLED_AFTER_SEND = textwrap.dedent("""
+    import asyncio, os, signal
+    from datetime import datetime
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession, async_sessionmaker, create_async_engine,
+    )
+    from sqlalchemy.pool import NullPool
+    from src.services import billing_outbox
+    from src.services.billing_fact_worker import (
+        BillingFactWorker, BillingFactWorkerConfig,
+    )
+
+    # The same explicit test-only waiver as the in-process fixture.
+    billing_outbox.PRESENTATION_PRECONDITIONS_OPEN = False
+    print(billing_outbox.__file__, flush=True)
+    now = datetime.fromisoformat(os.environ["FACT_KILL_NOW"])
+
+    async def killed_after_send(payload):
+        with open(os.environ["FACT_KILL_MARKER"], "w", encoding="utf-8") as sent:
+            sent.write(str(payload["event_id"]))
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    async def main():
+        engine = create_async_engine(os.environ["FACT_KILL_URL"], poolclass=NullPool)
+        sessions = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+        )
+        config = BillingFactWorkerConfig(
+            interval_seconds=30.0, batch_size=50, max_attempts=3,
+            stale_after_seconds=900.0, transport_timeout_seconds=5.0,
+        )
+        worker = BillingFactWorker(
+            sessions, transport=killed_after_send, config=config, now=lambda: now
+        )
+        await worker.run_tick()
+
+    asyncio.run(main())
+    raise SystemExit(3)  # reached only if nothing was presented
+""")
+
+
+async def _attempt_row(harness: _Harness, outbox_id: UUID) -> tuple[str, int, Any]:
+    (row,) = await _rows(
+        harness,
+        "SELECT state, attempt_count, last_attempt_at FROM billing_fact_deliveries "
+        "WHERE outbox_event_id = :id",
+        id=outbox_id,
+    )
+    return str(row[0]), int(row[1]), row[2]
+
+
+async def _unlocked(harness: _Harness) -> int:
+    async with harness.engine.begin() as connection:
+        locked = await connection.execute(
+            text(
+                "SELECT count(*) FROM (SELECT id FROM billing_fact_deliveries "
+                "FOR UPDATE NOWAIT) AS locked_rows"
+            )
+        )
+        return int(locked.scalar_one())
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_worker_killed_after_the_send_leaves_exactly_one_attempt_counted(
+    clean: _Harness, tmp_path: Path
+) -> None:
+    outbox_id = await _seed_fact(clean)
+    clock = _Clock()
+    marker = tmp_path / "sent"
+    child = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", _KILLED_AFTER_SEND],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "FACT_KILL_URL": clean.url.render_as_string(hide_password=False),
+            "FACT_KILL_NOW": clock.value.isoformat(),
+            "FACT_KILL_MARKER": str(marker),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    # This checkout's producer ran (not another worktree on the venv path),
+    # and the consumer really received the fact before the process died.
+    assert child.stdout.splitlines()[0] == str(ROOT / "src/services/billing_outbox.py")
+    assert marker.read_text(encoding="utf-8") == str(outbox_id)
+
+    state, count, last_attempt_at = await _attempt_row(clean, outbox_id)
+    assert (state, count, last_attempt_at) == ("pending", 1, clock.value)
+    assert await _unlocked(clean) == 1  # the dead backend left no row lock
+
+    log: list[tuple[str, str]] = []
+    engine, sessions = clean.factory()
+    restarted = BillingFactWorker(
+        sessions,
+        transport=_Recorder("restarted", log, pause=0.0),
+        config=_config(),
+        now=clock,
+    )
+    try:
+        # The attempt the dead process sent still holds its backoff...
+        assert (await restarted.run_tick()).presented == 0
+        clock.advance(seconds=59)
+        assert (await restarted.run_tick()).presented == 0
+        # ...and only then is the same fact presented again, counted once more.
+        clock.advance(seconds=2)
+        assert (await restarted.run_tick()).presented == 1
+    finally:
+        await engine.dispose()
+    assert log == [("restarted", str(outbox_id))]
+    assert await _delivery(clean, outbox_id) == ("awaiting_ack", 2)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_concurrent_workers_never_duplicate_an_attempt(clean: _Harness) -> None:
+    outbox_id = await _seed_fact(clean)
+    clock = _Clock()
+    held, release = asyncio.Event(), asyncio.Event()
+    holder_sent: list[str] = []
+
+    async def holding(payload: dict[str, object]) -> None:
+        holder_sent.append(str(payload["event_id"]))
+        held.set()
+        await release.wait()
+
+    # The competitor runs 59 s later: still inside backoff(1) of the lease.
+    late = _Clock()
+    late.value = clock.value + timedelta(seconds=59)
+    other_log: list[tuple[str, str]] = []
+    holder_engine, holder_sessions = clean.factory()
+    other_engine, other_sessions = clean.factory()
+    holder = BillingFactWorker(
+        holder_sessions,
+        transport=holding,
+        config=_config(transport_timeout_seconds=30.0),
+        now=clock,
+    )
+    other = BillingFactWorker(
+        other_sessions,
+        transport=_Recorder("other", other_log, pause=0.0),
+        config=_config(),
+        now=late,
+    )
+    try:
+        holding_tick = asyncio.create_task(holder.run_tick())
+        await asyncio.wait_for(held.wait(), timeout=10)
+        # Mid-presentation, from a third backend: the attempt is committed
+        # and no row lock is held, so only the lease keeps the others out.
+        in_flight = await _attempt_row(clean, outbox_id)
+        unlocked = await _unlocked(clean)
+        competing = await asyncio.wait_for(
+            asyncio.gather(other.run_tick(), other.run_tick()), timeout=10
+        )
+        assert not holding_tick.done()
+        release.set()
+        finished = await asyncio.wait_for(holding_tick, timeout=10)
+    finally:
+        release.set()
+        await holder_engine.dispose()
+        await other_engine.dispose()
+
+    assert in_flight == ("pending", 1, clock.value)
+    assert unlocked == 1
+    assert [report.presented for report in competing] == [0, 0]
+    assert other_log == []
+    assert (finished.presented, holder_sent) == (1, [str(outbox_id)])
+    assert await _delivery(clean, outbox_id) == ("awaiting_ack", 1)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_fact_locked_by_a_competing_phase_one_is_skipped_never_presented(
+    clean: _Harness,
+) -> None:
+    outbox_id = await _seed_fact(clean)
+    log: list[tuple[str, str]] = []
+    engine, sessions = clean.factory()
+    worker = BillingFactWorker(
+        sessions, transport=_Recorder("b", log, pause=0.0), config=_config()
+    )
+    try:
+        async with clean.engine.connect() as competitor:
+            transaction = await competitor.begin()
+            # Another worker inside phase 1: row claimed, attempt not committed.
+            await competitor.execute(
+                text(
+                    "SELECT id FROM billing_fact_deliveries "
+                    "WHERE outbox_event_id = :id FOR UPDATE"
+                ),
+                {"id": outbox_id},
+            )
+            during = await asyncio.wait_for(worker.run_tick(), timeout=10)
+            await competitor.execute(
+                text(
+                    "UPDATE billing_fact_deliveries SET attempt_count = "
+                    "attempt_count + 1, last_attempt_at = now() "
+                    "WHERE outbox_event_id = :id"
+                ),
+                {"id": outbox_id},
+            )
+            await transaction.commit()
+        # Once that lease is committed, the claim re-reads it: still not due.
+        after = await asyncio.wait_for(worker.run_tick(), timeout=10)
+    finally:
+        await engine.dispose()
+    assert (during.presented, after.presented, log) == (0, 0, [])
+    assert await _delivery(clean, outbox_id) == ("pending", 1)
+
+
+class _Unready:
+    def __init__(self) -> None:
+        self.ready = False
+        self.sent: list[str] = []
+
+    async def __call__(self, payload: dict[str, object]) -> None:
+        self.sent.append(str(payload["event_id"]))
+        if not self.ready:
+            raise TransportNotReady("consumer readiness flipped off")
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_an_unready_consumer_spends_no_attempt_and_does_not_spin_on_postgres(
+    clean: _Harness,
+) -> None:
+    ids = [await _seed_fact(clean) for _ in range(2)]
+    clock, consumer = _Clock(), _Unready()
+    engine, sessions = clean.factory()
+    # One attempt allowed: a spent not-ready attempt would exhaust the fact.
+    looping = BillingFactWorker(
+        sessions,
+        transport=consumer,
+        config=_config(interval_seconds=0.01, max_attempts=1),
+        now=clock,
+        monotonic=lambda: 0.0,
+    )
+    try:
+        task = looping.start()
+        deadline = asyncio.get_running_loop().time() + 10
+        while len(consumer.sent) < len(ids) and not task.done():
+            assert asyncio.get_running_loop().time() < deadline, consumer.sent
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.5)  # many 10 ms ticks at the same instant
+        await looping.stop()
+        assert task.done() and not task.cancelled()
+        # Each fact was turned away exactly once: no spin, no attempt spent,
+        # and the turned-away instant is kept as the start of the backoff.
+        assert sorted(consumer.sent) == sorted(str(i) for i in ids)
+        for outbox_id in ids:
+            assert await _attempt_row(clean, outbox_id) == ("pending", 0, clock.value)
+
+        clock.advance(seconds=61)
+        consumer.ready = True
+        ready = BillingFactWorker(
+            sessions, transport=consumer, config=_config(max_attempts=1), now=clock
+        )
+        report = await ready.run_tick()
+    finally:
+        await engine.dispose()
+    assert (report.presented, report.exhausted, report.not_ready) == (2, 0, 0)
+    for outbox_id in ids:
+        assert await _delivery(clean, outbox_id) == ("awaiting_ack", 1)
+
+
+async def _set_delivery(
+    harness: _Harness, outbox_id: UUID, values: str, **params: Any
+) -> None:
+    async with harness.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"UPDATE billing_fact_deliveries SET {values} "
+                "WHERE outbox_event_id = :id"
+            ),
+            {"id": outbox_id, **params},
+        )
+
+
+async def _publish_once(
+    harness: _Harness, clock: _Clock, transport: Any
+) -> PublishAttempt | None:
+    async with harness.sessions() as session:
+        return await BillingFactPublisher(session, now=clock).publish_next(
+            transport, policy=FactRetryPolicy(max_attempts=3), timeout=5.0
+        )
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+@pytest.mark.parametrize(
+    ("attempt_count", "backoff"),
+    [
+        (0, timedelta(seconds=60)),  # a not-ready attempt given back
+        (1, timedelta(seconds=60)),
+        (2, timedelta(seconds=120)),
+    ],
+)
+@pytest.mark.parametrize(
+    ("early", "due"),
+    [
+        pytest.param(timedelta(0), True, id="at-the-instant"),
+        pytest.param(timedelta(microseconds=1), False, id="one-microsecond-before"),
+    ],
+)
+async def test_a_retry_is_due_exactly_when_its_backoff_has_elapsed_on_postgres(
+    clean: _Harness,
+    attempt_count: int,
+    backoff: timedelta,
+    early: timedelta,
+    due: bool,
+) -> None:
+    outbox_id = await _seed_fact(clean)
+    clock = _Clock()
+    last_attempt_at = clock.value - backoff + early
+    await _set_delivery(
+        clean,
+        outbox_id,
+        "attempt_count = :count, last_attempt_at = :last",
+        count=attempt_count,
+        last=last_attempt_at,
+    )
+    log: list[tuple[str, str]] = []
+    attempt = await _publish_once(clean, clock, _Recorder("w", log, pause=0.0))
+    if due:
+        assert attempt is not None
+        assert (attempt.outcome, attempt.attempt_count) == (
+            "presented",
+            attempt_count + 1,
+        )
+        assert log == [("w", str(outbox_id))]
+    else:
+        assert attempt is None
+        assert log == []
+        assert await _attempt_row(clean, outbox_id) == (
+            "pending",
+            attempt_count,
+            last_attempt_at,
+        )
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.parametrize(
+    "takeover",
+    [
+        # Worker B leased (2, t1) after this lease expired, was turned away
+        # and gave its attempt back: (1, t1), this lease's count.
+        pytest.param(
+            ("attempt_count = 2, last_attempt_at = :t1", "attempt_count = 1"),
+            id="not-ready-give-back",
+        ),
+        # An operator requeue (0, NULL), then a fresh lease (1, t1).
+        pytest.param(
+            (
+                "state = 'pending', attempt_count = 0, last_attempt_at = NULL",
+                "attempt_count = 1, last_attempt_at = :t1",
+            ),
+            id="requeue-then-lease",
+        ),
+    ],
+)
+async def test_phase_two_never_overwrites_a_same_count_lease_on_postgres(
+    clean: _Harness, ready: bool, takeover: tuple[str, ...]
+) -> None:
+    outbox_id = await _seed_fact(clean)
+    clock = _Clock()
+    t1 = clock.value + timedelta(seconds=61)
+
+    async def overrun(payload: dict[str, object]) -> None:
+        # Committed by other backends while this presentation outlived its
+        # lease: only ``last_attempt_at`` tells the two leases apart.
+        for values in takeover:
+            await _set_delivery(clean, outbox_id, values, t1=t1)
+        if not ready:
+            raise TransportNotReady("consumer readiness flipped off")
+
+    attempt = await _publish_once(clean, clock, overrun)
+    assert attempt is not None
+    assert attempt.outcome == ("presented" if ready else "not_ready")
+    # No state, no compensation: the row is exactly as the other lease left it.
+    assert await _attempt_row(clean, outbox_id) == ("pending", 1, t1)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+@pytest.mark.parametrize("ready", [True, False])
+@pytest.mark.parametrize(
+    ("terminal", "ack_sha256"),
+    [
+        pytest.param("acknowledged", None, id="acknowledged"),
+        pytest.param("blocked", "0" * 64, id="blocked-digest-mismatch"),
+    ],
+)
+async def test_a_fact_reconciled_mid_presentation_is_never_rewritten_on_postgres(
+    clean: _Harness, ready: bool, terminal: str, ack_sha256: str | None
+) -> None:
+    outbox_id = await _seed_fact(clean)
+    clock = _Clock()
+    converged: list[Any] = []
+
+    async def reconciled_mid_flight(payload: dict[str, object]) -> None:
+        # No row lock is held during the send: the consumer acks (a digest
+        # mismatch blocks) and the reconciler converges the row meanwhile.
+        await _consumer_ack(clean, outbox_id, fact_sha256=ack_sha256)
+        engine, sessions = clean.factory()
+        try:
+            async with sessions() as session, session.begin():
+                converged.append(
+                    await asyncio.wait_for(
+                        BillingFactReconciler(session, now=clock).reconcile_open(
+                            limit=10
+                        ),
+                        timeout=10,
+                    )
+                )
+        finally:
+            await engine.dispose()
+        assert await _attempt_row(clean, outbox_id) == (terminal, 1, clock.value)
+        if not ready:
+            raise TransportNotReady("consumer readiness flipped off")
+
+    attempt = await _publish_once(clean, clock, reconciled_mid_flight)
+    assert len(converged) == 1
+    assert attempt is not None
+    assert attempt.outcome == ("presented" if ready else "not_ready")
+    # Terminal stays terminal; nothing compensated, no attempt rewritten.
+    assert await _attempt_row(clean, outbox_id) == (terminal, 1, clock.value)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_phase_two_waits_for_a_reconciler_holding_the_row_on_postgres(
+    clean: _Harness,
+) -> None:
+    outbox_id = await _seed_fact(clean)
+    clock = _Clock()
+    engine, sessions = clean.factory()
+    holding = asyncio.Event()
+    reconciler_pid: list[int] = []
+
+    async def blocked_waiters() -> int:
+        (row,) = await _rows(
+            clean,
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE :pid = ANY(pg_blocking_pids(pid))",
+            pid=reconciler_pid[0],
+        )
+        return int(row[0])
+
+    try:
+        async with sessions() as reconciler:
+
+            async def acked_while_presenting(payload: dict[str, object]) -> None:
+                # The reconciler converges the row and keeps its transaction
+                # (and the row lock) open as this presentation returns.
+                await _consumer_ack(clean, outbox_id)
+                await BillingFactReconciler(reconciler, now=clock).reconcile_open(
+                    limit=10
+                )
+                reconciler_pid.append(
+                    int(await reconciler.scalar(text("SELECT pg_backend_pid()")))
+                )
+                holding.set()
+
+            publishing = asyncio.create_task(
+                _publish_once(clean, clock, acked_while_presenting)
+            )
+            await asyncio.wait_for(holding.wait(), timeout=10)
+            # Commit only once phase 2 is provably queued behind the lock.
+            deadline = asyncio.get_running_loop().time() + 10
+            while await blocked_waiters() == 0:
+                assert not publishing.done(), "phase 2 did not wait for the row lock"
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            await reconciler.commit()
+            attempt = await asyncio.wait_for(publishing, timeout=10)
+    finally:
+        await engine.dispose()
+    assert attempt is not None and attempt.outcome == "presented"
+    assert await _attempt_row(clean, outbox_id) == ("acknowledged", 1, clock.value)
