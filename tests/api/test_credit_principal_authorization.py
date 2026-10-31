@@ -694,6 +694,7 @@ def test_the_narrowed_check_still_refuses_any_other_credit_sql() -> None:
 def test_the_credit_tables_exist_in_this_database(client: Any) -> None:
     """The row-count probe is not vacuous: every credit table is there."""
 
-    # 15 of migration 038, three 039 inventory and three 040 copy tables.
-    assert len(_CREDIT_TABLES) == 21
+    # 15 of migration 038, three 039 inventory, three 040 copy tables and
+    # thirteen 041 lifecycle/hold/purge/role tables (Group 5).
+    assert len(_CREDIT_TABLES) == 34
     assert client._submit(_credit_row_counts()) == dict.fromkeys(_CREDIT_TABLES, 0)

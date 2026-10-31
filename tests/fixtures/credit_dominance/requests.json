@@ -650,6 +650,25 @@
           }
         ]
       }
+    },
+    {
+      "id": "credits-export",
+      "ingress": "api_key",
+      "method": "GET",
+      "path": "/v1/credits/export",
+      "auth": "api_key/api_tenant",
+      "credit_surface": true
+    },
+    {
+      "id": "credits-admin-purge",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/admin/credits/purges",
+      "auth": "api_key/api_tenant",
+      "credit_surface": true,
+      "json": {
+        "enabled": true
+      }
     }
   ]
 }

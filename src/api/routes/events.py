@@ -47,6 +47,7 @@ from src.services import credit_metering, get_event_service
 from src.services.credit_metering import (
     CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
     CREDIT_PENDING_CODE,
+    CREDIT_SUSPENDED_CODE,
     DUPLICATE_EVENT_CODE,
     EVENT_FAILED_CODE,
     EVENT_IN_PROGRESS_CODE,
@@ -187,11 +188,15 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
             "Credits are enforced and the clinic cannot be charged yet "
             "(`credit_pending`: a clinic without a builder account, or a "
             "builder whose payment is in quarantine). No LLM runs and nothing "
-            "is recorded; the rate-limit slot stays consumed."
+            "is recorded; the rate-limit slot stays consumed. "
+            "`credit_suspended`: the builder's 72 hours of debt service after "
+            "exhaustion are over (the agent is suspended); no LLM runs."
         ),
         "content": {
             "application/json": {
-                "schema": _credit_code_schema(CREDIT_PENDING_CODE),
+                "schema": _credit_code_schema(
+                    CREDIT_PENDING_CODE, CREDIT_SUSPENDED_CODE
+                ),
                 "example": {"code": CREDIT_PENDING_CODE},
             }
         },
@@ -724,6 +729,11 @@ async def _process_enforced_event(
             return await _session_mismatch(http_request, tenant, db)
         if precheck == "credit_pending":
             return JSONResponse(status_code=402, content={"code": CREDIT_PENDING_CODE})
+        if precheck == "credit_suspended":
+            # Group 5: suspended after its 72 h of debt (no LLM, no claim).
+            return JSONResponse(
+                status_code=402, content={"code": CREDIT_SUSPENDED_CODE}
+            )
         leased = await credit_metering.acquire_events_claim(
             db, enforcement, takeover=verdict
         )

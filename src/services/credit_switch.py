@@ -64,7 +64,7 @@ _T = TypeVar("_T")
 
 # Highest credit migration the wish defines; every group that adds a credit
 # migration raises it (with the head pins of Group 1a's convention).
-CREDIT_SCHEMA_MIN_REVISION: Final = "040"
+CREDIT_SCHEMA_MIN_REVISION: Final = "041"
 # Key of the per-request captured value in the ASGI scope state
 # (``request.state.credit_switch_effective``).
 CREDIT_SWITCH_STATE_KEY: Final = "credit_switch_effective"

@@ -88,17 +88,21 @@ from src.api.schemas.knowledge import (
     SearchResponse,
 )
 from src.config.logging import get_logger
+from src.interaction_context import InteractionOrigin, classify_interaction_origin
 from src.models.knowledge import KnowledgeDocument
 from src.models.tenant import Tenant
 from src.repositories import KnowledgeDocumentRepository, get_db_session_dependency
-from src.services import credit_inventory
+from src.repositories.credit import CreditRepository
+from src.services import credit_inventory, credit_lifecycle
 from src.services.credit_allocations import (
     KNOWLEDGE_BATCH_MAX_FILES,
     KNOWLEDGE_DOCUMENT_MAX_CHARACTERS,
     KNOWLEDGE_FILE_MAX_BYTES,
+    reservation_effect_id,
 )
 from src.services.credit_metering import (
     CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
+    CREDIT_SUSPENDED_CODE,
     CreditEnforcementUnavailable,
     CreditTenantGone,
 )
@@ -319,12 +323,14 @@ def _document_not_found(document_id: UUID) -> HTTPException:
 # ============================================
 
 _CREDIT_PENDING = {"code": "credit_pending"}
+_CATEGORY_EXHAUSTED = {"code": "credit_category_exhausted"}
 _CREDIT_PENDING_RESPONSE: dict[int | str, dict[str, Any]] = {
     402: {
         "description": (
             "After credit_enforcement_at only: the tenant has no credit "
             "account (standalone) or its builder is on a quarantine hold "
-            "(credit_pending); nothing was stored"
+            "(credit_pending), or its builder is exhausted and this upload "
+            "needs new capacity (credit_category_exhausted); nothing was stored"
         ),
         "model": ErrorResponse,
     },
@@ -380,6 +386,23 @@ async def _reserve_or_refuse(
     if outcome.status == "credit_pending":
         await session.rollback()
         raise _credit_pending()
+    # Group 5: decided with the reservation, under the account lock it took:
+    # an exhausted builder adds no RAG content that needs new capacity
+    # (402 credit_category_exhausted, everything rolled back).
+    scope = await CreditRepository(session).tenant_scope(tenant_id)
+    if scope is not None and scope.builder_id is not None:
+        verdict = await credit_lifecycle.reservation_verdict(
+            session,
+            builder_id=scope.builder_id,
+            effect_id=reservation_effect_id(tenant_id, "rag", upload_id),
+            charged_mc=outcome.charged_mc,
+        )
+        if verdict == "category_exhausted":
+            await session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=_CATEGORY_EXHAUSTED,
+            )
 
 
 async def _refuse_standalone(session: AsyncSession, tenant_id: UUID) -> None:
@@ -817,6 +840,14 @@ accepted only for a builder that owns the clinic or a super admin.
             "description": "Search completed successfully",
             "model": SearchResponse,
         },
+        402: {
+            "description": (
+                "After credit_enforcement_at only, for an API key caller: the "
+                "builder is suspended after its 72 hours of debt service "
+                "(credit_suspended); nothing was searched"
+            ),
+            "model": ErrorResponse,
+        },
         **_TENANT_FORBIDDEN_RESPONSE,
     },
     tags=["Knowledge"],
@@ -831,10 +862,27 @@ async def search_knowledge(
     Perform semantic search in the knowledge base.
     """
     start_time = datetime.utcnow()
+    mode = await _credit_mode(http_request, session)
 
     # Authorize before searching: retrieval may only ever use this tenant,
     # never request.tenant_id.
-    await resolve_effective_tenant(http_request, tenant, request.tenant_id, session)
+    effective_tenant_id = await resolve_effective_tenant(
+        http_request, tenant, request.tenant_id, session
+    )
+    if mode.enforced and (
+        classify_interaction_origin(tenant) is InteractionOrigin.PRODUCTION
+    ):
+        # Group 5: past its 72 h of debt a suspended builder's RAG is
+        # suspended too (the gate's transition commits either way).
+        suspended = await credit_lifecycle.tenant_suspended(
+            session, effective_tenant_id
+        )
+        await session.commit()
+        if suspended:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={"code": CREDIT_SUSPENDED_CODE},
+            )
 
     # TODO: Implement semantic search (Task 19.0) scoped to the resolved tenant
     end_time = datetime.utcnow()

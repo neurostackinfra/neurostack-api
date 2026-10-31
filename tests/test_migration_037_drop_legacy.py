@@ -102,8 +102,9 @@ def test_037_revises_036_and_038_follows_it(migration: ModuleType) -> None:
     # neurostack-credit-system Group 1a: 038 (the additive credit schema) is
     # the only child of 037.
     assert [rev for rev, parent in revisions.values() if parent == "037"] == ["038"]
-    # Group 4b: 040 (additional object copies) follows 039 and is the head.
-    assert current_head() == "040"
+    # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
+    # (lifecycle, legal hold, purge and roles) follows 040 and is the head.
+    assert current_head() == "041"
 
 
 def test_scope_is_the_four_legacy_tables_and_their_ten_functions(

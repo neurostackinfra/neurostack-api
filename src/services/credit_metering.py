@@ -167,6 +167,7 @@ from src.repositories.credit import (
     OutboxClaim,
     ResponseOutboxRow,
 )
+from src.services import credit_lifecycle
 from src.services.credit_ledger import MILLICREDITS_PER_CREDIT, CreditLedger
 from src.services.credit_principal import (
     AuthenticatedIdentity,
@@ -1022,7 +1023,8 @@ EVENT_FAILED_CODE: Final = "event_failed"
 PAYLOAD_CONFLICT_LOG: Final = "credit_payload_conflict"
 ENFORCED_LOG: Final = "credit enforced decision"
 
-PrecheckOutcome = Literal["ok", "credit_pending", "tenant_gone"]
+CREDIT_SUSPENDED_CODE: Final = "credit_suspended"
+PrecheckOutcome = Literal["ok", "credit_pending", "credit_suspended", "tenant_gone"]
 
 
 class CreditTenantGone(Exception):
@@ -1368,7 +1370,18 @@ async def precheck_events(
         if await repository.quarantine_hold(scope.builder_id):
             await db.rollback()
             return "credit_pending"
+        # Group 5: the agent gate -- past the 72 h deadline the episode is
+        # evaluated under the account lock (same effect ids as the worker);
+        # its transitions commit with this transaction.
+        gate = await credit_lifecycle.request_gate(db, scope.builder_id)
         await db.commit()
+        if gate == "suspended":
+            logger.info(
+                ENFORCED_LOG,
+                reason=CREDIT_SUSPENDED_CODE,
+                tenant_id=str(enforcement.tenant_id),
+            )
+            return "credit_suspended"
         return "ok"
     except BaseException:
         with suppress(Exception):
@@ -1894,12 +1907,17 @@ async def _no_response_effect(
 # ---------------------------------------------------------------------------
 
 WebhookSource = Literal["zapi", "meta"]
-WebhookPrecheck = Literal["credit_pending"]
+WebhookPrecheck = Literal["credit_pending", "credit_suspended"]
 
 # The 200 bodies of the enforced webhook paths (the providers retry non-2xx).
 CREDIT_PENDING_SKIP: Final[Mapping[str, Any]] = {
     "ok": True,
     "skipped": CREDIT_PENDING_CODE,
+}
+# Group 5: a builder suspended after its 72 h of debt (the agent does not run).
+CREDIT_SUSPENDED_SKIP: Final[Mapping[str, Any]] = {
+    "ok": True,
+    "skipped": CREDIT_SUSPENDED_CODE,
 }
 DUPLICATE_MESSAGE_SKIP: Final[Mapping[str, Any]] = {
     "ok": True,
@@ -2102,11 +2120,21 @@ async def precheck_webhook(
         if await repository.quarantine_hold(scope.builder_id):
             await db.rollback()
             return "credit_pending"
+        # Group 5: the agent gate (see ``precheck_events``).
+        gate = await credit_lifecycle.request_gate(db, scope.builder_id)
         await db.commit()
     except BaseException:
         with suppress(Exception):
             await db.rollback()
         raise
+    if gate == "suspended":
+        logger.info(
+            ENFORCED_LOG,
+            reason=CREDIT_SUSPENDED_CODE,
+            source=source,
+            tenant_id=str(tenant_id),
+        )
+        return "credit_suspended"
     return WebhookEnforcement(
         source=source,
         tenant_id=tenant_id,
