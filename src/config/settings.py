@@ -490,6 +490,14 @@ class Settings(BaseSettings):
     credit_object_store_access_key_id: str = ""
     credit_object_store_secret_access_key: SecretStr = SecretStr("")
     credit_object_worker_interval_seconds: int = Field(default=15, ge=1, le=300)
+    # Group 5 lifecycle authority.  The signing key is deliberately server
+    # configuration only: neither a request nor a persisted record can select
+    # or replace it.  Empty/short keys fail closed in the lifecycle service.
+    credit_authorization_signing_key: SecretStr = SecretStr("")
+    # A settled subscription remains covered only for this bounded renewal
+    # interval.  The lifecycle helper, rather than callers, owns its meaning.
+    credit_binding_grace_days: int = Field(default=5, ge=0, le=31)
+    credit_lifecycle_worker_interval_seconds: int = Field(default=60, ge=5, le=3600)
 
     @field_validator("asaas_webhook_url")
     @classmethod

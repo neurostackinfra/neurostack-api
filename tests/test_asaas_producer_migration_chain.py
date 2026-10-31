@@ -39,5 +39,6 @@ def test_asaas_producer_migrations_extend_026_through_037_linearly() -> None:
 
     # neurostack-credit-system Group 1a: the additive credit schema (038, not
     # an ASAAS producer migration) follows 037; Group 4a's credit inventory
-    # Group 4b's additive object-copy revision (040) follows 039 and is head.
-    assert heads(revisions) == ["040"]
+    # Group 4b's additive object-copy revision (040) follows 039; Group 5's
+    # retention revision (041) follows 040 and is head.
+    assert heads(revisions) == ["041"]

@@ -1002,15 +1002,17 @@ def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
         for older, newer in window.upgrades:
             assert declared[newer] == older, (window.name, older, newer)
     # 038 (the additive credit schema, neurostack-credit-system Group 1a;
-    # owner sign-off 2026-10-26), 039 (inventory) and 040 (additional copies) are
-    # the last written revisions and have no production window yet: their
-    # ASAAS migration window is an entry condition of that wish's Group 8.
+    # owner sign-off 2026-10-26), 039 (inventory), 040 (additional copies) and
+    # 041 (lifecycle, legal hold, purge and roles, Group 5) are the last
+    # written revisions and have no production window yet: their ASAAS
+    # migration window is an entry condition of that wish's Group 8.
     # No later revision can exist unseen.
     assert declared["038"] == "037"
     assert declared["039"] == "038"
     assert declared["040"] == "039"
-    assert "041" not in declared
-    assert not [rev for rev, down in declared.items() if down == "040"]
+    assert declared["041"] == "040"
+    assert "042" not in declared
+    assert not [rev for rev, down in declared.items() if down == "041"]
 
 
 @pytest.mark.parametrize(

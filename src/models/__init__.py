@@ -40,6 +40,18 @@ from src.models.billing_producer_signed import (
 from src.models.builder import Builder
 from src.models.clinic_config import ClinicConfig
 from src.models.clinic_config_table import ClinicConfigTable
+from src.models.content_retention import (
+    CreditHoldEvent,
+    CreditHoldGeneration,
+    CreditLifecycleEpisode,
+    CreditLifecycleTransition,
+    CreditPurgeFence,
+    CreditPurgeJob,
+    CreditPurgeReceipt,
+    CreditPurgeResult,
+    CreditRetentionTombstone,
+    CreditThresholdAlert,
+)
 from src.models.coupon import Coupon
 from src.models.credit import (
     CreditAccount,
@@ -72,6 +84,11 @@ from src.models.event import Event
 from src.models.handoff import HandoffRecord
 from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
+from src.models.operational_capability import (
+    CreditOperationalAuthorization,
+    CreditOperationalAuthorizationReceipt,
+    CreditOperationalRoleAssignment,
+)
 from src.models.policy import Policy
 from src.models.rlhf_audit_review import RlhfAuditReview
 from src.models.rlhf_rating import RlhfRating
@@ -134,6 +151,20 @@ __all__ = [
     "CreditObjectCopy",
     "CreditObjectCopyJob",
     "CreditQdrantJob",
+    # Credit lifecycle, hold, purge and roles (Group 5, migration 041)
+    "CreditLifecycleEpisode",
+    "CreditLifecycleTransition",
+    "CreditThresholdAlert",
+    "CreditHoldGeneration",
+    "CreditHoldEvent",
+    "CreditPurgeFence",
+    "CreditRetentionTombstone",
+    "CreditPurgeJob",
+    "CreditPurgeResult",
+    "CreditPurgeReceipt",
+    "CreditOperationalRoleAssignment",
+    "CreditOperationalAuthorization",
+    "CreditOperationalAuthorizationReceipt",
     # Core Models
     "Builder",
     "Coupon",

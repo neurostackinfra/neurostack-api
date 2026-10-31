@@ -673,10 +673,10 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     assert postgres_harness.schemas_equivalent is True
     assert postgres_harness.legacy_survived_downgrade is True
     async with postgres_harness.engine.connect() as connection:
-        # Head: 040, Group 4b's additive object-copy tables on top of G4a.
+        # Head: 041, Group 5's lifecycle/hold/purge tables on top of G4b's 040.
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "040"
+            == "041"
         )
         legacy = (
             await connection.execute(

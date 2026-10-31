@@ -57,6 +57,20 @@ _EXPECTED_TABLES = {
     "credit_object_copies",
     "credit_object_copy_jobs",
     "credit_qdrant_jobs",
+    # Group 5, migration 041: lifecycle, legal hold, purge and roles.
+    "credit_lifecycle_episodes",
+    "credit_lifecycle_transitions",
+    "credit_threshold_alerts",
+    "credit_operational_role_assignments",
+    "credit_operational_authorizations",
+    "credit_operational_authorization_receipts",
+    "credit_hold_generations",
+    "credit_hold_events",
+    "credit_purge_fences",
+    "credit_retention_tombstones",
+    "credit_purge_jobs",
+    "credit_purge_results",
+    "credit_purge_receipts",
 }
 
 
@@ -185,7 +199,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "040"
+    assert version == "041"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 

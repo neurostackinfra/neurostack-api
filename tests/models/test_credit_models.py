@@ -138,7 +138,7 @@ def migration() -> ModuleType:
     return _load()
 
 
-# Group 4a/4b: credit inventory plus object-copy tables (pinned by
+# Group 4a/4b/5: inventory, object-copy and retention tables (pinned by
 # tests/integration/test_credit_orm_ddl_drift_postgres.py and the 039 part of
 # tests/integration/test_credit_migration_guards_postgres.py).
 _LATER_TABLES = {
@@ -148,6 +148,20 @@ _LATER_TABLES = {
     "credit_object_copies",
     "credit_object_copy_jobs",
     "credit_qdrant_jobs",
+    # Group 5, migration 041 (pinned by the same two suites).
+    "credit_lifecycle_episodes",
+    "credit_lifecycle_transitions",
+    "credit_threshold_alerts",
+    "credit_operational_role_assignments",
+    "credit_operational_authorizations",
+    "credit_operational_authorization_receipts",
+    "credit_hold_generations",
+    "credit_hold_events",
+    "credit_purge_fences",
+    "credit_retention_tombstones",
+    "credit_purge_jobs",
+    "credit_purge_results",
+    "credit_purge_receipts",
 }
 
 
@@ -187,8 +201,9 @@ def _created_columns(statement: str) -> list[str]:
 
 def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("038", "037")
-    # Group 4b: 040 (additional object copies) follows 039 and is the head.
-    assert current_head() == "040"
+    # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
+    # (lifecycle, legal hold, purge and roles) follows 040 and is the head.
+    assert current_head() == "041"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 

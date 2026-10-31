@@ -117,8 +117,9 @@ def test_the_image_chain_is_this_repository_s_linear_chain() -> None:
     assert chain == _expected_chain()
     assert chain[0] == "001"
     assert chain[-1] == current_head()
-    # 038/039/040 are the additive credit schema, inventory and copy chain.
-    assert chain.index("037") + 3 == chain.index(CREDIT_SCHEMA_MIN_REVISION)
+    # 038/039/040/041 are the additive credit schema, inventory, copy and
+    # retention chain.
+    assert chain.index("037") + 4 == chain.index(CREDIT_SCHEMA_MIN_REVISION)
 
 
 def test_the_minimum_is_the_highest_credit_revision_of_the_wish() -> None:
@@ -187,7 +188,7 @@ def test_a_chain_that_is_not_one_readable_line_is_refused(
 # The verdict for alembic_version rows.
 # ---------------------------------------------------------------------------
 
-_CHAIN = ("001", "036", "037", "038", "039", "040")
+_CHAIN = ("001", "036", "037", "038", "039", "040", "041")
 
 
 @pytest.mark.parametrize(
@@ -195,7 +196,8 @@ _CHAIN = ("001", "036", "037", "038", "039", "040")
     [
         (("038",), False, "schema_below_minimum"),
         (("039",), False, "schema_below_minimum"),
-        (("040",), True, "schema_ready"),
+        (("040",), False, "schema_below_minimum"),
+        (("041",), True, "schema_ready"),
         (("037",), False, "schema_below_minimum"),
         (("001",), False, "schema_below_minimum"),
         ((), False, "version_row_count"),
@@ -208,12 +210,12 @@ _CHAIN = ("001", "036", "037", "038", "039", "040")
 def test_schema_verdict_matrix(
     rows: tuple[str, ...], effective: bool, reason: str
 ) -> None:
-    reading = evaluate_schema_revision(rows, _CHAIN, "040")
+    reading = evaluate_schema_revision(rows, _CHAIN, "041")
     assert (reading.effective, reading.reason) == (effective, reason)
 
 
 def test_a_minimum_outside_the_image_chain_is_off() -> None:
-    reading = evaluate_schema_revision(("038",), ("001", "038"), "040")
+    reading = evaluate_schema_revision(("038",), ("001", "038"), "041")
     assert reading == CreditSwitchReading(False, "revision_outside_image_chain", "038")
 
 
@@ -295,12 +297,13 @@ async def test_config_off_by_default_settings_is_off(
 @pytest.mark.parametrize(
     ("enabled", "rows", "effective", "reason"),
     [
-        (False, ("040",), False, "config_disabled"),
+        (False, ("041",), False, "config_disabled"),
         (True, ("037",), False, "schema_below_minimum"),
-        # Group 4b: 040 is the minimum; 038/039 alone are below it.
+        # Group 5: 041 is the minimum; 038/039/040 alone are below it.
         (True, ("038",), False, "schema_below_minimum"),
         (True, ("039",), False, "schema_below_minimum"),
-        (True, ("040",), True, "schema_ready"),
+        (True, ("040",), False, "schema_below_minimum"),
+        (True, ("041",), True, "schema_ready"),
         (True, (), False, "version_row_count"),
         (True, ("038", "037"), False, "version_row_count"),
         (True, ("deadbeef",), False, "revision_outside_image_chain"),
@@ -439,7 +442,7 @@ async def test_refresh_reflects_an_upgrade_and_a_downgrade(
         await refresh_credit_switch(enabled=True, session_factory=version_db.factory)
     ).effective
 
-    await version_db.rows("040")
+    await version_db.rows("041")
     assert (
         await refresh_credit_switch(enabled=True, session_factory=version_db.factory)
     ).effective
@@ -475,7 +478,7 @@ async def test_the_background_refresher_follows_the_schema_within_an_interval(
     task = asyncio.create_task(run_credit_switch_refresher(interval, refresh=refresh))
     try:
         assert credit_switch_effective() is False
-        await version_db.rows("040")
+        await version_db.rows("041")
         assert await _wait_for(True, 2.0) <= 2 * interval + 1.0
         await version_db.rows("037")
         assert await _wait_for(False, 2.0) <= 2 * interval + 1.0

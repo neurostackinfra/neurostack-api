@@ -928,3 +928,209 @@ async def test_the_empty_040_round_trip_restores_039_exactly(
     assert await _catalog(cluster, at_040) == baseline_039.catalog_039
     await _migrate(cluster.url(at_040), "upgrade", "040")
     assert (await _catalog(cluster, at_040))["alembic_version"] == [("040",)]
+
+
+# ---------------------------------------------------------------------------
+# Migration 041 (Group 5): lifecycle, legal hold, purge and operational roles.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_041_PATH = (
+    _ROOT / "alembic" / "versions" / "20261030_000003_041_credit_retention.py"
+)
+_DOWNGRADE_041_REFUSED = "downgrade of migration 041 refused (nothing was changed): "
+_TABLES_041 = (
+    "credit_lifecycle_episodes",
+    "credit_lifecycle_transitions",
+    "credit_threshold_alerts",
+    "credit_operational_role_assignments",
+    "credit_operational_authorizations",
+    "credit_operational_authorization_receipts",
+    "credit_hold_generations",
+    "credit_hold_events",
+    "credit_purge_fences",
+    "credit_retention_tombstones",
+    "credit_purge_jobs",
+    "credit_purge_results",
+    "credit_purge_receipts",
+)
+_HEX = "a" * 64
+_ROWS_041 = {
+    "credit_lifecycle_episodes": (
+        "INSERT INTO credit_lifecycle_episodes (id, builder_id, account_id, "
+        "opened_effect_id, exhausted_at, suspension_due_at, deletion_due_at) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'e', now(), "
+        "now() + interval '72 hours', now() + interval '30 days')"
+    ),
+    "credit_lifecycle_transitions": (
+        "INSERT INTO credit_lifecycle_transitions (id, builder_id, episode_id, "
+        "transition, effect_id, occurred_at, source, detail) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'opened', 'e', "
+        "now(), 'worker', '{}')"
+    ),
+    "credit_threshold_alerts": (
+        "INSERT INTO credit_threshold_alerts (id, builder_id, arm_key, threshold, "
+        "capacity_mc, available_mc, effect_id, occurred_at) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), 'a', 50, 0, 0, 'e', now())"
+    ),
+    "credit_operational_role_assignments": (
+        "INSERT INTO credit_operational_role_assignments (id, role, user_id, "
+        "environment, action, actor_user_id, reason) VALUES (gen_random_uuid(), "
+        "'legal_hold_officer', gen_random_uuid(), 'test', 'granted', "
+        "gen_random_uuid(), 'r')"
+    ),
+    "credit_operational_authorizations": (
+        "INSERT INTO credit_operational_authorizations (id, purpose, environment, "
+        "builder_id, scope, subject_user_id, issued_by, issued_at, expires_at, "
+        "key_fingerprint, signature) VALUES (gen_random_uuid(), 'hold_request', "
+        "'test', gen_random_uuid(), 'builder', gen_random_uuid(), "
+        f"gen_random_uuid(), now(), now() + interval '1 hour', '{_HEX}', '{_HEX}')"
+    ),
+    "credit_operational_authorization_receipts": (
+        "INSERT INTO credit_operational_authorization_receipts (authorization_id, "
+        "consumed_by, consumed_for, result_ref, consumed_at) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), 'hold_requested', 'r', now())"
+    ),
+    "credit_hold_generations": (
+        "INSERT INTO credit_hold_generations (builder_id, scope) VALUES "
+        "(gen_random_uuid(), 'builder')"
+    ),
+    "credit_hold_events": (
+        "INSERT INTO credit_hold_events (id, intent_id, builder_id, scope, "
+        "event_type, reason_code, actor_user_id, occurred_at, generation, "
+        "authorization_id, digest) VALUES (gen_random_uuid(), gen_random_uuid(), "
+        "gen_random_uuid(), 'builder', 'hold_requested', 'r', gen_random_uuid(), "
+        f"now(), 1, gen_random_uuid(), '{_HEX}')"
+    ),
+    "credit_purge_fences": (
+        "INSERT INTO credit_purge_fences (id, builder_id, scope, generation, "
+        "operation_id) VALUES (gen_random_uuid(), gen_random_uuid(), 'builder', 0, "
+        "gen_random_uuid())"
+    ),
+    "credit_retention_tombstones": (
+        "INSERT INTO credit_retention_tombstones (id, token, operation_id, "
+        "builder_id, tenant_id, scope, source_kind, source_id, content_sha256, "
+        "size_bytes, qdrant_point_ids, observed_generation) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), "
+        f"gen_random_uuid(), 'builder', 'media', gen_random_uuid(), '{_HEX}', 1, "
+        "'[]', 0)"
+    ),
+    "credit_purge_jobs": (
+        "INSERT INTO credit_purge_jobs (id, token, operation_id, state) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'prepared')"
+    ),
+    "credit_purge_results": (
+        "INSERT INTO credit_purge_results (id, token, operation_id, attempt, "
+        "outcome, detail) VALUES (gen_random_uuid(), gen_random_uuid(), "
+        "gen_random_uuid(), 1, 'failed', 'd')"
+    ),
+    "credit_purge_receipts": (
+        "INSERT INTO credit_purge_receipts (operation_id, builder_id, scope, "
+        "status, deleted_count, held_count, failed_count, blocked_count, digest) "
+        "VALUES (gen_random_uuid(), gen_random_uuid(), 'builder', 'blocked', "
+        f"0, 0, 0, 0, '{_HEX}')"
+    ),
+}
+
+
+def _load_041() -> ModuleType:
+    import alembic as alembic_package
+
+    if not hasattr(alembic_package, "op"):
+        setattr(alembic_package, "op", SimpleNamespace())
+    spec = importlib.util.spec_from_file_location("migration_041", _MIGRATION_041_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_MIGRATION_041 = _load_041()
+
+
+@pytest.fixture
+async def at_041(baseline: _Baseline, baseline_039: _Baseline039) -> AsyncIterator[str]:
+    name = await baseline.cluster.clone(baseline_039.template_039)
+    await _migrate(baseline.cluster.url(name), "upgrade", "041")
+    try:
+        yield name
+    finally:
+        await baseline.cluster.drop(name)
+
+
+def test_041_declares_exactly_its_tables() -> None:
+    assert (_MIGRATION_041.revision, _MIGRATION_041.down_revision) == ("041", "040")
+    assert _MIGRATION_041.CREATED_TABLES == _TABLES_041
+    assert set(_ROWS_041) == set(_TABLES_041)
+
+
+@pytest.mark.parametrize("table", _TABLES_041)
+async def test_one_row_in_any_041_table_refuses_its_downgrade(
+    baseline: _Baseline, at_041: str, table: str
+) -> None:
+    await _execute(baseline.cluster, at_041, _PLANT, _ROWS_041[table])
+    before = await _catalog(baseline.cluster, at_041)
+    code, output = await _alembic(baseline.cluster.url(at_041), "downgrade", "040")
+    assert code != 0, output
+    # _refusal pins the SQLSTATE 55000 exception line (asyncpg's
+    # ObjectNotInPrerequisiteStateError), never the echoed DO block.
+    assert _refusal(output, _DOWNGRADE_041_REFUSED) == (
+        f"{_DOWNGRADE_041_REFUSED}tables that have rows: {table}"
+    )
+    assert await _catalog(baseline.cluster, at_041) == before
+
+
+async def test_every_occupied_041_table_is_reported_together(
+    baseline: _Baseline, at_041: str
+) -> None:
+    await _execute(baseline.cluster, at_041, _PLANT, *_ROWS_041.values())
+    code, output = await _alembic(baseline.cluster.url(at_041), "downgrade", "040")
+    assert code != 0, output
+    assert _refusal(output, _DOWNGRADE_041_REFUSED) == (
+        f"{_DOWNGRADE_041_REFUSED}tables that have rows: {', '.join(_TABLES_041)}"
+    )
+
+
+async def test_the_empty_041_round_trip_restores_040_exactly(
+    baseline: _Baseline, baseline_039: _Baseline039, at_041: str
+) -> None:
+    cluster = baseline.cluster
+    reference = await cluster.clone(baseline_039.template_039)
+    try:
+        await _migrate(cluster.url(reference), "upgrade", "040")
+        catalog_040 = await _catalog(cluster, reference)
+    finally:
+        await cluster.drop(reference)
+    await _migrate(cluster.url(at_041), "downgrade", "040")
+    assert await _catalog(cluster, at_041) == catalog_040
+    await _migrate(cluster.url(at_041), "upgrade", "041")
+    assert (await _catalog(cluster, at_041))["alembic_version"] == [("041",)]
+
+
+async def test_the_041_preflight_refuses_another_revision(
+    baseline: _Baseline, at_041: str
+) -> None:
+    cluster = baseline.cluster
+    await _execute(cluster, at_041, "UPDATE alembic_version SET version_num = '040'")
+    before = await _catalog(cluster, at_041)
+    engine = create_async_engine(cluster.url(at_041), poolclass=NullPool)
+    try:
+        with pytest.raises(DBAPIError) as info:
+            async with engine.begin() as connection:
+                await connection.exec_driver_sql(_MIGRATION_041.LOCK_TIMEOUT)
+                await connection.exec_driver_sql(_MIGRATION_041.downgrade_preflight())
+    finally:
+        await engine.dispose()
+    assert _sqlstate(info.value) == "55000"
+    assert f"{_DOWNGRADE_041_REFUSED}alembic_version is 040, not 041" in str(info.value)
+    assert await _catalog(cluster, at_041) == before
+
+
+async def test_the_041_downgrade_gives_up_after_the_lock_timeout(
+    baseline: _Baseline, at_041: str
+) -> None:
+    before = await _catalog(baseline.cluster, at_041)
+    code, output = await _alembic_while_reading(
+        baseline.cluster, at_041, "credit_hold_events", "downgrade", "040"
+    )
+    _assert_lock_timeout_in_the_preflight(code, output)
+    assert await _catalog(baseline.cluster, at_041) == before
