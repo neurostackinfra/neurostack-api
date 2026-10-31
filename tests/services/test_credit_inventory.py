@@ -1193,8 +1193,10 @@ def test_object_copy_worker_is_inert_without_the_effective_runtime(
     def unavailable() -> Any:
         raise AssertionError("an inert copy worker must not claim a job")
 
-    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: False)
-    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: False)
+    monkeypatch.setattr(
+        credit_inventory, "object_copy_runtime_enabled", lambda *_: False
+    )
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda *_: False)
 
     assert run(client, credit_inventory.run_credit_object_copy_once(unavailable)) == 0
 
@@ -1214,8 +1216,10 @@ def test_object_copy_lifecycle_cancels_cleanly(
     monkeypatch.setattr(
         credit_inventory.settings, "credit_object_worker_interval_seconds", 300
     )
-    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: False)
-    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: False)
+    monkeypatch.setattr(
+        credit_inventory, "object_copy_runtime_enabled", lambda *_: False
+    )
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda *_: False)
 
     async def scenario() -> None:
         task = credit_inventory.start_credit_object_workers()
@@ -1273,8 +1277,10 @@ def test_qdrant_rebuild_job_is_durable_and_derived_only(
         rebuilt.append((tenant_id, source_id, content))
         return 1
 
-    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: False)
-    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: True)
+    monkeypatch.setattr(
+        credit_inventory, "object_copy_runtime_enabled", lambda *_: False
+    )
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda *_: True)
     monkeypatch.setattr(credit_qdrant, "replace_derived_chunks", replace)
 
     async def scenario() -> None:
@@ -1304,3 +1310,109 @@ def test_qdrant_rebuild_job_is_durable_and_derived_only(
             await session.close()
 
     run(client, scenario())
+
+
+def _fill_object_store(monkeypatch: pytest.MonkeyPatch, environment: str) -> None:
+    """Every S3 setting filled and the switch forced effective: only the
+    environment can still close the Group 4b gate."""
+
+    from pydantic import SecretStr
+
+    config = credit_inventory.settings
+    monkeypatch.setattr(credit_inventory, "credit_switch_effective", lambda: True)
+    monkeypatch.setattr(config, "environment", environment)
+    monkeypatch.setattr(config, "credit_object_store_endpoint", "http://s3.invalid")
+    monkeypatch.setattr(config, "credit_object_store_bucket", "credit-copies")
+    monkeypatch.setattr(config, "credit_object_store_access_key_id", "key")
+    monkeypatch.setattr(
+        config, "credit_object_store_secret_access_key", SecretStr("secret")
+    )
+    monkeypatch.setattr(config, "qdrant_host", "qdrant.invalid")
+    monkeypatch.setattr(config, "qdrant_collection_name", "credit")
+
+
+async def _object_job_rows() -> tuple[int, int]:
+    session = get_db_session()
+    try:
+        copies = await session.scalar(
+            select(func.count()).select_from(CreditObjectCopyJob)
+        )
+        vectors = await session.scalar(
+            select(func.count()).select_from(CreditQdrantJob)
+        )
+        return int(copies or 0), int(vectors or 0)
+    finally:
+        await session.close()
+
+
+async def _enqueue_both(tenant: UUID, switch_on: bool | None) -> None:
+    session = get_db_session()
+    try:
+        for kind in ("media", "knowledge"):
+            await credit_inventory.enqueue_object_copy(
+                session,
+                source_kind=kind,  # type: ignore[arg-type]
+                source_id=uuid4(),
+                tenant_id=tenant,
+                switch_on=switch_on,
+            )
+            await credit_inventory.enqueue_source_collection(
+                session,
+                source_kind=kind,  # type: ignore[arg-type]
+                source_id=uuid4(),
+                tenant_id=tenant,
+                switch_on=switch_on,
+            )
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+def test_the_copy_gate_is_closed_in_staging_and_production_with_everything_else_on(
+    client: Any,
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+) -> None:
+    """Production runs ``ENVIRONMENT=staging``; neither value may open the
+    gate, whatever the switch and the S3 settings say (no ``is_production``)."""
+
+    _fill_object_store(monkeypatch, environment)
+
+    assert credit_inventory.object_copy_runtime_enabled() is False
+    assert credit_inventory.object_copy_runtime_enabled(True) is False
+    assert credit_inventory.qdrant_runtime_enabled(True) is False
+    run(client, _enqueue_both(world.tenant, None))
+    run(client, _enqueue_both(world.tenant, True))
+    assert run(client, _object_job_rows()) == (0, 0)
+
+
+def test_the_copy_gate_opens_only_in_development_or_test(
+    client: Any, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control for the test above: the same setup with ``ENVIRONMENT=test``
+    opens the gate and writes the job rows."""
+
+    _fill_object_store(monkeypatch, "test")
+
+    assert credit_inventory.object_copy_runtime_enabled() is True
+    run(client, _enqueue_both(world.tenant, True))
+    # copy + gc per kind; a Qdrant rebuild/delete for knowledge only.
+    assert run(client, _object_job_rows()) == (4, 2)
+
+
+def test_the_enqueue_obeys_the_switch_captured_at_request_entry(
+    client: Any, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request that captured the switch ON keeps it for its post-commit
+    enqueue, and one that captured OFF writes nothing, whatever the
+    process-wide verdict says by then."""
+
+    _fill_object_store(monkeypatch, "test")
+    monkeypatch.setattr(credit_inventory, "credit_switch_effective", lambda: True)
+    run(client, _enqueue_both(world.tenant, False))
+    assert run(client, _object_job_rows()) == (0, 0)
+
+    monkeypatch.setattr(credit_inventory, "credit_switch_effective", lambda: False)
+    run(client, _enqueue_both(world.tenant, True))
+    assert run(client, _object_job_rows()) == (4, 2)

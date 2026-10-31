@@ -336,3 +336,31 @@ def test_clinic_admin_is_scoped_to_its_token(
 )
 def test_entry_names_are_traversal_free(original: str, expected: str) -> None:
     assert safe_entry_name(original, "fallback") == expected
+
+
+def test_a_live_copy_under_legal_hold_keeps_its_s3_copy_in_the_manifest(
+    client: Any, world: World, switch: Callable[[bool], None]
+) -> None:
+    """Group 4b marks a live copy ``held`` while a credit legal hold is in
+    force; the export must still name that exact version."""
+
+    async def hold() -> None:
+        from sqlalchemy import update
+
+        session = get_db_session()
+        try:
+            async with session.begin():
+                await session.execute(
+                    update(CreditObjectCopy)
+                    .where(CreditObjectCopy.version_id == world.copy_version)
+                    .values(state="held")
+                )
+        finally:
+            await session.close()
+
+    client._submit(hold())
+    _, manifest = _archive(client.get(EXPORT, headers=world.api()))
+    by_id = {item["id"]: item for item in manifest["items"]}
+    assert by_id[str(world.media)]["s3_copy"]["version_id"] == world.copy_version
+    # A deleted copy is still never named.
+    assert by_id[str(world.document)]["s3_copy"] is None

@@ -95,10 +95,12 @@ def _enable_only_the_copy_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         settings, "credit_object_store_secret_access_key", SecretStr(secret_key)
     )
-    monkeypatch.setattr(credit_inventory, "object_copy_runtime_enabled", lambda: True)
+    monkeypatch.setattr(
+        credit_inventory, "object_copy_runtime_enabled", lambda *_: True
+    )
     # This file proves S3 lifecycle deterministically.  Qdrant's independent
     # real integration is tested in test_credit_qdrant_rebuild.py.
-    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda: False)
+    monkeypatch.setattr(credit_inventory, "qdrant_runtime_enabled", lambda *_: False)
 
 
 async def _seed_source(

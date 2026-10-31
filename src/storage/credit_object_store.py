@@ -16,7 +16,7 @@ from uuid import UUID
 
 import boto3
 from botocore.client import BaseClient
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from src.config.settings import Settings, settings
 
@@ -80,7 +80,7 @@ def assert_bucket_object_lock(config: Settings = settings) -> None:
         result = client.get_object_lock_configuration(
             Bucket=config.credit_object_store_bucket
         )
-    except ClientError as error:
+    except (ClientError, BotoCoreError) as error:
         raise ObjectCopyError("could not read S3 bucket copy controls") from error
     if versioning.get("Status") != "Enabled":
         raise ObjectCopyError("S3 bucket versioning must be Enabled")
@@ -130,7 +130,7 @@ def put_immutable_copy(
         head = client.head_object(
             Bucket=config.credit_object_store_bucket, Key=key, VersionId=version_id
         )
-    except ClientError as error:
+    except (ClientError, BotoCoreError) as error:
         raise ObjectCopyError("S3 put/head failed") from error
     # S3 returns the checksum in base64 whereas the registry pins lowercase
     # hex. Content length is not an integrity check: a same-length divergent
@@ -157,7 +157,7 @@ def put_immutable_copy(
                 VersionId=version_id,
             )
             remote_digest = hashlib.sha256(remote["Body"].read()).digest()
-        except (ClientError, KeyError, AttributeError) as error:
+        except (ClientError, BotoCoreError, KeyError, AttributeError) as error:
             raise ObjectCopyError("could not verify S3 copy bytes") from error
     if remote_digest != digest:
         raise ObjectCopyError("S3 copy digest differs from authoritative payload")
@@ -191,6 +191,9 @@ def delete_exact_copy(*, copy: StoredCopy, config: Settings = settings) -> None:
         )
     except ObjectCopyHeld:
         raise
+    except BotoCoreError as error:
+        # A connection/endpoint failure (not an S3 answer): nothing proven.
+        raise ObjectCopyError("S3 exact-version delete/verification failed") from error
     except ClientError as error:
         code = str(error.response.get("Error", {}).get("Code", ""))
         if code in {"AccessDenied", "InvalidRequest"}:
@@ -217,14 +220,15 @@ def delete_exact_copy(*, copy: StoredCopy, config: Settings = settings) -> None:
                 raise ObjectCopyError("S3 exact version remains in version listing")
     except ObjectCopyError:
         raise
-    except ClientError as error:
+    except (ClientError, BotoCoreError) as error:
         raise ObjectCopyError("S3 exact-version listing failed") from error
 
 
 def set_legal_hold(
     *, copy: StoredCopy, enabled: bool, config: Settings = settings
 ) -> None:
-    """Future Group 5 uses this exact-version operation; no caller bypasses it."""
+    """``PutObjectLegalHold`` on the exact version (the Group 4b worker sets
+    it from the credit legal hold in PostgreSQL)."""
 
     try:
         _client(config).put_object_legal_hold(
@@ -233,7 +237,7 @@ def set_legal_hold(
             VersionId=copy.version_id,
             LegalHold={"Status": "ON" if enabled else "OFF"},
         )
-    except ClientError as error:
+    except (ClientError, BotoCoreError) as error:
         raise ObjectCopyError("S3 legal-hold update failed") from error
 
 
