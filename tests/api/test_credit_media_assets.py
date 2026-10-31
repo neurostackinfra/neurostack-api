@@ -58,6 +58,7 @@ from src.repositories.database import get_db_session
 from src.services import credit_inventory, credit_metering
 from src.services.credit_switch import CreditSwitch
 from src.services.media_assets import MediaStorageCapacityGuard
+from tests.api.test_events_credit_enforced import _grant
 
 MEDIA = "/v1/media-assets"
 _FINANCIAL = (
@@ -432,8 +433,18 @@ def test_after_the_enforcement_an_upload_reserves_its_media_once(
 ) -> None:
     client._submit(_enforce())
     first = _upload(client, world, _png(5_000_000), "image/png")
+    assert first.status_code == 201
+    # Group 5: the first reservation's debt opened the builder's exhaustion
+    # episode, so new media is refused (nothing stored) until it pays.
+    refused = _upload(client, world, _mp4(16_000_000), "video/mp4")
+    assert (refused.status_code, refused.json()) == (
+        402,
+        {"detail": {"code": "credit_category_exhausted"}},
+    )
+    assert len(client._submit(_rows(MediaAsset))) == 1
+    client._submit(_grant(world.builder, 100_000))
     second = _upload(client, world, _mp4(16_000_000), "video/mp4")
-    assert (first.status_code, second.status_code) == (201, 201)
+    assert second.status_code == 201
     reservations = sorted(
         (row.target_mc, row.charged_mc, row.effect_id)
         for row in client._submit(_rows(CreditAllocation))
@@ -449,10 +460,11 @@ def test_after_the_enforcement_an_upload_reserves_its_media_once(
         f"media:{world.tenant}:{second.json()['id']}:reserve",
     }
     entries = client._submit(_rows(CreditLedgerEntry))
-    assert sorted((e.entry_type, e.amount_mc) for e in entries) == [
-        ("debt", 250),
-        ("debt", 800),
-    ]
+    reserved = {effect for _, _, effect in reservations}
+    # The first was served as debt; the second, after the payment, debits.
+    assert sorted(
+        (e.entry_type, e.amount_mc) for e in entries if e.effect_id in reserved
+    ) == [("debit", 800), ("debt", 250)]
     assert client._submit(_rows(CreditObservationalEffect)) == []
 
 

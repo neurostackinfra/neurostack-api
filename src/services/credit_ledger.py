@@ -1649,6 +1649,8 @@ class CreditLedger:
         self.repository = CreditRepository(session)
         self.clock_tolerance = clock_tolerance
         self._reference_clock = reference_clock
+        # Group 5: what the lifecycle evaluation of the last persist saw.
+        self.lifecycle_outcome: Any = None
 
     async def reference_now(self) -> datetime:
         """The clock writers are checked against (the database's)."""
@@ -1770,8 +1772,22 @@ class CreditLedger:
         book.sweep_expired(at)
         return book
 
-    async def persist(self, book: LedgerBook) -> tuple[str, ...]:
-        """Insert the book's recorded rows; returns the new effect ids."""
+    async def persist(
+        self,
+        book: LedgerBook,
+        *,
+        lifecycle_source: Literal["effect", "worker"] | None = "effect",
+    ) -> tuple[str, ...]:
+        """Insert the book's recorded rows; returns the new effect ids.
+
+        Group 5: then, still under the account lock the book was opened with,
+        the exhaustion lifecycle is evaluated on the swept book
+        (:meth:`src.services.credit_lifecycle.CreditLifecycle.evaluate`):
+        episode opening, grace shortening, the 72 h / 30 d transitions,
+        reactivation and thresholds.  Inert -- no query, no row -- while the
+        book's ``spend_hold`` says ``credit_enforcement_at`` is unset.
+        ``lifecycle_source=None`` skips it (the outcome lands on
+        :attr:`lifecycle_outcome`)."""
 
         writes = book.writes
         for model, rows in (
@@ -1793,6 +1809,14 @@ class CreditLedger:
             await self.session.execute(insert(CreditDebtSettlement), writes.settlements)
         created = writes.effect_ids
         book.writes = LedgerWrites()
+        self.lifecycle_outcome = None
+        if lifecycle_source is not None and book.spend_hold.enforced:
+            # Lazy import: credit_lifecycle builds on this module.
+            from src.services.credit_lifecycle import CreditLifecycle
+
+            self.lifecycle_outcome = await CreditLifecycle(self.session).evaluate(
+                book, source=lifecycle_source, writes=writes
+            )
         return created
 
     async def _origins_for(

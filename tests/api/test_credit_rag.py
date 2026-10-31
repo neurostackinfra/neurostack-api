@@ -54,6 +54,7 @@ from src.repositories.credit_inventory import CreditInventoryRepository
 from src.repositories.database import get_db_session
 from src.services import credit_inventory, credit_metering, knowledge_service
 from src.services.credit_switch import CreditSwitch
+from tests.api.test_events_credit_enforced import _grant
 
 DOCUMENTS = "/v1/knowledge/documents"
 UPLOAD = "/v1/knowledge/documents/upload"
@@ -636,6 +637,16 @@ def test_after_the_enforcement_a_batch_is_reserved_once_and_rounded_once(
     # No lot: the reservation is served as debt, never refused.
     assert [(entry.entry_type, entry.amount_mc) for entry in entries] == [("debt", 601)]
     assert client._submit(_rows(CreditObservationalEffect)) == []
+    # Group 5: that debt opened the builder's exhaustion episode, so new
+    # content is refused (nothing stored) until the builder pays.
+    refused = client.post(
+        DOCUMENTS, json=_json(world, "b" * 2_000), headers=world.headers()
+    )
+    assert (refused.status_code, refused.json()) == (
+        402,
+        {"detail": {"code": "credit_category_exhausted"}},
+    )
+    client._submit(_grant(world.builder, 100_000))
     # The JSON route reserves too, in the same window, by the delta.
     stored = client.post(
         DOCUMENTS, json=_json(world, "b" * 2_000), headers=world.headers()

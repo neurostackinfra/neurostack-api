@@ -55,11 +55,15 @@ from src.api.schemas.media_assets import (
 )
 from src.config.logging import get_logger
 from src.config.settings import settings
+from src.interaction_context import InteractionOrigin, classify_interaction_origin
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
-from src.services import credit_inventory
-from src.services.credit_allocations import ENFORCED_MEDIA_MAX_BYTES
+from src.services import credit_inventory, credit_lifecycle
+from src.services.credit_allocations import (
+    ENFORCED_MEDIA_MAX_BYTES,
+    reservation_effect_id,
+)
 from src.services.credit_metering import (
     CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
     CreditEnforcementUnavailable,
@@ -146,7 +150,10 @@ def _media_error(status_code: int, code: str) -> HTTPException:
 _CREDIT_PENDING_RESPONSE = {
     "description": (
         "After credit_enforcement_at only: the tenant has no credit account "
-        "(standalone) or its builder is on a quarantine hold (credit_pending); "
+        "(standalone) or its builder is on a quarantine hold (credit_pending), "
+        "or, on upload, its builder is exhausted and the upload needs new "
+        "capacity (credit_category_exhausted), or, on an API key download, its "
+        "builder is suspended after its 72 hours of debt (credit_suspended); "
         "nothing was stored and no byte was sent."
     ),
     "model": MediaAssetErrorResponse,
@@ -530,6 +537,19 @@ async def upload_media_asset(
                 )
                 if reserved.status == "credit_pending":
                     raise credit_inventory.CreditPendingError()
+                # Group 5: decided with the reservation, under the account
+                # lock it took -- an exhausted builder adds no media that
+                # needs new capacity (everything rolls back).
+                if target.builder_id is not None and (
+                    await credit_lifecycle.reservation_verdict(
+                        session,
+                        builder_id=target.builder_id,
+                        effect_id=reservation_effect_id(target.id, "media", asset.id),
+                        charged_mc=reserved.charged_mc,
+                    )
+                    == "category_exhausted"
+                ):
+                    raise _media_error(402, "credit_category_exhausted")
         await session.commit()
         logger.info(
             "media_asset_upload",
@@ -770,6 +790,16 @@ async def download_media_asset(
             # The egress overage is charged BEFORE the answer (owner G).
             assert mode.enforcement_at is not None
             await session.rollback()
+            if classify_interaction_origin(tenant) is InteractionOrigin.PRODUCTION:
+                # Group 5: past its 72 h of debt a suspended builder's media
+                # is suspended for API keys (the gate's transition commits
+                # either way); no byte is sent and nothing is charged.
+                suspended = await credit_lifecycle.tenant_suspended(session, target_id)
+                await session.commit()
+                if suspended:
+                    permit.release()
+                    permit = None
+                    raise _media_error(402, "credit_suspended")
             charged = await credit_inventory.charge_egress(
                 session,
                 tenant_id=target_id,

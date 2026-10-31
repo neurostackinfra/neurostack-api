@@ -127,8 +127,25 @@ _METERING_TABLES = frozenset(
         "credit_egress_deliveries",
     }
 )
+# Group 5: read (never written) by the export with the switch effective: it
+# names the S3 VersionId of a registered copy; the no-write check below still
+# requires zero rows in it.
+_READ_ONLY_TABLES = frozenset({"credit_object_copies"})
+# Group 5: the corpus uploads of the enforced run that need NEW capacity.
+# Its builder has no lot: the first charged decision's debt opens its
+# exhaustion episode, so an upload whose reservation charges above the
+# window's coverage answers 402 credit_category_exhausted there (nothing
+# stored) -- asserted by ``test_the_enforced_run_refuses_only_uploads_that_need_capacity``.
+# The media upload fits the baseline's coverage (zero delta): it is still
+# accepted, like main.
+_CATEGORY_GATED = (
+    "knowledge-json-upload",
+    "knowledge-files-upload",
+)
 # Group 4a: the credit surface of the corpus, outside the on/off comparison.
-_CREDIT_SURFACES = frozenset({"knowledge-files-upload"})
+_CREDIT_SURFACES = frozenset(
+    {"knowledge-files-upload", "credits-export", "credits-admin-purge"}
+)
 _FIXTURES = _ROOT / "tests" / "fixtures"
 _MULTIPART_BOUNDARY = "credit-dominance-boundary-4a"
 _RUN_TIMEOUT_SECONDS = 300
@@ -948,10 +965,10 @@ async def oracle(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[_Ora
         await _run_alembic(admin_url.set(database=at_037), "upgrade", "037")
         await _seed_world(admin_url.set(database=at_037), world)
         oracle.templates["037"] = at_037
-        # The credit-ready head: 040 (Group 4b; 039 before it).
-        at_040 = await oracle.clone("037")
-        await _run_alembic(admin_url.set(database=at_040), "upgrade", "040")
-        oracle.templates["040"] = at_040
+        # The credit-ready head: 041 (Group 5; 040 and 039 before it).
+        at_041 = await oracle.clone("037")
+        await _run_alembic(admin_url.set(database=at_041), "upgrade", "041")
+        oracle.templates["041"] = at_041
         yield oracle
     finally:
         for name in list(reversed(created)):
@@ -1023,7 +1040,7 @@ def _assert_same(on: dict[str, Any], off: dict[str, Any], world: _World) -> None
     assert actual["events"] == expected["events"]
 
 
-@pytest.mark.parametrize("revision", ["037", "040"])
+@pytest.mark.parametrize("revision", ["037", "041"])
 async def test_config_on_answers_and_stores_like_config_off(
     oracle: _Oracle, revision: str
 ) -> None:
@@ -1045,7 +1062,7 @@ async def test_config_on_answers_and_stores_like_config_off(
         assert on["reading"] == {
             "effective": True,
             "reason": "schema_ready",
-            "revision": "040",
+            "revision": "041",
         }
     _assert_same(on, off, oracle.world)
 
@@ -1112,6 +1129,9 @@ async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
         503,
         {"code": "credit_unavailable"},
     )
+    # Group 5: the export and the admin routes are credit surfaces too.
+    for case in ("credits-export", "credits-admin-purge"):
+        assert (status[case], body[case]) == (503, {"code": "credit_unavailable"})
 
 
 async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None:
@@ -1137,7 +1157,7 @@ async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None
 
 async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> None:
     _assert_same(
-        await oracle.run("040", enabled=False),
+        await oracle.run("041", enabled=False),
         await oracle.run("037", enabled=False),
         oracle.world,
     )
@@ -1145,7 +1165,7 @@ async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> Non
 
 @pytest.mark.parametrize(
     ("revision", "enabled"),
-    [("037", False), ("037", True), ("040", False)],
+    [("037", False), ("037", True), ("041", False)],
 )
 async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     oracle: _Oracle, revision: str, enabled: bool
@@ -1157,7 +1177,7 @@ async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
     assert run["statements"], "the listener saw no SQL at all"
     touching = [s for s in run["statements"] if _CREDIT_SQL.search(s)]
     assert touching == []
-    if revision == "040":
+    if revision == "041":
         assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
     else:
         assert run["credit_rows"] == {}
@@ -1170,7 +1190,7 @@ async def test_the_effective_switch_only_meters_observationally(
     writers' tables are touched, and nothing financial is ever written
     before the enforcement."""
 
-    run = await oracle.run("040", enabled=True)
+    run = await oracle.run("041", enabled=True)
 
     names = {
         match.group(0).lower()
@@ -1178,7 +1198,7 @@ async def test_the_effective_switch_only_meters_observationally(
         for match in _CREDIT_SQL.finditer(statement)
     }
     rows = run["credit_rows"]
-    assert names & set(rows) == _METERING_TABLES
+    assert names & set(rows) == _METERING_TABLES | _READ_ONLY_TABLES
     # The one other credit_* name in that SQL is the enforcement column.
     assert names - set(rows) == {"credit_enforcement_at"}
     assert rows["credit_ingress_claims"] > 0
@@ -1198,7 +1218,7 @@ def _event_id(run: dict[str, Any], case: str) -> str:
 async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
     oracle: _Oracle,
 ) -> None:
-    run = await oracle.run("040", enabled=True)
+    run = await oracle.run("041", enabled=True)
     world = oracle.world
     status = {r["id"]: r["status"] for r in run["responses"]}
     claims = run["metering"]["credit_ingress_claims"]
@@ -1319,8 +1339,8 @@ def _bodies(run: dict[str, Any]) -> dict[str, Any]:
     [
         ("037", False, 503),
         ("037", True, 503),
-        ("040", False, 503),
-        ("040", True, 201),
+        ("041", False, 503),
+        ("041", True, 201),
     ],
 )
 async def test_the_multipart_upload_exists_only_with_the_switch_effective(
@@ -1337,6 +1357,29 @@ async def test_the_multipart_upload_exists_only_with_the_switch_effective(
         assert document["metadata"]["title"] == "horarios.pdf"
 
 
+@pytest.mark.parametrize(
+    ("revision", "enabled", "export", "purge"),
+    [
+        ("037", True, 503, 503),
+        ("041", False, 503, 503),
+        ("041", True, 200, 403),
+    ],
+)
+async def test_group5_surfaces_exist_only_with_the_switch_effective(
+    oracle: _Oracle, revision: str, enabled: bool, export: int, purge: int
+) -> None:
+    """The export answers with the switch effective; the admin purge refuses
+    an API key (never an actor) -- and is ``purge_disabled`` for everyone."""
+
+    run = await oracle.run(revision, enabled=enabled)
+    answers = {r["id"]: r for r in run["responses"]}
+    assert answers["credits-export"]["status"] == export, answers["credits-export"]
+    assert answers["credits-admin-purge"]["status"] == purge
+    if export == 503:
+        assert answers["credits-export"]["body"] == {"code": "credit_unavailable"}
+        assert answers["credits-admin-purge"]["body"] == {"code": "credit_unavailable"}
+
+
 async def test_uploads_and_downloads_are_metered_observationally_only(
     oracle: _Oracle,
 ) -> None:
@@ -1344,7 +1387,7 @@ async def test_uploads_and_downloads_are_metered_observationally_only(
     and download WOULD debit, the window's maintenance once per category,
     the delivery -- and nothing financial."""
 
-    run = await oracle.run("040", enabled=True)
+    run = await oracle.run("041", enabled=True)
     world = oracle.world
     bodies = _bodies(run)
     effects = {
@@ -1449,8 +1492,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
     """``credit_enforcement_at`` set but the switch off: ``main`` exactly,
     no SQL touches a ``credit_*`` table, nothing is claimed or charged."""
 
-    off = await oracle.run("040", enabled=False)
-    enforced = await oracle.run("040", enabled=False, enforced=True)
+    off = await oracle.run("041", enabled=False)
+    enforced = await oracle.run("041", enabled=False, enforced=True)
 
     assert enforced["reading"] == off["reading"]
     _assert_same(enforced, off, oracle.world)
@@ -1463,8 +1506,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
 async def test_the_enforced_run_charges_each_production_decision_once(
     oracle: _Oracle,
 ) -> None:
-    off = await oracle.run("040", enabled=False)
-    run = await oracle.run("040", enabled=True, enforced=True)
+    off = await oracle.run("041", enabled=False)
+    run = await oracle.run("041", enabled=True, enforced=True)
     world = oracle.world
 
     assert run["reading"]["effective"] is True
@@ -1484,13 +1527,15 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     # Everything else -- the panel JWT (simulator), rejected requests, the
     # provider webhooks, enforced or not, and Group 4a's uploads and
     # download (reserved and charged below) -- answers like the config-off
-    # run.  The multipart upload is a credit surface (off: 503; here: 201).
+    # run.  The multipart upload is a credit surface (off: 503; with an
+    # unexhausted builder 201 -- here its builder is exhausted, see below).
     production = set(_KEYLESS) | set(_REPLAYS) | set(_CHARGED.values())
     expected, actual = _comparable(off, world), _comparable(run, world)
+    # Group 5: the uploads that need new capacity of an exhausted builder
+    # are refused (asserted by their own test below); the others compare.
     for want, got in zip(expected["responses"], actual["responses"], strict=True):
-        if got["id"] not in production | _CREDIT_SURFACES:
+        if got["id"] not in production | _CREDIT_SURFACES | set(_CATEGORY_GATED):
             assert got == want, got["id"]
-    assert answers["knowledge-files-upload"]["status"] == 201
     # The handoff runs on a session of its own: its enforced answer and its
     # stored events are main's (plus the srm.decision's credit_effect_id).
     [want] = [r for r in expected["responses"] if r["id"] == "events-api-key-handoff"]
@@ -1609,18 +1654,18 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     assert run["credit_rows"]["credit_accounts"] == 1
 
     # Group 4a: the window open at the enforcement got a free baseline
-    # (nothing stored before it is charged: the seeded media asset); each
-    # RAG upload reserved its aggregate delta, as debt (no lot); the media
-    # upload added nothing above the baseline's coverage (rounded once); the
-    # download was a delivery within the allowance (no egress charge).
+    # (nothing stored before it is charged: the seeded media asset); the
+    # media upload added nothing above the baseline's coverage (rounded
+    # once); the download was a delivery within the allowance (no egress
+    # charge).  Group 5: the two RAG uploads needed new capacity of an
+    # exhausted builder and were refused (their own test below), so no RAG
+    # reservation exists.
     bodies = {r["id"]: r["body"] for r in run["responses"]}
     tenant = world.api_tenant
     allocations = ledger["credit_allocations"]
     assert sorted((a["category"], a["allocation_kind"]) for a in allocations) == [
         ("media", "baseline"),
         ("rag", "baseline"),
-        ("rag", "reservation"),
-        ("rag", "reservation"),
     ]
     assert all(
         a["charged_mc"] == 0 and a["effect_id"] is None
@@ -1630,9 +1675,8 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     reserved = {
         a["effect_id"]: a for a in allocations if a["allocation_kind"] == "reservation"
     }
-    json_effect = f"rag:{tenant}:{bodies['knowledge-json-upload']['id']}:reserve"
     media_effect = f"media:{tenant}:{bodies['media-upload-pdf']['id']}:reserve"
-    assert json_effect in reserved and media_effect not in reserved
+    assert media_effect not in reserved
     [baseline] = [
         a
         for a in allocations
@@ -1652,7 +1696,28 @@ async def test_the_enforced_run_charges_each_production_decision_once(
         (d["tenant_id"], d["media_id"], d["mode"])
         for d in ledger["credit_egress_deliveries"]
     ] == [(tenant, world.media_asset, "enforced")]
-    assert {e["effect_kind"] for e in ledger["credit_effects"]} == {"trace", "rag"}
+    assert {e["effect_kind"] for e in ledger["credit_effects"]} == {"trace"}
+
+
+async def test_the_enforced_run_refuses_only_uploads_that_need_capacity(
+    oracle: _Oracle,
+) -> None:
+    """Group 5 (D3): the enforced builder has no lot, so its first charged
+    decision opens its exhaustion episode.  An upload whose reservation
+    charges above the window's coverage is then refused -- 402
+    ``credit_category_exhausted``, nothing stored, no reservation -- while
+    the media upload, which fits the baseline's coverage (zero delta), is
+    accepted (201) with the episode open."""
+
+    run = await oracle.run("041", enabled=True, enforced=True)
+    answers = {r["id"]: r for r in run["responses"]}
+    for case in _CATEGORY_GATED:
+        assert (answers[case]["status"], answers[case]["body"]) == (
+            402,
+            {"detail": {"code": "credit_category_exhausted"}},
+        ), case
+    assert answers["media-upload-pdf"]["status"] == 201
+    assert answers["media-upload-pdf"]["body"]["category"] == "pdf"
 
 
 # ---------------------------------------------------------------------------
@@ -1722,9 +1787,9 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
             ) as client:
                 before = await client.post("/v1/events", json={}, headers=unknown_key)
 
-                await _run_alembic(url, "upgrade", "040")
+                await _run_alembic(url, "upgrade", "041")
                 assert await _wait_for(True, bound) <= bound
-                assert credit_switch_reading().revision == "040"
+                assert credit_switch_reading().revision == "041"
                 during = await client.post("/v1/events", json={}, headers=unknown_key)
 
                 await _run_alembic(url, "downgrade", "037")

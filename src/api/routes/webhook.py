@@ -2684,6 +2684,9 @@ async def _process_zapi_authenticated_body(
             )
         if verdict == "credit_pending":
             return dict(credit_metering.CREDIT_PENDING_SKIP)
+        if verdict == "credit_suspended":
+            # Group 5: the builder is suspended -- no session, no reply.
+            return dict(credit_metering.CREDIT_SUSPENDED_SKIP)
         if isinstance(verdict, WebhookEnforcement):
             enforcement = verdict
 
@@ -4345,6 +4348,9 @@ async def meta_webhook(
                 )
             if verdict == "credit_pending":
                 return dict(credit_metering.CREDIT_PENDING_SKIP)
+            if verdict == "credit_suspended":
+                # Group 5: the builder is suspended -- no session, no reply.
+                return dict(credit_metering.CREDIT_SUSPENDED_SKIP)
             enforcement = verdict if isinstance(verdict, WebhookEnforcement) else None
 
             # ── get or create a session for this phone ──
