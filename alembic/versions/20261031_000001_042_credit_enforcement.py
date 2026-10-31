@@ -78,17 +78,39 @@ TRIGGERS = (
 
 
 def downgrade_preflight() -> str:
-    return """
+    """The downgrade's refusal block (SQLSTATE 55000, nothing changed).
+
+    Same shape as 041: the created tables are locked ACCESS EXCLUSIVE first
+    (an acceptance being written cannot slip in behind the emptiness check;
+    a conflicting lock gives up after ``lock_timeout``), and every
+    ``alembic_version`` row is read, so an empty table or a second row is a
+    refusal too.
+    """
+
+    occupied = ",\n            ".join(
+        f"({position}, '{table}', EXISTS (SELECT 1 FROM {table}))"
+        for position, table in enumerate(CREATED_TABLES, start=1)
+    )
+    return f"""
 DO $preflight$
 DECLARE
     problems TEXT[] := ARRAY[]::TEXT[];
+    listed TEXT;
 BEGIN
-    IF (SELECT version_num FROM alembic_version) <> '042' THEN
-        problems := problems || format('alembic_version is %s, not 042',
-            (SELECT version_num FROM alembic_version));
+    LOCK TABLE {", ".join(CREATED_TABLES)} IN ACCESS EXCLUSIVE MODE;
+    SELECT string_agg(version_num, ', ' ORDER BY version_num) INTO listed
+    FROM alembic_version;
+    IF listed IS DISTINCT FROM '042' THEN
+        problems := problems || format(
+            'alembic_version is %s, not 042', coalesce(listed, 'empty'));
     END IF;
-    IF EXISTS (SELECT 1 FROM credit_cutoff_acceptances) THEN
-        problems := problems || 'tables that have rows: credit_cutoff_acceptances';
+    SELECT string_agg(name, ', ' ORDER BY position) INTO listed
+    FROM (VALUES
+            {occupied}
+    ) AS guarded(position, name, has_rows)
+    WHERE has_rows;
+    IF listed IS NOT NULL THEN
+        problems := problems || format('tables that have rows: %s', listed);
     END IF;
     IF cardinality(problems) > 0 THEN
         RAISE EXCEPTION 'downgrade of migration 042 refused (nothing was changed): %',

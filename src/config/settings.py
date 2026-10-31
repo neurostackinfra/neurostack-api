@@ -498,6 +498,36 @@ class Settings(BaseSettings):
     # interval.  The lifecycle helper, rather than callers, owns its meaning.
     credit_binding_grace_days: int = Field(default=5, ge=0, le=31)
     credit_lifecycle_worker_interval_seconds: int = Field(default=60, ge=5, le=3600)
+    # Group 7, deliverable 9: the ONLY source of the credit
+    # ``production-serving`` role -- exact (environment, ECS cluster ARN, ECS
+    # service ARN) triples injected by configuration (env JSON, e.g.
+    # ``[["staging", "arn:...:cluster/x", "arn:...:service/x/y"]]``).  Empty
+    # by default: nothing derives.  Never read from AppConfig and never from
+    # ``is_production`` (false in real production, ENVIRONMENT=staging).  The
+    # real triples are pinned by the rollout-opening wish, not here.
+    credit_production_serving_allowlist: tuple[tuple[str, str, str], ...] = ()
+
+    @field_validator("credit_production_serving_allowlist")
+    @classmethod
+    def validate_credit_production_serving_allowlist(
+        cls, value: tuple[tuple[str, str, str], ...]
+    ) -> tuple[tuple[str, str, str], ...]:
+        """Exact, well-formed triples only; a malformed one fails start-up."""
+
+        for environment, cluster_arn, service_arn in value:
+            if environment not in ("development", "staging", "production", "test"):
+                raise ValueError(
+                    "CREDIT_PRODUCTION_SERVING_ALLOWLIST environment is unknown"
+                )
+            if not cluster_arn.startswith("arn:") or ":cluster/" not in cluster_arn:
+                raise ValueError(
+                    "CREDIT_PRODUCTION_SERVING_ALLOWLIST needs an ECS cluster ARN"
+                )
+            if not service_arn.startswith("arn:") or ":service/" not in service_arn:
+                raise ValueError(
+                    "CREDIT_PRODUCTION_SERVING_ALLOWLIST needs an ECS service ARN"
+                )
+        return value
 
     @field_validator("asaas_webhook_url")
     @classmethod

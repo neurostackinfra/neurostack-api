@@ -1953,3 +1953,44 @@ async def test_a_reversal_won_at_once_never_costs_the_customer(
         consumer, without
     )
     assert await _position(consumer, without, t1) == 5_000_000
+
+
+# ---------------------------------------------------------------------------
+# Group 7, deliverable 10: the consumer's acks never touch the rollout.
+# ---------------------------------------------------------------------------
+
+
+async def _rollout_surfaces(harness: _Harness) -> tuple[Any, ...]:
+    """``billing_rollout_control`` (``topup_commercial_enabled`` included)
+    and ``billing_topup_capability_receipts``, byte for byte."""
+
+    return (
+        await _one(
+            harness,
+            "SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) "
+            "FROM billing_rollout_control t",
+        ),
+        await _one(
+            harness,
+            "SELECT string_agg(environment || '=' || topup_commercial_enabled::text, "
+            "',' ORDER BY environment) FROM billing_rollout_control",
+        ),
+        await _one(
+            harness,
+            "SELECT md5(coalesce(string_agg(t::text, '|' ORDER BY t::text), '')) "
+            "FROM billing_topup_capability_receipts t",
+        ),
+    )
+
+
+async def test_the_fact_consumer_ack_never_touches_the_rollout_surfaces(
+    consumer: _Harness,
+) -> None:
+    payloads = [_fixture(name) for name in CYCLE + TOPUP]
+    for payload in payloads:
+        await _seed_payload(consumer, payload)
+    before = await _rollout_surfaces(consumer)
+    for payload in payloads:
+        await handle_billing_fact(payload)
+    assert await _one(consumer, "SELECT count(*) FROM billing_fact_acks") == 6
+    assert await _rollout_surfaces(consumer) == before
