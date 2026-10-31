@@ -310,6 +310,67 @@ def test_uazapi_gate_is_independent_from_financial_flag(
     safe_client.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["open", "closed", "absent", "stale", "error", "never_read", "unconfigured"],
+)
+@pytest.mark.asyncio
+async def test_f2_sdk_reader_releases_uazapi_only_when_open_and_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """The real gate chain: uazapi_service -> egress_policy -> F2 reader."""
+
+    from src.config.settings import settings
+    from src.infrastructure.appconfig import AppConfigDataFlagReader
+    from src.services import egress_policy
+    from tests.infrastructure.test_appconfig import _Clock, _FakeAppConfigData, _flags
+
+    monkeypatch.setattr(
+        uazapi_service, "require_uazapi_egress", egress_policy.require_uazapi_egress
+    )
+    monkeypatch.setattr(
+        settings, "appconfig_source", "agent" if case == "unconfigured" else "sdk"
+    )
+    monkeypatch.setattr(settings, "appconfig_enabled", case != "unconfigured")
+    monkeypatch.setattr(settings, "appconfig_application", "neurostack")
+    monkeypatch.setattr(settings, "appconfig_environment", "production")
+    monkeypatch.setattr(settings, "appconfig_profile", "egress-flags")
+    document = {
+        "closed": _flags(uazapi_egress_enabled=False, financial_egress_enabled=True),
+        "absent": _flags(financial_egress_enabled=True),
+    }.get(case, _flags(uazapi_egress_enabled=True))
+    clock = _Clock()
+    fake = _FakeAppConfigData([document, RuntimeError("appconfig down")])
+    reader = AppConfigDataFlagReader(
+        settings, client_factory=lambda: fake, monotonic=clock
+    )
+    monkeypatch.setattr(egress_policy, "APPCONFIG_DATA_READER", reader)
+    if case not in ("never_read", "unconfigured"):
+        assert await reader.refresh_now() is True
+    if case == "stale":
+        clock.now += 3 * reader.poll_interval
+    if case == "error":
+        assert await reader.refresh_now() is False
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"MessageID": "MID.f2"})
+
+    with egress_env(make_resolver("1.1.1.1"), httpx.MockTransport(handler)):
+        if case == "open":
+            result = await _invoke_operation("text")
+            assert result == {"MessageID": "MID.f2"}
+            assert len(seen) == 1
+            return
+        with pytest.raises(EgressDisabledError) as exc_info:
+            await _invoke_operation("text")
+
+    assert exc_info.value.code == "uazapi_egress_disabled"
+    assert seen == []
+
+
 class TestSendUazapiText:
     def test_happy_path_public_host(self) -> None:
         captured: dict[str, Any] = {}

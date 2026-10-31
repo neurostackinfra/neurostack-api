@@ -46,8 +46,19 @@ origem HTTP loopback, por exemplo `http://127.0.0.1:2772` ou
 opcional vem de `APPCONFIG_TOKEN` e nunca deve ser colocado em logs ou arquivos
 versionados.
 
+`APPCONFIG_SOURCE` escolhe a fonte das flags e só tem efeito com
+`APPCONFIG_ENABLED=true`: `agent` (padrão) lê o cache local do AppConfig Agent
+descrito nesta seção; `sdk` lê o AppConfig Data de dentro do processo, com um
+refresher em background por processo (`APPCONFIG_ORIGIN` e `APPCONFIG_TOKEN`
+não são usados). Produção usa `sdk` a partir do passo L7: a task de produção tem apenas os
+containers `app` e `otel`, então não há Agent para `agent` consultar. Hoje
+nenhum nome `APPCONFIG_*` está definido e as duas flags ficam fechadas por
+ausência. Detalhes
+em `docs/runbooks/asaas-deployment.md`, seção "AppConfig and opening financial
+egress (follow-up F2)".
+
 Somente `financial_egress_enabled` e `uazapi_egress_enabled` são aceitas, como
-decisões independentes no formato `{nome_da_flag: {enabled: boolean}}`. A
+decisões independentes no formato `{nome_da_flag: {enabled: boolean}}`. Com `agent`, a
 aplicação não mantém cache, refresher ou lifecycle próprios: cada consulta
 observa o snapshot atual do agente. Configuração incompleta, agente
 indisponível, timeout, resposta inválida ou flag ausente resultam em `false` e
