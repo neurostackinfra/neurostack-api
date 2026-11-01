@@ -1328,8 +1328,18 @@ def test_structural_evidence_validators_and_group5_template_accept_the_rendering
 
 def test_validator_d3_names_are_exactly_the_manifest_and_planner_names() -> None:
     manifest = wiring.load_yaml(MANIFEST)["task_definition"]
-    assert rollout.D3_ENVIRONMENT_NAMES == set(wiring.ADDED_ENVIRONMENT)
-    assert rollout.D3_ENVIRONMENT_NAMES == set(manifest["app_environment_added"])
+    # The planner renders the D3 names plus the two staged flags in every
+    # revision (asaas-rollout-opening, live step L2a on); the validator keeps
+    # them as two stages, each all or none.
+    added = rollout.D3_ENVIRONMENT_NAMES | rollout.STAGED_FLAG_ENVIRONMENT_NAMES
+    assert added == set(wiring.ADDED_ENVIRONMENT)
+    assert added == set(manifest["app_environment_added"])
+    assert rollout.D3_ENVIRONMENT_NAMES == {
+        "ASAAS_CHECKOUT_RETURN_URL",
+        "ASAAS_WEBHOOK_NOTIFICATION_EMAIL",
+        "ASAAS_WEBHOOK_URL",
+        "BILLING_FACT_WORKER_ENABLED",
+    }
     assert rollout.D3_SECRET_NAMES == set(wiring.ADDED_SECRETS)
     assert rollout.D3_SECRET_NAMES == set(manifest["app_secrets_added"])
     assert rollout.D3_SECRET_NAMES == {row[0] for row in wiring.SECRET_REFERENCES}
@@ -1715,7 +1725,15 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         # Present and valid here; its repository value is pinned once, by
         # test_the_repository_turns_the_outbox_worker_on.
         "BILLING_FACT_WORKER_ENABLED": values["BILLING_FACT_WORKER_ENABLED"],
+        # asaas-rollout-opening: both staged flags 'false' (live step L2a);
+        # each becomes 'true' only through its own reviewed PR (L5, L6).
+        "CREDIT_HOT_PATH_ENABLED": "false",
+        "BILLING_FACT_TRANSPORT_ENABLED": "false",
         "app_image_override": None,
+        # The AppConfig group is not rendered until live step L7.
+        "APPCONFIG_APPLICATION": None,
+        "APPCONFIG_ENVIRONMENT": None,
+        "APPCONFIG_PROFILE": None,
     }
     assert (
         Settings.validate_asaas_checkout_return_url(values["ASAAS_CHECKOUT_RETURN_URL"])
@@ -2302,16 +2320,40 @@ def test_migration_windows_pin_each_exact_upgrade() -> None:
         "035": ("032", "035", ("alembic", "upgrade", "035")),
         "036": ("035", "036", ("alembic", "upgrade", "036")),
         "037": ("036", "037", ("alembic", "upgrade", "037")),
+        "042": ("037", "042", ("alembic", "upgrade", "042")),
     }
     assert mw.WINDOW_035.verification == "read back alembic_version == 035"
     assert mw.WINDOW_036.verification == "read back alembic_version == 036"
     assert mw.WINDOW_037.verification == "read back alembic_version == 037"
+    assert mw.WINDOW_042.verification == "read back alembic_version == 042"
     assert set(wiring.MIGRATIONS_EXCLUDED) == set(mw.WINDOWS)
     window_steps = [w.manifest_step for w in mw.WINDOWS.values()]
-    assert window_steps == ["migrations_033_035", "migrations_036", "migrations_037"]
+    assert window_steps == [
+        "migrations_033_035",
+        "migrations_036",
+        "migrations_037",
+        "migrations_038_042",
+    ]
     assert [s for s, _scope in wiring.STEPS if s.startswith("migrations")] == (
         window_steps
     )
+    # The 038-042 window comes after the deploy of the image containing 042
+    # (live step L2) and the 037 window, and before any rollout transition.
+    order = [step for step, _scope in wiring.STEPS]
+    assert (
+        order.index("service_deployment")
+        < order.index("migrations_037")
+        < order.index("migrations_038_042")
+        == order.index("rollout_transitions") - 1
+    )
+    # The whole sentence: its every clause (the image prerequisite included)
+    # is what plan prints for the 037 window.
+    assert wiring.MIGRATIONS_EXCLUDED["037"] == (
+        "038-042 (the additive credit schema, neurostack-credit-system): "
+        "their own window (migrations_038_042), on its own explicit owner "
+        "instruction after the image containing 042 serves"
+    )
+    assert "043" in wiring.MIGRATIONS_EXCLUDED["042"]
     assert all(
         scope == "separate_approval"
         for step, scope in wiring.STEPS
@@ -3104,7 +3146,7 @@ def test_migrations_render_refuses_a_widened_window_table(
         _pins()
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042"])
 def test_a_window_outside_the_table_is_refused(name: str) -> None:
     """Only the table's own entries render: an equal-looking copy with any
     field changed is not a window."""
@@ -3660,7 +3702,7 @@ def test_an_equal_newest_revision_of_this_family_is_reported(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042"])
 def test_each_window_renders_only_its_own_baked_upgrade(name: str) -> None:
     window = mw.WINDOWS[name]
     status, rendered = _migrations(window=window)
@@ -3681,15 +3723,16 @@ def test_each_window_renders_only_its_own_baked_upgrade(name: str) -> None:
     "name,command",
     [
         (name, command)
-        for name in ("035", "036", "037")
+        for name in ("035", "036", "037", "042")
         for command in (
             ("alembic", "upgrade", "head"),
             ("alembic", "upgrade", "heads"),
             ("alembic", "upgrade", "035:037"),
             ("alembic", "upgrade", "+1"),
+            ("alembic", "upgrade", "041"),
             *[
                 ("alembic", "upgrade", other)
-                for other in ("035", "036", "037")
+                for other in ("035", "036", "037", "042")
                 if other != name
             ],
         )
@@ -3721,10 +3764,13 @@ def _registered_for(window: Any, arn: str = MIGRATIONS_NEXT_ARN) -> Any:
         ("035", "036", "would_register"),
         ("035", "037", "would_register"),
         ("036", "037", "would_register"),
+        ("037", "042", "would_register"),
         ("036", "035", "migrations_newest_revision_is_a_later_window"),
         ("037", "035", "migrations_newest_revision_is_a_later_window"),
         ("037", "036", "migrations_newest_revision_is_a_later_window"),
+        ("042", "037", "migrations_newest_revision_is_a_later_window"),
         ("036", "036", "registered"),
+        ("042", "042", "registered"),
     ],
 )
 def test_the_newest_revision_of_another_window_is_never_reused(
@@ -3772,7 +3818,7 @@ def test_cli_render_migrations_taskdef_requires_an_explicit_window(
     snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
     params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
     base = ["--params", str(params), "--readback-file", str(snapshot)]
-    for window in (None, "", "head", "034", "038", "035:037"):
+    for window in (None, "", "head", "034", "038", "041", "043", "035:037"):
         argv = ["render-migrations-taskdef", *base]
         if window is not None:
             argv += ["--window", window]
@@ -3780,7 +3826,7 @@ def test_cli_render_migrations_taskdef_requires_an_explicit_window(
             wiring.main(argv)
         assert raised.value.code == 2
         assert capsys.readouterr().out == ""
-    for name in ("035", "036", "037"):
+    for name in ("035", "036", "037", "042"):
         code, out, err = _run(
             [
                 "render-migrations-taskdef",
@@ -3844,7 +3890,7 @@ def _window_step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     "name,mutate",
     [
         (name, mutate)
-        for name in ("036", "037")
+        for name in ("036", "037", "042")
         for mutate in (
             lambda s, n: s.__setitem__(
                 "change",
@@ -3857,7 +3903,7 @@ def _window_step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
                 "change",
                 (
                     s["change"] + " then `alembic upgrade 037`"
-                    if n == "036"
+                    if n in ("036", "042")
                     else s["change"] + " then `alembic upgrade 036`"
                 ),
             ),
@@ -3881,14 +3927,14 @@ def _window_step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
             lambda s, n: s.__setitem__(
                 "preconditions",
                 [
-                    row.replace(f"pre-{n}-<date>", "pre-snapshot-<date>")
+                    row.replace(mw.WINDOWS[n].snapshot_pattern, "pre-snapshot-<date>")
                     for row in s["preconditions"]
                 ],
             ),
         )
     ],
 )
-def test_manifest_validator_pins_the_036_and_037_window_steps(
+def test_manifest_validator_pins_the_036_037_and_042_window_steps(
     name: str, mutate: Callable[[dict[str, Any], str], None]
 ) -> None:
     manifest = wiring.load_yaml(MANIFEST)
@@ -3906,7 +3952,13 @@ def test_manifest_window_steps_say_their_own_upgrade_exactly_once() -> None:
         assert f"--window {name}" in step["change"]
         assert window.snapshot_pattern in json.dumps(step)
         assert "separate owner approval" in step["approval"]
-    assert manifest["migrations_task_definition"]["windows"] == ["035", "036", "037"]
+    assert manifest["migrations_task_definition"]["windows"] == [
+        "035",
+        "036",
+        "037",
+        "042",
+    ]
+    assert manifest["migrations_task_definition"]["read_revisions"] == ["037"]
 
 
 # ---------------------------------------------------------------------------
@@ -3939,7 +3991,7 @@ def test_the_037_read_revision_bakes_only_the_readback() -> None:
     }
 
 
-@pytest.mark.parametrize("name", ["035", "036"])
+@pytest.mark.parametrize("name", ["035", "036", "042"])
 def test_only_window_037_has_a_read_revision(
     name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4159,6 +4211,9 @@ WORKER_ROLLBACK_TARGETS: dict[int, dict[str, Any]] = {
 # stdout of render-taskdef and check BEFORE the flag became a parameter (the
 # literal 'false', main a42754cd), in the D3 world (service on 8) and in the
 # bridge world (service on 9 registered from the rendering on the bridge image).
+# Since asaas-rollout-opening the rendering also carries the two staged flag
+# rows (both 'false'): with exactly those two rows taken out, it is still byte
+# for byte these.
 GOLDEN_RENDER_SHA256 = {
     "d3": "7cd9343411cbaf133f9586dbb6bbae6eca850b42399dfe4cdea5011aa12769d5",
     "bridge": "ee061bb407528bb48551f22309781528daaea9ff246aabb98a17f6ef194bd784",
@@ -4834,19 +4889,53 @@ def test_an_unquoted_yaml_flag_fails_before_any_aws_read(
     assert fake.calls == []
 
 
+def _emitted(payload: Any) -> str:
+    """What wiring._emit prints for ``payload``."""
+
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+
+
+def _without_the_staged_flag_rows(request: dict[str, Any]) -> dict[str, Any]:
+    stripped = copy.deepcopy(request)
+    app = evidence._container_map(stripped)["app"]
+    rows = [row for row in app["environment"] if row["name"] in STAGED_FLAG_ROWS]
+    assert rows == [
+        {"name": name, "value": "false"} for name in sorted(STAGED_FLAG_ROWS)
+    ], rows
+    app["environment"] = [
+        row for row in app["environment"] if row["name"] not in STAGED_FLAG_ROWS
+    ]
+    return stripped
+
+
+STAGED_FLAG_ROWS = ("BILLING_FACT_TRANSPORT_ENABLED", "CREDIT_HOT_PATH_ENABLED")
+
+
 @pytest.mark.parametrize("world,rollback", WORKER_WORLDS)
 def test_false_renders_and_checks_byte_for_byte_as_before(
     world: str, rollback: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    for command, golden in (
-        ("render-taskdef", GOLDEN_RENDER_SHA256),
-        ("check", GOLDEN_CHECK_SHA256),
-    ):
-        code, out, err = _worker_cli(
-            command, world, rollback, "false", tmp_path, capsys
-        )
-        assert code == 0, err
-        assert wiring.hashlib.sha256(out.encode("utf-8")).hexdigest() == golden[world]
+    code, out, err = _worker_cli(
+        "render-taskdef", world, rollback, "false", tmp_path, capsys
+    )
+    assert code == 0, err
+    rendered = json.loads(out)
+    assert out == _emitted(rendered)
+    before = _without_the_staged_flag_rows(rendered)
+    assert (
+        wiring.hashlib.sha256(_emitted(before).encode("utf-8")).hexdigest()
+        == GOLDEN_RENDER_SHA256[world]
+    )
+    code, out, err = _worker_cli("check", world, rollback, "false", tmp_path, capsys)
+    assert code == 0, err
+    check = json.loads(out)
+    assert out == _emitted(check)
+    assert check["rendered_request_sha256"] == wiring._sha256(rendered)
+    check["rendered_request_sha256"] = wiring._sha256(before)
+    assert (
+        wiring.hashlib.sha256(_emitted(check).encode("utf-8")).hexdigest()
+        == GOLDEN_CHECK_SHA256[world]
+    )
 
 
 @pytest.mark.parametrize("world,rollback", WORKER_WORLDS)
@@ -4871,10 +4960,11 @@ def test_true_renders_the_same_request_but_for_the_one_value(
     ]
     request_off, request_on = json.loads(off), json.loads(on)
     environment = evidence._container_map(request_on)["app"]["environment"]
-    # Same position as before: after the source names, the D3 names sorted.
-    assert [row["name"] for row in environment][-4:] == sorted(wiring.ADDED_ENVIRONMENT)
-    assert environment[-1] == {"name": WORKER_FLAG, "value": "true"}
-    environment[-1]["value"] = "false"
+    # After the source names, the D3 names and the staged flags, sorted.
+    assert [row["name"] for row in environment][-6:] == sorted(wiring.ADDED_ENVIRONMENT)
+    [index] = [i for i, row in enumerate(environment) if row["name"] == WORKER_FLAG]
+    assert environment[index] == {"name": WORKER_FLAG, "value": "true"}
+    environment[index]["value"] = "false"
     assert request_on == request_off
 
 
@@ -6166,3 +6256,1081 @@ def test_the_runbook_documents_the_image_bump() -> None:
     assert NEW_DIGEST in state
     assert NEW_DIGEST[7:] not in raw_runbook.replace(state, "")
     assert "\n  app_image_override: null\n" in PARAMS.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# asaas-rollout-opening (Decisions 12 to 14): the staged names
+# ---------------------------------------------------------------------------
+
+CREDIT_FLAG = "CREDIT_HOT_PATH_ENABLED"
+TRANSPORT_FLAG = "BILLING_FACT_TRANSPORT_ENABLED"
+STAGED_FLAGS = (TRANSPORT_FLAG, CREDIT_FLAG)
+APPCONFIG_GROUP_NAMES = (
+    "APPCONFIG_APPLICATION",
+    "APPCONFIG_ENABLED",
+    "APPCONFIG_ENVIRONMENT",
+    "APPCONFIG_PROFILE",
+    "APPCONFIG_SOURCE",
+)
+APPCONFIG = {
+    "APPCONFIG_APPLICATION": "neurostack-staging",
+    "APPCONFIG_ENVIRONMENT": "production",
+    "APPCONFIG_PROFILE": "financial-egress",
+}
+# The live revisions before this wish (no staged row): 10 (bridge image,
+# worker on; the rollback target) and 11 (the E7b image bump), then what the
+# live steps register: 12 the rows (L2a), 13 the image of L1 (L2b), 14 the
+# credit switch (L5), 15 the transport (L6), 16 the AppConfig group (L7).
+STAGED_ARNS = {n: SOURCE_ARN.rsplit(":", 1)[0] + f":{n}" for n in range(12, 17)}
+L1_IMAGE = OTHER_IMAGE
+
+
+def _staged_rendering(image: str, **changes: Any) -> dict[str, Any]:
+    """The planner's rendering of the D3 world with ``image``, the worker on
+    and the given parameters (the staged flags 'false' unless changed)."""
+
+    fake = _with_images(FakeAws(applied=True))
+    _plan_result, rendered = _plan(
+        fake,
+        pins=_worker_pins(8),
+        app_image_override=image,
+        **{WORKER_FLAG: "true", **changes},
+    )
+    assert rendered is not None, _plan_result["blocks"]
+    return rendered
+
+
+def _without_staged_rows(rendered: dict[str, Any]) -> dict[str, Any]:
+    """A revision as registered before live step L2a: no staged flag row."""
+
+    request = copy.deepcopy(rendered)
+    app = evidence._container_map(request)["app"]
+    app["environment"] = [
+        row for row in app["environment"] if row["name"] not in STAGED_FLAGS
+    ]
+    return request
+
+
+def _staged_world(serving: str, *revisions: tuple[str, dict[str, Any]]) -> FakeAws:
+    """The live revisions 10 and 11 (no staged row), then each (ARN, request)
+    registered in order; the last one is the newest; the service on
+    ``serving``."""
+
+    fake = _with_images(FakeAws(applied=True))
+    history = (
+        (REVISION_10_ARN, _without_staged_rows(_staged_rendering(BRIDGE_IMAGE))),
+        (REVISION_11_ARN, _without_staged_rows(_staged_rendering(NEW_IMAGE))),
+        *revisions,
+    )
+    for index, (arn, request) in enumerate(history):
+        _put_app_revision(
+            fake, arn, _registered_as(arn, request), latest=index == len(history) - 1
+        )
+    _serve(fake, serving)
+    return fake
+
+
+def _staged_plan(
+    fake: FakeAws, image: str, **changes: Any
+) -> tuple[dict[str, Any], Any]:
+    return _plan(
+        fake,
+        pins=_worker_pins(10),
+        app_image_override=image,
+        **{WORKER_FLAG: "true", **changes},
+    )
+
+
+def _task_step(plan: dict[str, Any]) -> dict[str, Any]:
+    return _step(plan, "task_definition_revision")
+
+
+def _env(request: dict[str, Any]) -> dict[str, str]:
+    return evidence._env_map(evidence._container_map(request)["app"])
+
+
+def test_the_staged_names_are_exactly_decisions_12_to_14() -> None:
+    assert wiring.STAGED_FLAG_PARAMETERS == STAGED_FLAGS
+    assert wiring.FLAG_PARAMETERS == (WORKER_FLAG, *STAGED_FLAGS)
+    assert wiring.REQUIRED_PARAMETERS[-3:] == (WORKER_FLAG, CREDIT_FLAG, TRANSPORT_FLAG)
+    for name in STAGED_FLAGS:
+        assert wiring.ADDED_ENVIRONMENT[name] == ("parameter", name)
+    assert dict(wiring.APPCONFIG_GROUP) == {
+        "APPCONFIG_APPLICATION": ("parameter", "APPCONFIG_APPLICATION"),
+        "APPCONFIG_ENABLED": ("value", "true"),
+        "APPCONFIG_ENVIRONMENT": ("parameter", "APPCONFIG_ENVIRONMENT"),
+        "APPCONFIG_PROFILE": ("parameter", "APPCONFIG_PROFILE"),
+        "APPCONFIG_SOURCE": ("value", "sdk"),
+    }
+    assert wiring.APPCONFIG_PARAMETERS == tuple(APPCONFIG)
+    # APPCONFIG_ stays a forbidden prefix: the group is its only exception.
+    assert wiring.FORBIDDEN_NAME_PREFIXES == ("ABACATEPAY_", "APPCONFIG_")
+    declared = (
+        set(wiring.ADDED_ENVIRONMENT)
+        | set(wiring.APPCONFIG_GROUP)
+        | set(wiring.REQUIRED_PARAMETERS)
+        | set(wiring.APPCONFIG_PARAMETERS)
+    )
+    for name in ("APPCONFIG_ORIGIN", "APPCONFIG_TOKEN"):
+        assert name not in declared
+
+
+def test_the_mirrored_staged_sets_are_equal_everywhere() -> None:
+    from scripts import asaas_deploy_hook as hook
+
+    task_definition = wiring.load_yaml(MANIFEST)["task_definition"]
+    assert (
+        rollout.STAGED_FLAG_ENVIRONMENT_NAMES
+        == set(wiring.STAGED_FLAG_PARAMETERS)
+        == set(hook.STAGED_FLAGS)
+    )
+    assert tuple(sorted(hook.STAGED_FLAGS)) == hook.STAGED_FLAGS
+    assert (
+        rollout.APPCONFIG_ENVIRONMENT_NAMES
+        == set(wiring.APPCONFIG_GROUP)
+        == set(hook.APPCONFIG_NAMES)
+        == set(task_definition["app_environment_appconfig_group"])
+    )
+    assert dict(hook.APPCONFIG_FIXED_VALUES) == {
+        name: reference
+        for name, (kind, reference) in wiring.APPCONFIG_GROUP.items()
+        if kind == "value"
+    }
+    assert task_definition["app_environment_appconfig_group"] == {
+        name: {kind: reference}
+        for name, (kind, reference) in wiring.APPCONFIG_GROUP.items()
+    }
+    assert hook.WORKER_FLAG_VALUES == wiring.WORKER_FLAG_VALUES
+    assert not rollout.STAGED_FLAG_ENVIRONMENT_NAMES & (
+        rollout.D3_ENVIRONMENT_NAMES | rollout.APPCONFIG_ENVIRONMENT_NAMES
+    )
+    base = rollout.BASE_ENVIRONMENT_NAMES
+    d3 = base | rollout.D3_ENVIRONMENT_NAMES
+    flags = d3 | rollout.STAGED_FLAG_ENVIRONMENT_NAMES
+    assert rollout.ENVIRONMENT_NAME_SETS == (
+        base,
+        d3,
+        flags,
+        flags | rollout.APPCONFIG_ENVIRONMENT_NAMES,
+    )
+    assert rollout.FINGERPRINTED_ENVIRONMENT_NAMES == rollout.ENVIRONMENT_NAME_SETS[-1]
+
+
+def test_the_repository_renders_both_staged_rows_false() -> None:
+    values = yaml.safe_load(PARAMS.read_text(encoding="utf-8"))["parameters"]
+    assert values[CREDIT_FLAG] == values[TRANSPORT_FLAG] == "false"
+    assert all(values[name] is None for name in APPCONFIG)
+    _plan_result, rendered = _plan(FakeAws(applied=True))
+    assert rendered is not None
+    environment = evidence._container_map(rendered)["app"]["environment"]
+    for name in STAGED_FLAGS:
+        assert [row for row in environment if row["name"] == name] == [
+            {"name": name, "value": "false"}
+        ]
+    assert not any(row["name"].startswith("APPCONFIG_") for row in environment)
+
+
+@pytest.mark.parametrize("name", STAGED_FLAGS)
+@pytest.mark.parametrize(
+    "value,reason",
+    [
+        (True, "parameter_invalid"),
+        (False, "parameter_invalid"),
+        (1, "parameter_invalid"),
+        ("TRUE", "parameter_invalid"),
+        ("yes", "parameter_invalid"),
+        (" false", "parameter_invalid"),
+        ("", "parameter_missing"),
+        (None, "parameter_missing"),
+    ],
+)
+def test_each_staged_flag_is_exactly_false_or_true(
+    name: str, value: Any, reason: str
+) -> None:
+    with pytest.raises(wiring.WiringError, match=f"{reason}:{name}"):
+        _validated(**{name: value})
+    for good in ("false", "true"):
+        assert _validated(**{name: good})[name] == good
+
+
+def test_the_appconfig_group_is_all_or_none() -> None:
+    parameters = _validated(**APPCONFIG)
+    assert {name: parameters[name] for name in APPCONFIG} == APPCONFIG
+    assert all(_validated()[name] is None for name in APPCONFIG)
+    for missing in APPCONFIG:
+        partial = {**APPCONFIG, missing: None}
+        with pytest.raises(wiring.WiringError, match="appconfig_group_partial"):
+            _validated(**partial)
+    for name in APPCONFIG:
+        for bad in ("", " x", "a b", "x/y", "x:y", "-x", "x" * 65, True, 7):
+            with pytest.raises(wiring.WiringError, match=f"parameter_invalid:{name}"):
+                _validated(**{**APPCONFIG, name: bad})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "APPCONFIG_ENABLED",
+        "APPCONFIG_SOURCE",
+        "APPCONFIG_ORIGIN",
+        "APPCONFIG_TOKEN",
+        "APPCONFIG_OTHER",
+    ],
+)
+def test_the_planner_written_and_unused_appconfig_names_are_never_parameters(
+    name: str,
+) -> None:
+    for value in ("true", "sdk", "agent", "http://127.0.0.1:2772"):
+        with pytest.raises(wiring.WiringError, match=f"parameter_unknown:{name}"):
+            _validated(**APPCONFIG, **{name: value})
+
+
+def test_the_appconfig_group_renders_complete_with_sdk_and_true() -> None:
+    rendered = _staged_rendering(NEW_IMAGE, **APPCONFIG)
+    environment = _env(rendered)
+    assert {name: environment[name] for name in APPCONFIG_GROUP_NAMES} == {
+        **APPCONFIG,
+        "APPCONFIG_ENABLED": "true",
+        "APPCONFIG_SOURCE": "sdk",
+    }
+    names = [
+        row["name"] for row in evidence._container_map(rendered)["app"]["environment"]
+    ]
+    assert names[-5:] == list(APPCONFIG_GROUP_NAMES)
+    assert wiring.forbidden_names_in(rendered) == []
+    assert wiring.appconfig_group_values(rendered) == {
+        **APPCONFIG,
+        "APPCONFIG_ENABLED": "true",
+        "APPCONFIG_SOURCE": "sdk",
+    }
+    # The group adds exactly its five rows to the rendering without it.
+    without = _staged_rendering(NEW_IMAGE)
+    evidence._container_map(without)["app"]["environment"] += [
+        {"name": name, "value": environment[name]} for name in APPCONFIG_GROUP_NAMES
+    ]
+    assert without == rendered
+
+
+def _with_rows(
+    request: dict[str, Any],
+    *rows: tuple[str, str],
+    field: str = "environment",
+    container: str = "app",
+) -> dict[str, Any]:
+    changed = copy.deepcopy(request)
+    target = evidence._container_map(changed)[container]
+    for name, value in rows:
+        if field == "secrets":
+            target.setdefault("secrets", []).append(
+                {"name": name, "valueFrom": SECRET_PREFIX + "x-AbC123"}
+            )
+        else:
+            target.setdefault("environment", []).append({"name": name, "value": value})
+    return changed
+
+
+def _altered(request: dict[str, Any], name: str, value: str | None) -> dict[str, Any]:
+    changed = copy.deepcopy(request)
+    app = evidence._container_map(changed)["app"]
+    app["environment"] = [
+        row if row["name"] != name else {"name": name, "value": value}
+        for row in app["environment"]
+        if not (row["name"] == name and value is None)
+    ]
+    return changed
+
+
+@pytest.mark.parametrize(
+    "mutate,found",
+    [
+        # Another APPCONFIG_* name next to the complete group.
+        (lambda r: _with_rows(r, ("APPCONFIG_TOKEN", "t")), ["APPCONFIG_TOKEN"]),
+        (
+            lambda r: _with_rows(r, ("APPCONFIG_ORIGIN", "http://127.0.0.1:2772")),
+            ["APPCONFIG_ORIGIN"],
+        ),
+        # A part of the group, or the group altered: every name is reported.
+        (
+            lambda r: _altered(r, "APPCONFIG_PROFILE", None),
+            [
+                "APPCONFIG_APPLICATION",
+                "APPCONFIG_ENABLED",
+                "APPCONFIG_ENVIRONMENT",
+                "APPCONFIG_SOURCE",
+            ],
+        ),
+        (
+            lambda r: _altered(r, "APPCONFIG_SOURCE", "agent"),
+            list(APPCONFIG_GROUP_NAMES),
+        ),
+        (
+            lambda r: _altered(r, "APPCONFIG_ENABLED", "false"),
+            list(APPCONFIG_GROUP_NAMES),
+        ),
+        (
+            lambda r: _altered(r, "APPCONFIG_PROFILE", "a b"),
+            list(APPCONFIG_GROUP_NAMES),
+        ),
+        (
+            lambda r: _with_rows(r, ("APPCONFIG_SOURCE", "sdk")),
+            sorted([*APPCONFIG_GROUP_NAMES, "APPCONFIG_SOURCE"]),
+        ),
+        # A group name anywhere but the app environment.
+        (
+            lambda r: _with_rows(r, ("APPCONFIG_PROFILE", ""), field="secrets"),
+            ["APPCONFIG_PROFILE"],
+        ),
+        (
+            lambda r: _with_rows(r, ("APPCONFIG_ENABLED", "true"), container="otel"),
+            ["APPCONFIG_ENABLED"],
+        ),
+    ],
+)
+def test_the_appconfig_exemption_is_exactly_the_complete_group(
+    mutate: Callable[[dict[str, Any]], dict[str, Any]], found: list[str]
+) -> None:
+    rendered = _staged_rendering(NEW_IMAGE, **APPCONFIG)
+    assert wiring.forbidden_names_in(rendered) == []
+    assert wiring.forbidden_names_in(mutate(rendered)) == found
+
+
+def test_a_group_name_without_the_group_stays_forbidden() -> None:
+    rendered = _staged_rendering(NEW_IMAGE)
+    for name in APPCONFIG_GROUP_NAMES:
+        value = {"APPCONFIG_ENABLED": "true", "APPCONFIG_SOURCE": "sdk"}.get(name, "x")
+        assert wiring.forbidden_names_in(_with_rows(rendered, (name, value))) == [name]
+
+
+@pytest.mark.parametrize(
+    "name", ["APPCONFIG_APPLICATION", "APPCONFIG_TOKEN", CREDIT_FLAG]
+)
+def test_a_source_revision_carrying_a_staged_name_never_renders(name: str) -> None:
+    fake = FakeAws(applied=True)
+    environment = _task_definition()["taskDefinition"]["containerDefinitions"][0][
+        "environment"
+    ] + [{"name": name, "value": "x"}]
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:8", "include": ["TAGS"]},
+        _task_definition(app_environment=environment),
+    )
+    plan, rendered = _plan(fake, **(APPCONFIG if name.startswith("APPCONFIG") else {}))
+    assert rendered is None
+    blocks = _step(plan, "task_definition_revision")["blocks"]
+    assert "source_already_has_added_name" in blocks or (
+        f"rollback_target_has_forbidden_names:{name}" in blocks
+    )
+    if name.startswith("APPCONFIG_"):
+        assert (
+            "appconfig_names_in_rollback_target"
+            in _step(plan, "financial_egress_closed")["blocks"]
+        )
+
+
+def test_the_d3_source_never_carries_the_appconfig_group_even_complete() -> None:
+    """The exemption is for the rendering only: a source revision 8 carrying
+    the whole valid group blocks the egress step and never renders."""
+
+    fake = FakeAws(applied=True)
+    environment = _task_definition()["taskDefinition"]["containerDefinitions"][0][
+        "environment"
+    ] + [
+        {"name": name, "value": value}
+        for name, value in {
+            **APPCONFIG,
+            "APPCONFIG_ENABLED": "true",
+            "APPCONFIG_SOURCE": "sdk",
+        }.items()
+    ]
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:8", "include": ["TAGS"]},
+        _task_definition(app_environment=environment),
+    )
+    plan, rendered = _plan(fake)
+    assert rendered is None
+    egress = _step(plan, "financial_egress_closed")
+    assert "appconfig_names_in_rollback_target" in egress["blocks"]
+    assert "source_already_has_added_name" in (
+        _step(plan, "task_definition_revision")["blocks"]
+    )
+
+
+@pytest.mark.parametrize(
+    "stage,changes",
+    [
+        ("d3", None),
+        ("flags", {}),
+        ("credit_and_transport_on", {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true"}),
+        ("appconfig", {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true", **APPCONFIG}),
+    ],
+)
+def test_every_stage_passes_the_protected_path_validators(
+    stage: str, changes: dict[str, Any] | None
+) -> None:
+    rendered = (
+        _without_staged_rows(_staged_rendering(NEW_IMAGE))
+        if changes is None
+        else _staged_rendering(NEW_IMAGE, **changes)
+    )
+    results = wiring.run_evidence_validators(rendered, SOURCE_ARN)
+    assert all(row["result"] == "pass" for row in results), results
+    names = frozenset(_env(rendered)) & rollout.FINGERPRINTED_ENVIRONMENT_NAMES
+    assert names in rollout.ENVIRONMENT_NAME_SETS, stage
+    # A stage out of order (the group without the flags) or a part of one is
+    # refused by the protected template validator.
+    if stage == "appconfig":
+        skipped = copy.deepcopy(rendered)
+        app = evidence._container_map(skipped)["app"]
+        app["environment"] = [
+            row for row in app["environment"] if row["name"] not in STAGED_FLAGS
+        ]
+        assert wiring.group5_template_verdict(skipped, SOURCE_ARN) == (
+            False,
+            "task_definition_base_environment_names_mismatch",
+        )
+    if stage == "flags":
+        one = _altered(rendered, CREDIT_FLAG, None)
+        assert wiring.group5_template_verdict(one, SOURCE_ARN) == (
+            False,
+            "task_definition_base_environment_names_mismatch",
+        )
+
+
+# -- L2a: the two rows alone, on the image that serves ------------------------
+
+
+def test_l2a_proposes_the_two_rows_alone_on_the_serving_image() -> None:
+    fake = _staged_world(REVISION_11_ARN)
+    plan, rendered = _staged_plan(fake, NEW_IMAGE)
+    step = _task_step(plan)
+    assert plan["status"] == "ready", plan["blocks"]
+    assert step["state"] == "would_change" and step["blocks"] == []
+    assert step["changes"] == [
+        {
+            "action": "register_task_definition",
+            "family": "neurostack-staging-app",
+            "derived_from": SOURCE_ARN,
+            "replaces": REVISION_11_ARN,
+            "flag_rows_added": {"names": list(STAGED_FLAGS), "value": "false"},
+            "request_sha256": wiring._sha256(rendered),
+            "service_changes": "none (service_deployment is a separate gate)",
+        }
+    ]
+    # The rendering is revision 11 plus exactly the two rows.
+    revision_11 = wiring._request_from_response(
+        fake.get(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app:11", "include": ["TAGS"]},
+        )
+    )
+    assert _without_staged_rows(rendered) == revision_11
+    assert {name: _env(rendered)[name] for name in STAGED_FLAGS} == {
+        TRANSPORT_FLAG: "false",
+        CREDIT_FLAG: "false",
+    }
+    assert "rollback_target_not_repinned_before_image_bump" not in (
+        _step(plan, "service_deployment")["blocks"]
+    )
+
+
+@pytest.mark.parametrize(
+    "image,changes",
+    [
+        # The rows and the new image never share a revision (Decision 13).
+        (L1_IMAGE, {}),
+        # Rows only at 'false': a row added at 'true' is a flip as well.
+        (NEW_IMAGE, {CREDIT_FLAG: "true"}),
+        (NEW_IMAGE, {TRANSPORT_FLAG: "true"}),
+        # Nor with the AppConfig group, nor with the worker flag.
+        (NEW_IMAGE, APPCONFIG),
+        (NEW_IMAGE, {WORKER_FLAG: "false"}),
+    ],
+)
+def test_l2a_never_shares_its_revision_with_another_change(
+    image: str, changes: dict[str, Any]
+) -> None:
+    plan, _rendered = _staged_plan(_staged_world(REVISION_11_ARN), image, **changes)
+    step = _task_step(plan)
+    assert plan["status"] == "blocked"
+    assert step["changes"] == []
+    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_11_ARN}"]
+
+
+def test_one_staged_row_without_the_other_is_never_a_reviewed_change() -> None:
+    rendered = _staged_rendering(NEW_IMAGE)
+    for name in STAGED_FLAGS:
+        registered = _registered_as(REVISION_11_ARN, _altered(rendered, name, None))
+        assert wiring.flag_rows_added(registered, rendered) is None
+        assert wiring.reviewed_change(registered, rendered) is None
+    registered = _registered_as(REVISION_11_ARN, _without_staged_rows(rendered))
+    assert wiring.flag_rows_added(registered, rendered) == STAGED_FLAGS
+    assert wiring.reviewed_change(registered, rendered) == (
+        "flag_rows_added",
+        STAGED_FLAGS,
+    )
+
+
+def test_the_l2a_revision_is_reported_until_and_after_it_serves() -> None:
+    rows = _staged_rendering(NEW_IMAGE)
+    fake = _staged_world(REVISION_11_ARN, (STAGED_ARNS[12], rows))
+    plan, _rendered = _staged_plan(fake, NEW_IMAGE)
+    step = _task_step(plan)
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert f"registered_not_deployed:{STAGED_ARNS[12]}" in step["compliant"]
+    assert step["info"]["registered_revision_adds_flag_rows"] == {
+        "serving": REVISION_11_ARN,
+        "names": list(STAGED_FLAGS),
+        "value": "false",
+    }
+    _serve(fake, STAGED_ARNS[12])
+    plan, _rendered = _staged_plan(fake, NEW_IMAGE)
+    assert f"registered_and_deployed:{STAGED_ARNS[12]}" in _task_step(plan)["compliant"]
+
+
+def test_a_newest_revision_without_the_rows_blocks_under_its_own_name() -> None:
+    """The service on the rows revision, the newest registered revision
+    without them (an abandoned revision): never green."""
+
+    rows = _staged_rendering(NEW_IMAGE)
+    fake = _staged_world(
+        STAGED_ARNS[12],
+        (STAGED_ARNS[12], rows),
+        (STAGED_ARNS[13], _without_staged_rows(rows)),
+    )
+    plan, _rendered = _staged_plan(fake, NEW_IMAGE)
+    step = _task_step(plan)
+    assert plan["status"] == "blocked"
+    assert step["blocks"] == [
+        f"newest_revision_differs_only_in_flag_rows:{STAGED_ARNS[13]}"
+    ]
+    assert step["info"]["newest_revision_flag_rows"] == {
+        "newest": STAGED_ARNS[13],
+        "names": list(STAGED_FLAGS),
+        "value": "false",
+        "serving": STAGED_ARNS[12],
+    }
+
+
+# -- L2b: the image alone, rows unchanged -------------------------------------
+
+
+def test_l2b_moves_the_image_alone_and_keeps_the_rows() -> None:
+    rows = _staged_rendering(NEW_IMAGE)
+    fake = _staged_world(STAGED_ARNS[12], (STAGED_ARNS[12], rows))
+    plan, rendered = _staged_plan(fake, L1_IMAGE)
+    [change] = _task_step(plan)["changes"]
+    assert plan["status"] == "ready", plan["blocks"]
+    assert change["replaces"] == STAGED_ARNS[12]
+    assert change["app_image"] == {
+        "repository": STAGING_REPOSITORY,
+        "from": NEW_DIGEST,
+        "to": OTHER_DIGEST,
+    }
+    assert (
+        set(change) & {"flag_rows_added", "worker_flag", "credit_hot_path_flag"}
+        == set()
+    )
+    assert {name: _env(rendered)[name] for name in STAGED_FLAGS} == {
+        TRANSPORT_FLAG: "false",
+        CREDIT_FLAG: "false",
+    }
+
+
+# -- L5, L6: one staged flag flipped alone ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "serving_changes,changes,key,name",
+    [
+        ({}, {CREDIT_FLAG: "true"}, "credit_hot_path_flag", CREDIT_FLAG),
+        (
+            {CREDIT_FLAG: "true"},
+            {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true"},
+            "transport_flag",
+            TRANSPORT_FLAG,
+        ),
+        # Off again, alone, is the same kind of revision.
+        ({CREDIT_FLAG: "true"}, {}, "credit_hot_path_flag", CREDIT_FLAG),
+    ],
+)
+def test_l5_and_l6_flip_one_staged_flag_alone(
+    serving_changes: dict[str, str], changes: dict[str, str], key: str, name: str
+) -> None:
+    serving = _staged_rendering(L1_IMAGE, **serving_changes)
+    fake = _staged_world(STAGED_ARNS[13], (STAGED_ARNS[13], serving))
+    plan, rendered = _staged_plan(fake, L1_IMAGE, **changes)
+    step = _task_step(plan)
+    assert plan["status"] == "ready", plan["blocks"]
+    [change] = step["changes"]
+    assert change["replaces"] == STAGED_ARNS[13]
+    assert change[key] == {
+        "name": name,
+        "from": _env(serving)[name],
+        "to": _env(rendered)[name],
+    }
+    assert set(change) & {"app_image", "flag_rows_added", "worker_flag"} == set()
+    # Registered, then reported like the worker flag until it serves.
+    _put_app_revision(
+        fake, STAGED_ARNS[14], _registered_as(STAGED_ARNS[14], rendered), latest=True
+    )
+    plan, _again = _staged_plan(fake, L1_IMAGE, **changes)
+    assert _task_step(plan)["info"][f"registered_revision_changes_{key}"] == {
+        "serving": STAGED_ARNS[13],
+        "from": _env(serving)[name],
+        "to": _env(rendered)[name],
+    }
+    assert "rollback_target_not_repinned_before_image_bump" not in (
+        _step(plan, "service_deployment")["blocks"]
+    )
+
+
+@pytest.mark.parametrize(
+    "image,changes",
+    [
+        (L1_IMAGE, {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true"}),
+        (NEW_IMAGE, {CREDIT_FLAG: "true"}),
+        (L1_IMAGE, {CREDIT_FLAG: "true", WORKER_FLAG: "false"}),
+        (L1_IMAGE, {CREDIT_FLAG: "true", **APPCONFIG}),
+    ],
+)
+def test_two_changes_never_share_a_revision(
+    image: str, changes: dict[str, str]
+) -> None:
+    serving = _staged_rendering(L1_IMAGE)
+    fake = _staged_world(STAGED_ARNS[13], (STAGED_ARNS[13], serving))
+    plan, _rendered = _staged_plan(fake, image, **changes)
+    assert _task_step(plan)["blocks"] == [
+        f"service_not_on_rollback_target:{STAGED_ARNS[13]}"
+    ]
+
+
+def test_rolling_l2b_back_to_the_pin_blocks_and_to_l2a_is_registered_not_deployed() -> (
+    None
+):
+    """After L2b (rows at 12, the image at 13): the service back on L2a's
+    revision reports 13 registered, not deployed; back on the rollback pin
+    (revision 10, without the rows and on the bridge image) it blocks, as the
+    runbook says."""
+
+    revisions = (
+        (STAGED_ARNS[12], _staged_rendering(NEW_IMAGE)),
+        (STAGED_ARNS[13], _staged_rendering(L1_IMAGE)),
+    )
+    plan, _rendered = _staged_plan(_staged_world(STAGED_ARNS[12], *revisions), L1_IMAGE)
+    assert plan["status"] != "blocked", plan["blocks"]
+    assert f"registered_not_deployed:{STAGED_ARNS[13]}" in (
+        _task_step(plan)["compliant"]
+    )
+    plan, _rendered = _staged_plan(_staged_world(REVISION_10_ARN, *revisions), L1_IMAGE)
+    assert _task_step(plan)["blocks"] == [
+        f"service_not_on_rollback_target:{REVISION_10_ARN}"
+    ]
+
+
+def test_a_newest_revision_differing_only_in_a_staged_flag_blocks() -> None:
+    serving = _staged_rendering(L1_IMAGE)
+    abandoned = _staged_rendering(L1_IMAGE, **{CREDIT_FLAG: "true"})
+    fake = _staged_world(
+        STAGED_ARNS[13], (STAGED_ARNS[13], serving), (STAGED_ARNS[14], abandoned)
+    )
+    plan, _rendered = _staged_plan(fake, L1_IMAGE)
+    step = _task_step(plan)
+    assert step["blocks"] == [
+        f"newest_revision_differs_only_in_credit_hot_path_flag:{STAGED_ARNS[14]}"
+    ]
+    assert step["info"]["newest_revision_credit_hot_path_flag"] == {
+        "newest": STAGED_ARNS[14],
+        "newest_value": "true",
+        "rendered_value": "false",
+        "serving": STAGED_ARNS[13],
+    }
+
+
+# -- L7: the AppConfig group alone; the egress step's two stages ---------------
+
+ON = {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true"}
+
+
+def _l7_world(applications: list[dict[str, Any]] | None = None) -> FakeAws:
+    fake = _staged_world(
+        STAGED_ARNS[15], (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON))
+    )
+    fake.put(
+        "appconfig",
+        "ListApplications",
+        {},
+        {
+            "Items": (
+                [{"Id": "abc1234", "Name": "neurostack-staging"}]
+                if applications is None
+                else applications
+            )
+        },
+    )
+    return fake
+
+
+def test_l7_adds_the_appconfig_group_alone() -> None:
+    plan, rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON, **APPCONFIG)
+    step = _task_step(plan)
+    assert plan["status"] == "ready", plan["blocks"]
+    [change] = step["changes"]
+    assert change["replaces"] == STAGED_ARNS[15]
+    assert change["appconfig_group_added"] == {
+        "names": list(APPCONFIG_GROUP_NAMES),
+        "application": "neurostack-staging",
+        "environment": "production",
+        "profile": "financial-egress",
+        "source": "sdk",
+    }
+    egress = _step(plan, "financial_egress_closed")
+    assert egress["state"] == "compliant", egress["blocks"]
+    assert "appconfig_group_complete_in_rendering" in egress["compliant"]
+    assert "appconfig_application_exists:neurostack-staging" in egress["compliant"]
+    assert "no_appconfig_names_in_rollback_target" in egress["compliant"]
+    assert egress["info"]["stage"] == "appconfig_group_sdk"
+    assert egress["info"]["appconfig"]["source"] == "sdk"
+    assert (
+        egress["compliant"].count("appconfig_application_exists:neurostack-staging")
+        == 1
+    )
+    assert plan["parameters"]["APPCONFIG_APPLICATION"] == "neurostack-staging"
+    assert wiring.renderable(plan, rendered) is rendered
+    # The diff lists the group among the added environment, with its values.
+    added = plan["task_definition_diff"]["app_environment_added"]
+    assert {name: added[name] for name in APPCONFIG_GROUP_NAMES} == {
+        "APPCONFIG_APPLICATION": "neurostack-staging",
+        "APPCONFIG_ENABLED": "true",
+        "APPCONFIG_ENVIRONMENT": "production",
+        "APPCONFIG_PROFILE": "financial-egress",
+        "APPCONFIG_SOURCE": "sdk",
+    }
+    assert list(added) == sorted(added)
+    # Before L7 it lists no APPCONFIG_* name.
+    plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON)
+    assert not [
+        name
+        for name in plan["task_definition_diff"]["app_environment_added"]
+        if name.startswith("APPCONFIG_")
+    ]
+
+
+@pytest.mark.parametrize(
+    "applications,reason",
+    [
+        ([], "appconfig_application_not_found:neurostack-staging"),
+        (
+            [{"Id": "abc1234", "Name": "other"}],
+            "appconfig_application_not_found:neurostack-staging",
+        ),
+        # Exactly one application answers to the name: two with that name,
+        # or one named as another's ID, is ambiguous.
+        (
+            [
+                {"Id": "abc1234", "Name": "neurostack-staging"},
+                {"Id": "def5678", "Name": "neurostack-staging"},
+            ],
+            "appconfig_application_ambiguous:neurostack-staging",
+        ),
+        (
+            [
+                {"Id": "abc1234", "Name": "neurostack-staging"},
+                {"Id": "neurostack-staging", "Name": "other"},
+            ],
+            "appconfig_application_ambiguous:neurostack-staging",
+        ),
+    ],
+)
+def test_l7_needs_the_named_appconfig_application(
+    applications: list[dict[str, Any]], reason: str
+) -> None:
+    plan, rendered = _staged_plan(_l7_world(applications), L1_IMAGE, **ON, **APPCONFIG)
+    egress = _step(plan, "financial_egress_closed")
+    assert plan["status"] == "blocked"
+    assert reason in egress["blocks"]
+    # render-taskdef and check refuse it, with the reason.
+    with pytest.raises(wiring.WiringError, match=f"plan_blocked:{reason}"):
+        wiring.renderable(plan, rendered)
+
+
+def test_l7_accepts_the_application_by_id_and_refuses_an_unreadable_listing() -> None:
+    by_id = {**APPCONFIG, "APPCONFIG_APPLICATION": "abc1234"}
+    plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON, **by_id)
+    assert "appconfig_application_exists:abc1234" in (
+        _step(plan, "financial_egress_closed")["compliant"]
+    )
+    for response in (
+        {"__error_code__": "AccessDeniedException"},
+        {"Items": [{"Name": "neurostack-staging"}], "NextToken": "n"},
+    ):
+        fake = _l7_world()
+        fake.put("appconfig", "ListApplications", {}, response)
+        plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON, **APPCONFIG)
+        assert "appconfig_applications_unreadable" in (
+            _step(plan, "financial_egress_closed")["blocks"]
+        )
+
+
+def test_until_l7_egress_stays_closed_by_absence_even_with_an_application() -> None:
+    plan, rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON)
+    egress = _step(plan, "financial_egress_closed")
+    assert egress["state"] == "compliant"
+    assert egress["info"]["stage"] == "closed_by_absence"
+    assert egress["info"]["financial_egress_enabled"] == "false (closed by absence)"
+    assert "no_appconfig_names_in_rendering" in egress["compliant"]
+    assert "APPCONFIG" not in json.dumps(rendered)
+    assert egress["info"]["appconfig_application_count"] == 1
+    # ... because the serving revision carries no APPCONFIG_* name either.
+    assert egress["info"]["serving_stage"] == "closed_by_absence"
+    assert "no_appconfig_names_in_serving" in egress["compliant"]
+
+
+L7_SERVING_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":17"
+
+
+@pytest.mark.parametrize("newer_clean_revision", [False, True])
+def test_nulled_appconfig_params_never_read_as_closed_while_the_group_serves(
+    newer_clean_revision: bool,
+) -> None:
+    """The service runs the L7 revision (the complete group); the params
+    group is set back to null. The egress step must not report closed by
+    absence: the serving task still reads AppConfig. Served from the newest
+    read, and from the serving read (a clean revision registered after it)."""
+
+    revisions = [
+        (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON)),
+        (STAGED_ARNS[16], _staged_rendering(L1_IMAGE, **ON, **APPCONFIG)),
+    ]
+    if newer_clean_revision:
+        revisions.append((L7_SERVING_ARN, _staged_rendering(L1_IMAGE, **ON)))
+    fake = _staged_world(STAGED_ARNS[16], *revisions)
+    fake.put(
+        "appconfig",
+        "ListApplications",
+        {},
+        {"Items": [{"Id": "abc1234", "Name": "neurostack-staging"}]},
+    )
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON)
+    egress = _step(plan, "financial_egress_closed")
+    assert plan["status"] == "blocked"
+    assert egress["state"] == "blocked"
+    assert egress["blocks"] == ["appconfig_group_serving_not_in_rendering"]
+    assert egress["info"]["serving_stage"] == "appconfig_group_sdk"
+    assert egress["info"]["stage"] == "undetermined"
+    assert "closed by absence" not in egress["info"]["financial_egress_enabled"]
+    assert "no_appconfig_names_in_rendering" in egress["compliant"]
+
+
+def test_the_serving_revision_carrying_the_group_with_the_group_rendered_is_compliant() -> (
+    None
+):
+    fake = _staged_world(
+        STAGED_ARNS[16],
+        (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON)),
+        (STAGED_ARNS[16], _staged_rendering(L1_IMAGE, **ON, **APPCONFIG)),
+    )
+    fake.put(
+        "appconfig",
+        "ListApplications",
+        {},
+        {"Items": [{"Id": "abc1234", "Name": "neurostack-staging"}]},
+    )
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON, **APPCONFIG)
+    egress = _step(plan, "financial_egress_closed")
+    assert egress["state"] == "compliant", egress["blocks"]
+    assert "appconfig_group_complete_in_serving" in egress["compliant"]
+    assert egress["info"]["serving_stage"] == "appconfig_group_sdk"
+    assert egress["info"]["stage"] == "appconfig_group_sdk"
+
+
+@pytest.mark.parametrize(
+    "serving_rows,stage,reason",
+    [
+        ((("APPCONFIG_TOKEN", "t"),), "appconfig_names_not_the_group", None),
+        (None, "unreadable", "serving_task_definition_unreadable"),
+    ],
+)
+def test_a_serving_revision_with_other_appconfig_names_or_unreadable_is_not_closed(
+    serving_rows: tuple[tuple[str, str], ...] | None, stage: str, reason: str | None
+) -> None:
+    fake = _staged_world(
+        STAGED_ARNS[15], (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON))
+    )
+    serving_arn = STAGED_ARNS[14]
+    _put_app_revision(
+        fake,
+        serving_arn,
+        (
+            _registered_as(
+                serving_arn, _with_rows(_staged_rendering(L1_IMAGE), *serving_rows)
+            )
+            if serving_rows is not None
+            else {"__error_code__": "ClientException"}
+        ),
+        latest=False,
+    )
+    _serve(fake, serving_arn)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON)
+    egress = _step(plan, "financial_egress_closed")
+    assert egress["state"] == "blocked"
+    assert egress["blocks"] == [reason or "appconfig_names_in_serving"]
+    assert egress["info"]["serving_stage"] == stage
+    assert egress["info"]["stage"] == "undetermined"
+
+
+def test_a_serving_read_holding_another_revision_is_unreadable() -> None:
+    """The serving read must be the revision the service runs: a response
+    for :14 that names :13 (clean, no APPCONFIG_* name) is not evidence that
+    :14 is closed by absence."""
+
+    fake = _staged_world(
+        STAGED_ARNS[15], (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON))
+    )
+    _put_app_revision(
+        fake,
+        STAGED_ARNS[14],
+        _registered_as(STAGED_ARNS[13], _staged_rendering(L1_IMAGE)),
+        latest=False,
+    )
+    _serve(fake, STAGED_ARNS[14])
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON)
+    egress = _step(plan, "financial_egress_closed")
+    assert egress["state"] == "blocked"
+    assert egress["blocks"] == ["serving_task_definition_unreadable"]
+    assert egress["info"]["serving_stage"] == "unreadable"
+    assert egress["info"]["stage"] == "undetermined"
+
+
+def test_the_appconfig_group_never_shares_its_revision() -> None:
+    for changes in (
+        {**APPCONFIG},  # with the credit switch and the transport off again
+        {**ON, **APPCONFIG, WORKER_FLAG: "false"},
+    ):
+        plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, **changes)
+        assert _task_step(plan)["blocks"] == [
+            f"service_not_on_rollback_target:{STAGED_ARNS[15]}"
+        ]
+    plan, _rendered = _staged_plan(_l7_world(), NEW_IMAGE, **ON, **APPCONFIG)
+    assert _task_step(plan)["blocks"] == [
+        f"service_not_on_rollback_target:{STAGED_ARNS[15]}"
+    ]
+
+
+def test_appconfig_group_added_requires_a_registered_revision_without_any_appconfig_name() -> (
+    None
+):
+    rendered = _staged_rendering(L1_IMAGE, **ON, **APPCONFIG)
+    before = _staged_rendering(L1_IMAGE, **ON)
+    assert wiring.appconfig_group_added(
+        _registered_as(STAGED_ARNS[15], before), rendered
+    ) == wiring.appconfig_group_values(rendered)
+    for extra in (("APPCONFIG_TOKEN", "t"), ("APPCONFIG_ENABLED", "false")):
+        registered = _registered_as(STAGED_ARNS[15], _with_rows(before, extra))
+        assert wiring.appconfig_group_added(registered, rendered) is None
+    assert (
+        wiring.appconfig_group_added(_registered_as(STAGED_ARNS[15], before), before)
+        is None
+    )
+
+
+def test_the_repository_parameters_propose_the_l2a_rows_revision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The live state before this wish (revision 11, the E7b image, serving
+    and the newest; no staged row), the reviewed manifest (rollback target
+    10) and the repository file with only the apply-time image set to the
+    serving digest: plan proposes one revision that adds the two rows at
+    'false' alone, render-taskdef prints revision 11 plus exactly those two
+    rows, and check passes."""
+
+    fake = _staged_world(REVISION_11_ARN)
+    snapshot = fake.snapshot(tmp_path / "readback.json")
+    params = _repository_params_with_image(tmp_path, NEW_IMAGE)
+    outputs = {}
+    for command in ("plan", "render-taskdef", "check"):
+        code, out, err = _run(
+            [
+                command,
+                "--params",
+                str(params),
+                "--readback-file",
+                str(snapshot),
+                "--manifest",
+                str(MANIFEST),
+            ],
+            capsys,
+        )
+        assert code == 0, (command, err)
+        outputs[command] = out
+    plan = json.loads(outputs["plan"])
+    [change] = _task_step(plan)["changes"]
+    assert change["replaces"] == REVISION_11_ARN
+    assert change["flag_rows_added"] == {"names": list(STAGED_FLAGS), "value": "false"}
+    assert (
+        plan["parameters"][CREDIT_FLAG] == plan["parameters"][TRANSPORT_FLAG] == "false"
+    )
+    revision_11 = wiring._request_from_response(
+        fake.get(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app:11", "include": ["TAGS"]},
+        )
+    )
+    rendered = json.loads(outputs["render-taskdef"])
+    assert _without_staged_rows(rendered) == revision_11
+    check = json.loads(outputs["check"])
+    assert check["status"] == "pass" and check["rendered_request_sha256"] == (
+        change["request_sha256"]
+    )
+
+
+def test_the_runbook_says_the_planner_checks_one_kind_not_the_order() -> None:
+    section = _between(
+        _flat(WORKER_FLAG_RUNBOOK),
+        "### The staged flags and the AppConfig group",
+        "### Ordered procedure",
+    )
+    for phrase in (
+        "**The planner checks one kind of change at a time, not the order.**",
+        "it does **not** check the order L2a > L2b > L3 > L5 > L6 > L7"
+        " (Decision 4: L7 after L6)",
+        "It proposes `transport_flag` while the credit flag is still `'false'`"
+        " (L6 before L5), and `appconfig_group_added` with both flags `'false'`"
+        " (L7 before L5 and L6)",
+        "it cannot read `alembic_version`, so it cannot know whether L3 ran",
+        "Keeping the order is the operator's and the owner's job",
+        "`registered_not_deployed:<L2a ARN>`",
+        "Rolling L2b back to the rollback pin (revision 10) instead of the"
+        " previous revision is expected to block with"
+        " `service_not_on_rollback_target:<revision 10 ARN>`",
+        "the flag flipped back to `'false'` alone, by its own reviewed PR, is"
+        " itself a reviewed kind",
+        "containment is the AppConfig configuration set to `false`",
+        "Removing the group from the parameters is **not** a reviewed kind",
+        "`appconfig_group_serving_not_in_rendering`",
+        "`info.serving_stage`",
+        "`appconfig_application_ambiguous:<name>`",
+        "`serving_task_definition_unreadable`",
+        "a case variant of any of these names",
+    ):
+        assert phrase in section, phrase
+
+
+def test_the_hook_section_lists_the_staged_and_appconfig_checks() -> None:
+    section = _between(
+        _flat(WORKER_FLAG_RUNBOOK),
+        "### Post-deploy webhook registration hook",
+        "3. `python scripts/asaas_deploy_hook.py render-run-task",
+    )
+    for phrase in (
+        "`billing_fact_worker_flag_reviewed`",
+        "`staged_flags_reviewed`",
+        "`appconfig_group_reviewed`",
+        "any case variant of those names refused",
+        "three identifiers matching the planner's pattern",
+    ):
+        assert phrase in section, phrase

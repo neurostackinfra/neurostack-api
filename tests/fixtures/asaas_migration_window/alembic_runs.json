@@ -1,5 +1,5 @@
 {
- "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app).",
+ "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app). Window 042's runs (pre_042_at_036, pre_042_at_037, post_042_at_037, success_042, pre_042_at_042, post_042_at_042) were captured on 2026-10-31 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 036, then 037, then 042 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT through default privileges set before the migrations); the server statement log showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK.",
  "runs": {
   "deadlock_036": {
    "exit_code": 1,
@@ -1098,6 +1098,18 @@
     "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.",
     "INFO  [alembic.runtime.migration] Will assume transactional DDL.",
     "INFO  [alembic.runtime.migration] Running upgrade 036 -> 037, drop the legacy AbacatePay migration saga and roster objects"
+   ]
+  },
+  "success_042": {
+   "exit_code": 0,
+   "lines": [
+    "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.",
+    "INFO  [alembic.runtime.migration] Will assume transactional DDL.",
+    "INFO  [alembic.runtime.migration] Running upgrade 037 -> 038, credit ledger, fact inbox, readiness and ingress schema",
+    "INFO  [alembic.runtime.migration] Running upgrade 038 -> 039, credit inventory, allocations and media egress deliveries",
+    "INFO  [alembic.runtime.migration] Running upgrade 039 -> 040, Additive credit object-copy registry and durable workers (Group 4b).",
+    "INFO  [alembic.runtime.migration] Running upgrade 040 -> 041, credit lifecycle, legal hold, purge fence and operational roles",
+    "INFO  [alembic.runtime.migration] Running upgrade 041 -> 042, credit enforcement cutoff acceptances"
    ]
   }
  }

@@ -1256,6 +1256,19 @@ D3_ENV = {
     "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": "operator@example.test",
     "BILLING_FACT_WORKER_ENABLED": "false",
 }
+# asaas-rollout-opening: the two staged flags (live step L2a on) and the
+# AppConfig group (L7 on), as the planner renders them.
+STAGED_FLAG_ENV = {
+    "BILLING_FACT_TRANSPORT_ENABLED": "false",
+    "CREDIT_HOT_PATH_ENABLED": "false",
+}
+APPCONFIG_ENV = {
+    "APPCONFIG_APPLICATION": "neurostack-staging",
+    "APPCONFIG_ENABLED": "true",
+    "APPCONFIG_ENVIRONMENT": "production",
+    "APPCONFIG_PROFILE": "financial-egress",
+    "APPCONFIG_SOURCE": "sdk",
+}
 _D3_SECRET_PREFIX = "arn:aws:secretsmanager:us-east-1:388460142431:secret:neurostack/"
 D3_SECRETS = {
     "ASAAS_API_KEY": _D3_SECRET_PREFIX + "staging/asaas-api-key-AbC123",
@@ -1412,10 +1425,80 @@ def test_validator_name_sets_are_the_revision_8_sets_plus_exactly_the_d3_names()
     assert rollout.BASE_ENVIRONMENT_NAMES == set(BASE_ENV_VALUES)
     assert rollout.D3_ENVIRONMENT_NAMES == set(D3_ENV)
     assert rollout.D3_SECRET_NAMES == set(D3_SECRETS)
-    assert rollout.FINGERPRINTED_ENVIRONMENT_NAMES == set(BASE_ENV_VALUES) | set(D3_ENV)
+    assert rollout.STAGED_FLAG_ENVIRONMENT_NAMES == set(STAGED_FLAG_ENV)
+    assert rollout.APPCONFIG_ENVIRONMENT_NAMES == set(APPCONFIG_ENV)
+    assert rollout.FINGERPRINTED_ENVIRONMENT_NAMES == (
+        set(BASE_ENV_VALUES) | set(D3_ENV) | set(STAGED_FLAG_ENV) | set(APPCONFIG_ENV)
+    )
+    # Each stage all or none, a later one only on top of the earlier ones.
+    assert rollout.ENVIRONMENT_NAME_SETS == (
+        set(BASE_ENV_VALUES),
+        set(BASE_ENV_VALUES) | set(D3_ENV),
+        set(BASE_ENV_VALUES) | set(D3_ENV) | set(STAGED_FLAG_ENV),
+        set(BASE_ENV_VALUES) | set(D3_ENV) | set(STAGED_FLAG_ENV) | set(APPCONFIG_ENV),
+    )
+    assert rollout_evidence._APP_ENVIRONMENT_NAME_SETS is rollout.ENVIRONMENT_NAME_SETS
     assert rollout_evidence._BASE_ENV_NAMES == set(BASE_ENV_VALUES)
     assert rollout_evidence._EXPECTED_APP_SECRET_NAMES == BASE_SECRET_NAMES
     assert rollout.SOURCE_IMAGE_REPOSITORY == SOURCE_REPOSITORY
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        (STAGED_FLAG_ENV,),
+        (STAGED_FLAG_ENV, APPCONFIG_ENV),
+    ],
+)
+def test_template_accepts_each_staged_set_and_fingerprints_its_values(
+    monkeypatch: pytest.MonkeyPatch, stages: tuple[dict[str, str], ...]
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _d3_template(signer)
+    added: dict[str, str] = {}
+    for stage in stages:
+        added.update(stage)
+    _app_container(template["task_definition"])["environment"] += [
+        {"name": n, "value": v} for n, v in added.items()
+    ]
+    validated = validate_task_definition_template(template)
+    assert validated["app_environment_names"] == sorted(
+        set(BASE_ENV_VALUES) | set(D3_ENV) | set(added)
+    )
+    assert validated["base_environment_sha256"] == {
+        name: _sha(value)
+        for name, value in {**BASE_ENV_VALUES, **D3_ENV, **added}.items()
+    }
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        # One staged flag without the other.
+        ("CREDIT_HOT_PATH_ENABLED",),
+        ("BILLING_FACT_TRANSPORT_ENABLED",),
+        # The AppConfig group without the flags, or a part of it.
+        tuple(APPCONFIG_ENV),
+        (*STAGED_FLAG_ENV, "APPCONFIG_ENABLED", "APPCONFIG_SOURCE"),
+        (*STAGED_FLAG_ENV, *APPCONFIG_ENV, "APPCONFIG_TOKEN"),
+        (*STAGED_FLAG_ENV, *APPCONFIG_ENV, "APPCONFIG_ORIGIN"),
+    ],
+)
+def test_template_refuses_a_partial_or_out_of_order_stage(
+    monkeypatch: pytest.MonkeyPatch, names: tuple[str, ...]
+) -> None:
+    signer = P256Signer()
+    _set_group2_key_pins(monkeypatch, signer)
+    template = _d3_template(signer)
+    values = {**STAGED_FLAG_ENV, **APPCONFIG_ENV}
+    _app_container(template["task_definition"])["environment"] += [
+        {"name": name, "value": values.get(name, "x")} for name in names
+    ]
+    with pytest.raises(
+        EvidenceError, match="task_definition_base_environment_names_mismatch"
+    ):
+        validate_task_definition_template(template)
 
 
 def test_template_accepts_exactly_the_d3_names_and_fingerprints_their_values(
@@ -1842,6 +1925,34 @@ def test_attested_snapshot_accepts_exactly_the_d3_names() -> None:
     assert checked["app_image_digest"] == DIGEST
     assert checked["base_environment_sha256"] == {
         name: _sha(value) for name, value in {**BASE_ENV_VALUES, **D3_ENV}.items()
+    }
+
+
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize(
+    "added,accepted",
+    [
+        (STAGED_FLAG_ENV, True),
+        ({**STAGED_FLAG_ENV, **APPCONFIG_ENV}, True),
+        ({"CREDIT_HOT_PATH_ENABLED": "false"}, False),
+        (APPCONFIG_ENV, False),
+        ({**STAGED_FLAG_ENV, "APPCONFIG_SOURCE": "sdk"}, False),
+    ],
+)
+def test_snapshot_accepts_each_staged_set_whole_and_fingerprints_it(
+    phase: str, added: dict[str, str], accepted: bool
+) -> None:
+    raw = _d3_snapshot(phase=phase)
+    app = _app_container(raw["task_definition"])
+    app["environment"] += [{"name": n, "value": v} for n, v in added.items()]
+    if not accepted:
+        with pytest.raises(RolloutError, match="^task_environment_name_set_mismatch$"):
+            _validate_d3_snapshot(raw, phase=phase)
+        return
+    checked = _validate_d3_snapshot(raw, phase=phase)
+    assert checked["base_environment_sha256"] == {
+        name: _sha(value)
+        for name, value in {**BASE_ENV_VALUES, **D3_ENV, **added}.items()
     }
 
 

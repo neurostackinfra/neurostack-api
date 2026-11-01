@@ -28,6 +28,24 @@ parameters:
   # tests/scripts/test_asaas_production_wiring.py changed with it, then a new
   # revision (docs/runbooks/asaas-deployment.md, "The outbox worker flag").
   BILLING_FACT_WORKER_ENABLED: 'true'
+  # The credit switch and the fact transport (asaas-rollout-opening Decisions
+  # 12 and 13), rendered as the app environment values of the same names.
+  # Exactly the quoted string 'false' or 'true', like the worker flag. Both
+  # rows enter the task definition together, both 'false', in a revision of
+  # their own with the image that already serves (live step L2a); each value
+  # then becomes 'true' alone, through its own reviewed PR and revision: the
+  # credit switch at L5, the transport at L6.
+  CREDIT_HOT_PATH_ENABLED: 'false'
+  BILLING_FACT_TRANSPORT_ENABLED: 'false'
+  # The AppConfig group (Decision 14, live step L7): null renders no
+  # APPCONFIG_* name (financial egress closed by absence). All three set, to
+  # the reviewed AppConfig application, environment and configuration
+  # profile (name or ID), renders the complete group with APPCONFIG_ENABLED
+  # 'true' and APPCONFIG_SOURCE sdk, which the planner writes itself; a part
+  # of the three fails the plan.
+  APPCONFIG_APPLICATION: null
+  APPCONFIG_ENVIRONMENT: null
+  APPCONFIG_PROFILE: null
   # null keeps the live app image reference exactly. A value must be an
   # immutable <account ECR repository URI>@sha256:<digest> that exists in ECR;
   # building and attesting that image is a separate gate. It is an apply-time

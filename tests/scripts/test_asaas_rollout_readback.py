@@ -4,11 +4,15 @@ Every test runs on recorded readback files built here; nothing reaches AWS or
 a database. The read program output the verifier classifies is real:
 ``tests/fixtures/asaas_rollout_readback/read_runs.json`` holds what the
 rendered program printed against a disposable PostgreSQL 16 cluster (at 036,
-at 037, row-level security on, one row opened to ``general``).
+at 037, row-level security on, one row opened to ``general``; and, for the
+two windows the readback is chosen for, ``--window 037`` before the 038-042
+window and ``--window 042`` after it, each program on the other schema and
+the 042 program at 042).
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import copy
 import gzip
@@ -180,6 +184,10 @@ def _events(*messages: str, token: str = "f/1") -> dict[str, Any]:
     }
 
 
+# The capture each window's program verifies on.
+GOOD_RUN = {"037": "rollout_at_037", "042": "rollout_042_at_042"}
+
+
 def _lines(name: str = "rollout_at_037") -> list[str]:
     return list(RUNS[name]["lines"])
 
@@ -227,8 +235,13 @@ class World:
     """A recorded readback file, one response per exact request."""
 
     def __init__(
-        self, *, captured_at: str = CAPTURED_PLAN, now: datetime = NOW_DT
+        self,
+        *,
+        window: str = "037",
+        captured_at: str = CAPTURED_PLAN,
+        now: datetime = NOW_DT,
     ) -> None:
+        self.window = window
         self.reads: dict[str, dict[str, Any]] = {}
         self.records: dict[str, Any] = {}
         self.extra: dict[str, Any] = {}
@@ -289,16 +302,19 @@ class World:
         return path
 
     def readback(self, tmp_path: Path, name: str = "readback.json") -> Any:
-        return rr.load_readback(self.write(tmp_path / name))
+        return rr.load_readback(self.write(tmp_path / name), self.window)
 
     def context(self) -> rr.Context:
         return rr.make_context(
+            window=self.window,
             service_task_definition=self.service_td,
             read_task_definition=self.read_td,
         )
 
     def args(self, tmp_path: Path, name: str = "readback.json") -> list[str]:
         return [
+            "--window",
+            self.window,
             "--readback-file",
             str(self.write(tmp_path / name)),
             "--service-task-definition",
@@ -321,6 +337,7 @@ class World:
         return rr.build_request(
             context.network,
             context.target,
+            window=rr.READ_WINDOWS[self.window],
             attempt=attempt,
             day=self.now.astimezone(timezone.utc).date(),
         )
@@ -421,7 +438,9 @@ class World:
                 },
             )
         if logs:
-            self.put_pages(pages if pages is not None else [lines or _lines()])
+            self.put_pages(
+                pages if pages is not None else [lines or _lines(GOOD_RUN[self.window])]
+            )
         self.captured_at = captured
         return rendered
 
@@ -429,8 +448,14 @@ class World:
         return rr.verify(self.readback(tmp_path, "verify.json"), self.context())
 
 
-def recorded(tmp_path: Path, lines: list[str] | None = None, **record: Any) -> World:
-    world = World()
+def recorded(
+    tmp_path: Path,
+    lines: list[str] | None = None,
+    *,
+    window: str = "037",
+    **record: Any,
+) -> World:
+    world = World(window=window)
     world.record_read(tmp_path, lines, **record)
     return world
 
@@ -481,8 +506,11 @@ def _sql_tokens(sql: str) -> list[str]:
     return re.findall(r"[A-Za-z_][A-Za-z0-9_]*|::|\S", text)
 
 
-def test_the_rendered_program_is_select_only_and_read_only(tmp_path: Path) -> None:
-    request = World().render(tmp_path)
+@pytest.mark.parametrize("window", ["037", "042"])
+def test_the_rendered_program_is_select_only_and_read_only(
+    tmp_path: Path, window: str
+) -> None:
+    request = World(window=window).render(tmp_path)
     (override,) = request["overrides"]["containerOverrides"]
     command = override["command"]
     assert command[:2] == ["python", "-c"]
@@ -492,7 +520,7 @@ def test_the_rendered_program_is_select_only_and_read_only(tmp_path: Path) -> No
     header = mw._READ_HEADER.match(program)
     assert header is not None
     assert program[header.end() :] == mw._READ_PROGRAM_BODY
-    assert (header.group("window"), header.group("phase")) == ("037", "rollout")
+    assert (header.group("window"), header.group("phase")) == (window, "rollout")
     assert header.group("settings") == (
         "SET LOCAL lock_timeout='3s';SET LOCAL statement_timeout='60s';"
         "SET LOCAL search_path=public"
@@ -591,7 +619,16 @@ def test_the_expected_table_is_the_criterion() -> None:
         ("rollout topup_commercial_enabled", env, "false")
         for env in ("development", "production", "staging", "test")
     ]
-    assert rr.SPEC.expected_version == "037" and rr.SPEC.role == "app"
+    # One spec per window, the same SQL, rule, checks and role: only the
+    # revision the read must see differs, and it is the window's "after".
+    assert tuple(rr.READ_WINDOWS) == tuple(rr.SPECS) == ("037", "042")
+    for name, spec in rr.SPECS.items():
+        assert rr.READ_WINDOWS[name] is mw.WINDOWS[name]
+        assert spec.expected_version == mw.WINDOWS[name].after == name
+        assert spec.role == "app" and spec.phase == "rollout"
+        assert spec.sql_file == "scripts/asaas_rollout_readback.sql"
+        assert spec.checks == rr.CHECKS
+        assert mw.read_payload(spec) == rr.read_payload()
 
 
 def test_the_fixture_was_captured_with_this_payload() -> None:
@@ -600,15 +637,22 @@ def test_the_fixture_was_captured_with_this_payload() -> None:
     for name, run in RUNS.items():
         begin = json.loads(run["lines"][0])
         assert begin["payload_sha256"] == rr.payload_sha256(), name
-        assert (begin["window"], begin["phase"]) == ("037", "rollout")
+        # rollout_<window>_at_<schema> names its program's window; the
+        # earlier captures (rollout_at_...) are all window 037's program.
+        window = name.split("_")[1] if name.split("_")[1] in rr.SPECS else "037"
+        assert (begin["window"], begin["phase"]) == (window, "rollout"), name
 
 
-def test_the_rollout_label_is_recognized_only_with_window_037() -> None:
-    program = rr.read_program()
+def test_the_rollout_label_is_recognized_only_with_windows_037_and_042() -> None:
+    program = rr.read_program(rr.READ_WINDOWS["037"])
     assert mw.normalized_read_command(["python", "-c", program]) is not None
     for window in ("035", "036"):
         relabelled = program.replace("W='037'", f"W='{window}'", 1)
         assert mw.normalized_read_command(["python", "-c", relabelled]) is None
+    # The two programs differ in that label alone.
+    other = rr.read_program(rr.READ_WINDOWS["042"])
+    assert other == program.replace("W='037'", "W='042'", 1) != program
+    assert mw.normalized_read_command(["python", "-c", other]) is not None
     unknown = program.replace("P='rollout'", "P='other'", 1)
     assert mw.normalized_read_command(["python", "-c", unknown]) is None
     # The windows' own programs are still recognized, unchanged.
@@ -619,7 +663,7 @@ def test_the_rollout_label_is_recognized_only_with_window_037() -> None:
 
 
 def test_a_tampered_payload_is_not_the_program() -> None:
-    program = rr.read_program()
+    program = rr.read_program(rr.READ_WINDOWS["037"])
     header = mw._READ_HEADER.match(program)
     assert header is not None
     tampered = base64.b64encode(
@@ -669,7 +713,7 @@ def test_the_readback_file_is_strict(
     path = tmp_path / "readback.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(hook.HookError, match=reason):
-        rr.load_readback(path)
+        rr.load_readback(path, "037")
 
 
 @pytest.mark.parametrize("field", ["SecretString", "SecretBinary", "RandomPassword"])
@@ -711,12 +755,55 @@ def test_a_dsn_in_the_recorded_read_is_never_echoed(
 
 def test_arguments_are_validated() -> None:
     with pytest.raises(mw.WindowError, match="service_task_definition_invalid"):
-        rr.make_context(service_task_definition=READ_TD, read_task_definition=READ_TD)
+        rr.make_context(
+            window="037",
+            service_task_definition=READ_TD,
+            read_task_definition=READ_TD,
+        )
     with pytest.raises(mw.WindowError, match="read_task_definition_invalid"):
         rr.make_context(
+            window="037",
             service_task_definition=SERVICE_TD,
             read_task_definition=TD_PREFIX + "neurostack-staging-migrations:7",
         )
+    for window in ("035", "036", "038", "041", "043", "", None, "head"):
+        with pytest.raises(mw.WindowError, match="read_window_unknown"):
+            rr.make_context(
+                window=window,
+                service_task_definition=SERVICE_TD,
+                read_task_definition=READ_TD,
+            )
+    # Never a default: the window is a required keyword everywhere.
+    with pytest.raises(TypeError):
+        rr.make_context(  # type: ignore[call-arg]
+            service_task_definition=SERVICE_TD, read_task_definition=READ_TD
+        )
+
+
+def test_the_window_is_an_explicit_required_option(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parser = rr._parser()
+    subparsers = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    for name, sub in subparsers.choices.items():
+        (window,) = [a for a in sub._actions if "--window" in a.option_strings]
+        assert window.required is True and window.default is None, name
+        assert tuple(window.choices) == ("037", "042"), name
+    args = World().args(tmp_path)
+    without = args[2:]
+    assert args[:2] == ["--window", "037"]
+    for argv in (
+        ["plan", *without],
+        ["plan", "--window", "036", *without],
+        ["plan", "--window", "038", *without],
+        ["plan", *args, "--window", "042"],
+    ):
+        code, out, err = run_cli(argv, capsys)
+        assert (code, out, err.strip()) == (2, "", "blocked: usage"), argv
 
 
 def test_each_option_is_given_once_and_there_is_no_now(
@@ -1026,7 +1113,7 @@ def test_render_prints_the_hardened_run_task(
     assert set(override) == {"name", "command"} and override["name"] == "consulta"
     assert mw.normalized_read_command(
         override["command"]
-    ) == mw.normalized_read_command(rr.read_command())
+    ) == mw.normalized_read_command(rr.read_command(rr.READ_WINDOWS["037"]))
     assert re.fullmatch(r"rollout-readback-[0-9a-f]{32}", request["clientToken"])
     size = len(json.dumps(request["overrides"], separators=(",", ":")))
     assert size <= mw.OVERRIDES_BUDGET_CHARS
@@ -1106,7 +1193,7 @@ def test_the_request_invariants_refuse_any_widening(
     request = world.render(tmp_path)
     mutate(request)
     with pytest.raises(mw.WindowError, match=reason):
-        rr.assert_request_invariants(request, context.target)
+        rr.assert_request_invariants(request, context.target, rr.READ_WINDOWS["037"])
 
 
 def test_the_request_invariants_refuse_another_family(tmp_path: Path) -> None:
@@ -1125,7 +1212,84 @@ def test_the_request_invariants_refuse_another_family(tmp_path: Path) -> None:
         image=BRIDGE_IMAGE,
     )
     with pytest.raises(mw.WindowError, match="override_only_on_the_read_family"):
-        rr.assert_request_invariants(request, target)
+        rr.assert_request_invariants(request, target, rr.READ_WINDOWS["037"])
+
+
+# ---------------------------------------------------------------------------
+# Two windows, chosen explicitly: 037 before the 038-042 window, 042 after
+# ---------------------------------------------------------------------------
+
+
+def test_the_042_plan_is_ready_and_names_its_window(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(window="042")
+    document = world.plan(tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert document["window"] == "042"
+    assert document["read"]["expected_alembic_version"] == "042"
+    assert document["run_task"]["payload_sha256"] == rr.payload_sha256()
+    code, out, err = run_cli(["plan", *world.args(tmp_path)], capsys)
+    assert code == 0 and err == ""
+    assert json.loads(out)["window"] == "042"
+    assert World().plan(tmp_path)["window"] == "037"
+
+
+def test_a_file_is_judged_only_as_the_window_it_was_loaded_for(tmp_path: Path) -> None:
+    world = World(window="042")
+    readback = rr.load_readback(world.write(tmp_path / "readback.json"), "037")
+    with pytest.raises(mw.WindowError, match="readback_window_mismatch"):
+        rr.evaluate_plan(readback, world.context(), now=NOW_DT)
+    world.record_read(tmp_path)
+    readback = rr.load_readback(world.write(tmp_path / "verify.json"), "037")
+    with pytest.raises(mw.WindowError, match="readback_window_mismatch"):
+        rr.verify(readback, world.context())
+
+
+def test_verify_on_the_042_capture_is_verified(tmp_path: Path) -> None:
+    result = recorded(tmp_path, window="042").verify(tmp_path)
+    assert result["outcome"] == "verified", result["reasons"]
+    assert result["reasons"] == [] and result["alert"] is False
+    assert result["window"] == "042"
+    assert result["expected_alembic_version"] == "042"
+    assert result["alembic_version"] == ["042"]
+    # The 038-042 window changes none of the facts the readback reads.
+    assert result["facts"] == recorded(tmp_path).verify(tmp_path)["facts"]
+    assert "Read in that transaction: alembic_version 042. " in result["verdict"]
+    assert "alembic_version 037" not in result["verdict"]
+
+
+@pytest.mark.parametrize(
+    "window,run,version",
+    [
+        ("042", "rollout_042_at_037", ["037"]),
+        ("037", "rollout_037_at_042", ["042"]),
+    ],
+)
+def test_each_window_stops_on_the_other_schema(
+    tmp_path: Path, window: str, run: str, version: list[str]
+) -> None:
+    """Real runs: each program, on the other window's schema, stops on the
+    revision alone (every other fact reads the same at 037 and 042)."""
+
+    result = recorded(tmp_path, _lines(run), window=window).verify(tmp_path)
+    _stopped_with(result, "read_alembic_version_mismatch")
+    assert result["reasons"] == ["read_alembic_version_mismatch"]
+    assert result["alembic_version"] == version
+    assert result["expected_alembic_version"] == window
+
+
+def test_a_read_of_one_window_never_verifies_as_the_other(tmp_path: Path) -> None:
+    rendered = World().render(tmp_path)
+    world = World(window="042")
+    world.record_read(tmp_path, _lines("rollout_at_037"), params=rendered)
+    _stopped_with(
+        world.verify(tmp_path),
+        "read_request_not_rendered_by_this_tool",
+        "read_task_command_mismatch",
+        "read_begin_mismatch",
+        "read_alembic_version_mismatch",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1398,7 +1562,7 @@ def test_verify_stops_when_the_program_hash_differs(tmp_path: Path) -> None:
         b"IS NULL THEN 'absent'", b"IS NOT NULL THEN 'absent'"
     )
     assert raw != rr.read_payload()
-    other = mw.program_for_payload(rr.READ_WINDOW, rr.READ_PHASE, raw)
+    other = mw.program_for_payload(rr.READ_WINDOWS["037"], rr.READ_PHASE, raw)
     assert mw.normalized_read_command(["python", "-c", other]) is not None
     world.record_read(
         tmp_path,
@@ -1443,7 +1607,7 @@ def test_verify_stops_on_a_request_this_tool_did_not_render(tmp_path: Path) -> N
         "python",
         "-c",
         mw.program_for_payload(
-            rr.READ_WINDOW, rr.READ_PHASE, b'{"sql":"","version":""}'
+            rr.READ_WINDOWS["037"], rr.READ_PHASE, b'{"sql":"","version":""}'
         ),
     ]
     world.record_read(
@@ -1477,7 +1641,7 @@ def test_verify_stops_on_a_request_this_tool_did_not_render(tmp_path: Path) -> N
                     "containerOverrides": [
                         {
                             "name": "consulta",
-                            "command": rr.read_command(),
+                            "command": rr.read_command(rr.READ_WINDOWS["037"]),
                             "environment": [{"name": "X", "value": "1"}],
                         }
                     ],
@@ -1490,7 +1654,10 @@ def test_verify_stops_on_a_request_this_tool_did_not_render(tmp_path: Path) -> N
             {
                 "overrides": {
                     "containerOverrides": [
-                        {"name": "consulta", "command": rr.read_command()}
+                        {
+                            "name": "consulta",
+                            "command": rr.read_command(rr.READ_WINDOWS["037"]),
+                        }
                     ],
                     "taskRoleArn": f"arn:aws:iam::{ACCOUNT}:role/other",
                 }
@@ -1880,8 +2047,33 @@ def test_the_runbook_section_matches_the_tool() -> None:
         "It does **not** show the history",
         "billing_checkout_sessions_not_empty",
         "tests/integration/test_rollout_readback_postgres.py",
+        # The window is chosen explicitly, in the commands too.
+        "**Two windows, chosen explicitly.** Every subcommand requires "
+        "`--window`, given once and with no default",
+        'args=(--window "$W"',
+        # The serving revision is a variable: :11 before L2a, the L2b
+        # revision for window 042 (a hard-coded :11 blocks plan there).
+        '--service-task-definition "$SERVICE_TD" '
+        "# the revision serving now (see below)",
+        "for `--window 037`, the revision serving at the time "
+        "(`neurostack-staging-app:11`, the final deploy of 2026-10-25, before "
+        "L2a; the L2a or L2b revision until L3)",
+        "for `--window 042`, which runs only after L2a and L2b, the revision "
+        "L2b registered and the service serves",
+        "With `:11` once the service runs a later revision, `plan` blocks on "
+        "the service check (`service_task_definition_mismatch`)",
+        # The choice of window: 037 until window 042 (L3) has run.
+        "`037` while the production schema is at `037` (before window `042`, "
+        "live step L3 of asaas-rollout-opening), `042` after it",
+        # From the CLI the file carries no window: what stops a cross-window
+        # read is the RunTask, the command, the label and the revision.
+        "A RunTask or a task rendered for one window never verifies as the other",
+        "`readback_window_mismatch` guards the Python API",
+        "from the command line it cannot fire",
     ):
         assert fragment in flat, fragment
+    assert "--service-task-definition arn:" not in flat
+    assert "A file, a RunTask or a task rendered for one window" not in flat
     # The superseded claim that the system clock judges every subcommand.
     assert "(the system clock judges freshness)" not in flat
     for check, subject, value in rr.EXPECTED_TABLE:
@@ -1895,3 +2087,19 @@ def test_the_runbook_section_matches_the_tool() -> None:
         < text.index("## Post-deploy rollout readback")
         < text.index("## Production wiring (Group 9 D3/D4)")
     )
+
+
+def test_the_standing_guidance_names_the_rehearsal_token_for_the_readback() -> None:
+    """The server readback route takes only the 10-minute staging rehearsal
+    token; a login JWT (a super_admin's included) gets 401."""
+
+    text = RUNBOOK.read_text(encoding="utf-8")
+    start = text.index("## Standing guidance\n")
+    standing = " ".join(text[start : text.index("\n## ", start + 1)].split())
+    bullet = standing[standing.index("Billing rollout is `disabled`") :]
+    bullet = bullet[: bullet.index(" - ")]
+    assert "`GET /v1/admin/billing/rollout/readback`" in bullet
+    assert "staging rehearsal token" in bullet
+    assert "a login JWT gets 401" in bullet
+    # Backticks stripped: "`super_admin` JWT" is the same claim.
+    assert "super_admin JWT" not in standing.replace("`", "")

@@ -83,6 +83,29 @@ ECR_REGISTRY = rollout.ECR_REGISTRY
 # may carry either value; any other value was never rendered by the planner.
 WORKER_FLAG = "BILLING_FACT_WORKER_ENABLED"
 WORKER_FLAG_VALUES = ("false", "true")
+# The two staged flags (asaas-rollout-opening Decisions 12 and 13; the
+# planner's STAGED_FLAG_PARAMETERS and the rollout validator's
+# STAGED_FLAG_ENVIRONMENT_NAMES, a test pins the three equal): a deployed
+# revision carries both, each exactly once with a reviewed value, or neither
+# (revisions registered before live step L2a).
+STAGED_FLAGS = ("BILLING_FACT_TRANSPORT_ENABLED", "CREDIT_HOT_PATH_ENABLED")
+# The AppConfig group (Decision 14; the planner's APPCONFIG_GROUP and the
+# validator's APPCONFIG_ENVIRONMENT_NAMES): all five names or none, and the
+# two the planner writes itself only with their fixed values.
+APPCONFIG_NAMES = (
+    "APPCONFIG_APPLICATION",
+    "APPCONFIG_ENABLED",
+    "APPCONFIG_ENVIRONMENT",
+    "APPCONFIG_PROFILE",
+    "APPCONFIG_SOURCE",
+)
+APPCONFIG_FIXED_VALUES: Mapping[str, str] = MappingProxyType(
+    {"APPCONFIG_ENABLED": "true", "APPCONFIG_SOURCE": "sdk"}
+)
+# The three identifiers (application, environment, profile; by name or ID),
+# the planner's _APPCONFIG_IDENTIFIER and the runbook's pattern (a test pins
+# the three equal): no empty value, no space, no separator.
+APPCONFIG_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 # ---------------------------------------------------------------------------
 # The registration command's result contract (src/ops/asaas_webhook.py, T1,
@@ -802,6 +825,15 @@ def _single_flight(response: Any, checks: _Checks) -> list[str]:
     return [arn for arn in arns if isinstance(arn, str) and _TASK_ARN.fullmatch(arn)]
 
 
+_APPCONFIG_FOLDED_PREFIX = "appconfig_"
+
+
+def _settings_fold(name: Any) -> str:
+    """A name as pydantic-settings compares it (case-insensitive: lower)."""
+
+    return str(name if name is not None else "").lower()
+
+
 def _names(container: dict[str, Any], field: str) -> set[str]:
     rows = container.get(field)
     if not isinstance(rows, list):
@@ -872,15 +904,101 @@ def _task_definition_view(
         "task_definition_missing_webhook_wiring",
     )
     environment = app.get("environment")
-    flag_values = [
-        row.get("value")
-        for row in (environment if isinstance(environment, list) else [])
-        if isinstance(row, dict) and row.get("name") == WORKER_FLAG
+    # pydantic-settings reads names case-insensitively, by str.lower(): a
+    # non-ASCII name can fold onto an ASCII one (the Kelvin sign U+212A
+    # lowers to "k"), so the app carries ASCII names only.
+    checks.check(
+        all(
+            name.isascii()
+            for name in _names(app, "environment") | _names(app, "secrets")
+        ),
+        "app_names_ascii",
+        "app_name_not_ascii",
+    )
+    # Names are classified by that same fold (_settings_fold): every row
+    # whose folded name is the worker flag's counts, in env and secrets of
+    # every container. Exactly one, in the app environment, spelled exactly,
+    # with a reviewed value; billing_fact_worker_enabled beside it, a
+    # duplicate, a secret or a row in otel is unreviewed.
+    worker_rows = [
+        (container.get("name"), field, row)
+        for container in rows
+        if isinstance(container, dict)
+        for field in ("environment", "secrets")
+        for row in (
+            container.get(field) if isinstance(container.get(field), list) else []
+        )
+        if isinstance(row, dict)
+        and _settings_fold(row.get("name")) == _settings_fold(WORKER_FLAG)
     ]
     checks.check(
-        len(flag_values) == 1 and flag_values[0] in WORKER_FLAG_VALUES,
+        len(worker_rows) == 1
+        and worker_rows[0][0] == APP_CONTAINER
+        and worker_rows[0][1] == "environment"
+        and worker_rows[0][2].get("name") == WORKER_FLAG
+        and worker_rows[0][2].get("value") in WORKER_FLAG_VALUES,
         "billing_fact_worker_flag_reviewed",
         "billing_fact_worker_flag_unreviewed",
+    )
+    env_rows: list[dict[str, Any]] = [
+        row
+        for row in (environment if isinstance(environment, list) else [])
+        if isinstance(row, dict)
+    ]
+    # Names are classified by the settings fold and must then match the
+    # reviewed name exactly: credit_hot_path_enabled or appconfig_source next
+    # to (or instead of) the reviewed rows is unreviewed.
+    staged_folded = {_settings_fold(name) for name in STAGED_FLAGS}
+    staged = [
+        row for row in env_rows if _settings_fold(row.get("name")) in staged_folded
+    ]
+    checks.check(
+        not any(
+            _settings_fold(name) in staged_folded for name in _names(app, "secrets")
+        )
+        and (
+            staged == []
+            or (
+                sorted(str(row.get("name")) for row in staged) == list(STAGED_FLAGS)
+                and all(row.get("value") in WORKER_FLAG_VALUES for row in staged)
+            )
+        ),
+        "staged_flags_reviewed",
+        "staged_flags_unreviewed",
+    )
+    app_names = _names(app, "environment") | _names(app, "secrets")
+    appconfig_rows = [
+        row
+        for row in env_rows
+        if _settings_fold(row.get("name")).startswith(_APPCONFIG_FOLDED_PREFIX)
+    ]
+    checks.check(
+        not any(
+            _settings_fold(name).startswith(_APPCONFIG_FOLDED_PREFIX)
+            for name in app_names
+        )
+        or (
+            sorted(str(row.get("name")) for row in appconfig_rows)
+            == list(APPCONFIG_NAMES)
+            and not any(
+                _settings_fold(name).startswith(_APPCONFIG_FOLDED_PREFIX)
+                for name in _names(app, "secrets")
+            )
+            and all(
+                (
+                    row.get("value") == APPCONFIG_FIXED_VALUES[str(row.get("name"))]
+                    if row.get("name") in APPCONFIG_FIXED_VALUES
+                    else isinstance(row.get("value"), str)
+                    and APPCONFIG_IDENTIFIER.fullmatch(str(row.get("value")))
+                    is not None
+                )
+                for row in appconfig_rows
+            )
+            # Only on top of the staged flags (L7 comes after L2a).
+            and len(staged) == len(STAGED_FLAGS)
+        ),
+        "appconfig_group_reviewed",
+        "appconfig_group_unreviewed",
     )
     log_configuration = app.get("logConfiguration")
     options = (

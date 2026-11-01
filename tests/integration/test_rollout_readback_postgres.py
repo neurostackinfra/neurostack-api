@@ -4,14 +4,17 @@ One of the release-candidate PostgreSQL suites
 (``asaas_release_candidate_postgres_suites`` in ``scripts/wish-gates.sh``,
 run by CI); it needs ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback
 cluster, as every PostgreSQL suite here). It migrates a fresh database with
-this tree's migrations and runs the exact program
-``scripts/asaas_rollout_readback.py`` renders, as the cluster superuser and as
-a throwaway non-superuser login role (its own password, ``SELECT`` through
-default privileges set before the migrations, as the application role gets
-it): at 036 the verifier's judge stops on the revision and on every legacy
-object of migration 037; at 037 it accepts the table and the read changed
-nothing; with row-level security on, the non-superuser is not exempt (its
-rows are hidden), while the superuser sees them and only the RLS row stops.
+this tree's migrations and runs the exact programs
+``scripts/asaas_rollout_readback.py`` renders for its two windows (``--window
+037`` before the 038-042 window, ``--window 042`` after it), as the cluster
+superuser and as a throwaway non-superuser login role (its own password,
+``SELECT`` through default privileges set before the migrations, as the
+application role gets it): at 036 both judges stop on the revision and on
+every legacy object of migration 037; at 037 the 037 judge accepts the table
+and the 042 judge stops on the revision alone; at 042 the reverse; the reads
+changed nothing; with row-level security on, the non-superuser is not exempt
+(its rows are hidden), while the superuser sees them and only the RLS row
+stops.
 """
 
 from __future__ import annotations
@@ -105,9 +108,9 @@ async def database() -> AsyncIterator[_Database]:
         await admin.dispose()
 
 
-def _run(url: URL) -> tuple[int, list[str]]:
+def _run(url: URL, window: str) -> tuple[int, list[str]]:
     completed = subprocess.run(
-        [sys.executable, "-c", rr.read_program()],
+        [sys.executable, "-c", rr.read_program(rr.READ_WINDOWS[window])],
         cwd="/tmp",
         env={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -122,11 +125,13 @@ def _run(url: URL) -> tuple[int, list[str]]:
     return completed.returncode, completed.stdout.splitlines()
 
 
-async def _judged(url: URL) -> tuple[list[str], dict[str, Any]]:
-    code, lines = await asyncio.to_thread(_run, url)
+async def _judged(url: URL, window: str) -> tuple[list[str], dict[str, Any]]:
+    code, lines = await asyncio.to_thread(_run, url, window)
     assert code == 0, lines
-    assert json.loads(lines[0])["payload_sha256"] == rr.payload_sha256()
-    return rr.judge(mw.parse_read_lines(lines))
+    begin = json.loads(lines[0])
+    assert begin["payload_sha256"] == rr.payload_sha256()
+    assert (begin["window"], begin["phase"]) == (window, "rollout")
+    return rr.judge(mw.parse_read_lines(lines), rr.READ_WINDOWS[window])
 
 
 async def _execute(url: URL, *statements: str) -> None:
@@ -155,49 +160,57 @@ async def _rollout_rows(url: URL) -> list[tuple[Any, ...]]:
         await engine.dispose()
 
 
-async def test_the_readback_stops_at_036_and_passes_at_037(database: _Database) -> None:
+async def test_each_window_passes_only_on_its_own_revision(database: _Database) -> None:
     await _run_alembic(database.superuser, "upgrade", "036")
     for url in (database.superuser, database.application):
-        reasons, report = await _judged(url)
-        assert report["alembic_version"] == ["036"]
-        assert "read_alembic_version_mismatch" in reasons
-        assert sum(r.startswith("legacy_table_present:") for r in reasons) == 4
-        assert sum(r.startswith("legacy_function_present:") for r in reasons) == 10
-        assert len(reasons) == 15, reasons
+        for window in ("037", "042"):
+            reasons, report = await _judged(url, window)
+            assert report["alembic_version"] == ["036"]
+            assert "read_alembic_version_mismatch" in reasons
+            assert sum(r.startswith("legacy_table_present:") for r in reasons) == 4
+            assert sum(r.startswith("legacy_function_present:") for r in reasons) == 10
+            assert len(reasons) == 15, reasons
 
-    await _run_alembic(database.superuser, "upgrade", "037")
-    before = await _rollout_rows(database.superuser)
-    for url in (database.superuser, database.application):
-        reasons, report = await _judged(url)
-        assert reasons == [], reasons
-        assert report["alembic_version"] == ["037"]
-        facts = report["facts"]
-        assert [row["state"] for row in facts["billing_rollout_control"]] == [
-            "disabled"
-        ] * 4
-        assert facts["legacy_tables_absent"] == 4
-        assert facts["legacy_functions_absent"] == 10
-        assert facts["billing_subscriptions_rows"] == 0
-        assert facts["billing_checkout_sessions_rows"] == 0
-        assert facts["row_level_security_on_read_tables"] == 0
-    assert await _rollout_rows(database.superuser) == before
+    for revision in ("037", "042"):
+        await _run_alembic(database.superuser, "upgrade", revision)
+        before = await _rollout_rows(database.superuser)
+        for url in (database.superuser, database.application):
+            for window in ("037", "042"):
+                reasons, report = await _judged(url, window)
+                assert report["alembic_version"] == [revision]
+                if window != revision:
+                    # The other window's read stops on the revision alone.
+                    assert reasons == ["read_alembic_version_mismatch"], reasons
+                    continue
+                assert reasons == [], reasons
+                facts = report["facts"]
+                assert [row["state"] for row in facts["billing_rollout_control"]] == [
+                    "disabled"
+                ] * 4
+                assert facts["legacy_tables_absent"] == 4
+                assert facts["legacy_functions_absent"] == 10
+                assert facts["billing_subscriptions_rows"] == 0
+                assert facts["billing_checkout_sessions_rows"] == 0
+                assert facts["row_level_security_on_read_tables"] == 0
+        assert await _rollout_rows(database.superuser) == before
 
 
+@pytest.mark.parametrize("window", ["037", "042"])
 async def test_row_level_security_is_not_bypassed_for_the_application_role(
-    database: _Database,
+    database: _Database, window: str
 ) -> None:
-    await _run_alembic(database.superuser, "upgrade", "037")
+    await _run_alembic(database.superuser, "upgrade", window)
     await _execute(
         database.superuser,
         "ALTER TABLE public.billing_rollout_control ENABLE ROW LEVEL SECURITY",
         "ALTER TABLE public.billing_checkout_sessions ENABLE ROW LEVEL SECURITY",
     )
-    reasons, report = await _judged(database.application)
+    reasons, report = await _judged(database.application, window)
     assert "read_checks_mismatch" in reasons
     assert "row_level_security_on_read_tables" in reasons
     assert "read_fact_missing:rollout_state_not_disabled:production" in reasons
     assert report["facts"]["row_level_security_on_read_tables"] == 2
     # The superuser bypasses RLS: it sees every row, and only the RLS row stops.
-    reasons, report = await _judged(database.superuser)
+    reasons, report = await _judged(database.superuser, window)
     assert reasons == ["row_level_security_on_read_tables"]
     assert report["facts"]["row_level_security_on_read_tables"] == 2

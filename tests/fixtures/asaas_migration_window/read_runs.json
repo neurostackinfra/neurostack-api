@@ -1,5 +1,5 @@
 {
- "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app).",
+ "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app). Window 042's runs (pre_042_at_036, pre_042_at_037, post_042_at_037, success_042, pre_042_at_042, post_042_at_042) were captured on 2026-10-31 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 036, then 037, then 042 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT through default privileges set before the migrations); the server statement log showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK.",
  "runs": {
   "post_035_at_035": {
    "exit_code": 0,
@@ -43,6 +43,22 @@
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"public.billing_migrations\",true]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"public.billing_roster_control\",true]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"end\",\"status\":\"ok\",\"rows\":4}"
+   ]
+  },
+  "post_042_at_037": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"042\",\"phase\":\"post\",\"payload_sha256\":\"58db831ad117baa99eaf9b53caa20348065920687b32f6f71152d22f887e56b9\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"037\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"ok\",\"rows\":0}"
+   ]
+  },
+  "post_042_at_042": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"042\",\"phase\":\"post\",\"payload_sha256\":\"58db831ad117baa99eaf9b53caa20348065920687b32f6f71152d22f887e56b9\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"042\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"end\",\"status\":\"ok\",\"rows\":0}"
    ]
   },
   "pre_035_at_032": {
@@ -170,6 +186,54 @@
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":11,\"kind\":\"row\",\"values\":[10,\"owners and privileges\",\"ok\"]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":12,\"kind\":\"row\",\"values\":[11,\"comments\",\"comments the downgrade would not restore: table public.billing_migrations\"]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":13,\"kind\":\"end\",\"status\":\"ok\",\"rows\":11}"
+   ]
+  },
+  "pre_042_at_036": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"042\",\"phase\":\"pre\",\"payload_sha256\":\"700b6b1cba62f37847ed6716c31d789ccf72fd4c58af3f027f4f5a1cc2b14332\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"036\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"038 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"039 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"040 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"041 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[\"042 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[\"038 functions present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[\"041 functions present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[\"042 functions present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"end\",\"status\":\"ok\",\"rows\":8}"
+   ]
+  },
+  "pre_042_at_037": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"042\",\"phase\":\"pre\",\"payload_sha256\":\"700b6b1cba62f37847ed6716c31d789ccf72fd4c58af3f027f4f5a1cc2b14332\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"037\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"038 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"039 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"040 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"041 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[\"042 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[\"038 functions present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[\"041 functions present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[\"042 functions present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"end\",\"status\":\"ok\",\"rows\":8}"
+   ]
+  },
+  "pre_042_at_042": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"042\",\"phase\":\"pre\",\"payload_sha256\":\"700b6b1cba62f37847ed6716c31d789ccf72fd4c58af3f027f4f5a1cc2b14332\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"042\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"038 tables present\",15]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"039 tables present\",3]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"040 tables present\",3]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"row\",\"values\":[\"041 tables present\",13]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":6,\"kind\":\"row\",\"values\":[\"042 tables present\",1]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":7,\"kind\":\"row\",\"values\":[\"038 functions present\",4]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":8,\"kind\":\"row\",\"values\":[\"041 functions present\",2]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":9,\"kind\":\"row\",\"values\":[\"042 functions present\",1]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":10,\"kind\":\"end\",\"status\":\"ok\",\"rows\":8}"
    ]
   }
  }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Pure run tooling for the production migration windows 035, 036 and 037.
+"""Pure run tooling for the production migration windows 035, 036, 037 and 042.
 
-Three windows, each run only on its own explicit owner instruction, each with
+Four windows, each run only on its own explicit owner instruction, each with
 one entry in ``WINDOWS`` (the single source of truth; the planner
 ``scripts/asaas_production_wiring.py`` validates the manifest steps and
 renders the migrations task definition from the same table):
@@ -12,6 +12,7 @@ window   baked command              before  after  RDS snapshot
 ``035``  ``alembic upgrade 035``    032     035    ``pre-033-035-<date>``
 ``036``  ``alembic upgrade 036``    035     036    ``pre-036-<date>``
 ``037``  ``alembic upgrade 037``    036     037    ``pre-037-<date>``
+``042``  ``alembic upgrade 042``    037     042    ``pre-038-042-<date>``
 =======  =========================  ======  =====  ========================
 
 Like ``scripts/asaas_deploy_hook.py`` (whose readback, log-paging and
@@ -127,11 +128,13 @@ RULE_ZERO_COUNTS = "zero_counts"
 RULE_VERDICT_OK = "verdict_ok"
 RULE_RELATIONS_GONE = "relations_gone"
 # 035: the service may still run the tagged revision 8 (expand-only window);
-# the migrations revision carries the bridge image. 036 and 037: the image
-# containing the migration runs on every service task and is the migrations
-# revision's image, by digest; the manifest's rollback_target is its last pin,
-# revision 10 (the planner's WORKER_FLAG_REVISION, re-pinned from 9 before the
-# image bump; a test pins the two equal), with no pending re-pin.
+# the migrations revision carries the bridge image. 036, 037 and 042 (every
+# window after the first; the table guard below refuses anything else): the
+# image containing the migration runs on every service task and is the
+# migrations revision's image, by digest; the manifest's rollback_target is
+# its last pin, revision 10 (the planner's WORKER_FLAG_REVISION, re-pinned
+# from 9 before the image bump; a test pins the two equal), with no pending
+# re-pin.
 IMAGE_RULE_BRIDGE = "migrations_revision_on_bridge_image"
 IMAGE_RULE_DEPLOYED = "service_runs_the_migrations_image"
 PHASES = ("register", "snapshot", "pre_read", "run", "verify", "post_read")
@@ -233,6 +236,20 @@ GONE_037 = (
     "public.billing_migration_receipts",
     "public.billing_migrations",
     "public.billing_roster_control",
+)
+# Window 042: one row per migration and kind of object it creates (its
+# CREATED_TABLES or CREATED_FUNCTIONS; 039 and 040 create no function), each
+# counting the ones that already exist. A test keeps the SQL lists equal to
+# the migrations' constants.
+PREFLIGHT_042 = (
+    "038 tables present",
+    "039 tables present",
+    "040 tables present",
+    "041 tables present",
+    "042 tables present",
+    "038 functions present",
+    "041 functions present",
+    "042 functions present",
 )
 
 WINDOW_035 = MigrationWindow(
@@ -347,8 +364,52 @@ WINDOW_037 = MigrationWindow(
         ("post_read", "S24"),
     ),
 )
+# The credit schema (neurostack-credit-system migrations 038-042), one window
+# (asaas-rollout-opening Group 5, live step L3): additive only (each migration
+# creates tables, functions, indexes and triggers and alters nothing that
+# existed at 037), applied after the image containing 042 serves (L2), so the
+# deployed app stays valid on either schema. The pre-read, as the application
+# role, requires every count 0: none of those objects exists yet; the
+# post-read reads the revision only.
+WINDOW_042 = MigrationWindow(
+    name="042",
+    manifest_step="migrations_038_042",
+    before="037",
+    after="042",
+    chain=("037", "038", "039", "040", "041", "042"),
+    command=("alembic", "upgrade", "042"),
+    snapshot_prefix="pre-038-042-",
+    image_rule=IMAGE_RULE_DEPLOYED,
+    rollback_target_revision=10,
+    started_by="neurostack-migration-window-042",
+    pre_read=ReadSpec(
+        phase="pre",
+        sql_file="scripts/migration_038_042_preflight.sql",
+        rule=RULE_ZERO_COUNTS,
+        checks=PREFLIGHT_042,
+        role=READ_ROLE_APP,
+        expected_version="037",
+    ),
+    post_read=ReadSpec(
+        phase="post",
+        sql_file=None,
+        rule=RULE_VERSION_ONLY,
+        checks=(),
+        role=READ_ROLE_APP,
+        expected_version="042",
+    ),
+    # S25-S27 continue the S1-S24 numbering of the earlier windows.
+    plan_steps=(
+        ("register", "S25"),
+        ("snapshot", "S25"),
+        ("pre_read", "S26"),
+        ("run", "S26"),
+        ("verify", "S27"),
+        ("post_read", "S27"),
+    ),
+)
 WINDOWS: Mapping[str, MigrationWindow] = MappingProxyType(
-    {window.name: window for window in (WINDOW_035, WINDOW_036, WINDOW_037)}
+    {window.name: window for window in (WINDOW_035, WINDOW_036, WINDOW_037, WINDOW_042)}
 )
 # The window the VPS deploy pin (scripts/deploy-vps.sh APPROVED_ALEMBIC_REVISION)
 # and docs/configuration.md name: the first production window. It is NOT a
@@ -373,7 +434,7 @@ def _assert_window_table() -> None:
 
     rows = list(WINDOWS.values())
     _require(
-        [row.name for row in rows] == ["035", "036", "037"]
+        [row.name for row in rows] == ["035", "036", "037", "042"]
         and PINNED_WINDOW in WINDOWS,
         "window_table_names",
     )
@@ -1561,7 +1622,7 @@ def _rollback_target(
     checks: hook._Checks,
     manifest: Path | None,
 ) -> dict[str, Any]:
-    """036 and 037: the manifest's rollback_target re-pinned, revision ACTIVE.
+    """036, 037 and 042: the manifest's rollback_target re-pinned, revision ACTIVE.
 
     Read through the planner (its strict loader and full manifest validation),
     imported here only: the planner imports this module's window table.
@@ -1694,8 +1755,10 @@ _READ_HEADER = re.compile(
 # The one read outside the windows: the post-deploy rollout readback
 # (scripts/asaas_rollout_readback.py), the same program on the read family,
 # labelled with the window whose schema it reads and a phase of its own. A
-# program labelled ``rollout`` is recognized only with this window.
-ROLLOUT_READ_WINDOW = "037"
+# program labelled ``rollout`` is recognized only with one of these windows:
+# 037 (the schema until window 042 runs, live step L3) and 042 (after it);
+# the readback names one explicitly, never by default.
+ROLLOUT_READ_WINDOWS = ("037", "042")
 ROLLOUT_READ_PHASE = "rollout"
 
 
@@ -1798,7 +1861,7 @@ def normalized_read_command(command: Any) -> list[str] | None:
         or match.group("window") not in WINDOWS
         or (
             match.group("phase") == ROLLOUT_READ_PHASE
-            and match.group("window") != ROLLOUT_READ_WINDOW
+            and match.group("window") not in ROLLOUT_READ_WINDOWS
         )
         or match.group("connect") != str(READ_CONNECT_TIMEOUT_SECONDS)
         or match.group("settings") != _read_settings()

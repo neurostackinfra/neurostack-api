@@ -3130,3 +3130,476 @@ def test_the_hook_worker_flag_is_the_planner_parameter() -> None:
         "parameter",
         wiring.WORKER_FLAG_PARAMETER,
     )
+
+
+# ---------------------------------------------------------------------------
+# asaas-rollout-opening: the staged flags and the AppConfig group
+# ---------------------------------------------------------------------------
+
+STAGED = [
+    {"name": "BILLING_FACT_TRANSPORT_ENABLED", "value": "false"},
+    {"name": "CREDIT_HOT_PATH_ENABLED", "value": "false"},
+]
+GROUP = [
+    {"name": "APPCONFIG_APPLICATION", "value": "neurostack-staging"},
+    {"name": "APPCONFIG_ENABLED", "value": "true"},
+    {"name": "APPCONFIG_ENVIRONMENT", "value": "production"},
+    {"name": "APPCONFIG_PROFILE", "value": "financial-egress"},
+    {"name": "APPCONFIG_SOURCE", "value": "sdk"},
+]
+
+
+def _with_staged(
+    *rows: dict[str, Any], secrets: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    app = _app_container()
+    return _definition_with(
+        environment=[*app["environment"], *rows],
+        **({"secrets": [*app["secrets"], *secrets]} if secrets else {}),
+    )
+
+
+def _hook_plan(world_definition: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
+    world = World()
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": EXPECTED_ARN},
+        world_definition,
+    )
+    return plan(world, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        STAGED,
+        [{**STAGED[0], "value": "true"}, {**STAGED[1], "value": "true"}],
+        [*STAGED, *GROUP],
+    ],
+)
+def test_plan_accepts_every_stage_the_planner_renders(
+    rows: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    document = _hook_plan(_with_staged(*rows), tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert "staged_flags_reviewed" in document["checks"]
+    assert "appconfig_group_reviewed" in document["checks"]
+
+
+@pytest.mark.parametrize(
+    "rows,secrets,reason",
+    [
+        ([STAGED[0]], None, "staged_flags_unreviewed"),
+        ([STAGED[1]], None, "staged_flags_unreviewed"),
+        ([STAGED[0], {**STAGED[1], "value": "TRUE"}], None, "staged_flags_unreviewed"),
+        ([*STAGED, STAGED[1]], None, "staged_flags_unreviewed"),
+        (GROUP, None, "appconfig_group_unreviewed"),
+        ([*STAGED, *GROUP[:4]], None, "appconfig_group_unreviewed"),
+        (
+            [*STAGED, *GROUP[:4], {"name": "APPCONFIG_SOURCE", "value": "agent"}],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [
+                *STAGED,
+                {"name": "APPCONFIG_ENABLED", "value": "false"},
+                *GROUP[2:],
+                GROUP[0],
+            ],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [*STAGED, *GROUP, {"name": "APPCONFIG_TOKEN", "value": "t"}],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [*STAGED, {"name": "APPCONFIG_ORIGIN", "value": "http://127.0.0.1:2772"}],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [*STAGED, *GROUP],
+            [{"name": "APPCONFIG_TOKEN", "valueFrom": "arn:aws:secretsmanager:x"}],
+            "appconfig_group_unreviewed",
+        ),
+    ],
+)
+def test_plan_refuses_a_stage_the_planner_never_renders(
+    rows: list[dict[str, Any]],
+    secrets: list[dict[str, Any]] | None,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    document = _hook_plan(_with_staged(*rows, secrets=secrets), tmp_path)
+    assert document["status"] == "blocked"
+    assert reason in document["blocks"]
+
+
+def test_the_hook_staged_names_are_the_planner_and_validator_names() -> None:
+    from scripts import asaas_production_wiring as wiring
+
+    assert hook.STAGED_FLAGS == wiring.STAGED_FLAG_PARAMETERS
+    assert set(hook.STAGED_FLAGS) == rollout.STAGED_FLAG_ENVIRONMENT_NAMES
+    assert hook.APPCONFIG_NAMES == tuple(sorted(wiring.APPCONFIG_GROUP))
+    assert set(hook.APPCONFIG_NAMES) == rollout.APPCONFIG_ENVIRONMENT_NAMES
+    assert dict(hook.APPCONFIG_FIXED_VALUES) == {
+        name: reference
+        for name, (kind, reference) in wiring.APPCONFIG_GROUP.items()
+        if kind == "value"
+    }
+    for name in hook.STAGED_FLAGS:
+        assert wiring.ADDED_ENVIRONMENT[name] == ("parameter", name)
+
+
+def test_the_hook_appconfig_identifier_is_the_planner_and_runbook_pattern() -> None:
+    from scripts import asaas_production_wiring as wiring
+
+    pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    assert hook.APPCONFIG_IDENTIFIER.pattern == pattern
+    assert wiring._APPCONFIG_IDENTIFIER.pattern == pattern
+    runbook = (ROOT / "docs/runbooks/asaas-deployment.md").read_text(encoding="utf-8")
+    assert "`" + pattern.removeprefix("^").removesuffix("$") + "`" in runbook
+
+
+def _group_with(name: str, value: str) -> list[dict[str, Any]]:
+    return [{**row, "value": value} if row["name"] == name else row for row in GROUP]
+
+
+@pytest.mark.parametrize(
+    "rows,secrets,reason",
+    [
+        # Settings reads names case-insensitively: a case variant of a staged
+        # flag or an APPCONFIG_* name is unreviewed, alone or next to the
+        # reviewed rows.
+        (
+            [{"name": "credit_hot_path_enabled", "value": "true"}],
+            None,
+            "staged_flags_unreviewed",
+        ),
+        (
+            [*STAGED, {"name": "Credit_Hot_Path_Enabled", "value": "true"}],
+            None,
+            "staged_flags_unreviewed",
+        ),
+        (
+            [STAGED[0], {"name": "credit_hot_path_enabled", "value": "false"}],
+            None,
+            "staged_flags_unreviewed",
+        ),
+        (
+            STAGED,
+            [{"name": "credit_hot_path_enabled", "valueFrom": "arn:aws:x"}],
+            "staged_flags_unreviewed",
+        ),
+        (
+            [*STAGED, *GROUP, {"name": "appconfig_source", "value": "agent"}],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [*STAGED, {"name": "appconfig_enabled", "value": "true"}],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [*STAGED, *GROUP[:4], {"name": "AppConfig_Source", "value": "sdk"}],
+            None,
+            "appconfig_group_unreviewed",
+        ),
+        (
+            [*STAGED, *GROUP],
+            [{"name": "appconfig_token", "valueFrom": "arn:aws:x"}],
+            "appconfig_group_unreviewed",
+        ),
+        # The three identifiers: never empty, a space or a separator.
+        *(
+            ([*STAGED, *_group_with(name, value)], None, "appconfig_group_unreviewed")
+            for name in (
+                "APPCONFIG_APPLICATION",
+                "APPCONFIG_ENVIRONMENT",
+                "APPCONFIG_PROFILE",
+            )
+            for value in ("", " ", "a b/c", "-leading", "x" * 65, "ok\n")
+        ),
+    ],
+)
+def test_plan_refuses_case_variants_and_unreviewed_appconfig_identifiers(
+    rows: list[dict[str, Any]],
+    secrets: list[dict[str, Any]] | None,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    document = _hook_plan(_with_staged(*rows, secrets=secrets), tmp_path)
+    assert document["status"] == "blocked"
+    assert reason in document["blocks"]
+
+
+@pytest.mark.parametrize("value", ["abc1234", "neurostack.staging_2-x", "x" * 64])
+def test_plan_accepts_every_reviewed_appconfig_identifier(
+    value: str, tmp_path: Path
+) -> None:
+    for name in ("APPCONFIG_APPLICATION", "APPCONFIG_ENVIRONMENT", "APPCONFIG_PROFILE"):
+        document = _hook_plan(
+            _with_staged(*STAGED, *_group_with(name, value)), tmp_path
+        )
+        assert document["status"] == "ready", (name, document["blocks"])
+
+
+# Settings reads environment names case-insensitively: every name whose upper
+# case is the worker flag counts, in env and secrets of every container.
+
+
+def _with_otel(definition: dict[str, Any], **changes: Any) -> dict[str, Any]:
+    changed = copy.deepcopy(definition)
+    [otel] = [
+        row
+        for row in changed["taskDefinition"]["containerDefinitions"]
+        if row["name"] == "otel"
+    ]
+    otel.update(changes)
+    return changed
+
+
+REVIEWED_WORKER = {"name": "BILLING_FACT_WORKER_ENABLED", "value": "false"}
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        pytest.param(
+            _with_worker_flag(
+                REVIEWED_WORKER,
+                {"name": "billing_fact_worker_enabled", "value": "true"},
+            ),
+            id="lowercase-beside-reviewed",
+        ),
+        pytest.param(
+            _with_worker_flag(
+                REVIEWED_WORKER,
+                {"name": "Billing_Fact_Worker_Enabled", "value": "false"},
+            ),
+            id="mixed-case-beside-reviewed",
+        ),
+        pytest.param(
+            _with_worker_flag({"name": "billing_fact_worker_enabled", "value": "true"}),
+            id="lowercase-instead-of-reviewed",
+        ),
+        pytest.param(
+            _with_worker_flag(REVIEWED_WORKER, dict(REVIEWED_WORKER)),
+            id="duplicate-exact",
+        ),
+        pytest.param(
+            _definition_with(
+                secrets=[
+                    *_app_container()["secrets"],
+                    {
+                        "name": "BILLING_FACT_WORKER_ENABLED",
+                        "valueFrom": SECRET_PREFIX + "worker-AbC123",
+                    },
+                ]
+            ),
+            id="one-in-env-one-in-secrets",
+        ),
+        pytest.param(
+            _definition_with(
+                secrets=[
+                    *_app_container()["secrets"],
+                    {
+                        "name": "billing_fact_worker_enabled",
+                        "valueFrom": SECRET_PREFIX + "worker-AbC123",
+                    },
+                ]
+            ),
+            id="lowercase-in-secrets",
+        ),
+        pytest.param(
+            _with_otel(
+                _definition_with(),
+                environment=[{"name": "BILLING_FACT_WORKER_ENABLED", "value": "true"}],
+            ),
+            id="in-otel-environment",
+        ),
+        pytest.param(
+            _with_otel(
+                _definition_with(),
+                environment=[{"name": "billing_fact_worker_enabled", "value": "true"}],
+            ),
+            id="lowercase-in-otel-environment",
+        ),
+        pytest.param(
+            _with_otel(
+                _definition_with(),
+                secrets=[
+                    {
+                        "name": "BILLING_FACT_WORKER_ENABLED",
+                        "valueFrom": SECRET_PREFIX + "worker-AbC123",
+                    }
+                ],
+            ),
+            id="in-otel-secrets",
+        ),
+    ],
+)
+def test_plan_refuses_worker_flag_case_variants_duplicates_and_other_places(
+    definition: dict[str, Any], tmp_path: Path
+) -> None:
+    document = _hook_plan(definition, tmp_path)
+    assert document["status"] == "blocked"
+    assert "billing_fact_worker_flag_unreviewed" in document["blocks"]
+    assert "billing_fact_worker_flag_reviewed" not in document["checks"]
+
+
+@pytest.mark.parametrize("worker", ["false", "true"])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param([], id="revisions-9-to-11-no-staged-rows"),
+        pytest.param(STAGED, id="staged-rows-false"),
+        pytest.param(
+            [{**STAGED[0], "value": "true"}, {**STAGED[1], "value": "true"}],
+            id="staged-rows-true",
+        ),
+        pytest.param([*STAGED, *GROUP], id="staged-rows-and-appconfig-group"),
+    ],
+)
+def test_plan_still_accepts_every_reviewed_worker_flag_stage(
+    worker: str, rows: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    """The D3 revisions (9 to 11: the worker flag, no staged row) and every
+    later stage, with either reviewed worker value, still pass; revision 8
+    (no D3 wiring) was never accepted by the hook and is unchanged."""
+
+    definition = _with_worker_flag({**REVIEWED_WORKER, "value": worker}, *rows)
+    document = _hook_plan(definition, tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert "billing_fact_worker_flag_reviewed" in document["checks"]
+    assert "app_names_ascii" in document["checks"]
+
+
+def test_the_runbook_hook_section_states_where_the_worker_flag_may_be() -> None:
+    text = (ROOT / "docs/runbooks/asaas-deployment.md").read_text(encoding="utf-8")
+    start = text.index("### Post-deploy webhook registration hook")
+    flat = " ".join(text[start : text.index("\n### ", start + 1)].split())
+    assert (
+        "the worker flag `BILLING_FACT_WORKER_ENABLED` exactly once, in the `app`"
+        " environment and nowhere else (no secret, no row in `otel`), at `false`"
+        " or `true` (`billing_fact_worker_flag_reviewed`)"
+    ) in flat
+    assert "with any case variant of those names refused" in flat
+
+
+# pydantic-settings folds names with str.lower(): the Kelvin sign U+212A lowers
+# to "k" (str.upper() leaves it unchanged), so a Kelvin-sign spelling of the
+# worker flag is read as the flag. The hook folds the same way, and refuses
+# any non-ASCII name in the app container.
+KELVIN_WORKER = "BILLING_FACT_WORKER_ENABLED"
+
+
+def test_the_kelvin_sign_folds_onto_the_worker_flag_as_settings_reads_it() -> None:
+    assert KELVIN_WORKER.lower() == hook.WORKER_FLAG.lower()
+    assert KELVIN_WORKER.upper() != hook.WORKER_FLAG
+    assert not KELVIN_WORKER.isascii()
+
+
+@pytest.mark.parametrize(
+    "definition,reasons",
+    [
+        pytest.param(
+            _with_worker_flag(
+                REVIEWED_WORKER, {"name": KELVIN_WORKER, "value": "true"}
+            ),
+            ["billing_fact_worker_flag_unreviewed", "app_name_not_ascii"],
+            id="kelvin-worker-beside-reviewed",
+        ),
+        pytest.param(
+            _with_worker_flag({"name": KELVIN_WORKER, "value": "true"}),
+            ["billing_fact_worker_flag_unreviewed", "app_name_not_ascii"],
+            id="kelvin-worker-instead-of-reviewed",
+        ),
+        pytest.param(
+            _definition_with(
+                secrets=[
+                    *_app_container()["secrets"],
+                    {
+                        "name": KELVIN_WORKER,
+                        "valueFrom": SECRET_PREFIX + "worker-AbC123",
+                    },
+                ]
+            ),
+            ["billing_fact_worker_flag_unreviewed", "app_name_not_ascii"],
+            id="kelvin-worker-in-secrets",
+        ),
+        pytest.param(
+            _with_otel(
+                _definition_with(),
+                environment=[{"name": KELVIN_WORKER, "value": "true"}],
+            ),
+            ["billing_fact_worker_flag_unreviewed"],
+            id="kelvin-worker-in-otel",
+        ),
+        pytest.param(
+            _with_staged(
+                *STAGED, {"name": "CREDIT_HOT_PATH_ENABLEDı", "value": "true"}
+            ),
+            ["app_name_not_ascii"],
+            id="dotless-i-staged-suffix",
+        ),
+        pytest.param(
+            _with_staged(*STAGED, *GROUP, {"name": "APPCONﬁG_SOURCE", "value": "x"}),
+            ["app_name_not_ascii"],
+            id="ligature-appconfig-name",
+        ),
+        pytest.param(
+            _with_staged(*STAGED, {"name": "SPÄ_ENABLED", "value": "1"}),
+            ["app_name_not_ascii"],
+            id="non-ascii-name",
+        ),
+    ],
+)
+def test_plan_refuses_non_ascii_names_and_kelvin_sign_spellings(
+    definition: dict[str, Any], reasons: list[str], tmp_path: Path
+) -> None:
+    document = _hook_plan(definition, tmp_path)
+    assert document["status"] == "blocked"
+    for reason in reasons:
+        assert reason in document["blocks"], (reason, document["blocks"])
+
+
+def test_the_hook_folds_names_like_settings_for_every_reviewed_class() -> None:
+    """Every name class is classified by the settings fold, not by upper():
+    a name that lowers onto a reviewed name is in its class."""
+
+    assert hook._settings_fold(KELVIN_WORKER) == hook._settings_fold(hook.WORKER_FLAG)
+    for name in (*hook.STAGED_FLAGS, *hook.APPCONFIG_NAMES):
+        assert hook._settings_fold(name) == name.lower()
+    assert hook._settings_fold(None) == ""
+    assert hook._APPCONFIG_FOLDED_PREFIX == "APPCONFIG_".lower()
+
+
+@pytest.mark.parametrize(
+    "rows,reason",
+    [
+        pytest.param(
+            [{"name": "credit_hot_path_enabled", "value": "true"}],
+            "staged_flags_unreviewed",
+            id="folded-staged-flag",
+        ),
+        pytest.param(
+            [*STAGED, {"name": "appconfig_enabled", "value": "true"}],
+            "appconfig_group_unreviewed",
+            id="folded-appconfig-name",
+        ),
+    ],
+)
+def test_the_ascii_case_variants_are_still_in_their_class(
+    rows: list[dict[str, Any]], reason: str, tmp_path: Path
+) -> None:
+    document = _hook_plan(_with_staged(*rows), tmp_path)
+    assert document["status"] == "blocked"
+    assert reason in document["blocks"]
+    assert "app_names_ascii" in document["checks"]

@@ -87,8 +87,14 @@ evidence on 2026-10-25.
   [`asaas-producer-image-rollout-group5.md`](./asaas-producer-image-rollout-group5.md).
 - Billing rollout is `disabled` and `topup_commercial_enabled=false`. Verify
   both from the server readback (`GET /v1/admin/billing/rollout/readback`,
-  `super_admin` JWT; it answers only when the app runs with
-  `ENVIRONMENT=staging`, which is how the production-serving service is
+  which accepts only the 10-minute staging rehearsal token that
+  `POST /v1/auth/staging-rehearsal-token` issues to a `super_admin`, never a
+  login JWT: a login JWT gets 401 `unauthorized`, and the rehearsal token
+  gets 401 `unauthorized` on the mutating rollout routes, as on every route
+  outside the rehearsal's own list. The issuer needs Redis: it answers 503
+  `issuer_unavailable` when Redis cannot be reached and 429 `rate_limited`
+  over its limits. The issuer and the readback answer only when the app runs
+  with `ENVIRONMENT=staging`, which is how the production-serving service is
   configured), never from UI state or environment overrides.
 - The commercial credit top-up is deferred and stays unavailable.
 - The product owner decided that `general` opens only after a delivered,
@@ -892,7 +898,7 @@ restored guards refuse what they refused.
 
 ## Migration windows: the run tooling
 
-Three production migration windows, each its own manifest step and each run
+Four production migration windows, each its own manifest step and each run
 only on its own explicit owner instruction, in this order. The window table
 of `scripts/asaas_migration_window.py` (`WINDOWS`) is the only source: the
 planner validates the manifest steps against it and renders each window's
@@ -903,6 +909,7 @@ migrations revision from it.
 | `035` | `migrations_033_035` | S10-S13 | `alembic upgrade 035` | `032`, `035` | `pre-033-035-<date>` | `scripts/migration_033_035_zero_reads.sql`, application role | the migrations revision carries the bridge image by digest (in ECR); every service task runs its own revision's image (revision 8 may still serve, by tag) |
 | `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 10, `ACTIVE` |
 | `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 10, `ACTIVE` |
+| `042` | `migrations_038_042` | S25-S27 | `alembic upgrade 042` | `037`, `042` | `pre-038-042-<date>` | `scripts/migration_038_042_preflight.sql`, application role | as for 036, with the image containing 042 (live step L2b of asaas-rollout-opening), carried by the migrate revision; `rollback_target` revision 10, `ACTIVE` |
 
 History: windows `036` and `037` actually ran with `rollback_target`
 revision 9; the requirement of revision 10 in the table applies to any later
@@ -910,7 +917,8 @@ use of the tooling.
 
 After the run every window reads back `alembic_version` as the application
 role; it must be exactly the window's "after" (window `037` also reads
-`scripts/migration_037_post_read.sql`: the four legacy tables gone).
+`scripts/migration_037_post_read.sql`: the four legacy tables gone). Window
+`042` is described in "Window 042: migrations 038-042" below.
 `windows` prints this table.
 
 There is **no default window**: every subcommand of the tool, and the
@@ -1037,13 +1045,13 @@ every freshness window is judged against the system clock.
 
 ```bash
 tool=scripts/asaas_migration_window.py
-args=(--window "$W"                                   # 035, 036 or 037: the owner's order
+args=(--window "$W"                                   # 035, 036, 037 or 042: the owner's order
       --readback-file "$workdir/window-readback.json"
       --service-task-definition "$SERVICE_TD"         # the revision the service runs
       --migrations-task-definition "$MIGRATIONS_TD"   # registered for this window (> :3)
       --read-task-definition "$READ_TD"               # neurostack-staging-consulta:28
       --snapshot-id "$SNAPSHOT_ID")                   # printed by render-snapshot-requests
-# window 037 only (required there, refused for 035 and 036):
+# window 037 only (required there, refused for 035, 036 and 042):
 args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read revision
 ```
 
@@ -1051,14 +1059,14 @@ args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read 
 `plan-*` and `plan` list the reads still missing as `next_requests`, with
 status `incomplete`: send them, record the responses, run them again):
 
-| Phase | Plan step (035 / 036 / 037) | Subcommands, in order | Done when |
+| Phase | Plan step (035 / 036 / 037 / 042) | Subcommands, in order | Done when |
 |---|---|---|---|
-| register | S10 / S20 / S23 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
-| snapshot | S11 / S20 / S23 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
-| pre-read | S12 / S21 / S24 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
-| run | S12 / S21 / S24 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
-| verify | S13 / S22 / S24 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
-| post-read | S13 / S22 / S24 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" |
+| register | S10 / S20 / S23 / S25 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
+| snapshot | S11 / S20 / S23 / S25 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
+| pre-read | S12 / S21 / S24 / S26 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
+| run | S12 / S21 / S24 / S26 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
+| verify | S13 / S22 / S24 / S27 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
+| post-read | S13 / S22 / S24 / S27 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" |
 
 **Snapshot order.** `plan-snapshot` runs, and exits 0, **before**
 `CreateDBSnapshot` is sent: it is the check that the deploy state allows
@@ -1098,7 +1106,8 @@ table's `plan_steps`, printed by `windows`). They map the S1-S24 plan of
 2026-10-19 by the ranges given for each window (S10-S13, S20-S22, S23-S24);
 the plan's own step texts are not in this repository, so the mapping is
 inferred, and a label whose step differs is renamed here and in the window
-table together.
+table together. Window `042`'s S25-S27 continue that numbering for live step
+L3 of asaas-rollout-opening and map no step of the 2026-10-19 plan.
 
 **Same-day snapshot retry: a known limitation.** The snapshot name is
 `pre-<span>-<date>` (owner decision 2026-10-19 b) and has no second slot for
@@ -1116,7 +1125,7 @@ pending, Fargate, private awsvpc; `ListTasks` of the service listing exactly
 `desiredCount` tasks, each `RUNNING` on `$SERVICE_TD` with the `app`
 container on the expected image digest, and no task told to stop still
 running (`desiredStatus` `STOPPED` listing all `STOPPED`); the expected digest
-is, for 036 and 037, the migrations revision's image, which must equal the
+is, for 036, 037 and 042, the migrations revision's image, which must equal the
 service revision's `app` image exactly, and for 035 the service revision's
 own image (a tag resolved through `ecr:DescribeImages`); the migrations
 revision of this window: family `neurostack-staging-migrations`, revision
@@ -1126,7 +1135,7 @@ ECR, `DATABASE_URL` only as the `database-url-migrations` secret, `awslogs`;
 the snapshot `$SNAPSHOT_ID` of `neurostack-staging-db`, manual, `postgres`,
 `available`, created within the last 60 minutes and named for its creation
 date (or the day before); no task of the migrations family, of the
-window's `startedBy` or of the read family running; for 036 and 037 the
+window's `startedBy` or of the read family running; for 036, 037 and 042 the
 manifest's `rollback_target` revision 10 with no pending re-pin and revision 10
 `ACTIVE` on an image by digest; for 037 the read revision (baked readback,
 no mention of the migration tool, same image as the migrate revision) and the
@@ -1273,6 +1282,83 @@ migration task reach the same database: the read family's and the
 migrations family's `DATABASE_URL` secrets are different names, and the
 tool only checks that each names its own secret.
 
+### Window 042: migrations 038-042
+
+Window `042` applies the credit schema of neurostack-credit-system,
+migrations `038` to `042`, in one run (`alembic upgrade 042` from `037`;
+Alembic runs the five upgrades in one transaction, so a failure changes
+nothing). It is live step L3 of the asaas-rollout-opening wish, run only on
+its own explicit owner instruction. The five migrations only create tables,
+functions, indexes and triggers and alter nothing that existed at `037` (the
+only side effect on an existing object is the pair of internal RI triggers
+PostgreSQL adds on `tenants` for the two foreign keys of 038), so the
+application deployed before the window keeps working on either schema, and a
+service rollback stays valid with the schema at `042`.
+
+**Preconditions.** Window `037` applied and verified. The image containing
+`042` deployed and running on every service task, by digest: live step L2,
+two deploys, each with one change only (first the revision that only adds the
+rows `CREDIT_HOT_PATH_ENABLED` and `BILLING_FACT_TRANSPORT_ENABLED` at
+`'false'`, on the image that already serves; then the revision that only
+moves the image; see "The staged flags and the AppConfig group" below), so
+the window's tooling finds the service on the migrations image. The window
+tool refuses any other image (`migrations_image_differs_from_deployed_image`,
+`service_task_image_digest_mismatch`), like for 036 and 037.
+`rollback_target` revision 10 with no pending re-pin, `ACTIVE`, by digest.
+
+**Preflight (SELECT only, immediately before the run)**, as the application
+role on the read family: `scripts/migration_038_042_preflight.sql`, byte for
+byte below (its comment lines aside). The same task reads `alembic_version`,
+which must be `037`: the start state is exactly `037`, with none of the
+objects the window creates. Each row counts the tables (`CREATED_TABLES`)
+or the functions (`CREATED_FUNCTIONS`, exact signatures) one of the five
+migrations creates that already exist; every count must be `0`, or stop and
+return to the owner. The rows count catalog objects, not table rows, so
+row-level security cannot hide one. The real runs on PostgreSQL 16
+(`tests/fixtures/asaas_migration_window/read_runs.json`): at `037` every
+count `0` (`read_ok`); at `036` every count `0` and the revision alone stops
+it; at `042` the revision and every count stop it.
+
+```sql
+SELECT '038 tables present' AS check_name, count(*) AS found FROM unnest(ARRAY['public.credit_accounts', 'public.credit_effects', 'public.credit_lots', 'public.credit_ledger_entries', 'public.credit_debts', 'public.credit_debt_origins', 'public.credit_debt_settlements', 'public.credit_fact_inbox', 'public.credit_revision_gaps', 'public.credit_capability_readiness', 'public.credit_ingress_claims', 'public.credit_response_outbox', 'public.credit_enforcement_state', 'public.credit_enforcement_binding', 'public.credit_observational_effects']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '039 tables present', count(*) FROM unnest(ARRAY['public.credit_inventory_versions', 'public.credit_allocations', 'public.credit_egress_deliveries']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '040 tables present', count(*) FROM unnest(ARRAY['public.credit_object_copies', 'public.credit_object_copy_jobs', 'public.credit_qdrant_jobs']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '041 tables present', count(*) FROM unnest(ARRAY['public.credit_lifecycle_episodes', 'public.credit_lifecycle_transitions', 'public.credit_threshold_alerts', 'public.credit_operational_role_assignments', 'public.credit_operational_authorizations', 'public.credit_operational_authorization_receipts', 'public.credit_hold_generations', 'public.credit_hold_events', 'public.credit_purge_fences', 'public.credit_retention_tombstones', 'public.credit_purge_jobs', 'public.credit_purge_results', 'public.credit_purge_receipts']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '042 tables present', count(*) FROM unnest(ARRAY['public.credit_cutoff_acceptances']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '038 functions present', count(*) FROM unnest(ARRAY['public.reject_credit_history_mutation()', 'public.check_credit_tenant_builder()', 'public.guard_credit_revision_gap()', 'public.guard_credit_enforcement_binding()']) AS signature WHERE to_regprocedure(signature) IS NOT NULL
+UNION ALL SELECT '041 functions present', count(*) FROM unnest(ARRAY['public.guard_credit_lifecycle_episode()', 'public.guard_credit_hold_generation()']) AS signature WHERE to_regprocedure(signature) IS NOT NULL
+UNION ALL SELECT '042 functions present', count(*) FROM unnest(ARRAY['public.reject_credit_cutoff_acceptance_mutation()']) AS signature WHERE to_regprocedure(signature) IS NOT NULL;
+```
+
+Order (each step stops on any divergence and returns to the owner; the
+subcommands are `scripts/asaas_migration_window.py --window 042`, with the
+arguments of "Files" above and no `--migrations-read-task-definition`):
+
+1. Register the window's migrations revision with `render-migrations-taskdef
+   --window 042 --purpose migrate` (the deployed image digest, the command
+   baked to exactly `alembic upgrade 042`).
+2. `plan-snapshot`, then `render-snapshot-requests`: the manual RDS snapshot
+   named `pre-038-042-<date>`, `available` and recent.
+3. `plan-pre-read`, `render-pre-read`, `verify-pre-read`: `read_ok`, every
+   count `0` with `alembic_version` == `037`, read as the application role.
+4. `plan`, then `render-run-task`, and the RunTask exactly as printed.
+5. `render-verify-reads --target migration`, then `verify-result`:
+   `applied`, exactly the five upgrade lines `037 -> 038`, `038 -> 039`,
+   `039 -> 040`, `040 -> 041` and `041 -> 042`, in that order (the real run
+   is in `tests/fixtures/asaas_migration_window/alembic_runs.json`,
+   `success_042`).
+6. `plan-post-read`, `render-post-read`, `verify-post-read`. **Verify**
+   `alembic_version` == `042`; `post_read_version_is_before_nothing_applied`
+   means it still reads `037`.
+
+**Rollback (window 042).** None from the window. A service rollback to the
+rollback target stays valid on the `042` schema (the migrations are
+additive). Each downgrade of 038 to 042 refuses while any of its tables holds
+a row (038 also while `billing_fact_acks` does), so they are not a way back
+once the credit system writes; restoring the snapshot is an owner decision
+of last resort, because it loses every write made after it. SQLSTATE
+`55P03`, `40P01` or `55000` means nothing changed: report and stop.
+
 ## Post-deploy rollout readback
 
 The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one
@@ -1292,11 +1378,29 @@ transaction that is never committed, `lock_timeout` 3 s, `statement_timeout`
 task, one JSON line per result), the read family contract of
 `neurostack-staging-consulta:28` (application role), the RunTask hardening,
 the log reader, the exposure scan and the output guard. The program carries
-the labels window `037`, phase `rollout` (the window tool recognizes that
-pair, and only it, as a read program besides the windows' own).
+the labels window `<W>`, phase `rollout` (the window tool recognizes these
+two pairs, and only them, as a read program besides the windows' own).
+
+**Two windows, chosen explicitly.** Every subcommand requires `--window`,
+given once and with no default: `037` while the production schema is at
+`037` (before window `042`, live step L3 of asaas-rollout-opening), `042`
+after it. The window is the program's label and the revision the read must
+see; nothing else differs (the SQL, the payload digest, the table and the
+judge are the same). The readback file carries no window (the window is
+`--window`'s; a file with a `window` key is `readback_file_shape_invalid`).
+A RunTask or a task rendered for one window never verifies as the other: the
+recorded RunTask, the task's command, the program's window label and the
+revision stop it (`read_request_not_rendered_by_this_tool`,
+`read_task_command_mismatch`, `read_begin_mismatch`), and the program of one
+window on the other window's schema stops on the revision alone
+(`read_alembic_version_mismatch`): the 038 to 042 window changes none of the
+facts it reads. `readback_window_mismatch` guards the Python API (a
+readback loaded for one window passed with the context of the other); from
+the command line it cannot fire.
 
 **What it reads** (`scripts/asaas_rollout_readback.sql`, verbatim in the
-program): `alembic_version`, which must be exactly `037`, and one row per
+program): `alembic_version`, which must be exactly the chosen window (`037`
+or `042`), and one row per
 fact, `check_name`, `subject`, `value`. `verify` requires exactly this
 table of 25 rows (4 + 4 + 4 + 10 + 3), no row missing, none added or
 repeated. Rows are judged by `check_name` and `subject`, so their order is
@@ -1341,8 +1445,9 @@ that no transition to `canary_allowlist` or `general` ever happened; the
 ```bash
 tool=scripts/asaas_rollout_readback.py
 workdir="$(mktemp -d)" && chmod 700 "$workdir"; umask 077
-args=(--readback-file "$workdir/rollout-readback.json"
-      --service-task-definition arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:11
+args=(--window "$W"                                   # 037 before window 042, 042 after it
+      --readback-file "$workdir/rollout-readback.json"
+      --service-task-definition "$SERVICE_TD"            # the revision serving now (see below)
       --read-task-definition arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-consulta:28)
 poetry run python "$tool" plan "${args[@]}" > "$workdir/rollout-readback-plan.json"     # 0 ready
 poetry run python "$tool" render "${args[@]}" > "$workdir/rollout-readback-task.json"   # the RunTask
@@ -1353,8 +1458,14 @@ Each option is given at most once, and there is no `--now`. `plan` and
 `render` judge freshness against the system clock; `verify` does not read
 the clock at all: it judges every time from the recorded reads'
 `captured_at_utc` and the task's own timestamps. `--service-task-definition`
-is the revision the service must be serving (`:11` after the final deploy
-of 2026-10-25); the verdict names it. Running the three commands in
+(`$SERVICE_TD`, a full task-definition ARN) is the revision the service must
+be serving when the read runs: for `--window 037`, the revision serving at
+the time (`neurostack-staging-app:11`, the final deploy of 2026-10-25,
+before L2a; the L2a or L2b revision until L3); for `--window 042`, which
+runs only after L2a and L2b, the revision L2b registered and the service
+serves. With `:11` once the service runs a later revision, `plan` blocks on
+the service check (`service_task_definition_mismatch`); the verdict names
+it. Running the three commands in
 sequence before the RunTask is sent is harmless: the tool itself sends
 nothing (it only prints the request), `render` prints nothing and exits 2
 unless the plan is `ready`, and `verify` exits 2 (`read_not_recorded`)
@@ -1418,8 +1529,8 @@ recorded reads and at most 60 s (clock skew) after them
 (`read_task_not_recent`: an older task handed back for a reused token is
 not this read); a task still running after 600 s is
 `read_watch_deadline_exceeded`; container exit 0; every log page; the
-program's lines exactly `begin` (window `037`, phase `rollout`, the payload
-digest), `version`, the rows and `end`, with no foreign or malformed line
+program's lines exactly `begin` (the chosen window, phase `rollout`, the
+payload digest), `version`, the rows and `end`, with no foreign or malformed line
 (`read_log_foreign_line`, `read_line_malformed`, `read_sequence_broken`,
 `read_end_missing`, `read_row_count_mismatch`); a URL, `user@host`, an IPv4
 address, an AWS host, a password or token anywhere in the log is
@@ -1431,7 +1542,7 @@ address, an AWS host, a password or token anywhere in the log is
 `row_level_security_on_read_tables`, `read_fact_missing:...`,
 `read_checks_mismatch` for a row missing, added, repeated or of another
 shape, and
-`read_alembic_version_mismatch` for any revision but `037`). A database
+`read_alembic_version_mismatch` for any revision but the chosen window's). A database
 error is `read_failed` with its class and SQLSTATE only (`42501` is a
 missing privilege).
 
@@ -1443,16 +1554,20 @@ with a new file and `render --attempt <n+1>` (the same day) or attempt 1
 **Not yet run in production.** Its first run is the readback the criterion
 waits for. The SQL and the program were run on PostgreSQL 16 as a
 non-superuser application role
-(`tests/fixtures/asaas_rollout_readback/read_runs.json`: at 036, at 037,
-with row-level security on `billing_rollout_control` and on
-`billing_checkout_sessions`, with one row opened to `general`); the server
-log of that capture shows each read session running only `BEGIN ISOLATION
-LEVEL REPEATABLE READ READ ONLY`, the `SET LOCAL` settings, the two SELECTs
-and `ROLLBACK`. `tests/integration/test_rollout_readback_postgres.py`, in
-the release-candidate PostgreSQL suites CI runs
+(`tests/fixtures/asaas_rollout_readback/read_runs.json`: window `037`'s
+program at 036, at 037, with row-level security on `billing_rollout_control`
+and on `billing_checkout_sessions`, with one row opened to `general`; and,
+captured on 2026-10-31, window `042`'s program at 037 and at 042 and window
+`037`'s at 042; window `037`'s program at 037 printed the earlier capture
+again, byte for byte); the server log of those captures shows each read
+session running only `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, the
+`SET LOCAL` settings, the two SELECTs and `ROLLBACK`.
+`tests/integration/test_rollout_readback_postgres.py`, in the
+release-candidate PostgreSQL suites CI runs
 (`asaas_release_candidate_postgres_suites`), migrates a fresh database to
-036 and 037 and runs the program as the superuser and as a throwaway
-non-superuser login role (row-level security is not bypassed for it).
+036, 037 and 042 and runs both windows' programs as the superuser and as a
+throwaway non-superuser login role at each (each passes only on its own
+revision; row-level security is not bypassed for the non-superuser).
 
 ## Production wiring (Group 9 D3/D4)
 
@@ -1471,7 +1586,11 @@ The reviewed artifacts are:
   one at apply time, edit this file, have it reviewed, and run `plan` again.
   It also holds `BILLING_FACT_WORKER_ENABLED`, the outbox worker flag:
   exactly `'true'` (the repository value since E7-B1) or `'false'`, see
-  [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled).
+  [The outbox worker flag](#the-outbox-worker-flag-billing_fact_worker_enabled);
+  `CREDIT_HOT_PATH_ENABLED` and `BILLING_FACT_TRANSPORT_ENABLED` (the file
+  sets both to `'false'`); and the AppConfig group's three parameters (the
+  file sets them to `null`), see
+  [The staged flags and the AppConfig group](#the-staged-flags-and-the-appconfig-group).
 - `scripts/asaas_production_wiring.py`: the read-only planner.
 
 ### The read-only planner
@@ -1485,7 +1604,7 @@ python scripts/asaas_production_wiring.py check          --params "$params"
 python scripts/asaas_production_wiring.py render-migrations-taskdef --window 035 --purpose migrate --params "$params"
 ```
 
-`render-migrations-taskdef` requires `--window` (`035`, `036` or `037`) and
+`render-migrations-taskdef` requires `--window` (`035`, `036`, `037` or `042`) and
 `--purpose` (`migrate`, or `read` for window `037` only); neither has a
 default. `migrate` bakes exactly the window's own upgrade; `read` bakes
 window `037`'s SELECT-only readback program on the same image, roles and
@@ -1591,6 +1710,10 @@ secret, as a separate revision.
 
    It never carries a name with a forbidden prefix (the legacy payment
    provider, or `APPCONFIG_`) and never sets `SPA_ENABLED` or `SPA_DIST_DIR`.
+   Since asaas-rollout-opening every rendering also carries the two staged
+   flags, and from its live step L7 the complete AppConfig group, the one
+   exception to the `APPCONFIG_` prefix
+   ([The staged flags and the AppConfig group](#the-staged-flags-and-the-appconfig-group)).
 5. **Financial egress: closed by absence.** The app reads
    `financial_egress_enabled` only through the AppConfig Agent at a loopback
    origin, and only when `APPCONFIG_ENABLED` is true
@@ -1598,7 +1721,8 @@ secret, as a separate revision.
    definition, every read returns false before any I/O, so checkout creation
    fails with `financial_egress_disabled` before any provider POST. No
    AppConfig application exists in the account (read back 2026-10-18). This is
-   the only supported initial state.
+   the only supported initial state; it lasts until the AppConfig group is
+   rendered (live step L7 of asaas-rollout-opening, below).
 
 ### The outbox worker flag (`BILLING_FACT_WORKER_ENABLED`)
 
@@ -1930,6 +2054,130 @@ carried out by the operator and never by these tools, as for the flag:
 either deregister that unwanted newest revision (owner approval required),
 or, when its image is the one wanted, set the override to its digest and
 deploy it (step 6). Then run `plan` again.
+
+### The staged flags and the AppConfig group
+
+The asaas-rollout-opening wish fixes the names (its Decisions 12 to 14) and
+the order in which they reach the task definition (its live steps L2 to L7).
+The planner accepts exactly these, each in its own revision, and keeps
+refusing any other name:
+
+| Live step | Revision | Parameters (`infra/production/asaas-production-wiring.params.yaml`) | `plan` change (`replaces` the serving revision) |
+|---|---|---|---|
+| L2a | the rows `CREDIT_HOT_PATH_ENABLED` and `BILLING_FACT_TRANSPORT_ENABLED` added, both `'false'`, nothing else (the image that serves) | both `'false'`, as the file sets them; `app_image_override` the serving digest | `flag_rows_added: {names, value: 'false'}` |
+| L2b | the app image alone (the image built for this wish) | `app_image_override` the new digest | `app_image` (the image bump) |
+| L5 | `CREDIT_HOT_PATH_ENABLED` `'true'` alone | its own reviewed PR to `'true'` | `credit_hot_path_flag: {name, from, to}` |
+| L6 | `BILLING_FACT_TRANSPORT_ENABLED` `'true'` alone | its own reviewed PR to `'true'` | `transport_flag: {name, from, to}` |
+| L7 | the AppConfig group alone | `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT`, `APPCONFIG_PROFILE` set | `appconfig_group_added: {names, application, environment, profile, source: sdk}` |
+
+**The planner checks one kind of change at a time, not the order.** Each
+`plan` compares the serving revision with the rendering and accepts exactly
+one reviewed kind; it does **not** check the order L2a > L2b > L3 > L5 > L6 >
+L7 (Decision 4: L7 after L6). It proposes `transport_flag` while the credit
+flag is still `'false'` (L6 before L5), and `appconfig_group_added` with
+both flags `'false'` (L7 before L5 and L6), and it cannot read
+`alembic_version`, so it cannot know whether L3 ran. Keeping the order is the
+operator's and the owner's job (whether the planner should enforce it is an
+open owner decision).
+
+Rollback and containment, per step:
+
+- **L2a, L2b**: update the service back to the previous revision; `plan`
+  then reports the revision it left as `registered_not_deployed:<ARN>` (for
+  L2a, `registered_not_deployed:<L2a ARN>` with
+  `info.registered_revision_adds_flag_rows`). Rolling L2b back to the
+  rollback pin (revision 10) instead of the previous revision is expected
+  to block with `service_not_on_rollback_target:<revision 10 ARN>`:
+  revision 10 differs from the rendering in the rows and the image, two
+  kinds.
+- **L5, L6**: the flag flipped back to `'false'` alone, by its own reviewed
+  PR, is itself a reviewed kind (`credit_hot_path_flag` or `transport_flag`
+  from `'true'` to `'false'`), proposed and deployed like the flip on.
+- **L7**: containment is the AppConfig configuration set to `false` ("AppConfig
+  and opening financial egress (follow-up F2)" below), not a revision.
+  Removing the group from the parameters is **not** a reviewed kind: `plan`
+  blocks (`service_not_on_rollback_target:<ARN>`, and
+  `financial_egress_closed` blocks with
+  `appconfig_group_serving_not_in_rendering`).
+
+- **The two flags** are reviewed parameters of the worker flag's form:
+  exactly the quoted string `'false'` or `'true'` (a YAML boolean, another
+  spelling, whitespace or a missing value fails the plan before any AWS
+  read, `parameter_invalid:<NAME>` or `parameter_missing:<NAME>`). Every
+  rendering carries both rows. They enter together, both `'false'`, in a
+  revision that changes nothing else (Decision 13: an image and a flag never
+  share a revision or a deploy, so L2 is two deploys). `Settings` ignores
+  names it does not know (`extra="ignore"`), so on the image that serves the
+  rows change no behaviour. One row without the other, a row added at
+  `'true'`, or the rows with the image or any other change match no reviewed
+  kind and block (`service_not_on_rollback_target:<ARN>`). Afterwards each
+  value flips alone, like the worker flag, through its own reviewed PR and
+  revision.
+- **The AppConfig group** (Decision 14) is rendered all or none: the three
+  parameters all `null` (no `APPCONFIG_*` name at all) or all set to an
+  AppConfig identifier (name or ID, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`); a part
+  fails the plan (`parameter_invalid:appconfig_group_partial`). With them the
+  planner writes the complete group itself: the three values plus
+  `APPCONFIG_ENABLED` `'true'` and `APPCONFIG_SOURCE` `sdk`, which are never
+  parameters (`parameter_unknown`). The source is always `sdk`: the task runs
+  exactly `app` and `otel`, so there is no Agent container. `APPCONFIG_`
+  stays a forbidden prefix (`task_definition.forbidden_name_prefixes`): the
+  complete group, in the `app` environment, is its only exception;
+  `APPCONFIG_ORIGIN`, `APPCONFIG_TOKEN`, any other `APPCONFIG_*` name, a part
+  of the group, another value, or a group name in the secrets or in `otel`
+  are forbidden names (`forbidden_name_in_rendering`,
+  `rollback_target_has_forbidden_names`).
+- **`financial_egress_closed`** knows the two stages. Until L7 the rendering
+  carries no `APPCONFIG_*` name (`info.stage: closed_by_absence`, compliant
+  `no_appconfig_names_in_rendering`), whatever AppConfig application exists.
+  From L7 it carries exactly the complete group
+  (`appconfig_group_complete_in_rendering`, `info.stage:
+  appconfig_group_sdk`) and exactly one application must be listed by
+  `appconfig:ListApplications` under that name or ID, on one complete page
+  (`appconfig_application_exists:<name>`; otherwise
+  `appconfig_application_not_found:<name>`,
+  `appconfig_application_ambiguous:<name>` when two answer to it, or
+  `appconfig_applications_unreadable` block the plan). Opening egress is then
+  the configuration's value, set outside this planner under its own owner
+  approval. The D3 source revision never carries an `APPCONFIG_*` name
+  (`appconfig_names_in_rollback_target`). The stage is the rendering's, but
+  the step also reads the revision the service runs (`info.serving_stage`):
+  closed by absence is reported only when that revision carries no
+  `APPCONFIG_*` name either (`no_appconfig_names_in_serving`). Parameters set
+  back to `null` while the serving revision still carries the group block
+  (`appconfig_group_serving_not_in_rendering`, `info.stage: undetermined`),
+  as do any other `APPCONFIG_*` name there (`appconfig_names_in_serving`)
+  and an unreadable serving revision (`serving_task_definition_unreadable`).
+- **Registered, not yet deployed, and stuck states** are reported for every
+  kind as for the worker flag and the image bump:
+  `registered_not_deployed:<ARN>` with
+  `info.registered_revision_adds_flag_rows`,
+  `registered_revision_changes_credit_hot_path_flag`,
+  `registered_revision_changes_transport_flag` or
+  `registered_revision_adds_appconfig_group`; and, when the newest
+  registered revision differs from the rendering in one kind alone while the
+  service runs the rendering (or differs from it in that kind),
+  `newest_revision_differs_only_in_<flag_rows|credit_hot_path_flag|transport_flag|appconfig_group>:<ARN>`,
+  which blocks.
+- **The protected deploy path** accepts the same stages and nothing else:
+  `scripts/verify_asaas_producer_image_rollout.py` adds two name sets on top
+  of the D3 wiring (`STAGED_FLAG_ENVIRONMENT_NAMES`, then
+  `APPCONFIG_ENVIRONMENT_NAMES`, each all or none and only in that order) and
+  fingerprints their values like the D3 values;
+  `scripts/asaas_deploy_hook.py` mirrors the names (`STAGED_FLAGS`,
+  `APPCONFIG_NAMES`, `APPCONFIG_FIXED_VALUES`, `APPCONFIG_IDENTIFIER`) and
+  refuses a deployed revision with one flag, an unreviewed value (a flag
+  other than `'false'` or `'true'`, an AppConfig identifier that is empty or
+  does not match the pattern above), an incomplete or altered group, or a
+  case variant of any of these names (`Settings` reads names
+  case-insensitively, so `credit_hot_path_enabled` or `appconfig_source`
+  is refused, alone or next to the reviewed rows) (`staged_flags_unreviewed`,
+  `appconfig_group_unreviewed`). Tests pin the three mirrors equal, and the
+  identifier pattern equal in the planner, the hook and this runbook.
+- **The window `042`** (live step L3) runs after L2b, on the image containing
+  042, before L5 ("Window 042: migrations 038-042" above); its manifest step,
+  `migrations_038_042`, follows `migrations_037` and precedes
+  `rollout_transitions`.
 
 ### Ordered procedure
 
@@ -2510,9 +2758,18 @@ Sequence (`ARN` is the revision the deployment completed on):
    groups and `assignPublicIp: DISABLED` on the service; the revision
    `ACTIVE` on awsvpc and Fargate, with exactly the containers `app` and
    `otel`, an essential `app` container, no entry point, the D3
-   webhook wiring, an `awslogs` log configuration in `us-east-1` with a
-   stream prefix, and an image pinned by digest that still exists in ECR; no
-   RunTask already recorded in the file.
+   webhook wiring, the worker flag `BILLING_FACT_WORKER_ENABLED` exactly once,
+   in the `app` environment and nowhere else (no secret, no row in `otel`),
+   at `false` or `true` (`billing_fact_worker_flag_reviewed`), the two staged
+   flags both or neither, each once at `false` or `true`
+   (`staged_flags_reviewed`), no `APPCONFIG_*` name or exactly the complete
+   AppConfig group in the `app` environment, on top of the staged flags,
+   `APPCONFIG_ENABLED` `true`, `APPCONFIG_SOURCE` `sdk` and three
+   identifiers matching the planner's pattern (`appconfig_group_reviewed`),
+   with any case variant of those names refused ("The staged flags and the
+   AppConfig group" above), an `awslogs` log configuration in `us-east-1`
+   with a stream prefix, and an image pinned by digest that still exists in
+   ECR; no RunTask already recorded in the file.
 3. `python scripts/asaas_deploy_hook.py render-run-task --expected-task-definition "$ARN" --readback-file "$workdir/hook-readback.json" > "$workdir/hook-run-task.json"`
    (no `--now` in a live run: it re-checks freshness against the system
    clock; add `--force-rewrite-token` only for a token rotation, below;
@@ -2777,8 +3034,9 @@ and `uazapi_service.py` only consume the result.
 - **Evidence validators:** the `APPCONFIG_*` names enter the task definition
   only at L7 and all together (Decision 12 of the wish): `APPCONFIG_ENABLED`,
   `APPCONFIG_SOURCE`, `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` and
-  `APPCONFIG_PROFILE`. The planner allowlist and the
-  `financial_egress_closed` step are Group 5.
+  `APPCONFIG_PROFILE`. They are in the planner allowlist and the
+  `financial_egress_closed` step as of Group 5, staged at L7 ("The staged
+  flags and the AppConfig group" above).
 - **Network:** the tasks reach AppConfig through the existing NAT gateway.
   There is no AppConfig VPC endpoint.
 
