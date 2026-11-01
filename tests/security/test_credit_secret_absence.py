@@ -3,7 +3,8 @@
 Deliverable 10: readiness rows, acks, metrics and credit routes never write
 ``billing_rollout_control``, ``topup_commercial_enabled`` or
 ``billing_topup_capability_receipts``.  By analysis (AST and SQL literals,
-nothing imported) over every credit module:
+nothing imported) over every credit module, the one-off arming task
+``src/ops/credit_enforcement.py`` included:
 
 * ``BillingTopupCapabilityReceipt`` is never named (only an import would be
   harmless, and there is none);
@@ -69,6 +70,8 @@ def _credit_modules() -> list[Path]:
         ROOT / "src/api/schemas/credits.py",
         ROOT / "src/api/schemas/admin_credits.py",
         ROOT / "src/observability/metric_dimensions.py",
+        # asaas-rollout-opening Group 6: the one-off task that arms.
+        ROOT / "src/ops/credit_enforcement.py",
     ]
     return [path for path in paths if path.exists()]
 
@@ -219,6 +222,7 @@ def test_the_swept_set_includes_rollout_routes_and_repositories() -> None:
         "src/repositories/credit.py",
         "src/api/routes/admin_credits.py",
         "src/services/credit_fact_consumer.py",
+        "src/ops/credit_enforcement.py",
     } <= swept
 
 

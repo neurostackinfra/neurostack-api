@@ -2,8 +2,9 @@
 
 The credit consumer owns only the *technical* preconditions.  This module is
 intentionally incapable of changing billing rollout/top-up state; its one
-write to ``credit_enforcement_state`` has no route and is reserved for the
-future operational opening.  All ASAAS rows are read-only.
+write to ``credit_enforcement_state`` has no route: its only caller is the
+one-off ECS task ``python -m src.ops.credit_enforcement``.  All ASAAS rows are
+read-only.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
-from typing import Final, Literal
+from typing import Awaitable, Callable, Final, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -47,6 +48,7 @@ from src.models.credit_inventory import CreditAllocation
 from src.models.event import Event
 from src.models.handoff import HandoffRecord
 from src.models.tenant import Tenant
+from src.models.user import User, UserRole
 from src.observability.metric_dimensions import ContractCounter as Counter
 from src.observability.metric_dimensions import ContractGauge as Gauge
 from src.observability.metric_dimensions import precreate_closed_children
@@ -233,6 +235,15 @@ class CapabilityReadiness:
             and not self.has_backlog
             and not self.has_alert
         )
+
+
+@dataclass(frozen=True)
+class DeletionClosurePreview:
+    """Read-only: what ``arm_enforcement``'s orphan step would write and leave."""
+
+    closures_to_write: int
+    orphans_after: OrphanReport
+    readiness_after: CapabilityReadiness
 
 
 class CreditEnforcementRejected(RuntimeError):
@@ -662,9 +673,17 @@ class CreditRolloutService:
         ack or digest mismatch, and while an orphan effect is open.
         """
 
+        return await self._capability_readiness(now=now, orphans=self.orphan_report)
+
+    async def _capability_readiness(
+        self,
+        *,
+        now: datetime | None,
+        orphans: Callable[[], Awaitable[OrphanReport]],
+    ) -> CapabilityReadiness:
         reconciliation = await self.reconciliation_report()
         readback = await self.readback_report(now=now)
-        orphan = await self.orphan_report()
+        orphan = await orphans()
         watermark = int(
             await self.session.scalar(
                 select(func.coalesce(func.max(CreditFactInbox.inbox_seq), 0))
@@ -795,6 +814,12 @@ class CreditRolloutService:
                     CreditObservationalEffect.recorded_at >= lower,
                     CreditObservationalEffect.recorded_at <= upper,
                 )
+                # A deleted tenant keeps the FIRST recorded builder (``seen``):
+                # ordered, so the digest never depends on the query plan.
+                .order_by(
+                    CreditObservationalEffect.recorded_at,
+                    CreditObservationalEffect.id,
+                )
             )
         ).all()
         for tenant_id, builder_id, origin, authenticated in observational_rows:
@@ -804,14 +829,14 @@ class CreditRolloutService:
 
         unknown_ingress_rows = (
             await self.session.execute(
-                select(
-                    CreditIngressClaim.tenant_id, CreditIngressClaim.builder_id
-                ).where(
+                select(CreditIngressClaim.tenant_id, CreditIngressClaim.builder_id)
+                .where(
                     CreditIngressClaim.mode == "observational",
                     CreditIngressClaim.source.in_(UNKNOWN_INGRESS_SOURCES),
                     CreditIngressClaim.created_at >= lower,
                     CreditIngressClaim.created_at <= upper,
                 )
+                .order_by(CreditIngressClaim.created_at, CreditIngressClaim.id)
             )
         ).all()
         for tenant_id, builder_id in unknown_ingress_rows:
@@ -895,6 +920,14 @@ class CreditRolloutService:
         is limited to a deletion closure for an already-deleted tenant.
         """
 
+        return await self._orphan_report(assumed_closures=frozenset(), publish=True)
+
+    async def _orphan_report(
+        self, *, assumed_closures: frozenset[str], publish: bool
+    ) -> OrphanReport:
+        """:meth:`orphan_report` as if *assumed_closures* (deletion-closure
+        effect ids) were already written; the gauge only when *publish*."""
+
         claims = (
             await self.session.execute(
                 select(
@@ -925,7 +958,7 @@ class CreditRolloutService:
                     )
                 )
             ).all()
-        }
+        } | assumed_closures
         live_tenants = {
             tenant_id
             for (tenant_id,) in (await self.session.execute(select(Tenant.id))).all()
@@ -964,8 +997,7 @@ class CreditRolloutService:
             closed_by_deletion = (
                 tenant_id is not None
                 and tenant_id not in live_tenants
-                and "deletion_closure:" + hashlib.sha256(effect_id.encode()).hexdigest()
-                in closure_effect_ids
+                and self._deletion_closure_id(effect_id) in closure_effect_ids
             )
             if (
                 kind in {"trace", "trace_credit_pending", "trace_no_response"}
@@ -1050,9 +1082,68 @@ class CreditRolloutService:
             orphan_outbox=orphan_outbox,
             handoff_without_effect=handoff_without_effect,
         )
-        if credit_switch_effective():
+        if publish and credit_switch_effective():
             CREDIT_ORPHAN_EFFECTS.set(report.open_count)
         return report
+
+    @staticmethod
+    def _deletion_closure_id(effect_id: str) -> str:
+        return "deletion_closure:" + hashlib.sha256(effect_id.encode()).hexdigest()
+
+    async def _deleted_tenant_effects(self) -> list[CreditEffect]:
+        """The effects :meth:`reconcile_orphans` closes: of a tenant that no
+        longer exists, of a kind the orphan report checks."""
+
+        return list(
+            (
+                await self.session.execute(
+                    select(CreditEffect).where(
+                        CreditEffect.tenant_id.is_not(None),
+                        CreditEffect.effect_kind.in_(ORPHAN_EFFECT_KINDS),
+                        ~exists().where(Tenant.id == CreditEffect.tenant_id),
+                    )
+                )
+            ).scalars()
+        )
+
+    async def deletion_closure_preview(
+        self, *, now: datetime | None = None
+    ) -> DeletionClosurePreview:
+        """What ``arm_enforcement`` would see after its first step,
+        :meth:`reconcile_orphans` -- by reading only.
+
+        The same effect selection as :meth:`reconcile_orphans`; the orphan
+        report and the readiness are :meth:`orphan_report` and
+        :meth:`capability_ready` with those closures assumed instead of
+        written (and no gauge published)."""
+
+        pending = {
+            (effect.builder_id, self._deletion_closure_id(effect.effect_id))
+            for effect in await self._deleted_tenant_effects()
+        }
+        closures = frozenset(closure_id for _builder, closure_id in pending)
+        written = {
+            (builder_id, effect_id)
+            for builder_id, effect_id in (
+                await self.session.execute(
+                    select(CreditEffect.builder_id, CreditEffect.effect_id).where(
+                        CreditEffect.effect_kind == "deletion_closure",
+                        CreditEffect.effect_id.in_(sorted(closures)),
+                    )
+                )
+            ).all()
+        }
+
+        async def after_closures() -> OrphanReport:
+            return await self._orphan_report(assumed_closures=closures, publish=False)
+
+        return DeletionClosurePreview(
+            closures_to_write=len(pending - written),
+            orphans_after=await after_closures(),
+            readiness_after=await self._capability_readiness(
+                now=now, orphans=after_closures
+            ),
+        )
 
     async def reconcile_orphans(self) -> OrphanReport:
         """Write only idempotent deleted-tenant closure effects, then report.
@@ -1062,21 +1153,10 @@ class CreditRolloutService:
         table.  Normal orphan classes remain blockers for a human repair.
         """
 
-        deleted_effects = (
-            await self.session.execute(
-                select(CreditEffect).where(
-                    CreditEffect.tenant_id.is_not(None),
-                    CreditEffect.effect_kind.in_(ORPHAN_EFFECT_KINDS),
-                    ~exists().where(Tenant.id == CreditEffect.tenant_id),
-                )
-            )
-        ).scalars()
+        deleted_effects = await self._deleted_tenant_effects()
         repository = CreditRepository(self.session)
         for effect in deleted_effects:
-            closure_id = (
-                "deletion_closure:"
-                + hashlib.sha256(effect.effect_id.encode()).hexdigest()
-            )
+            closure_id = self._deletion_closure_id(effect.effect_id)
             await repository.insert_effect(
                 builder_id=effect.builder_id,
                 tenant_id=None,
@@ -1095,16 +1175,34 @@ class CreditRolloutService:
         reason: str,
         report_digest: str,
         author_user_id: UUID,
-        accepted_at: datetime,
     ) -> CreditCutoffAcceptance:
-        """Persist one explicit owner acknowledgement; there is intentionally no API."""
+        """Persist one explicit owner acknowledgement; there is intentionally no API.
+
+        The caller names neither a role nor an instant: the author must be an
+        ACTIVE ``super_admin`` (its row is held ``FOR SHARE`` until the
+        caller's commit, so a concurrent deactivation waits) and
+        ``accepted_at`` is the database clock (:meth:`CreditRepository.
+        database_now`).  The only caller is ``src.ops.credit_enforcement``.
+        """
 
         if len(report_digest) != 64 or any(
             c not in "0123456789abcdef" for c in report_digest
         ):
             raise ValueError("report_digest must be a lowercase SHA-256")
-        if not reason.strip() or accepted_at.tzinfo is None:
-            raise ValueError("cutoff acceptance requires reason and aware timestamp")
+        if not reason.strip():
+            raise ValueError("cutoff acceptance requires a reason")
+        author = await self.session.scalar(
+            select(User).where(User.id == author_user_id).with_for_update(read=True)
+        )
+        if (
+            author is None
+            or author.is_active is not True
+            or author.role != UserRole.super_admin
+        ):
+            raise CreditEnforcementRejected(
+                "cutoff acceptance author is not an active super_admin"
+            )
+        accepted_at = await CreditRepository(self.session).database_now()
         builder_clause = (
             CreditCutoffAcceptance.builder_id.is_(None)
             if builder_id is None
@@ -1140,13 +1238,27 @@ class CreditRolloutService:
         return acceptance
 
     async def arm_enforcement(
-        self, *, set_by: str, at: datetime | None = None
+        self,
+        *,
+        set_by: str,
+        at: datetime | None = None,
+        expected_report_digest: str,
     ) -> CreditEnforcementState:
         """Internal Group-7 transaction, intentionally unreachable by a route.
 
-        The Group 8 operational process may call this only after its own
-        independent owner decision.  A second call is rejected rather than
-        moving the boundary and charging history.
+        Its one caller is the one-off task ``python -m
+        src.ops.credit_enforcement arm`` (asaas-rollout-opening Group 6),
+        run only on the owner's explicit order.  A second call is rejected
+        rather than moving the boundary and charging history.
+
+        ``expected_report_digest`` (required, keyword-only, no default) is
+        the digest of the cutoff report the operator reviewed.  Anything but
+        64 lowercase hex characters is refused before the rollout lock and
+        before any write.  A well-formed digest is compared, in THIS
+        transaction and under the rollout lock, with the report this
+        transaction evaluates at the database clock: a report that changed
+        since it was reviewed is refused even when it would otherwise be
+        accepted.
 
         ``credit_enforcement_at`` is the database clock (``clock_timestamp``,
         read through :meth:`CreditRepository.database_now` once the rollout
@@ -1167,6 +1279,16 @@ class CreditRolloutService:
 
         if (at is not None and at.tzinfo is None) or not set_by:
             raise ValueError("enforcement needs an aware timestamp and actor")
+        # The confirmation's shape is checked at the boundary: before the
+        # rollout lock is taken and before anything is written.
+        if not (
+            isinstance(expected_report_digest, str)
+            and len(expected_report_digest) == 64
+            and all(c in "0123456789abcdef" for c in expected_report_digest)
+        ):
+            raise CreditEnforcementRejected(
+                "expected_report_digest is not a lowercase SHA-256"
+            )
         repository = CreditRepository(self.session)
         # Same lock as ASAAS subscription writers.  No Billing control fields
         # are read or written as authority by this service.
@@ -1189,6 +1311,10 @@ class CreditRolloutService:
         if not ready.ready:
             raise CreditEnforcementRejected("credit readiness is incomplete")
         cutoff = await self.cutoff_report(now=database_now)
+        if cutoff.digest != expected_report_digest:
+            raise CreditEnforcementRejected(
+                "tenant cutoff report differs from the confirmed digest"
+            )
         if not cutoff.ready:
             raise CreditEnforcementRejected("tenant cutoff report is unaccepted")
         state = await self.session.get(CreditEnforcementState, 1, with_for_update=True)
