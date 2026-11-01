@@ -4,7 +4,10 @@ Every "worker" here is a :class:`BillingFactWorker` on its own engine, so two
 workers are genuinely separate backends competing for the same rows, exactly
 like two ECS tasks.  Facts are produced by ``BillingFactProducer`` on top of
 migration-head schema (triggers, CHECKs, immutability) from a disposable
-child database.  No network: the consumer transport is an in-memory fake.
+child database.  No network: the consumer transport is an in-memory fake,
+except in the asaas-rollout-opening Group 2c section, which presents through
+the transport and readiness hook ``src/api/main.py`` wires, to the real
+credit consumer on the same database and one shared process pool.
 """
 
 from __future__ import annotations
@@ -121,7 +124,8 @@ async def template() -> AsyncIterator[_Template]:
 
 @pytest.fixture
 def presentation_preconditions_waived(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Explicit test-only waiver: production cannot wire a transport yet."""
+    """Pin the presentation guard closed (its default since Group 2c), so the
+    proofs of the fake-transport state machine survive a reopened guard."""
 
     monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", False)
 
@@ -1124,3 +1128,306 @@ async def test_phase_two_waits_for_a_reconciler_holding_the_row_on_postgres(
         await engine.dispose()
     assert attempt is not None and attempt.outcome == "presented"
     assert await _attempt_row(clean, outbox_id) == ("acknowledged", 1, clock.value)
+
+
+# ---------------------------------------------------------------------------
+# The transport src/api/main.py wires, end to end over the REAL consumer
+# (asaas-rollout-opening Group 2c)
+# ---------------------------------------------------------------------------
+
+# The switch causes, then the image-level faults of the consumer's contract
+# check (``consumer_contract_digests``), which the readiness hook reads too.
+_IMAGE_FAULTS = (
+    "bundle_digest_unavailable",
+    "bundle_digest_differs",
+    "schema_unavailable",
+    "schema_digest_differs",
+    "catalog_differs",
+)
+_UNREADY_CAUSES = ("config_off", "schema_below_042", *_IMAGE_FAULTS)
+
+
+@dataclass
+class _Wired:
+    harness: _Harness
+    engine: AsyncEngine
+    sessions: async_sessionmaker[AsyncSession]
+    application_name: str
+    consumer_calls: list[str]
+
+
+@pytest.fixture
+async def wired(
+    clean: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_Wired]:
+    """One process pool (the approved profile's), shared by the worker and the
+    real consumer, as in production; the consumer's calls are recorded."""
+
+    from scripts import check_database_connection_budget as budget
+    from src.services import credit_fact_consumer as consumer_module
+    from src.services.credit_switch import stop_credit_switch
+
+    profile = budget.load_profile(
+        ROOT / "config/database-connection-budgets.json", "ecs-poc"
+    )
+    application_name = f"g2c-{uuid4().hex[:12]}"
+    engine = create_async_engine(
+        clean.url,
+        pool_size=profile["pool_size"],
+        max_overflow=profile["max_overflow"],
+        pool_timeout=profile["pool_timeout"],
+        connect_args={"server_settings": {"application_name": application_name}},
+    )
+    sessions = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+    )
+    calls: list[str] = []
+    real_handler = consumer_module.handle_billing_fact
+
+    async def recorded(payload: dict[str, object]) -> None:
+        calls.append(str(payload["event_id"]))
+        await real_handler(payload)
+
+    monkeypatch.setattr(consumer_module, "handle_billing_fact", recorded)
+    monkeypatch.setattr(consumer_module, "default_session_factory", lambda: sessions)
+    try:
+        yield _Wired(clean, engine, sessions, application_name, calls)
+    finally:
+        await stop_credit_switch(None)
+        await engine.dispose()
+
+
+# The consumer's pins as first read (unpatched: monkeypatch undoes per test).
+_REAL_PINS: dict[str, str] = {}
+
+
+async def _set_readiness(
+    wired: _Wired, monkeypatch: pytest.MonkeyPatch, cause: str | None
+) -> None:
+    """Drive the REAL switch verdict (from this database) and the consumer's
+    contract check (``None``: every image check back to the real bytes)."""
+
+    from src.services import billing_catalog
+    from src.services import credit_fact_consumer as consumer_module
+    from src.services.credit_switch import refresh_credit_switch
+
+    async with wired.harness.engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE alembic_version SET version_num = :revision"),
+            {"revision": "041" if cause == "schema_below_042" else "042"},
+        )
+    reading = await refresh_credit_switch(
+        enabled=cause != "config_off", session_factory=wired.harness.sessions
+    )
+    assert reading.effective is (cause is None or cause in _IMAGE_FAULTS)
+    bundle = outbox_module.billing_fact_bundle_digest
+    schema = outbox_module.billing_fact_schema_digest
+    catalog = billing_catalog.catalog_snapshot_bytes
+    missing = ROOT / "no-such-dir"
+    faults: dict[str, tuple[str, Any]] = {
+        "bundle_digest_unavailable": (
+            "billing_fact_bundle_digest",
+            lambda: bundle(missing / "SHA256SUMS"),
+        ),
+        "bundle_digest_differs": ("billing_fact_bundle_digest", lambda: "0" * 64),
+        "schema_unavailable": (
+            "billing_fact_schema_digest",
+            lambda: schema(missing / "billing_fact_v1.schema.json"),
+        ),
+        "catalog_differs": (
+            "catalog_snapshot_bytes",
+            lambda: catalog() + b"another catalog",
+        ),
+    }
+    monkeypatch.setattr(consumer_module, "billing_fact_bundle_digest", bundle)
+    monkeypatch.setattr(consumer_module, "billing_fact_schema_digest", schema)
+    monkeypatch.setattr(consumer_module, "catalog_snapshot_bytes", catalog)
+    pinned_schema = _REAL_PINS.setdefault(
+        "schema", consumer_module.PINNED_SCHEMA_DIGEST
+    )
+    monkeypatch.setattr(
+        consumer_module,
+        "PINNED_SCHEMA_DIGEST",
+        "0" * 64 if cause == "schema_digest_differs" else pinned_schema,
+    )
+    if cause in faults:
+        name, fault = faults[cause]
+        monkeypatch.setattr(consumer_module, name, fault)
+
+
+def _wired_worker(wired: _Wired, clock: _Clock, **config: Any) -> BillingFactWorker:
+    from src.api import main as main_module
+
+    return BillingFactWorker(
+        wired.sessions,
+        transport=main_module._credit_fact_transport(),
+        transport_ready=main_module._billing_fact_transport_ready,
+        config=_config(**config),
+        now=clock,
+    )
+
+
+async def _credit_rows(harness: _Harness) -> tuple[int, int, int]:
+    (row,) = await _rows(
+        harness,
+        "SELECT (SELECT count(*) FROM credit_fact_inbox),"
+        " (SELECT count(*) FROM billing_fact_acks),"
+        " (SELECT count(*) FROM credit_accounts)",
+    )
+    return int(row[0]), int(row[1]), int(row[2])
+
+
+@pytest.mark.parametrize("cause", _UNREADY_CAUSES)
+async def test_an_unready_consumer_spends_nothing_then_gets_the_fact_once_on_postgres(
+    wired: _Wired, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    outbox_id = await _seed_fact(wired.harness)
+    await _set_readiness(wired, monkeypatch, cause)
+    clock = _Clock()
+    # One attempt allowed: a single spent attempt would block the fact.
+    worker = _wired_worker(wired, clock, max_attempts=1)
+    for _ in range(3):
+        report = await worker.run_tick()
+        assert (report.not_ready, report.presented, report.failed) == (1, 0, 0)
+        assert (report.exhausted, report.backlog.blocked) == (0, 0)
+        state, count, last = await _attempt_row(wired.harness, outbox_id)
+        assert (state, count) == ("pending", 0)
+        assert last == clock.value  # kept: the fact waits its backoff again
+        clock.advance(hours=2)
+    assert wired.consumer_calls == []
+    assert await _credit_rows(wired.harness) == (0, 0, 0)
+    assert await _alert_count(wired.harness, outbox_id, RETRY_EXHAUSTED_DETAIL) == 0
+
+    # The cause fixed, the same never-spent fact reaches the consumer once.
+    await _set_readiness(wired, monkeypatch, None)
+    assert (await worker.run_tick()).presented == 1
+    clock.advance(minutes=2)
+    await worker.run_tick()  # the maintenance pass reads the ack
+    assert await _delivery(wired.harness, outbox_id) == ("acknowledged", 1)
+    assert wired.consumer_calls == [str(outbox_id)]
+    inbox, acks, _accounts = await _credit_rows(wired.harness)
+    assert (inbox, acks) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "hook", ["real", "forced_ready"], ids=["main-hook", "hook-forced-true"]
+)
+async def test_the_switch_turning_off_mid_presentation_is_not_an_attempt_on_postgres(
+    wired: _Wired, monkeypatch: pytest.MonkeyPatch, hook: str
+) -> None:
+    from src.api import main as main_module
+    from src.services import credit_fact_consumer as consumer_module
+    from src.services.credit_switch import refresh_credit_switch
+
+    outbox_id = await _seed_fact(wired.harness)
+    await _set_readiness(wired, monkeypatch, None)
+    recorded = consumer_module.handle_billing_fact
+
+    async def switch_turns_off_then_consumes(payload: dict[str, object]) -> None:
+        # The refresher reads the config off between the hook and the consumer.
+        await refresh_credit_switch(
+            enabled=False, session_factory=wired.harness.sessions
+        )
+        await recorded(payload)
+
+    monkeypatch.setattr(
+        consumer_module, "handle_billing_fact", switch_turns_off_then_consumes
+    )
+    worker = BillingFactWorker(
+        wired.sessions,
+        transport=main_module._credit_fact_transport(),
+        # Forced true, only main.py's CreditSwitchOff translation is left.
+        transport_ready=(
+            main_module._billing_fact_transport_ready
+            if hook == "real"
+            else (lambda: True)
+        ),
+        config=_config(max_attempts=1),
+        now=_Clock(),
+    )
+    report = await worker.run_tick()
+    assert (report.not_ready, report.failed, report.exhausted) == (1, 0, 0)
+    assert wired.consumer_calls == [str(outbox_id)]  # it reached the consumer
+    assert (await _attempt_row(wired.harness, outbox_id))[:2] == ("pending", 0)
+    assert await _credit_rows(wired.harness) == (0, 0, 0)
+
+
+async def test_a_per_fact_handoff_mismatch_is_counted_then_blocked_on_postgres(
+    wired: _Wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The image passes its contract check; the fact's handoff names another
+    bundle digest: a counted failure (not a not-ready turn-away), then the
+    cap blocks it."""
+
+    from src.api import main as main_module
+    from src.services import credit_fact_consumer as consumer_module
+
+    outbox_id = await _seed_fact(wired.harness)  # handoff: the real digest
+    await _set_readiness(wired, monkeypatch, None)
+    # The handoff table is append-only: the image moves instead, consistently
+    # (its digest equals its own pin), so only the per-fact check differs.
+    monkeypatch.setattr(consumer_module, "billing_fact_bundle_digest", lambda: "e" * 64)
+    monkeypatch.setattr(consumer_module, "PINNED_BUNDLE_DIGEST", "e" * 64)
+    assert main_module._billing_fact_transport_ready() is True
+    clock = _Clock()
+    worker = _wired_worker(wired, clock, max_attempts=1)
+    first = await worker.run_tick()
+    assert (first.failed, first.not_ready, first.presented) == (1, 0, 0)
+    assert await _delivery(wired.harness, outbox_id) == ("pending", 1)
+    clock.advance(hours=2)
+    second = await worker.run_tick()
+    assert (second.exhausted, second.not_ready) == (1, 0)
+    assert await _delivery(wired.harness, outbox_id) == ("blocked", 1)
+    assert wired.consumer_calls == [str(outbox_id)]
+    assert await _credit_rows(wired.harness) == (0, 0, 0)
+
+
+async def test_the_worker_and_consumer_stay_within_the_connection_budget_on_postgres(
+    wired: _Wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.scripts.test_database_connection_budget import (
+        WORKER_AND_CONSUMER_CONNECTION_BUDGET,
+        PoolCounter,
+    )
+
+    facts = [await _seed_fact(wired.harness) for _ in range(3)]
+    await _set_readiness(wired, monkeypatch, None)
+    from src.services import credit_fact_consumer as consumer_module
+
+    counter = PoolCounter(wired.engine.sync_engine.pool)
+    backends: list[int] = []
+    recorded = consumer_module.handle_billing_fact
+
+    async def opened() -> int:
+        # Server-side truth: the backends this process pool has open.  The
+        # pool opens one only when none is idle, so after the consumer ran
+        # this is the most it ever needed at once (the worker's included).
+        (row,) = await _rows(
+            wired.harness,
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = :name",
+            name=wired.application_name,
+        )
+        return int(row[0])
+
+    async def sampled(payload: dict[str, object]) -> None:
+        backends.append(await opened())
+        await recorded(payload)
+        backends.append(await opened())
+
+    monkeypatch.setattr(consumer_module, "handle_billing_fact", sampled)
+    clock = _Clock()
+    worker = _wired_worker(wired, clock)
+    presenting = await worker.run_tick()
+    clock.advance(minutes=2)
+    await worker.run_tick()
+    assert (presenting.presented, presenting.failed, presenting.not_ready) == (
+        3,
+        0,
+        0,
+    )
+    for outbox_id in facts:
+        assert await _delivery(wired.harness, outbox_id) == ("acknowledged", 1)
+    assert len(backends) == 6 and min(backends) >= 1
+    assert max(backends) <= WORKER_AND_CONSUMER_CONNECTION_BUDGET, backends
+    assert counter.checkouts > 0 and counter.current == 0
+    assert counter.peak <= WORKER_AND_CONSUMER_CONNECTION_BUDGET, counter.peak

@@ -13,27 +13,33 @@ is a database guarantee, never a process-local one:
   a crash between a send and its outcome still leaves the attempt counted
   and the backoff and ``max_attempts`` in force.  A consumer that turns a
   presentation away with ``TransportNotReady`` spends no attempt and ends
-  the batch.  At most ``batch_size`` facts per tick and no new claim after
-  the tick budget.
+  the batch; so does a ``transport_ready`` hook that reads false before the
+  presentation, or after a failed one (the readiness flipped during it).
+  At most ``batch_size`` facts per tick and no new claim after the tick
+  budget.
 * **Maintenance phase** (reconcile + overdue escalation): serialized across
   all processes by ``pg_try_advisory_xact_lock``; a loop that does not get
   the lock skips the phase instead of waiting.  Both steps are bounded pages.
 * **Observation**: every loop recomputes the global backlog gauges from the
   database, so any process a scrape reaches reports the global state.
 
-Presentation stays forbidden while ``PRESENTATION_PRECONDITIONS_OPEN`` (in
-``billing_outbox``) is true: constructing a worker with a transport raises,
-so the only production wiring is ``transport=None``.
+Presentation is allowed since ``PRESENTATION_PRECONDITIONS_OPEN`` (in
+``billing_outbox``) was closed; reopening it makes constructing a worker
+with a transport raise again.  The transport and its readiness hook are
+injected by ``src/api/main.py`` (``BILLING_FACT_TRANSPORT_ENABLED``, off by
+default); a not-ready turn-away is counted in its own label-less counter,
+never as an attempt.
 
 Liveness: :meth:`BillingFactWorker.start` stamps the last-tick gauge, so a
 loop that never completes a tick still exports a non-zero timestamp that
 ages into ``BillingFactWorkerStalled``; a disabled process exports ``0``.
 
-Without a consumer (``transport=None``, today) nothing is presented and no
-attempt is counted: facts stay ``pending`` and retriable, and the stale gauge
-and ``ack overdue`` alert rows fire after the threshold.  This module never
-imports or calls credit or ledger code, and never deletes or acknowledges a
-fact; only the reconciler marks ``acknowledged``, from a consumer-owned ack.
+Without a consumer (``transport=None``, the default) nothing is presented
+and no attempt is counted: facts stay ``pending`` and retriable, and the
+stale gauge and ``ack overdue`` alert rows fire after the threshold.  This
+module never imports or calls credit or ledger code, and never deletes or
+acknowledges a fact; only the reconciler marks ``acknowledged``, from a
+consumer-owned ack.
 """
 
 from __future__ import annotations
@@ -55,6 +61,7 @@ from src.config.logging import get_logger
 from src.config.settings import Settings
 from src.observability.metrics import (
     BILLING_FACT_BACKLOG,
+    BILLING_FACT_CONSUMER_NOT_READY_TOTAL,
     BILLING_FACT_PUBLISH_ATTEMPTS_TOTAL,
     BILLING_FACT_WORKER_LAST_TICK,
     BILLING_FACT_WORKER_TICKS_TOTAL,
@@ -72,6 +79,11 @@ from src.services.billing_outbox import (
 logger = get_logger(__name__)
 
 FactTransport = Callable[[dict[str, object]], Awaitable[None]]
+# Synchronous and cheap: ``True`` only when the consumer can take a fact now.
+# It may raise an ``Exception`` (read as not ready) but never a bare
+# ``BaseException`` (``CancelledError``, ``KeyboardInterrupt``,
+# ``SystemExit``): that escapes the worker with the leased attempt counted.
+FactReadiness = Callable[[], bool]
 TickOutcome = Literal["completed", "deadline", "stopped"]
 
 # A presentation that does not return within this window is a failed attempt.
@@ -155,9 +167,22 @@ def _set_metric(metric: Any, value: float, **labels: str) -> None:
 
 def _count(metric: Any, **labels: str) -> None:
     try:
-        metric.labels(**labels).inc()
+        (metric.labels(**labels) if labels else metric).inc()
     except Exception:  # pragma: no cover - telemetry is best effort
         logger.warning("billing fact metric emission failed")
+
+
+def _is_ready(ready: FactReadiness) -> bool:
+    """Read the readiness hook; anything but ``True`` (or a raise) is not."""
+
+    try:
+        return ready() is True
+    except Exception as error:
+        logger.error(
+            "billing fact consumer readiness unreadable",
+            failure_class=type(error).__name__,
+        )
+        return False
 
 
 async def _try_maintenance_lock(session: AsyncSession) -> bool:
@@ -182,11 +207,15 @@ class BillingFactWorker:
         config: BillingFactWorkerConfig,
         now: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        transport_ready: FactReadiness | None = None,
     ) -> None:
         if transport is not None:
             require_presentation_allowed()
+        elif transport_ready is not None:
+            raise ValueError("a readiness hook needs a transport")
         self._session_factory = session_factory
         self._transport = transport
+        self._transport_ready = transport_ready
         self._config = config
         self._policy = config.retry_policy
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -246,7 +275,9 @@ class BillingFactWorker:
                     )
                 if attempt.outcome == "not_ready":
                     # Not an attempt, so not in the attempts counter (whose
-                    # outcome enum is presented/failed/exhausted).
+                    # outcome enum is presented/failed/exhausted): its own
+                    # label-less counter is the bounded signal.
+                    _count(BILLING_FACT_CONSUMER_NOT_READY_TOTAL)
                     break  # the next fact would be turned away the same way
                 if attempt.outcome != "skipped":
                     _count(BILLING_FACT_PUBLISH_ATTEMPTS_TOTAL, outcome=attempt.outcome)
@@ -369,12 +400,42 @@ class BillingFactWorker:
         # No ``session.begin()``: publish_next commits its lease before the
         # presentation and its outcome after it; closing the session rolls
         # back only what an interrupted phase left uncommitted.
+        ready = self._transport_ready
+        presented = transport if ready is None else self._behind(transport, ready)
         async with self._session_factory() as session:
             return await BillingFactPublisher(session, now=self._now).publish_next(
-                transport,
+                presented,
                 policy=self._policy,
                 timeout=self._config.transport_timeout_seconds,
             )
+
+    @staticmethod
+    def _behind(transport: FactTransport, ready: FactReadiness) -> FactTransport:
+        """``transport`` gated by the consumer's readiness hook.
+
+        Not ready before the presentation, or after a presentation that
+        failed (the readiness flipped while it ran): ``TransportNotReady``,
+        which the publisher gives back without counting.  A failure while
+        still ready stays a counted attempt; a cancellation (the timeout, a
+        shutdown) is never intercepted here.
+        """
+
+        async def present(payload: dict[str, object]) -> None:
+            if not _is_ready(ready):
+                raise TransportNotReady("the billing fact consumer is not ready")
+            try:
+                await transport(payload)
+            except TransportNotReady:
+                raise
+            except Exception as error:
+                if _is_ready(ready):
+                    raise
+                raise TransportNotReady(
+                    "the billing fact consumer readiness turned off during the "
+                    "presentation"
+                ) from error
+
+        return present
 
     async def _observe(self) -> FactBacklog:
         async with self._session_factory() as session:
@@ -400,14 +461,17 @@ def start_billing_fact_worker(
     session_factory: Callable[[], async_sessionmaker[AsyncSession]],
     *,
     transport: FactTransport | None = None,
+    transport_ready: FactReadiness | None = None,
 ) -> BillingFactWorker | None:
     """Start the lifespan loop only when the operator flag is on.
 
     ``session_factory`` is a provider so the flag-off path never touches the
-    database pool.  ``transport`` is the consumer's in-process inbox handoff;
-    no consumer exists yet, so production passes ``None`` and facts stay
-    pending (and alert) instead of being presented anywhere.  Passing a
-    transport raises while the presentation preconditions are open.
+    database pool.  ``transport`` is the consumer's in-process inbox handoff
+    and ``transport_ready`` its readiness hook, both injected by
+    ``src/api/main.py`` only with ``BILLING_FACT_TRANSPORT_ENABLED``; with
+    ``None`` facts stay pending (and alert) instead of being presented
+    anywhere.  Passing a transport raises while the presentation
+    preconditions are open.
     """
 
     if not source.billing_fact_worker_enabled:
@@ -416,6 +480,7 @@ def start_billing_fact_worker(
         session_factory(),
         transport=transport,
         config=BillingFactWorkerConfig.from_settings(source),
+        transport_ready=transport_ready,
     )
     worker.start()
     logger.info(
@@ -433,6 +498,7 @@ __all__ = [
     "TRANSPORT_TIMEOUT_SECONDS",
     "BillingFactWorker",
     "BillingFactWorkerConfig",
+    "FactReadiness",
     "FactTransport",
     "TickReport",
     "TransportNotReady",

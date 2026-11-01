@@ -135,8 +135,10 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
     # family + 1 credit-system Group 1b switch family + 3 Group 7 readiness
     # families + 7 Group 7 deliverable-4 families (inbox, rejected ack,
     # lifecycle transitions, balance thresholds, debt recorded, debt settled,
-    # hold/purge).
-    assert len(METRIC_DIMENSION_CONTRACTS) == 86
+    # hold/purge) + 1 asaas-rollout-opening Group 2c family (the label-less
+    # billing fact consumer not-ready counter: a turned-away presentation is
+    # not an attempt, so it stays out of the closed attempts outcome enum).
+    assert len(METRIC_DIMENSION_CONTRACTS) == 87
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 

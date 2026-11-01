@@ -71,8 +71,10 @@ from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
 from src.services.billing_fact_worker import (
     BillingFactWorker,
+    FactTransport,
     start_billing_fact_worker,
 )
+from src.services.billing_outbox import TransportNotReady
 from src.services.billing_webhook import ASAAS_WEBHOOK_READINESS
 from src.services.credit_inventory import (
     start_credit_object_workers,
@@ -94,6 +96,7 @@ from src.services.credit_rollout import (
 )
 from src.services.credit_switch import (
     CreditUnavailableError,
+    credit_switch_effective,
     credit_unavailable_exception_handler,
     refresh_credit_switch,
     start_credit_switch_refresher,
@@ -140,17 +143,84 @@ def _start_webhook_readiness_refresher() -> "asyncio.Task[None] | None":
     )
 
 
+def _billing_fact_transport_ready() -> bool:
+    """Whether the credit consumer can take a fact now (the worker's hook).
+
+    False while the credit dominance switch is not effective
+    (``CREDIT_HOT_PATH_ENABLED`` off, or the schema below ``042``) or this
+    image fails the consumer's own contract check
+    (:func:`~src.services.credit_fact_consumer.consumer_contract_digests`: the
+    #137 bundle manifest or the schema file unavailable, or the bundle, schema
+    or catalog digest different from the consumer's pins).  Those are faults
+    of the image, not of a fact: the worker turns the presentation away with
+    ``TransportNotReady``, no attempt spent.  A fact whose handoff names
+    another bundle digest stays a counted failure (the consumer raises it
+    inside the presentation, with the image check passing).
+
+    The check reads two packaged files and the in-memory catalog, never the
+    database.  The consumer module is imported lazily: this hook is wired
+    only with both billing fact settings on, after ``_credit_fact_transport``
+    has already loaded it.
+    """
+
+    if not credit_switch_effective():
+        return False
+    from src.services.credit_fact_consumer import (
+        ConsumerContractDivergence,
+        consumer_contract_digests,
+    )
+
+    try:
+        consumer_contract_digests()
+    except ConsumerContractDivergence:
+        return False
+    return True
+
+
+def _credit_fact_transport() -> FactTransport:
+    """The credit consumer as the worker's transport (asaas-rollout-opening 2c).
+
+    Imported here, only when the transport is on: with the setting off the
+    consumer module (and its metric families) never loads.  ``CreditSwitchOff``
+    is raised before the consumer reads or writes anything, so it becomes
+    ``TransportNotReady``: the switch turned off after the readiness hook.
+    """
+
+    from src.services.credit_fact_consumer import CreditSwitchOff, handle_billing_fact
+
+    async def present(payload: dict[str, object]) -> None:
+        try:
+            await handle_billing_fact(payload)
+        except CreditSwitchOff as error:
+            raise TransportNotReady("the credit switch is not effective") from error
+
+    return present
+
+
 def _start_billing_fact_worker() -> BillingFactWorker | None:
     """Deliver and escalate ``billing.fact.v1`` rows (Group 9), off by default.
 
     ``BILLING_FACT_WORKER_ENABLED=false`` returns before touching the pool.
-    No credit consumer exists yet, so no transport is wired: facts stay
-    pending/retriable and the stale alert fires instead of a presentation.
+    Without ``BILLING_FACT_TRANSPORT_ENABLED`` (off by default) no transport
+    is wired: facts stay pending/retriable and the stale alert fires instead
+    of a presentation.  With both on, the credit consumer is the transport,
+    behind its readiness hook; this module is its only wiring point.
     """
 
     from src.repositories.database import get_db_session_factory
 
-    return start_billing_fact_worker(settings, get_db_session_factory, transport=None)
+    if not (
+        settings.billing_fact_worker_enabled and settings.billing_fact_transport_enabled
+    ):
+        return start_billing_fact_worker(
+            settings, get_db_session_factory, transport=None
+        )
+    return start_billing_fact_worker(
+        settings,
+        get_db_session_factory,
+        transport=_credit_fact_transport(),
+        transport_ready=_billing_fact_transport_ready,
+    )
 
 
 def _install_outermost_ingress_body_limit(app: FastAPI) -> None:

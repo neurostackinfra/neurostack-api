@@ -462,6 +462,13 @@ class Settings(BaseSettings):
     billing_fact_worker_max_attempts: int = Field(default=10, ge=1, le=50)
     # A pending/awaiting_ack fact older than this raises the stale alert.
     billing_fact_worker_stale_after_seconds: int = Field(default=900, ge=60, le=86_400)
+    # The worker's consumer transport (asaas-rollout-opening Group 2c).  Off by
+    # default: the worker gets transport=None and the credit consumer module
+    # is never imported.  On, with the worker on, src/api/main.py hands it the
+    # credit consumer behind a readiness hook: while the credit switch is not
+    # effective or the image fails the consumer's contract check, a
+    # presentation is turned away without spending an attempt.
+    billing_fact_transport_enabled: bool = False
     # Credit dominance switch (neurostack-credit-system Group 1b).  Off by
     # default: every credit surface stays inert and no refresh task starts.
     # When true it is EFFECTIVE only while alembic_version holds one row at

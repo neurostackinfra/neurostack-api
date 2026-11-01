@@ -320,6 +320,14 @@ BILLING_FACT_WORKER_LAST_TICK = Gauge(
     "neurostack_billing_fact_worker_last_tick_timestamp_seconds",
     "Unix time of this process's last completed billing fact worker tick or loop start",
 )
+# asaas-rollout-opening Group 2c: presentations the consumer turned away
+# unread (``TransportNotReady``, the readiness hook false).  Not an attempt,
+# so never an outcome of the attempts counter; label-less, so no builder or
+# tenant identity can enter.  Per process, like the other counters.
+BILLING_FACT_CONSUMER_NOT_READY_TOTAL = Counter(
+    "neurostack_billing_fact_consumer_not_ready_total",
+    "Billing fact presentations turned away unread while the consumer was not ready",
+)
 
 # Deliberately label-free: a telemetry failure must never create tenant,
 # provider, endpoint, model, or secret cardinality in Prometheus.

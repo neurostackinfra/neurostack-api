@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,6 +38,7 @@ from src.services.billing_outbox import (
     BillingFactPublisher,
     BillingFactReconciler,
     BillingFactViolation,
+    FactRetryPolicy,
     _copy_lines,
     _validate_offer_snapshot,
     billing_fact_bundle_digest,
@@ -314,10 +315,10 @@ async def test_subscription_fact_creates_current_cycle_with_xor_target(
 
 async def test_lost_ack_republishes_same_event_then_reconciles_read_only_ack(
     session_factory: async_sessionmaker[AsyncSession],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Explicit test-only waiver: the legacy sender raises in production.
-    monkeypatch.setattr(billing_outbox, "PRESENTATION_PRECONDITIONS_OPEN", False)
+    # The two-phase publish_next (the legacy single-phase publish_pending was
+    # removed when the presentation guard closed, asaas-rollout-opening 2c).
+    assert billing_outbox.PRESENTATION_PRECONDITIONS_OPEN is False
     async with session_factory() as session:
         effect, projection, _order = await _settled_topup(session)
         outbox = await BillingFactProducer(session).record_effect(effect, projection)
@@ -330,11 +331,18 @@ async def test_lost_ack_republishes_same_event_then_reconciles_read_only_ack(
     async def transport(payload: dict[str, object]) -> None:
         sent.append(str(payload["event_id"]))
 
+    instant = [datetime(2026, 10, 12, 12, tzinfo=timezone.utc)]
+    policy = FactRetryPolicy(max_attempts=3)
+    for _ in range(2):  # presented, ack lost, presented again after backoff
+        async with session_factory() as session:
+            attempt = await BillingFactPublisher(
+                session, now=lambda: instant[0]
+            ).publish_next(transport, policy=policy, timeout=1.0)
+        assert attempt is not None and attempt.outcome == "presented"
+        instant[0] += policy.backoff(attempt.attempt_count) + timedelta(seconds=1)
+    assert sent == [str(outbox_id), str(outbox_id)]
+
     async with session_factory() as session:
-        publisher = BillingFactPublisher(session)
-        await publisher.publish_pending(transport)
-        await publisher.publish_pending(transport)
-        assert sent == [str(outbox_id), str(outbox_id)]
         delivery = await session.scalar(
             select(BillingFactDelivery).where(
                 BillingFactDelivery.outbox_event_id == outbox_id
@@ -342,6 +350,7 @@ async def test_lost_ack_republishes_same_event_then_reconciles_read_only_ack(
         )
         stored = await session.get(BillingOutboxEvent, outbox_id)
         assert delivery is not None and stored is not None
+        assert (delivery.state, delivery.attempt_count) == ("awaiting_ack", 2)
         # This is deliberately a direct consumer-owned insert.  The producer
         # has no ack creation API and only reads the append-only row below.
         session.add(

@@ -494,6 +494,10 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
             outcome=_enum("completed", "deadline", "stopped", "failed")
         ),
         "neurostack_billing_fact_worker_last_tick_timestamp_seconds": _NONE,
+        # asaas-rollout-opening Group 2c: a consumer that turned a fact away
+        # unread spent no attempt, so it is its own label-less family and
+        # never an outcome of ``neurostack_billing_fact_publish_attempts``.
+        "neurostack_billing_fact_consumer_not_ready": _NONE,
         # neurostack-credit-system (src/services/credit_switch.py): every
         # ``neurostack_credit_*`` family is declared here, without identity
         # labels.  The switch gauge is 0 whenever the switch is not effective.

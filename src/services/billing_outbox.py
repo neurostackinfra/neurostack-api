@@ -123,24 +123,29 @@ ACK_MISSING_DETAIL: Final = "ack missing"
 ACK_OVERDUE_DETAIL: Final = "ack overdue"
 RETRY_EXHAUSTED_DETAIL: Final = "retry cap exhausted"
 
-# Presenting a fact to a real consumer is NOT safe yet.  Three binding
-# preconditions must all be met before this may become ``False``:
+# Presenting a fact to a real consumer had three binding preconditions; all
+# are met, so the guard is closed (asaas-rollout-opening Group 2c):
 #
-# 1. MET by the two-phase record of ``BillingFactPublisher.publish_next``:
-#    the attempt is counted in a committed lease BEFORE the fact is
+# 1. The two-phase record of ``BillingFactPublisher.publish_next`` (Group
+#    2a): the attempt is counted in a committed lease BEFORE the fact is
 #    presented, so a crash or lost commit after a consumer-visible send
 #    leaves exactly that attempt counted, and the backoff and
 #    ``max_attempts`` still bound the re-presentation.  The legacy
-#    ``publish_pending`` is still single-phase and is not a delivery path:
-#    it must never be wired, whatever this flag says.
-# 2. ``blocked`` deliveries have an operator requeue path (today only a late
-#    valid ack or manual SQL leaves ``blocked``).
+#    single-phase sender was removed with this closure; ``publish_next`` is
+#    the only presenting path.
+# 2. ``blocked`` deliveries that exhausted their retries have an audited
+#    operator requeue, a one-off command under ``src/ops`` (Group 2b) that no
+#    HTTP route reaches.
 # 3. The runbook ``docs/runbooks/asaas-billing-reconciliation.md`` covers the
-#    real transport.
+#    real transport (Group 2b).
 #
-# While it is ``True`` every presenting entry point raises and production
-# wires ``transport=None``; only tests waive it, explicitly, per test.
-PRESENTATION_PRECONDITIONS_OPEN: Final = True
+# Closing the guard turns nothing on by itself: production presents only
+# when ``src/api/main.py`` wires the consumer transport, which it does only
+# with ``BILLING_FACT_TRANSPORT_ENABLED`` (off by default).  Setting this
+# back to ``True`` makes every presenting entry point -- the worker with a
+# transport, ``publish_next`` and the credit consumer's ``handle`` -- raise
+# ``PresentationPreconditionsOpen`` again before any work.
+PRESENTATION_PRECONDITIONS_OPEN: Final = False
 
 
 class PresentationPreconditionsOpen(RuntimeError):
@@ -251,15 +256,6 @@ class PartialCreditLine(BillingFactViolation):
 
 class AmbiguousLineAllocation(BillingFactViolation):
     """Aggregate provider money cannot be attributed to individual lines."""
-
-
-@dataclass(frozen=True, slots=True)
-class PublishedFact:
-    """One immutable message that may safely be re-presented to a consumer."""
-
-    outbox_event_id: UUID
-    event_id: UUID
-    payload: dict[str, object]
 
 
 PublishOutcome = Literal["presented", "failed", "exhausted", "skipped", "not_ready"]
@@ -1388,57 +1384,6 @@ class BillingFactPublisher:
         self._db = db
         self._now = now or (lambda: datetime.now(timezone.utc))
 
-    async def pending(self, *, limit: int = 100) -> tuple[PublishedFact, ...]:
-        """Legacy unbounded read of presentable rows; see :meth:`publish_pending`."""
-
-        require_presentation_allowed()
-        if limit <= 0:
-            raise ValueError("limit must be positive")
-        rows = await self._db.execute(
-            select(BillingFactDelivery, BillingOutboxEvent)
-            .join(
-                BillingOutboxEvent,
-                BillingOutboxEvent.id == BillingFactDelivery.outbox_event_id,
-            )
-            .where(BillingFactDelivery.state.in_(("pending", "awaiting_ack")))
-            .order_by(BillingOutboxEvent.created_at, BillingOutboxEvent.id)
-            .limit(limit)
-        )
-        return tuple(
-            PublishedFact(
-                outbox_event_id=outbox.id,
-                event_id=delivery.event_id,
-                payload=dict(outbox.payload),
-            )
-            for delivery, outbox in rows
-        )
-
-    async def publish_pending(
-        self,
-        transport: Callable[[dict[str, object]], Awaitable[None]],
-        *,
-        limit: int = 100,
-    ) -> tuple[PublishedFact, ...]:
-        """Legacy bulk send; caller owns commit policy.  NOT a delivery path.
-
-        Warning: this bypasses everything :meth:`publish_next` enforces: no
-        ``SKIP LOCKED`` claim, no backoff, no ``max_attempts`` cap, no ack
-        re-read and no transport timeout.  It has no production caller and
-        raises while ``PRESENTATION_PRECONDITIONS_OPEN`` is true.
-        """
-
-        require_presentation_allowed()
-        published: list[PublishedFact] = []
-        for item in await self.pending(limit=limit):
-            try:
-                await transport(item.payload)
-            except Exception:
-                await self._record_attempt(item.event_id, delivered=False)
-            else:
-                await self._record_attempt(item.event_id, delivered=True)
-                published.append(item)
-        return tuple(published)
-
     async def publish_next(
         self,
         transport: Callable[[dict[str, object]], Awaitable[None]],
@@ -1649,22 +1594,6 @@ class BillingFactPublisher:
             .with_for_update(of=BillingFactDelivery, skip_locked=True)
             .execution_options(populate_existing=True)
         )
-
-    async def _record_attempt(self, event_id: UUID, *, delivered: bool) -> None:
-        """Legacy single-phase record, after the send: ``publish_pending`` only."""
-
-        delivery = await self._db.scalar(
-            select(BillingFactDelivery)
-            .where(BillingFactDelivery.event_id == event_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        if delivery is None or delivery.state in {"acknowledged", "blocked"}:
-            return
-        delivery.attempt_count += 1
-        delivery.last_attempt_at = _utc(self._now())
-        delivery.state = "awaiting_ack" if delivered else "pending"
-        await self._db.flush()
 
 
 class BillingFactReconciler:

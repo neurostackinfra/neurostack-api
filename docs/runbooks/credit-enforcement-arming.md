@@ -317,8 +317,8 @@ the credit switch:
    and no ack are written, so no subscription or top-up allowance is
    granted while the switch is off. What happens to the fact then depends
    on the build (see `docs/runbooks/asaas-billing-reconciliation.md`):
-   - **Before Group 2c** (`main` today wires `transport=None`, so nothing
-     is presented at all). In a build that presents facts without Group
+   - **Before Group 2c** (an image without Group 2c wires
+     `transport=None`, so nothing is presented at all). In a build that presents facts without Group
      2c, `CreditSwitchOff` is a counted failed attempt. After
      `BILLING_FACT_WORKER_MAX_ATTEMPTS` (default 10, about 5 h) the
      delivery is `blocked`, with no ack and the `retry cap exhausted`
@@ -329,8 +329,9 @@ the credit switch:
      switch-off becomes `TransportNotReady`. No attempt is counted, the
      fact stays `pending` (only the stale alert fires), nothing becomes
      `blocked`, and the fact is delivered once the switch is back on.
-     Group 2c's `transport_ready` is not on `main` and was not checked
-     here (O6).
+     Group 2c's `transport_ready` hook and the translation of
+     `CreditSwitchOff` exist (`src/api/main.py`), with unit tests and
+     PostgreSQL tests, but they were NOT verified live (O6).
 4. `credit_enforcement_at` stays set. Turning the switch back on resumes
    enforcement from that boundary. Usage while the switch is off is not
    metered.
@@ -374,6 +375,7 @@ decides:
   acceptance satisfies `arm` again if the same finding set recurs.
 - **O6, containment pauses fact-delivered grants.** Default: stated in
   "Containment" above, for both builds. Still open: whether Group 2c's
-  `transport_ready` really turns a switch-off into `TransportNotReady` (not
-  on `main`, not checked). Without it, a long switch-off ends in `blocked`
-  deliveries that need the requeue task.
+  `transport_ready` really turns a switch-off into `TransportNotReady` in a
+  live deployment (the hook and its unit and PostgreSQL tests exist since
+  Group 2c; it was not verified live). Without it, a long switch-off ends
+  in `blocked` deliveries that need the requeue task.

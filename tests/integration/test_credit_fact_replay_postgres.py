@@ -6,7 +6,8 @@ bytes of the six contract fixtures with their outbox, delivery and handoff
 rows), always under the explicit per-test waiver of the producer's
 presentation guard (``presentation_preconditions_waived``) and with the
 credit switch read for real from that database (config on, schema at head).
-No live replay: production keeps ``transport=None``.
+No live replay: production presents facts only with
+``BILLING_FACT_TRANSPORT_ENABLED`` on (``src/api/main.py``, off by default).
 
 Proven here: inbox/ack values and their acceptance by the untouched ASAAS
 reconciler; idempotency per event and per aggregate revision under replay
@@ -900,18 +901,33 @@ async def test_without_the_waiver_or_the_switch_nothing_is_written(
     monkeypatch.setattr(
         consumer_module, "default_session_factory", lambda: clean.sessions
     )
-    with pytest.raises(PresentationPreconditionsOpen):
-        await handle_billing_fact(dict(payload))
-    with pytest.raises(PresentationPreconditionsOpen):
-        BillingFactWorker(
-            clean.sessions, transport=handle_billing_fact, config=_config()
-        )
     from src.services import billing_outbox as outbox_module
 
-    monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", False)
+    # Inverted pin (asaas-rollout-opening Group 2c): the guard is closed by
+    # default, so with the switch off the refusal is CreditSwitchOff.
+    assert outbox_module.PRESENTATION_PRECONDITIONS_OPEN is False
     await refresh_credit_switch(enabled=False, session_factory=clean.sessions)
     with pytest.raises(CreditSwitchOff):
         await handle_billing_fact(dict(payload))
+    # Reopened, the guard refuses first again, even with the switch effective.
+    monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", True)
+    reading = await refresh_credit_switch(enabled=True, session_factory=clean.sessions)
+    assert reading.effective, reading
+    try:
+        with pytest.raises(PresentationPreconditionsOpen):
+            await handle_billing_fact(dict(payload))
+        with pytest.raises(PresentationPreconditionsOpen):
+            BillingFactWorker(
+                clean.sessions, transport=handle_billing_fact, config=_config()
+            )
+    finally:
+        await refresh_credit_switch(enabled=False, session_factory=clean.sessions)
+    # Reopened with the switch OFF: still the guard, never CreditSwitchOff
+    # (the guard is checked before the switch).
+    with pytest.raises(PresentationPreconditionsOpen):
+        await handle_billing_fact(dict(payload))
+    with pytest.raises(PresentationPreconditionsOpen):
+        await CreditFactConsumer(clean.sessions).handle(dict(payload))
     assert await _one(clean, "SELECT count(*) FROM credit_fact_inbox") == 0
     assert await _one(clean, "SELECT count(*) FROM billing_fact_acks") == 0
     assert await _one(clean, "SELECT count(*) FROM credit_accounts") == 0

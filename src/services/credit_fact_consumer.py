@@ -1,15 +1,18 @@
 """Credit consumer of ASAAS ``billing.fact.v1`` facts (Group 2).
 
 The single ingestion point is :func:`handle_billing_fact`, a ``FactTransport``
-(``src/services/billing_fact_worker.py``).  No group of the credit wish wires
-it into ``src/api/main.py`` (Group 8 does, once ASAAS closes its presentation
-preconditions); reading ``billing_outbox`` directly is never ingestion, only
-the lookup of a presented fact's producer row.
+(``src/services/billing_fact_worker.py``).  ``src/api/main.py`` is its only
+wiring point: it hands it to the worker only with
+``BILLING_FACT_TRANSPORT_ENABLED`` on (asaas-rollout-opening Group 2c, which
+took the wiring over from the credit wish's Group 8); reading
+``billing_outbox`` directly is never ingestion, only the lookup of a
+presented fact's producer row.
 
 One call, in order:
 
 1. ``require_presentation_allowed()`` (``billing_outbox``): raises
-   ``PresentationPreconditionsOpen`` while the producer forbids presentation;
+   ``PresentationPreconditionsOpen`` only if the producer reopens its
+   presentation guard (closed since asaas-rollout-opening Group 2c);
 2. the dominance switch must be EFFECTIVE (``credit_switch_effective()``),
    otherwise :class:`CreditSwitchOff` -- nothing is read or written;
 3. the consumer's own contract digests (:func:`consumer_contract_digests`),
@@ -19,8 +22,12 @@ One call, in order:
    and the bundle digest must equal the handoff's.  A divergence -- including
    ``BillingFactViolation`` from ``billing_fact_bundle_digest()`` when the
    manifest is unavailable -- raises :class:`ConsumerContractDivergence`
-   without inbox or ack: the publisher presents the fact again, which only a
-   deploy within ``max_attempts`` of its ``FactRetryPolicy`` can fix;
+   without inbox or ack.  Wired through ``src/api/main.py``, an image-level
+   divergence (bundle, schema or catalog against the pins, or bytes
+   unavailable) is read first by the worker's readiness hook and the fact is
+   turned away with no attempt spent; only a per-fact mismatch (the bundle
+   digest against the handoff's) spends attempts, and the publisher presents
+   it again until ``max_attempts`` of its ``FactRetryPolicy`` blocks it;
 4. its own session (``get_db_session_factory()``), one transaction, the whole
    call inside ``TRANSPORT_TIMEOUT_SECONDS``; a cancelled connection is
    invalidated, never returned to the pool mid-statement;

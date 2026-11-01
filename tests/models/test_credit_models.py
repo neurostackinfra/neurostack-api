@@ -87,7 +87,8 @@ _MODELS = {
     "CreditResponseOutbox",
     "CreditRevisionGap",
 }
-# The ASAAS producer set never imports credit code (wish, "Conjunto producer").
+# The ASAAS producer set never imports credit code (wish, "Conjunto producer";
+# the requeue joined it with asaas-rollout-opening Group 2b).
 _PRODUCER_FILES = (
     *(
         f"src/services/billing_{name}.py"
@@ -116,6 +117,7 @@ _PRODUCER_FILES = (
     "src/api/routes/billing_producer_setup.py",
     "src/api/schemas/billing.py",
     "src/ops/asaas_webhook.py",
+    "src/ops/billing_fact_requeue.py",
     "src/services/asaas.py",
     "src/services/asaas_secret_rotation.py",
 )

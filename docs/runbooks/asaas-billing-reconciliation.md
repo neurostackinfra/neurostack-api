@@ -7,67 +7,122 @@ Target of the `runbook_url` on the three `neurostack_billing_facts` alerts.
 The consumer of every `billing.fact.v1` fact is the credit system, **in the
 same process**. There is no queue, broker or network hop.
 
-**Status (read first).** The `BILLING_FACT_TRANSPORT_ENABLED` wiring in
-`main.py` and the two-phase attempt record ship with Groups 2c and 2a of the
-`asaas-rollout-opening` wish; an image without them (`main` today) wires
-`transport=None`.
-The code guard `PRESENTATION_PRECONDITIONS_OPEN` in
-`src/services/billing_outbox.py` makes every presenting entry point raise
-while it is `True`. Check the image's flag value and that guard before you
-read a presentation failure as a consumer fault. The rollout turns the
-transport on last, after the credit switch (`CREDIT_HOT_PATH_ENABLED`).
-Items tagged "(Group 2c)" or "(Group 2a)" below describe the design once that
-group has landed, not `main` today.
+**Status (read first).** The code describes what an image built from it
+does, not what runs in production: check the deployed image and its task
+definition. The code ships the two-phase attempt record (Group 2a of the
+`asaas-rollout-opening` wish), the requeue below (Group 2b) and the
+`BILLING_FACT_TRANSPORT_ENABLED` wiring in `src/api/main.py` (Group 2c). The
+code guard `PRESENTATION_PRECONDITIONS_OPEN` in
+`src/services/billing_outbox.py` is closed (`False`), so the worker may be
+given a transport; it gets one only when `BILLING_FACT_TRANSPORT_ENABLED` is
+`true` (default `false`). An image that predates these groups wires
+`transport=None` and keeps the guard open. Check the image and the flag
+value before you read a presentation failure as a consumer fault. The
+rollout turns the transport on last, after the credit switch
+(`CREDIT_HOT_PATH_ENABLED`).
 
 The path of a fact:
 
 1. Each API worker process with `BILLING_FACT_WORKER_ENABLED=true` runs one
    `BillingFactWorker` loop (`src/services/billing_fact_worker.py`).
-   (Group 2c) With `BILLING_FACT_TRANSPORT_ENABLED=true`, `src/api/main.py`
-   hands it the transport `handle_billing_fact`
-   (`src/services/credit_fact_consumer.py`).
-   With the flag `false` (the default) the loop gets `transport=None`:
-   nothing is presented, no attempt is counted, facts stay `pending` and the
-   stale alert fires after the threshold.
+   With `BILLING_FACT_TRANSPORT_ENABLED=true`, `src/api/main.py` hands it the
+   transport `handle_billing_fact` (`src/services/credit_fact_consumer.py`)
+   and a readiness hook (see "When the consumer is not ready" below).
+   With the flag `false` (the default) the loop gets `transport=None` and the
+   consumer module is not even loaded: nothing is presented, no attempt is
+   counted, facts stay `pending` and the stale alert fires after the
+   threshold.
 2. A tick claims at most `BILLING_FACT_WORKER_BATCH_SIZE` due deliveries, one
    per short transaction, `FOR UPDATE OF billing_fact_deliveries SKIP
    LOCKED`. A delivery with **any** row in `billing_fact_acks` is never
    claimed. The presentation is bounded by `TRANSPORT_TIMEOUT_SECONDS`
-   (10 s). (Group 2a) With the two-phase attempt record, the attempt is
-   committed before the fact is presented, so a crash after a send still
-   counts against the cap.
+   (10 s). With the two-phase attempt record, the attempt is committed before
+   the fact is presented, so a crash after a send still counts against the
+   cap.
 3. `handle_billing_fact` runs in **its own** session and transaction. On
    success it appends the credit inbox row and the consumer-owned ack
    (`accepted`, or `rejected` for a problem in the fact itself) in that
    transaction. A replay of a fact already in the inbox is a no-op.
-4. Any exception raised by the consumer is a **failed attempt**, except
-   `TransportNotReady` (Group 2a), which is not counted (the API log
+4. Any exception raised by the consumer is a **failed attempt** (the API log
    `billing fact presentation failed` carries only `failure_class` and
-   `attempt_count`). The fact is presented again after an exponential backoff
-   of 60 s doubling to at most 1 h. After `BILLING_FACT_WORKER_MAX_ATTEMPTS`
-   (default 10, about 5 h in total) the delivery becomes `blocked` with the
-   alert row `retry cap exhausted`. The fact is never deleted.
+   `attempt_count`), except a not-ready turn-away (`TransportNotReady`, next
+   section), which is not counted. The fact is presented again after an
+   exponential backoff of 60 s doubling to at most 1 h. After
+   `BILLING_FACT_WORKER_MAX_ATTEMPTS` (default 10, about 5 h in total) the
+   delivery becomes `blocked` with the alert row `retry cap exhausted`. The
+   fact is never deleted.
 5. The maintenance phase (one process at a time, advisory lock) reads the
    ack: a valid one moves the delivery to `acknowledged`; a mismatching or
    `rejected` one moves it to `blocked` with `collision`, `digest_mismatch` or
    `schema_mismatch` evidence.
 
+### When the consumer is not ready
+
+The readiness hook `src/api/main.py` injects is false while the credit
+dominance switch is not effective (`CREDIT_HOT_PATH_ENABLED` off, or the
+schema below `042`) or the image fails the consumer's own contract check
+(`consumer_contract_digests`: the #137 bundle manifest or the schema file is
+unavailable, or the bundle, schema or catalog digest differs from the
+consumer's pins). Those are faults of the image, not of one fact. A fact
+whose handoff names another bundle digest is not: the image check passes, the
+consumer raises `ConsumerContractDivergence` inside the presentation and the
+attempt counts. Three cases turn a presentation away **without spending an attempt**:
+the hook is false before the presentation; the consumer raises
+`CreditSwitchOff` (before it reads or writes anything; `main.py` turns it
+into `TransportNotReady`); or the presentation fails and the hook reads false
+right after (the readiness turned off during it). The publisher gives the
+leased attempt back, keeps `last_attempt_at` at the turn-away instant, and
+the tick ends its batch. The fact stays `pending` (or `awaiting_ack`), so a
+consumer that stays unready never takes a delivery to `blocked`; the stale
+alert fires after the threshold.
+
+How to see it: the WARN `billing fact consumer not ready` (with
+`attempt_count`) and the label-less per-process counter
+`neurostack_billing_fact_consumer_not_ready_total`, one per turn-away. The
+WARN does not say which cause it was; tell them apart with the switch gauge
+`neurostack_credit_switch_effective`: `0` means the switch or the schema
+(`CREDIT_HOT_PATH_ENABLED`, `alembic_version` below `042`); `1` means the
+image (its bundle manifest or schema file, or a bundle, schema or catalog
+digest that is not the consumer's pin): redeploy an aligned image. The
+attempts counter `neurostack_billing_fact_publish_attempts_total` does not
+count it, and the tick still reports `completed`. As with the other
+per-process counters, `/metrics` reaches one process per scrape: read it as a
+hint, never as a rate. No alert rule reads it.
+
+Backoff after a turn-away (**open owner decision, unchanged on purpose**):
+the fact waits the backoff of its restored count again, from the turn-away
+instant. A fact with `attempt_count = 2` waits 120 s, and a higher count up
+to `max_backoff` (1 h), even if the consumer becomes ready seconds later. A
+never-presented fact (count 0) waits the 60 s base backoff.
+
+The switch verdict is per process and cached: each API worker process reads
+it again every `CREDIT_SWITCH_REFRESH_SECONDS` (default 60, at most 300). A
+schema downgrade below `042` is not seen until that process's next refresh,
+and a presentation can still happen in between (reproduced on a disposable
+PostgreSQL during review, not in production: a tick presented with
+`alembic_version` already at `041`, before the refresh). The settings are
+read once per process, so turning `CREDIT_HOT_PATH_ENABLED` off takes a new
+task revision, never a refresh. Downgrade in this
+order: set `BILLING_FACT_TRANSPORT_ENABLED=false` and roll it out, wait one
+refresh interval (the configured `CREDIT_SWITCH_REFRESH_SECONDS`, 300 s when
+unsure), and only then downgrade the schema.
+
 Failure classes the consumer raises, and what fixes them:
 
 | `failure_class` | Cause | Fix |
 |---|---|---|
-| `CreditSwitchOff` | the credit dominance switch is not effective (`CREDIT_HOT_PATH_ENABLED` off, or the schema is not at `042`) | turn the switch on **before** the transport (the rollout order puts the transport last). From Groups 2a/2c, `main.py` turns this into `TransportNotReady`: no attempt is counted, the fact stays `pending` and only the stale alert fires; it never leads to `blocked`. |
-| `ConsumerContractDivergence` | the consumer's bundle, schema or catalog pins differ from the image's, or from the fact's handoff | a deploy that aligns the pins; until then every attempt fails |
+| `CreditSwitchOff` | the credit dominance switch is not effective (`CREDIT_HOT_PATH_ENABLED` off, or the schema is not at `042`) | turn the switch on **before** the transport (the rollout order puts the transport last). `main.py` turns this into `TransportNotReady`: no attempt is counted, the fact stays `pending` and only the stale alert fires; it never leads to `blocked`. It is never logged as `billing fact presentation failed`. |
+| `ConsumerContractDivergence` | the fact's handoff names another bundle digest than the image's (per fact); or the image's bundle, schema or catalog differs from the consumer's pins (image level) | per fact: a counted failure, then `blocked` after the cap; check the handoff's deployment. Image level: the readiness hook reads it first and turns the fact away without an attempt (it surfaces here only if the image check changed during the presentation); a deploy that aligns the pins |
 | `UnresolvableFact` | no outbox row or handoff for the presented event id | lineage gap: see the `gap` alerts below |
 | `FactCollision` | the event id, or the aggregate revision, is already held by other bytes in the inbox | consumer contract bug: escalate, never edit the inbox |
 | `CycleIdentityConflict` | a second settled cycle with the same subscription period | billing data bug: escalate to the owner |
 | `LedgerClockAhead` | the builder's ledger clock is beyond the database clock plus tolerance | wait for the clocks to converge; check host time |
 | `TimeoutError` / `CancelledError` | the consumer exceeded 10 s, or raised a stray cancellation | database health, lock waits |
 
-`main` today wires `transport=None`, so none of these is raised yet (see
-Status). From Groups 2a/2c, each of them except `CreditSwitchOff` ends, if it
-lasts more than about 5 h, in a `blocked` delivery **without an ack**: that
-is the only case the requeue below may reopen.
+With the transport off (`transport=None`) none of these is raised (see
+Status). With it on, each of them except `CreditSwitchOff` ends, if it lasts
+more than about 5 h while the consumer stays ready, in a `blocked` delivery
+**without an ack**: that is the only case the requeue below may reopen.
 
 ## What each alert means
 
@@ -190,8 +245,8 @@ result. Record both names in the incident log (see the audit gap).
    Requeueing while the consumer still fails only burns another ~5 h of
    attempts and ends `blocked` again. Check that the credit switch is
    effective, the image's contract pins match, and the worker runs with
-   `BILLING_FACT_TRANSPORT_ENABLED=true` (Group 2c; the setting exists only
-   once that group lands, and a requeue before it is never presented).
+   `BILLING_FACT_TRANSPORT_ENABLED=true` (with it `false`, or on an image
+   that predates the setting, a requeued fact is never presented).
 2. **Plan (read-only).** Run a one-off ECS task on the service's own task
    definition, so the database credentials stay inside the task, with the
    command:
@@ -324,8 +379,9 @@ the owner authorizes, not an operator action.
 1. Do not delete facts, deliveries, acks or alert rows, and do not mark a
    delivery `acknowledged` by hand. Only a valid consumer ack may do that.
 2. Check that the worker is enabled where you expect it
-   (`BILLING_FACT_WORKER_ENABLED`, and `BILLING_FACT_TRANSPORT_ENABLED`
-   (Group 2c) once that group lands) and that
+   (`BILLING_FACT_WORKER_ENABLED` and `BILLING_FACT_TRANSPORT_ENABLED`; the
+   start line `billing fact worker started` says `consumer=present` only
+   with the transport on) and that
    the API logs show `billing fact worker started` and no repeated
    `billing fact worker tick failed`. The `failure_class` field carries only
    an exception class name.
@@ -336,13 +392,16 @@ the owner authorizes, not an operator action.
    already died.
 4. For `BillingFactDeliveryStale` with the transport off, confirm the
    backlog matches the facts produced, then acknowledge the alert as
-   expected. `main` today wires `transport=None`: nothing is presented, so
-   no fact becomes `blocked` this way yet. From Groups 2a/2c, with the
-   transport on, read `billing fact presentation failed` in the API logs: a
-   stale fact is being retried and, for every failure class except
-   `CreditSwitchOff`, will be `blocked` in about 5 h unless the cause is
-   fixed; under `CreditSwitchOff` it stays `pending` and no attempt is
-   counted.
+   expected: with `transport=None` nothing is presented, so no fact becomes
+   `blocked` this way. With the transport on, read the API logs: `billing
+   fact presentation failed` means a stale fact is being retried and will be
+   `blocked` in about 5 h unless the cause is fixed; `billing fact consumer
+   not ready` (and a growing
+   `neurostack_billing_fact_consumer_not_ready_total`) means the consumer is
+   turning facts away, so they stay `pending` and no attempt is counted: fix
+   the readiness cause (the switch, the schema, the image's bundle manifest
+   or contract digests; `neurostack_credit_switch_effective` tells the switch
+   and schema, at `0`, from the image, at `1`).
 5. For `BillingFactDeliveryBlocked`, run the `plan` (or the classification
    query) before you change anything. Cap exhaustion: fix the cause, then
    requeue. An ack mismatch: investigate, never requeue. The old manual
@@ -615,10 +674,14 @@ payments. Do not clear them by editing `paid_at`.
 - A requeue resets `attempt_count`: the earlier attempt count survives only
   in the `retry cap exhausted` row's existence and the API logs, not in the
   delivery row.
-- Without the two-phase attempt record (an image that predates it), a crash
-  or lost commit after a consumer-visible send is not counted. It is
-  re-presented without limit, bypassing the backoff and the cap (see
-  `PRESENTATION_PRECONDITIONS_OPEN`).
+- An image that predates the two-phase attempt record kept the presentation
+  guard (`PRESENTATION_PRECONDITIONS_OPEN`) open and wired no transport; the
+  legacy single-phase sender it guarded is gone from the code.
+- A not-ready turn-away restarts the backoff of the restored count (see
+  "When the consumer is not ready"; an open owner decision).
+- A presentation cut off by the worker's own 10 s timeout is a counted
+  attempt even if the readiness turned off while it ran: the timeout cancels
+  it before the hook can be read again.
 - A `blocked` delivery with a divergent or `rejected` ack has no exit path
   in code and keeps `BillingFactDeliveryBlocked` firing (see the
   investigation section).

@@ -838,10 +838,12 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
                                 "body": body,
                             }
                         )
+                if spec.get("fact") is not None:
+                    await _await_fact_handled(spec["database_url"], spec["fact"])
             finally:
                 event.remove(engine, "before_cursor_execute", record)
     events, credit_rows, metering, ledger = await _read_back(spec["database_url"])
-    return {
+    result = {
         "reading": asdict(reading),
         "responses": responses,
         "events": events,
@@ -850,6 +852,110 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
         "metering": metering,
         "ledger": ledger,
     }
+    if spec.get("fact") is not None:
+        result["fact"] = await _fact_outcome(spec["database_url"], spec["fact"])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# asaas-rollout-opening Group 2c: the same app with the billing fact worker
+# and its transport on (BILLING_FACT_WORKER_ENABLED and
+# BILLING_FACT_TRANSPORT_ENABLED), over one fact the producer wrote.
+# ---------------------------------------------------------------------------
+
+
+async def _await_fact_handled(database_url: str, outbox_id: str) -> None:
+    """Until the app's worker has taken the fact once (presented, or turned
+    away without an attempt), so the outcome read later is never vacuous."""
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        deadline = asyncio.get_running_loop().time() + 60
+        while True:
+            async with engine.connect() as connection:
+                tried = await connection.scalar(
+                    text(
+                        "SELECT last_attempt_at IS NOT NULL FROM "
+                        "billing_fact_deliveries WHERE outbox_event_id = :id"
+                    ),
+                    {"id": outbox_id},
+                )
+            if tried:
+                return
+            assert asyncio.get_running_loop().time() < deadline, "fact untouched"
+            await asyncio.sleep(0.2)
+    finally:
+        await engine.dispose()
+
+
+async def _fact_outcome(database_url: str, outbox_id: str) -> dict[str, Any]:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            state, attempts, tried = (
+                await connection.execute(
+                    text(
+                        "SELECT state, attempt_count, last_attempt_at IS NOT NULL "
+                        "FROM billing_fact_deliveries WHERE outbox_event_id = :id"
+                    ),
+                    {"id": outbox_id},
+                )
+            ).one()
+            acks = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM billing_fact_acks WHERE outbox_event_id = :id"
+                ),
+                {"id": outbox_id},
+            )
+            inbox = None
+            if await connection.scalar(text("SELECT to_regclass('credit_fact_inbox')")):
+                inbox = await connection.scalar(
+                    text("SELECT count(*) FROM credit_fact_inbox")
+                )
+    finally:
+        await engine.dispose()
+    return {
+        "state": state,
+        "attempt_count": int(attempts),
+        "tried": bool(tried),
+        "acks": int(acks),
+        "inbox": None if inbox is None else int(inbox),
+    }
+
+
+async def _seed_one_fact(database_url: Any) -> str:
+    """One settled top-up fact, written by the producer exactly as in the
+    worker suite (its own builder: nothing of the corpus' world)."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+    from sqlalchemy.pool import NullPool
+
+    from tests.integration.test_billing_fact_worker_postgres import _Harness, _seed_fact
+
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    try:
+        harness = _Harness(
+            url=database_url,
+            engine=engine,
+            sessions=async_sessionmaker(
+                engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+            ),
+        )
+        return str(await _seed_fact(harness))
+    finally:
+        await engine.dispose()
 
 
 def _runner_main() -> None:
@@ -867,7 +973,12 @@ def _closed_port() -> int:
 
 
 async def _run_in_subprocess(
-    database_url: Any, world: _World, *, enabled: bool, workdir: Path
+    database_url: Any,
+    world: _World,
+    *,
+    enabled: bool,
+    workdir: Path,
+    fact: str | None = None,
 ) -> dict[str, Any]:
     label = f"{database_url.database}-{'on' if enabled else 'off'}"
     spec_path = workdir / f"{label}.spec.json"
@@ -875,7 +986,12 @@ async def _run_in_subprocess(
     url = database_url.render_as_string(hide_password=False)
     spec_path.write_text(
         json.dumps(
-            {"database_url": url, "world": asdict(world), "output": str(output)}
+            {
+                "database_url": url,
+                "world": asdict(world),
+                "output": str(output),
+                "fact": fact,
+            }
         ),
         encoding="utf-8",
     )
@@ -895,6 +1011,14 @@ async def _run_in_subprocess(
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
+    if fact is not None:
+        # Group 2c: the worker with the credit consumer as its transport.
+        environment.update(
+            {
+                "BILLING_FACT_WORKER_ENABLED": "true",
+                "BILLING_FACT_TRANSPORT_ENABLED": "true",
+            }
+        )
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
@@ -934,7 +1058,7 @@ class _Oracle:
     templates: dict[str, str]
     created: list[str]
     workdir: Path
-    runs: dict[tuple[str, bool, bool], dict[str, Any]]
+    runs: dict[tuple[str, bool, bool, bool], dict[str, Any]]
 
     async def clone(self, revision: str) -> str:
         name = f"neurostack_asaas_smoke_{uuid4().hex[:12]}"
@@ -976,19 +1100,26 @@ class _Oracle:
             await engine.dispose()
 
     async def run(
-        self, revision: str, enabled: bool, *, enforced: bool = False
+        self,
+        revision: str,
+        enabled: bool,
+        *,
+        enforced: bool = False,
+        transport: bool = False,
     ) -> dict[str, Any]:
-        key = (revision, enabled, enforced)
+        key = (revision, enabled, enforced, transport)
         if key not in self.runs:
             name = await self.clone(revision)
             try:
                 if enforced:
                     await self.enforce(name)
+                url = self.admin_url.set(database=name)
                 self.runs[key] = await _run_in_subprocess(
-                    self.admin_url.set(database=name),
+                    url,
                     self.world,
                     enabled=enabled,
                     workdir=self.workdir,
+                    fact=await _seed_one_fact(url) if transport else None,
                 )
             finally:
                 await self.drop(name)
@@ -1903,6 +2034,59 @@ async def test_the_enforced_run_refuses_only_uploads_that_need_capacity(
         ), case
     assert answers["media-upload-pdf"]["status"] == 201
     assert answers["media-upload-pdf"]["body"]["category"] == "pdf"
+
+
+# ---------------------------------------------------------------------------
+# asaas-rollout-opening Group 2c: the transport setting on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("revision", "enabled", "effective"),
+    [
+        pytest.param("037", True, False, id="037-config-on-schema-below"),
+        pytest.param("042", False, False, id="042-config-off"),
+        pytest.param("042", True, True, id="042-config-on-effective"),
+    ],
+)
+async def test_the_transport_on_keeps_dominance_and_presents_only_when_effective(
+    oracle: _Oracle, revision: str, enabled: bool, effective: bool
+) -> None:
+    """The app with ``BILLING_FACT_WORKER_ENABLED`` and
+    ``BILLING_FACT_TRANSPORT_ENABLED`` on, over one fact the producer wrote,
+    answers and stores like the same run with the transport off; the fact
+    reaches the credit consumer only while the switch is effective, and is
+    otherwise turned away without an attempt and without any credit SQL."""
+
+    plain = await oracle.run(revision, enabled=enabled)
+    wired = await oracle.run(revision, enabled=enabled, transport=True)
+
+    assert wired["reading"] == plain["reading"]
+    assert wired["reading"]["effective"] is effective
+    _assert_same(wired, plain, oracle.world)
+    started = [
+        json.loads(line)
+        for line in wired["log"].splitlines()
+        if '"billing fact worker started"' in line
+    ]
+    assert [entry["consumer"] for entry in started] == ["present"], started
+    fact = wired["fact"]
+    if effective:
+        assert fact["state"] in ("awaiting_ack", "acknowledged"), fact
+        assert (fact["attempt_count"], fact["acks"], fact["inbox"]) == (1, 1, 1)
+    else:
+        assert fact == {
+            "state": "pending",
+            "attempt_count": 0,
+            "tried": True,  # the worker did reach it: turned away, not spent
+            "acks": 0,
+            "inbox": None if revision == "037" else 0,
+        }
+        assert [s for s in wired["statements"] if _CREDIT_SQL.search(s)] == []
+        if revision == "042":
+            assert set(wired["credit_rows"].values()) == {0}
+        else:
+            assert wired["credit_rows"] == {}
 
 
 # ---------------------------------------------------------------------------
