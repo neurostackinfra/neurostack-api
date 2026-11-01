@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.config.logging import get_logger
 from src.config.settings import settings
 from src.models.billing import BillingCheckoutSession, BillingTopupOrder
 from src.models.coupon import Coupon
@@ -166,6 +167,9 @@ class ResolvedCoupon:
 
     code: str
     discount_percent: int
+
+
+logger = get_logger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -728,6 +732,12 @@ class BillingCheckoutService:
             client = self._client_factory()
         except Exception as exc:
             await self._rollback()
+            # Fixed 503 for the browser; the operator gets the failing stage.
+            # Only the exception class is logged: messages may carry config.
+            logger.warning(
+                "Checkout unavailable: creation precondition failed",
+                cause=type(exc).__name__,
+            )
             raise CheckoutUnavailable() from exc
         return _CreationPreconditions(callback=callback, client=client)
 
