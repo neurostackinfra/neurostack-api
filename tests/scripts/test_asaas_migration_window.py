@@ -43,6 +43,14 @@ TD_PREFIX = f"arn:aws:ecs:us-east-1:{ACCOUNT}:task-definition/"
 SERVICE_TD_8 = TD_PREFIX + "neurostack-staging-app:8"
 SERVICE_TD_9 = TD_PREFIX + "neurostack-staging-app:9"
 SERVICE_TD_10 = TD_PREFIX + "neurostack-staging-app:10"
+SERVICE_TD_11 = TD_PREFIX + "neurostack-staging-app:11"
+# Window 042 (live step L3): the service runs live step L2b's revision 13,
+# whose app image contains 042 (the fixture's BRIDGE_IMAGE stands for it, the
+# image the migrations revision carries too), and the rollback target is
+# L2a's revision 12: the same revision on the E7b image, the worker on.
+SERVICE_TD_12 = TD_PREFIX + "neurostack-staging-app:12"
+SERVICE_TD_13 = TD_PREFIX + "neurostack-staging-app:13"
+WORKER_ON = [{"name": "BILLING_FACT_WORKER_ENABLED", "value": "true"}]
 MIGRATIONS_TD = {
     "035": TD_PREFIX + "neurostack-staging-migrations:4",
     "036": TD_PREFIX + "neurostack-staging-migrations:5",
@@ -55,6 +63,8 @@ READ_TD = TD_PREFIX + "neurostack-staging-consulta:26"
 MIGRATIONS_READ_TD = TD_PREFIX + "neurostack-staging-migrations:7"
 BRIDGE_DIGEST = "sha256:" + "2" * 64
 BRIDGE_IMAGE = f"{REGISTRY}/neurostack-staging@{BRIDGE_DIGEST}"
+# The E7b image revisions 11 and 12 run (window 042's rollback target).
+E7B_IMAGE = f"{REGISTRY}/neurostack-staging@sha256:" + "6" * 64
 OLD_TAG = "asaas-gateway-staging-20261014-cfcb7f0b"
 OLD_IMAGE = f"{REGISTRY}/neurostack-staging:{OLD_TAG}"
 OLD_DIGEST = "sha256:" + "8" * 64
@@ -166,7 +176,16 @@ def _service(task_definition: str, **changes: Any) -> dict[str, Any]:
     return {"services": [service], "failures": []}
 
 
-def _app_definition(arn: str, image: str, **changes: Any) -> dict[str, Any]:
+def _app_definition(
+    arn: str,
+    image: str,
+    *,
+    environment: list[dict[str, str]] | None = None,
+    **changes: Any,
+) -> dict[str, Any]:
+    app: dict[str, Any] = {"name": "app", "image": image, "essential": True}
+    if environment is not None:
+        app["environment"] = copy.deepcopy(environment)
     definition: dict[str, Any] = {
         "taskDefinitionArn": arn,
         "family": "neurostack-staging-app",
@@ -175,7 +194,7 @@ def _app_definition(arn: str, image: str, **changes: Any) -> dict[str, Any]:
         "networkMode": "awsvpc",
         "requiresCompatibilities": ["FARGATE"],
         "containerDefinitions": [
-            {"name": "app", "image": image, "essential": True},
+            app,
             {
                 "name": "otel",
                 "image": "public.ecr.aws/aws-observability/aws-otel-collector@sha256:"
@@ -325,7 +344,9 @@ class World:
         self.reads: dict[str, dict[str, Any]] = {}
         self.records: dict[str, dict[str, Any]] = {}
         self.captured_at = CAPTURED_PLAN
-        self.service_td = SERVICE_TD_8 if window == "035" else SERVICE_TD_10
+        self.service_td = {"035": SERVICE_TD_8, "042": SERVICE_TD_13}.get(
+            window, SERVICE_TD_10
+        )
         self.migrations_td = MIGRATIONS_TD[window]
         self.snapshot_id = SNAPSHOT_ID[window]
         service_image = OLD_IMAGE if window == "035" else BRIDGE_IMAGE
@@ -364,8 +385,20 @@ class World:
             "ecs",
             "DescribeTaskDefinition",
             mw.describe_task_definition_request(self.service_td),
-            _app_definition(self.service_td, service_image),
+            _app_definition(
+                self.service_td,
+                service_image,
+                environment=WORKER_ON if window == "042" else None,
+            ),
         )
+        if window == "042":
+            # The rollback target: revision 13 but for the app image.
+            self.put(
+                "ecs",
+                "DescribeTaskDefinition",
+                mw.describe_task_definition_request(SERVICE_TD_12),
+                _app_definition(SERVICE_TD_12, E7B_IMAGE, environment=WORKER_ON),
+            )
         if window == "035":
             self.put(
                 "ecr",
@@ -473,6 +506,16 @@ class World:
         self, tmp_path: Path, name: str = "readback.json"
     ) -> mw.WindowReadback:
         return mw.load_readback(self.write(tmp_path / name), self.window)
+
+    def manifest(self, tmp_path: Path) -> Path:
+        """A manifest pinned at this window's rollback target."""
+
+        return window_manifest(tmp_path, self.name)
+
+    def manifest_args(self, tmp_path: Path) -> list[str]:
+        """``--manifest`` for the commands that read the rollback target."""
+
+        return ["--manifest", str(self.manifest(tmp_path))]
 
     def context(self, **changes: Any) -> mw.Context:
         arguments: dict[str, Any] = {
@@ -719,19 +762,52 @@ LIVE_REVISION_9_IMAGE = (
     f"{REGISTRY}/neurostack-staging@sha256:"
     "18358ce728c465ffd0d9cf6d0e9cf4641c32f6bab9dfa2905729c5495bcf7f24"
 )
-# The worker-flag revision 10 it is re-pinned to since (revision 9 with the
-# worker flag 'true', on the same bridge image digest).
+# The worker-flag revision 10 it was re-pinned to next (revision 9 with the
+# worker flag 'true', on the same bridge image digest; the reviewed manifest
+# moved on to 11 in Group 5b).
 LIVE_REVISION_10 = SERVICE_TD_10
 LIVE_REVISION_10_IMAGE = LIVE_REVISION_9_IMAGE
 
 
-def initial_manifest(tmp_path: Path) -> Path:
-    """The manifest as it read before the re-pin: revision 8 with its note.
+def pinned_manifest(tmp_path: Path, revision: int) -> Path:
+    """The reviewed manifest with the rollback target at ``revision`` (no
+    note), with that pin's own effective step."""
 
-    The reviewed manifest itself is re-pinned to revision 10 (8 to 9, then 9
-    to 10; no ``repin`` block), so every 036 and 037 plan below reads it
-    through the default.
+    pin = wiring.rollback_target_pin(revision)
+    assert pin is not None and pin[1] is None, revision
+    text = MANIFEST.read_text(encoding="utf-8")
+    start = text.index("rollback_target:\n")
+    end = text.index("\nsecrets:\n")
+    target = (
+        "rollback_target:\n"
+        f"  revision: {revision}\n"
+        f"  effective_after: {pin[0]}\n"
+    )
+    path = tmp_path / f"manifest-pinned-{revision}.yaml"
+    path.write_text(text[:start] + target + text[end:], encoding="utf-8")
+    return path
+
+
+def window_manifest(tmp_path: Path, name: str) -> Path:
+    """A manifest pinned at the window's own rollback target (10 for 036 and
+    037, 12 for 042; 035 reads none).
+
+    The reviewed manifest moved past 10 (Group 5b: 10 to 11, then 12 and 13
+    by the live chain), so 036 and 037, already run in production, are
+    planned here against a test manifest at 10, and 042 against one at 12
+    (live step L2c); the tests of the reviewed manifest itself pass it
+    explicitly.
     """
+
+    revision = mw.WINDOWS[name].rollback_target_revision
+    return pinned_manifest(
+        tmp_path, revision if revision is not None else wiring.WORKER_FLAG_REVISION
+    )
+
+
+def initial_manifest(tmp_path: Path) -> Path:
+    """The manifest as it read before the first re-pin: revision 8 with its
+    note."""
 
     text = MANIFEST.read_text(encoding="utf-8")
     start = text.index("rollback_target:\n")
@@ -784,14 +860,17 @@ def plan(
         world.readback(tmp_path, "plan.json"),
         world.context(),
         now=now,
-        manifest=manifest,
+        manifest=manifest if manifest is not None else world.manifest(tmp_path),
     )
     return document
 
 
 def render_run(world: World, tmp_path: Path, *, attempt: int = 1) -> dict[str, Any]:
     run = mw.run_context_for(
-        world.readback(tmp_path, "render.json"), world.context(), now=NOW_DT
+        world.readback(tmp_path, "render.json"),
+        world.context(),
+        now=NOW_DT,
+        manifest=world.manifest(tmp_path),
     )
     return mw.build_run_task_request(
         world.window,
@@ -991,7 +1070,15 @@ def test_each_window_pins_its_command_versions_snapshot_readback_and_steps(
     assert window.image_rule == (
         mw.IMAGE_RULE_BRIDGE if name == "035" else mw.IMAGE_RULE_DEPLOYED
     )
-    assert window.rollback_target_revision == (None if name == "035" else 10)
+    assert (
+        window.rollback_target_revision
+        == {
+            "035": None,
+            "036": 10,
+            "037": 10,
+            "042": 12,
+        }[name]
+    )
     assert (ROOT / sql).is_file()
 
 
@@ -1194,10 +1281,18 @@ def test_target_comes_from_the_hook_and_the_planner_shares_the_family() -> None:
     assert wiring.MIGRATIONS_TASK_SOURCE_REVISION == mw.MIGRATIONS_SOURCE_REVISION == 3
     assert wiring.MIGRATIONS_DATABASE_SECRET_NAME == mw.MIGRATIONS_DATABASE_SECRET
     assert wiring.MIGRATION_WINDOWS is mw.WINDOWS
-    assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_036.rollback_target_revision
-    assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_037.rollback_target_revision
-    # Window 042 goes back to the same revision: the planner's last pin.
-    assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_042.rollback_target_revision
+    # Two modes (Group 5b): 036 and 037 require the last safety pin (the
+    # planner's WORKER_FLAG_REVISION) by number only; 042 goes back to live
+    # step L2a's revision 12, above it, by number and by content.
+    assert wiring.WORKER_FLAG_REVISION == mw.ROLLBACK_LAST_SAFETY_PIN == 10
+    assert mw.WINDOW_036.rollback_target_revision == mw.ROLLBACK_LAST_SAFETY_PIN
+    assert mw.WINDOW_037.rollback_target_revision == mw.ROLLBACK_LAST_SAFETY_PIN
+    assert mw.WINDOW_042.rollback_target_revision == 12
+    assert mw.WINDOW_042.rollback_target_revision > mw.ROLLBACK_LAST_SAFETY_PIN
+    assert wiring.rollback_target_pin(12) == (
+        wiring.ROLLBACK_EFFECTIVE_STAGED_ROWS,
+        None,
+    )
 
 
 def test_policy_values_and_watch_budgets() -> None:
@@ -1247,7 +1342,12 @@ def test_windows_subcommand_prints_the_table(
         "041 -> 042",
     ]
     assert rows[3]["image_prerequisite"] == mw.IMAGE_RULE_DEPLOYED
-    assert rows[3]["rollback_target_must_be_revision"] == 10
+    assert [row["rollback_target_must_be_revision"] for row in rows] == [
+        None,
+        10,
+        10,
+        12,
+    ]
     assert UPGRADE_HEAD.search(out) is None
 
 
@@ -1811,7 +1911,7 @@ def test_plan_refuses_without_a_recorded_pre_read(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("window", ["036", "037", "042"])
-def test_036_and_037_refuse_a_rollback_target_not_repinned(
+def test_036_037_and_042_refuse_a_rollback_target_not_repinned(
     window: str, tmp_path: Path
 ) -> None:
     world = ready_world(tmp_path, window)
@@ -1821,26 +1921,81 @@ def test_036_and_037_refuse_a_rollback_target_not_repinned(
     for manifest in (initial_manifest(tmp_path), bridge_manifest(tmp_path)):
         blocks = _blocks(world, tmp_path, manifest=manifest)
         assert "rollback_target_not_repinned" in blocks
+    # Any other pin than the window's own, the reviewed manifest's 11 too:
+    # 036 and 037 require 10, 042 requires 12 (never 10, 11 or a later one).
+    own = mw.WINDOWS[window].rollback_target_revision
+    for revision in (10, 11, 12, 13, 14):
+        if revision == own:
+            continue
+        blocks = _blocks(world, tmp_path, manifest=pinned_manifest(tmp_path, revision))
+        assert "rollback_target_not_repinned" in blocks, revision
+    assert "rollback_target_not_repinned" in _blocks(world, tmp_path, manifest=MANIFEST)
 
 
-def test_the_reviewed_manifest_is_re_pinned_to_revision_10() -> None:
+def test_the_reviewed_manifest_is_pinned_to_revision_11() -> None:
+    """Group 5b re-pinned the reviewed manifest from 10 to 11 (the E7b image
+    bump, the way back from live step L2a). No window goes back to 11: 036
+    and 037 (already applied in production, which is at 037) require 10 and
+    can run again only with a manifest at 10, after a snapshot restore; 042
+    requires 12, after live step L2c."""
+
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 10,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
+        "revision": 11,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_E7B,
     }
     pins = wiring.manifest_pins(wiring.validate_manifest(raw))
-    assert pins.rollback_revision == mw.WINDOW_036.rollback_target_revision
-    assert pins.rollback_revision == mw.WINDOW_037.rollback_target_revision
+    assert pins.rollback_revision == 11
     assert pins.rollback_repin_before is None
-    assert pins.rollback_task_definition_arn == LIVE_REVISION_10
+    assert pins.rollback_task_definition_arn == SERVICE_TD_11
+    assert pins.rollback_revision not in {
+        window.rollback_target_revision for window in mw.WINDOWS.values()
+    }
 
 
 @pytest.mark.parametrize("window", ["036", "037", "042"])
+def test_without_a_manifest_the_tool_reads_the_reviewed_one(
+    window: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The live operator's path (the runbook passes no ``--manifest``): the
+    reviewed manifest, read through the planner's default, pinned to 11, so
+    no window's own target: each refuses ``rollback_target_not_repinned``
+    (never ``manifest_invalid``)."""
+
+    world = ready_world(tmp_path, window)
+    document, run = mw.evaluate_plan(
+        world.readback(tmp_path, "plan.json"), world.context(), now=NOW_DT
+    )
+    assert run is None and document["status"] == "blocked"
+    assert document["manifest"] == {"rollback_target_revision": 11}
+    assert "rollback_target_not_repinned" in document["blocks"]
+    assert "manifest_invalid" not in document["blocks"]
+    document, run = mw.evaluate_plan(
+        world.readback(tmp_path, "plan.json"),
+        world.context(),
+        now=NOW_DT,
+        manifest=None,
+    )
+    assert document["manifest"] == {"rollback_target_revision": 11}
+    code, out, _err = run_cli(["plan", *world.args(tmp_path)], capsys)
+    assert code == 2
+    printed = json.loads(out)
+    assert printed["manifest"] == {"rollback_target_revision": 11}
+    assert "rollback_target_not_repinned" in printed["blocks"]
+    assert "manifest_invalid" not in printed["blocks"]
+    # With the window's own target the same reads are ready.
+    code, out, err = run_cli(
+        ["plan", *world.args(tmp_path), *world.manifest_args(tmp_path)], capsys
+    )
+    assert code == 0, err
+
+
+@pytest.mark.parametrize("window", ["036", "037"])
 def test_036_and_037_accept_the_live_revision_10_by_digest(
     window: str, tmp_path: Path
 ) -> None:
-    """The reviewed manifest, read by default: revision 10 ACTIVE by digest.
+    """A manifest at 10 (the reviewed one until Group 5b): revision 10
+    ACTIVE by digest, by number only.
 
     The service runs a later revision (the image bump, revision 11) with the
     image containing the window's migration; the rollback target is the live
@@ -1848,7 +2003,7 @@ def test_036_and_037_accept_the_live_revision_10_by_digest(
     """
 
     world = ready_world(tmp_path, window)
-    later = TD_PREFIX + "neurostack-staging-app:11"
+    later = SERVICE_TD_11
     world.service_td = later
     world.put(
         "ecs", "DescribeServices", mw.describe_services_request(), _service(later)
@@ -1876,9 +2031,11 @@ def test_036_and_037_accept_the_live_revision_10_by_digest(
     )
     document = plan(world, tmp_path)
     assert document["status"] == "ready", document["blocks"]
+    # By number only: no content check, no content info.
     assert document["manifest"] == {"rollback_target_revision": 10}
     assert "rollback_target_repinned" in document["checks"]
     assert "rollback_target_revision_active_digest_pinned" in document["checks"]
+    assert "rollback_target_worker_flag_true" not in document["checks"]
     tagged = LIVE_REVISION_10_IMAGE.split("@", 1)[0] + ":" + OLD_TAG
     world.put(
         "ecs",
@@ -1887,6 +2044,320 @@ def test_036_and_037_accept_the_live_revision_10_by_digest(
         _app_definition(LIVE_REVISION_10, tagged),
     )
     assert "rollback_target_revision_unusable" in _blocks(world, tmp_path)
+
+
+def test_042_accepts_the_l2a_revision_12_by_number_and_by_content(
+    tmp_path: Path,
+) -> None:
+    """Live step L3: the service runs L2b's revision 13 (the image containing
+    042), the manifest pins L2a's revision 12 (L2c): ACTIVE by digest, the
+    worker 'true' exactly once, revision 13 but for the app image."""
+
+    world = ready_world(tmp_path, "042")
+    document = plan(world, tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert document["manifest"] == {
+        "rollback_target_revision": 12,
+        "rollback_target_change_to_service_revision": "app_image",
+    }
+    for check in (
+        "rollback_target_repinned",
+        "rollback_target_revision_active_digest_pinned",
+        "rollback_target_worker_flag_true",
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ):
+        assert check in document["checks"], check
+    assert document["service_task_definition_arn"] == SERVICE_TD_13
+
+
+def _target_12(world: World) -> dict[str, Any]:
+    return dict(
+        world.response(
+            "ecs",
+            "DescribeTaskDefinition",
+            mw.describe_task_definition_request(SERVICE_TD_12),
+        )
+    )
+
+
+def _target_12_app(response: dict[str, Any]) -> dict[str, Any]:
+    [app] = [
+        c
+        for c in response["taskDefinition"]["containerDefinitions"]
+        if c["name"] == "app"
+    ]
+    return dict(app)
+
+
+def _set_target_12_app(world: World, **changes: Any) -> None:
+    response = copy.deepcopy(_target_12(world))
+    for container in response["taskDefinition"]["containerDefinitions"]:
+        if container["name"] == "app":
+            container.update(changes)
+            for key, value in list(container.items()):
+                if value is None:
+                    del container[key]
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(SERVICE_TD_12),
+        response,
+    )
+
+
+WORKER_OFF = [{"name": "BILLING_FACT_WORKER_ENABLED", "value": "false"}]
+# L2a's two rows, both 'false', and L7's AppConfig group.
+STAGED_ROWS = [
+    {"name": "BILLING_FACT_TRANSPORT_ENABLED", "value": "false"},
+    {"name": "CREDIT_HOT_PATH_ENABLED", "value": "false"},
+]
+APPCONFIG_ROWS = [
+    {"name": "APPCONFIG_APPLICATION", "value": "neurostack-staging"},
+    {"name": "APPCONFIG_ENABLED", "value": "true"},
+    {"name": "APPCONFIG_ENVIRONMENT", "value": "production"},
+    {"name": "APPCONFIG_PROFILE", "value": "financial-egress"},
+    {"name": "APPCONFIG_SOURCE", "value": "sdk"},
+]
+
+
+def _with_extra_field(response: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(response)
+    out["taskDefinition"]["unexpectedField"] = "x"
+    return out
+
+
+# The kind each content refusal leaves in the plan's manifest info (the
+# planner's reviewed_change of the target and the service revision; None
+# when they differ in no single reviewed kind).
+TARGET_12_REFUSAL_KINDS = {
+    "same_image_as_the_service": None,
+    "differs_by_a_flag_not_the_image": "worker_flag",
+    "differs_by_the_staged_rows_alone": "flag_rows_added",
+    "differs_by_the_appconfig_group_alone": "appconfig_group_added",
+}
+# Target 12 changes, each making it something else than the revision L2b
+# replaced: (change, the check that refuses it).
+TARGET_12_REFUSALS: dict[str, tuple[Callable[[World], None], str]] = {
+    # A way back that turns the worker off, or names it twice or never.
+    "worker_false": (
+        lambda w: _set_target_12_app(w, environment=WORKER_OFF),
+        "rollback_target_worker_flag_true",
+    ),
+    "worker_missing": (
+        lambda w: _set_target_12_app(w, environment=None),
+        "rollback_target_worker_flag_true",
+    ),
+    "worker_twice": (
+        lambda w: _set_target_12_app(w, environment=WORKER_ON + WORKER_ON),
+        "rollback_target_worker_flag_true",
+    ),
+    # The same image as the service revision: not what L2b replaced.
+    "same_image_as_the_service": (
+        lambda w: _set_target_12_app(w, image=BRIDGE_IMAGE),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # Another image AND another row: two kinds, not the image alone.
+    "image_and_a_row": (
+        lambda w: _set_target_12_app(
+            w, environment=[*WORKER_ON, {"name": "LOG_FORMAT", "value": "json"}]
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # Another repository: never an app image change.
+    "image_in_another_repository": (
+        lambda w: _set_target_12_app(
+            w, image=E7B_IMAGE.replace("/neurostack-staging@", "/neurostack-other@")
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # The same image as the service revision, differing from it in a flag
+    # value instead (the service runs the worker off): a reviewed kind, but
+    # not the app image.
+    "differs_by_a_flag_not_the_image": (
+        lambda w: (
+            _set_target_12_app(w, image=BRIDGE_IMAGE),
+            w.put(
+                "ecs",
+                "DescribeTaskDefinition",
+                mw.describe_task_definition_request(SERVICE_TD_13),
+                _app_definition(SERVICE_TD_13, BRIDGE_IMAGE, environment=WORKER_OFF),
+            ),
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # The same image as the service revision, which adds the two staged
+    # rows at 'false' alone (L2a and L2b run in the wrong order): a reviewed
+    # kind, but not the app image. The planner does not enforce the order
+    # (Decision 16), so this check is the only guard.
+    "differs_by_the_staged_rows_alone": (
+        lambda w: (
+            _set_target_12_app(w, image=BRIDGE_IMAGE),
+            w.put(
+                "ecs",
+                "DescribeTaskDefinition",
+                mw.describe_task_definition_request(SERVICE_TD_13),
+                _app_definition(
+                    SERVICE_TD_13, BRIDGE_IMAGE, environment=WORKER_ON + STAGED_ROWS
+                ),
+            ),
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # The same image, the service revision adding the AppConfig group alone.
+    "differs_by_the_appconfig_group_alone": (
+        lambda w: (
+            _set_target_12_app(w, image=BRIDGE_IMAGE),
+            w.put(
+                "ecs",
+                "DescribeTaskDefinition",
+                mw.describe_task_definition_request(SERVICE_TD_13),
+                _app_definition(
+                    SERVICE_TD_13, BRIDGE_IMAGE, environment=WORKER_ON + APPCONFIG_ROWS
+                ),
+            ),
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # A read the planner cannot parse (an unexpected field): a WiringError,
+    # refused, never a crash. In the service revision's read it is raised by
+    # _request_from_response; in the target's, reviewed_change swallows it.
+    "service_read_with_an_extra_field": (
+        lambda w: w.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            mw.describe_task_definition_request(SERVICE_TD_13),
+            _with_extra_field(
+                _app_definition(SERVICE_TD_13, BRIDGE_IMAGE, environment=WORKER_ON)
+            ),
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    "target_read_with_an_extra_field": (
+        lambda w: w.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            mw.describe_task_definition_request(SERVICE_TD_12),
+            _with_extra_field(_target_12(w)),
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # The worker 'false' in both target 12 and service 13, which differ in
+    # the app image alone: the worker check is the ONLY one that fails.
+    "worker_false_in_both_image_alone": (
+        lambda w: (
+            _set_target_12_app(w, environment=WORKER_OFF),
+            w.put(
+                "ecs",
+                "DescribeTaskDefinition",
+                mw.describe_task_definition_request(SERVICE_TD_13),
+                _app_definition(SERVICE_TD_13, BRIDGE_IMAGE, environment=WORKER_OFF),
+            ),
+        ),
+        "rollback_target_worker_flag_true",
+    ),
+    # The two reads made differently (one with TAGS): never comparable.
+    "read_with_tags": (
+        lambda w: w.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            mw.describe_task_definition_request(SERVICE_TD_12),
+            {
+                **_target_12(w),
+                "tags": [{"key": "ManagedBy", "value": "manual"}],
+            },
+        ),
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(TARGET_12_REFUSALS))
+def test_042_refuses_a_target_12_that_is_not_the_revision_l2b_replaced(
+    refusal: str, tmp_path: Path
+) -> None:
+    world = ready_world(tmp_path, "042")
+    assert plan(world, tmp_path)["status"] == "ready"
+    mutate, check = TARGET_12_REFUSALS[refusal]
+    mutate(world)
+    document = plan(world, tmp_path)
+    assert document["status"] == "blocked"
+    assert "rollback_target_not_repinned" in document["blocks"]
+    assert check not in document["checks"]
+    # Still the reviewed number and a usable revision: only the content fails.
+    assert "rollback_target_repinned" in document["checks"]
+    assert "rollback_target_revision_active_digest_pinned" in document["checks"]
+    if refusal == "worker_false_in_both_image_alone":
+        # Only the worker check fails: its own block reason carries the plan.
+        assert (
+            "rollback_target_is_the_revision_the_service_revision_replaced"
+            in document["checks"]
+        )
+        assert document["manifest"]["rollback_target_change_to_service_revision"] == (
+            "app_image"
+        )
+        assert document["blocks"] == ["rollback_target_not_repinned"]
+    if refusal in TARGET_12_REFUSAL_KINDS:
+        assert document["manifest"]["rollback_target_change_to_service_revision"] == (
+            TARGET_12_REFUSAL_KINDS[refusal]
+        )
+
+
+def test_042_refuses_an_unusable_or_missing_target_12(tmp_path: Path) -> None:
+    world = ready_world(tmp_path, "042")
+    response = copy.deepcopy(_target_12(world))
+    response["taskDefinition"]["status"] = "INACTIVE"
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(SERVICE_TD_12),
+        response,
+    )
+    assert "rollback_target_revision_unusable" in _blocks(world, tmp_path)
+    world.drop(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(SERVICE_TD_12),
+    )
+    document = plan(world, tmp_path)
+    assert document["status"] != "ready"
+    assert "rollback_target_revision_unusable" in document["blocks"]
+    # A target that was never read has no content to weigh: the content
+    # checks are skipped, not reported as a target not re-pinned.
+    assert "rollback_target_not_repinned" not in document["blocks"]
+    assert document["manifest"] == {"rollback_target_revision": 12}
+
+
+def test_042_refuses_before_l2b_serves(tmp_path: Path) -> None:
+    """The service still on revision 12 itself (L2b not deployed): the target
+    is not a revision the service revision replaced (nor does the service
+    run the image containing 042 yet; that check is the image rule's)."""
+
+    world = ready_world(tmp_path, "042")
+    world.service_td = SERVICE_TD_12
+    world.put(
+        "ecs",
+        "DescribeServices",
+        mw.describe_services_request(),
+        _service(SERVICE_TD_12),
+    )
+    world.put(
+        "ecs",
+        "DescribeTasks",
+        mw.describe_tasks_request(SERVICE_TASKS),
+        {
+            "tasks": [
+                _running_task(arn, SERVICE_TD_12, world.digest) for arn in SERVICE_TASKS
+            ],
+            "failures": [],
+        },
+    )
+    document = plan(world, tmp_path)
+    assert document["status"] == "blocked"
+    assert "rollback_target_not_repinned" in document["blocks"]
+    assert (
+        "rollback_target_is_the_revision_the_service_revision_replaced"
+        not in document["checks"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -2005,7 +2476,8 @@ def test_plan_cli_exit_codes_and_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     world = ready_world(tmp_path)
-    code, out, err = run_cli(["plan", *world.args(tmp_path)], capsys)
+    manifest = world.manifest_args(tmp_path)
+    code, out, err = run_cli(["plan", *world.args(tmp_path), *manifest], capsys)
     assert code == 0, err
     assert json.loads(out)["status"] == "ready"
     world.put(
@@ -2014,7 +2486,7 @@ def test_plan_cli_exit_codes_and_output(
         mw.list_family_tasks_request(mw.MIGRATIONS_FAMILY),
         {"taskArns": [RUN_TASK]},
     )
-    code, out, _err = run_cli(["plan", *world.args(tmp_path)], capsys)
+    code, out, _err = run_cli(["plan", *world.args(tmp_path), *manifest], capsys)
     assert code == 2
     assert "migrations_task_running" in json.loads(out)["blocks"]
 
@@ -2190,6 +2662,7 @@ def test_render_run_task_refuses_unless_plan_is_ready(
         [
             "render-run-task",
             *world.args(tmp_path),
+            *world.manifest_args(tmp_path),
         ],
         capsys,
     )
@@ -2200,6 +2673,7 @@ def test_render_run_task_refuses_unless_plan_is_ready(
         [
             "render-run-task",
             *world.args(tmp_path),
+            *world.manifest_args(tmp_path),
         ],
         capsys,
     )
@@ -2212,6 +2686,7 @@ def test_render_run_task_refuses_unless_plan_is_ready(
         [
             "render-run-task",
             *world.args(tmp_path),
+            *world.manifest_args(tmp_path),
         ],
         capsys,
     )
@@ -3568,7 +4043,7 @@ def test_verify_read_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
 def _snapshot_args(world: World, tmp_path: Path) -> list[str]:
     args = world.args(tmp_path, "snapshot.json")
     index = args.index("--snapshot-id")
-    return args[:index] + args[index + 2 :]
+    return args[:index] + args[index + 2 :] + world.manifest_args(tmp_path)
 
 
 @pytest.mark.parametrize("window", ["035", "036", "037", "042"])
@@ -3904,7 +4379,7 @@ def test_script_runs_standalone_without_repository_on_the_path(tmp_path: Path) -
     # standalone (manifest read through the planner) and refuses on freshness
     # unless the system clock happens to sit inside the window.
     world = ready_world(tmp_path, "036")
-    plan_run = run("plan", *world.args(tmp_path))
+    plan_run = run("plan", *world.args(tmp_path), *world.manifest_args(tmp_path))
     document = json.loads(plan_run.stdout)
     assert plan_run.returncode == (0 if document["status"] == "ready" else 2)
     assert document["window"] == "036"

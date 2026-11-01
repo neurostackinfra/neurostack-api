@@ -416,9 +416,10 @@ def test_runbook_separates_what_the_live_run_verified() -> None:
 
 def test_runbook_state_section_is_the_live_state_of_2026_10_25() -> None:
     """The state section records the operator's live evidence as of
-    2026-10-25: 036 and 037 applied, revision 11 serving, rollback target 10,
-    worker flag true, rollout still disabled. None of it is repo-derivable;
-    the next live change updates this test with the text."""
+    2026-10-25: 036 and 037 applied, revision 11 serving, worker flag true,
+    rollout still disabled; and the rollback target, re-pinned from 10 to 11
+    by asaas-rollout-opening Group 5b (2026-11-01). None of it is
+    repo-derivable; the next live change updates this test with the text."""
 
     raw = _text(RUNBOOK)
     assert "## Current state (2026-10-17)" not in raw
@@ -476,10 +477,16 @@ def test_runbook_state_section_is_the_live_state_of_2026_10_25() -> None:
         "sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e",
         "`BILLING_FACT_WORKER_ENABLED` `false`",
         # Rollback target.
-        "**Rollback target: revision 10.**",
+        "**Rollback target: revision 11.**",
         "9 to 10 in PR #133 after revision 10's observation (minimum 6 h)"
         " closed at 2026-10-25T12:42Z, after about 11 h clean",
+        "and 10 to 11 (asaas-rollout-opening Group 5b) after the owner declared"
+        " revision 11's observation closed at 2026-11-01T01:19Z (the manifest's"
+        " second marker `closed_at`)",
         "Revision 8 is no longer a way back after migration 036",
+        "Windows `036` and `037` require revision 10 and can no longer run"
+        " against the reviewed manifest; they would run again only after a"
+        " snapshot restore, with a manifest at 10 (a fact, not a pending item).",
         # Webhook, read family, what stays off.
         "(task `8593671855574617b5267cbacfdfa081`, on revision 9)",
         "verdict `ready`, action `created`, one provider write",
@@ -511,13 +518,15 @@ def test_runbook_state_section_is_the_live_state_of_2026_10_25() -> None:
 
 
 def test_rollback_runbook_states_every_rollback_target_phase() -> None:
-    # Both re-pins are merged (8 -> 9 after revision 9's 24 h observation,
-    # 9 -> 10 in PR #133 after revision 10's observation closed at
-    # 2026-10-25T12:42Z): the ladder reads as history, revision 10 is R.
+    # The three re-pins are merged (8 -> 9 after revision 9's 24 h
+    # observation, 9 -> 10 in PR #133 after revision 10's observation closed
+    # at 2026-10-25T12:42Z, 10 -> 11 by asaas-rollout-opening Group 5b after
+    # revision 11's closed at 2026-11-01T01:19Z): the ladder reads as
+    # history, revision 11 is R, and the live chain moves it on.
     text = " ".join(_text(ROLLBACK_RUNBOOK).split())
     for phrase in (
-        "It went through three phases, each move a reviewed manifest change;"
-        " both re-pins are merged, and the field reads revision 10",
+        "It went through four phases, each move a reviewed manifest change;"
+        " the three re-pins are merged, and the field reads revision 11",
         "**Revision 8, until the first re-pin merged**",
         "**Revision 9, from the first re-pin to the second**",
         "about **2026-10-23 18:30 UTC**",
@@ -528,28 +537,76 @@ def test_rollback_runbook_states_every_rollback_target_phase() -> None:
         "The re-pin merged before the image bump (revision 11, a new app image"
         " digest) was deployed, at 2026-10-25 15:04 UTC: a rollback to revision 9"
         " would also turn the worker off",
-        "Revision 11 serves now, and the way back is revision 10",
+        "Revision 11 then served, and the way back was revision 10",
+        "**Revision 11, since the third re-pin** (`neurostack-staging-app:11`,",
+        "`effective_after: e7b_revision_11_serving_verified_and_observation_closed`,"
+        " no `repin` block; asaas-rollout-opening Group 5b) merged after the owner"
+        " declared revision 11 observed and stable at 2026-11-01T01:19Z, the"
+        " manifest's second marker `closed_at`, and before live step L2a",
+        "each structural deploy goes back to **the revision it replaces**",
+        "11 for L2a; 12 (L2a's revision, the last before the image containing"
+        " 042) for L2b and during window 042 (L3), re-pinned in L2c after L2a's"
+        " observation; 13 (L2b's revision) from L4 on",
+        "During the flips L5 to L7 the target stays 13, and the way back from a"
+        " flip is the flip back or the previous revision.",
+        "A hotfix image during the canary first re-pins the target to the"
+        " serving revision (any revision above 13), by a manifest PR alone.",
         "**Revision 8 is unsafe after migration 036**: it reads columns 036"
         " drops, and 036 ran on 2026-10-24",
         "--task-definition neurostack-staging-app:R",
-        "`R` is the rollback target, `10` since the second re-pin (it was `8`"
-        " until the first re-pin merged and `9` until the second); never `8`,"
-        " because migration 036 has run",
+        "`R` is the rollback target, `11` since the third re-pin (it was `8`"
+        " until the first re-pin merged, `9` until the second and `10` until the"
+        " third); never `8`, because migration 036 has run",
+        "After L6 do not roll back by hand to R (13)",
+        "`service_on_rollback_target_plan_stuck:<revision 13 ARN>`",
+        # The breaker after L6: a safe state, not the documented way back.
+        "the breaker goes back to the previous flip's revision (14 for a failed"
+        " L6), not to R (13). Both are safe service states; after L6 the"
+        " documented way back is the previous revision or the flip back (R"
+        " leaves `plan` stuck).",
+        "**Verify:** `plan` shows `current_task_definition` on the revision"
+        " rolled back to (R, or after L6 the previous revision)",
+        # Containment with an unusable target (owner decision, 2026-11-01).
+        "**A flag flip off, even with an unusable rollback target.**",
+        "from `'true'` to `'false'` is a task definition revision of its own."
+        " It is never gated by the rollback target (a target with a pending"
+        " safety re-pin, 9, aside), and it is the only deploy that passes when"
+        " the target is unusable (`INACTIVE`, missing, `ACTIVE` but not pinned by"
+        " digest, or a read naming another ARN than the manifest's revision;"
+        " owner decision, 2026-11-01): `plan` then reports"
+        " `info.rollback_target_unusable_containment_flip` instead of"
+        " `rollback_target_revision_unusable`. Turning a flag on, an image"
+        " change, the staged rows and the AppConfig group stay blocked until the"
+        " target is repaired",
+        "The block is a gate block (in `gate_blocks`; the plan `status` stays"
+        " `ready` or `compliant`): do not deploy while it is reported.",
+        # No image hotfix while the worker is contained (by spec).
+        "While the worker runs `'false'` (a containment flip), no revision"
+        " qualifies as the rollback target (it must carry the worker `'true'`),"
+        " so no image change passes, re-pinned or not: turn the worker back on"
+        " first, or stop and return to the owner.",
+        "the two diverge only after L4",
         "## Current state (2026-10-25)",
         # The current state, each database fact dated by its read.
         "the service `neurostack-staging-app` serves revision 11 (the image bump"
         " of revision 10, deployed 2026-10-25 15:04Z, `COMPLETED` 15:06:57Z),"
         " `BILLING_FACT_WORKER_ENABLED=true`, `alembic_version` `037` (the"
         " post-read of window `037`, 2026-10-24; not read again since revision"
-        " 11 was deployed), and the rollback target is revision 10.",
+        " 11 was deployed), and the rollback target is revision 11 (re-pinned"
+        " from 10 on 2026-11-01, asaas-rollout-opening Group 5b).",
         "Billing rollout is `disabled` (all four rows in the post-read of window"
         " `037`, 2026-10-24) and `topup_commercial_enabled=false`.",
         "deployment completed 2026-10-25 01:51 UTC",
-        # The E6 rule after 037 holds for revision 10 (operator evidence).
-        "Revision 10, the rollback target, meets this rule (operator evidence,"
-        " recorded in the wish): its image, the bridge digest `sha256:18358ce7…`"
-        " that revisions 9 and 10 run, was built from commit `67b9b51c`, the"
-        " merge of #126, which contains migration 037 and the E6 code.",
+        # The E6 rule after 037 holds for revision 10 (operator evidence) and
+        # for the targets of the live chain.
+        "Revision 10, the rollback target until 2026-11-01, meets this rule"
+        " (operator evidence, recorded in the wish): its image, the bridge digest"
+        " `sha256:18358ce7…` that revisions 9 and 10 run, was built from commit"
+        " `67b9b51c`, the merge of #126, which contains migration 037 and the E6"
+        " code.",
+        "revisions 11 and 12 run the E7b image, built from `main` `143ca9db`,"
+        " which contains that merge (`git merge-base --is-ancestor 67b9b51c"
+        " 143ca9db`, verified)",
         "The schema is forward-only. After 037 the only way back for the"
         " database is a restore from a snapshot",
     ):
@@ -565,6 +622,13 @@ def test_rollback_runbook_states_every_rollback_target_phase() -> None:
         "Once migration 037 is applied",
         "needs the 037 downgrade first",
         "## Current state (2026-10-17)",
+        "both re-pins are merged, and the field reads revision 10",
+        "Revision 11 serves now, and the way back is revision 10",
+        "and the rollback target is revision 10.",
+        "are valid ways back",
+        "`current_task_definition` on revision R,",
+        "(`INACTIVE` or missing;",
+        "Turning a flag on, an image change and the AppConfig group stay" " blocked",
     ):
         assert retired not in text, retired
 
@@ -602,8 +666,9 @@ def test_runbook_migration_sections_record_036_and_037_as_applied() -> None:
         ), number
     section_037 = " ".join(_section(raw, "## Migration 037:", r"^## ").split())
     assert (
-        "Revision 10, the production rollback target, meets the rule (operator"
-        " evidence, recorded in the wish): its bridge image `sha256:18358ce7…` was"
+        "Revision 10, the production rollback target until 2026-11-01, meets the"
+        " rule (operator evidence, recorded in the wish): its bridge image"
+        " `sha256:18358ce7…` was"
         " built from commit `67b9b51c`, the merge of #126, which contains"
         " migration 037 and the E6 code." in section_037
     )

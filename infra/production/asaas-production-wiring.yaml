@@ -35,7 +35,7 @@ context:
     - A revision that only moves the app image to another digest of the same repository (the image bump, from the apply-time parameter app_image_override) is its own owner approval; plan reports it as a register_task_definition change carrying app_image. An image and a worker flag change never share a revision.
     - CREDIT_HOT_PATH_ENABLED and BILLING_FACT_TRANSPORT_ENABLED render their reviewed parameters exactly ('false' or 'true') in every rendering. Their two rows enter together, both 'false', in a revision that changes nothing else, the serving image included (plan change flag_rows_added); afterwards each value flips alone in its own revision (credit_hot_path_flag, transport_flag). A row change, a flag flip and an image change never share a revision.
     - The AppConfig group (task_definition.app_environment_appconfig_group) is rendered all or none, only when its three parameters are set, in a revision that adds it alone (plan change appconfig_group_added); APPCONFIG_ENABLED is always 'true' and APPCONFIG_SOURCE always sdk, written by the planner, never parameters.
-    - The service rollback target is the field rollback_target; code paths read it from here and it moves only through its documented re-pins (8 to 9, then 9 to 10).
+    - The service rollback target is the field rollback_target; code paths read it from here and it moves one reviewed re-pin at a time, 8 to 9 and 9 to 10 being the safety re-pins (each with its mandatory repin note while pending), 10 to 11 and later owner re-pins with no note (11 recorded in this manifest; 12 and 13 are separate PRs of the live sequence), and above 13 any serving revision with effective_after revision_serving_verified_and_observation_closed.
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
     - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names; the one exception is exactly the complete AppConfig group, in the app environment (APPCONFIG_ORIGIN, APPCONFIG_TOKEN and any other APPCONFIG_ name stay forbidden).
     - Keep financial_egress_enabled closed by absence until the AppConfig group is rendered; opening it is then the AppConfig configuration's value, set outside this manifest under its own owner approval.
@@ -88,11 +88,37 @@ target:
 # at or after 2026-10-25T07:51Z) (docs/runbooks/asaas-deployment.md, "Merge
 # condition of the re-pin (9 to 10)").
 # closed_at: 2026-10-25T12:42Z
-# Revision 10 is the final pin of the planner (no further re-pin is allowed
-# by it).
+# Those two were the planner's safety re-pins (each with its repin note while
+# pending). From revision 10 on the target follows the live chain, one
+# reviewed re-pin at a time and with no note (asaas-rollout-opening Group
+# 5b): each structural deploy goes back to the revision it replaces, and the
+# planner and the migration-window tool prove that by content (the target
+# ACTIVE by digest, exactly one BILLING_FACT_WORKER_ENABLED 'true', differing
+# from the change's revision in that change's kind alone, the service on the
+# target for a change not yet serving). Re-pinned from revision 10 to
+# revision 11 (the E7b image bump of revision 10, serving since 2026-10-25,
+# deployment COMPLETED 15:06:57Z) once revision 11 had served, been verified
+# and its observation closed, and before live step L2a (whose revision
+# replaces 11). Evidence of revision 11 (read only, 2026-11-01): ACTIVE, app
+# image sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159,
+# exactly one BILLING_FACT_WORKER_ENABLED 'true', no staged flag row, no
+# APPCONFIG_ name; request_sha256
+# d173600cf8bcf2428b6662b79200fc03a645ea6c243bb4bb6ec78bc4429561d3, defined
+# as _sha256(_request_from_response(<DescribeTaskDefinition
+# neurostack-staging-app:11 with include TAGS>)) in
+# scripts/asaas_production_wiring.py (not the plan's rendered_request_sha256).
+# The owner declared the observation closed at the time on the next line
+# (floor: 6 hours after revision 11's deployment completed, by the 9 to 10
+# precedent, so 2026-10-25T21:07Z).
+# closed_at: 2026-11-01T01:19Z
+# Next, each its own reviewed PR with the same evidence: 11 to 12 after live
+# step L2a's observation (L2c, before L2b), 12 to 13 after window 042's
+# observation (L4, before L5). Above 13 any revision may be pinned with
+# effective_after revision_serving_verified_and_observation_closed (a hotfix
+# image during the canary is re-pinned to the serving revision first).
 rollback_target:
-  revision: 10
-  effective_after: worker_flag_revision_10_serving_verified_and_observation_closed
+  revision: 11
+  effective_after: e7b_revision_11_serving_verified_and_observation_closed
 
 secrets:
   kms_key_arn: arn:aws:kms:us-east-1:388460142431:key/90eff49a-c2bf-4836-834f-d5666294d956
@@ -443,7 +469,7 @@ steps:
     preconditions:
       - Window 037 applied and verified first; read back the exact revision with the window's SELECT-only pre-read (scripts/migration_038_042_preflight.sql, application role) and continue only if alembic_version == 037 and every count is 0 (none of the tables or functions 038 to 042 create exists yet).
       - The image containing 042 is deployed and running on every service task, by digest (live step L2, its own revision after the parameter-rows revision); the window's migrations revision carries that same digest.
-      - rollback_target stays revision 10 with no pending re-pin and revision 10 is ACTIVE; the migrations are additive, so it stays a valid way back with the schema at 042.
+      - rollback_target is revision 12 with no pending re-pin (L2a's revision, re-pinned from 11 by live step L2c, before L2b), ACTIVE, its app image pinned by digest, with exactly one BILLING_FACT_WORKER_ENABLED row, 'true', and differing from the revision the service runs (L2b's, on the image containing 042) in the app image alone; the migrations are additive, so it stays a valid way back with the schema at 042.
       - Manual RDS snapshot pre-038-042-<date> available and recent before the run.
     change: register the window's neurostack-staging-migrations revision with render-migrations-taskdef --window 042 --purpose migrate (the deployed image digest, the command baked to exactly `alembic upgrade 042`) and run it once through scripts/asaas_migration_window.py --window 042 (plan, render-run-task, verify-result), with no command override and no propagateTags
     verification:

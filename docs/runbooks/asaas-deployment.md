@@ -60,12 +60,17 @@ evidence on 2026-10-25.
   otel pinned by digest
   `sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e`,
   `BILLING_FACT_WORKER_ENABLED` `false`.
-- **Rollback target: revision 10.** Both re-pins of the manifest field
+- **Rollback target: revision 11.** The three re-pins of the manifest field
   `rollback_target` are merged: 8 to 9 after revision 9's 24 h observation,
-  and 9 to 10 in PR #133 after revision 10's observation (minimum 6 h)
+  9 to 10 in PR #133 after revision 10's observation (minimum 6 h)
   closed at 2026-10-25T12:42Z, after about 11 h clean (the manifest marker
-  `closed_at`). Revision 8 is no
-  longer a way back after migration 036. See
+  `closed_at`), and 10 to 11 (asaas-rollout-opening Group 5b) after the
+  owner declared revision 11's observation closed at 2026-11-01T01:19Z (the
+  manifest's second marker `closed_at`). Revision 8 is no
+  longer a way back after migration 036. Windows `036` and `037` require
+  revision 10 and can no longer run against the reviewed manifest; they
+  would run again only after a snapshot restore, with a manifest at 10 (a
+  fact, not a pending item). See
   [`asaas-rollback.md`](./asaas-rollback.md).
 - **Webhook registered by the deploy hook** (task
   `8593671855574617b5267cbacfdfa081`, on revision 9): verdict `ready`, action
@@ -820,10 +825,14 @@ restored guards refuse what they refused.
   back the application only to an image of this release; running the E5
   image again needs the 036 schema back, which in production is a snapshot
   restore (`pre-037-2026-10-24`), a separate owner decision, never this
-  downgrade. Revision 10, the production rollback target, meets the rule
-  (operator evidence, recorded in the wish): its bridge image
+  downgrade. Revision 10, the production rollback target until 2026-11-01,
+  meets the rule (operator evidence, recorded in the wish): its bridge image
   `sha256:18358ce7…` was built from commit `67b9b51c`, the merge of #126,
-  which contains migration 037 and the E6 code.
+  which contains migration 037 and the E6 code. So do the targets of the
+  live chain that follow it (asaas-rollout-opening Group 5b): revisions 11
+  and 12 run the E7b image, built from `main` `143ca9db`, which contains
+  that merge (`git merge-base --is-ancestor 67b9b51c 143ca9db`, verified),
+  and revision 13 runs the image of live step L1, built for this release.
 
 ### Open follow-ups recorded by E6
 
@@ -907,13 +916,17 @@ migrations revision from it.
 | Window | Manifest step | Plan steps | Baked command | `alembic_version` before, after | Snapshot | SELECT-only readback before the run | Image prerequisite |
 |---|---|---|---|---|---|---|---|
 | `035` | `migrations_033_035` | S10-S13 | `alembic upgrade 035` | `032`, `035` | `pre-033-035-<date>` | `scripts/migration_033_035_zero_reads.sql`, application role | the migrations revision carries the bridge image by digest (in ECR); every service task runs its own revision's image (revision 8 may still serve, by tag) |
-| `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 10, `ACTIVE` |
-| `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 10, `ACTIVE` |
-| `042` | `migrations_038_042` | S25-S27 | `alembic upgrade 042` | `037`, `042` | `pre-038-042-<date>` | `scripts/migration_038_042_preflight.sql`, application role | as for 036, with the image containing 042 (live step L2b of asaas-rollout-opening), carried by the migrate revision; `rollback_target` revision 10, `ACTIVE` |
+| `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 10, `ACTIVE` (by number) |
+| `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 10, `ACTIVE` (by number) |
+| `042` | `migrations_038_042` | S25-S27 | `alembic upgrade 042` | `037`, `042` | `pre-038-042-<date>` | `scripts/migration_038_042_preflight.sql`, application role | as for 036, with the image containing 042 (live step L2b of asaas-rollout-opening), carried by the migrate revision; `rollback_target` revision 12 (L2a's, re-pinned in L2c), `ACTIVE`, and by content: the worker `'true'` exactly once, and the service revision (L2b's) differing from it in the app image alone |
 
 History: windows `036` and `037` actually ran with `rollback_target`
 revision 9; the requirement of revision 10 in the table applies to any later
-use of the tooling.
+use of the tooling. Since the re-pin from 10 to 11 (asaas-rollout-opening
+Group 5b) the reviewed manifest satisfies neither: production is at `037`,
+so they could run again only after a snapshot restore, planned with a
+manifest at 10 (a fact, not a pending item). Window `042` requires revision
+12 by number and by content (below), never the number alone.
 
 After the run every window reads back `alembic_version` as the application
 role; it must be exactly the window's "after" (window `037` also reads
@@ -1135,9 +1148,16 @@ ECR, `DATABASE_URL` only as the `database-url-migrations` secret, `awslogs`;
 the snapshot `$SNAPSHOT_ID` of `neurostack-staging-db`, manual, `postgres`,
 `available`, created within the last 60 minutes and named for its creation
 date (or the day before); no task of the migrations family, of the
-window's `startedBy` or of the read family running; for 036, 037 and 042 the
+window's `startedBy` or of the read family running; for 036 and 037 the
 manifest's `rollback_target` revision 10 with no pending re-pin and revision 10
-`ACTIVE` on an image by digest; for 037 the read revision (baked readback,
+`ACTIVE` on an image by digest; for 042 revision 12, likewise, and, by
+content, exactly one `BILLING_FACT_WORKER_ENABLED` row in revision 12, `'true'`
+(`rollback_target_worker_flag_true`), and the service revision
+(`--service-task-definition`, the one running the image containing 042)
+differing from revision 12 in the app image alone, the planner's
+`reviewed_change`, both read the same way, without `TAGS`
+(`rollback_target_is_the_revision_the_service_revision_replaced`), else
+`rollback_target_not_repinned`; for 037 the read revision (baked readback,
 no mention of the migration tool, same image as the migrate revision) and the
 migrate revision never swapped; the recorded pre-read verified `read_ok`,
 stopped within the last 15 minutes and created at or after the snapshot; no
@@ -1304,7 +1324,18 @@ moves the image; see "The staged flags and the AppConfig group" below), so
 the window's tooling finds the service on the migrations image. The window
 tool refuses any other image (`migrations_image_differs_from_deployed_image`,
 `service_task_image_digest_mismatch`), like for 036 and 037.
-`rollback_target` revision 10 with no pending re-pin, `ACTIVE`, by digest.
+`rollback_target` revision 12 with no pending re-pin, `ACTIVE`, by digest:
+L2a's revision (revision 11 plus the two rows at `'false'`, on the E7b
+image), the last before the image containing 042, re-pinned from 11 by live
+step L2c (its own reviewed PR, after L2a's observation and before L2b). The
+tool also checks it by content: exactly one `BILLING_FACT_WORKER_ENABLED`
+row in it, `'true'`, and the service revision differing from it in the app
+image alone (`rollback_target_not_repinned` otherwise, also with the target
+at 10 or 11). That proves the content, not the provenance: that revision 12
+is the very revision L2b replaced comes from the planner's L2b gate (the
+service on the target) and the stop rule. Revision 12 is the way back during
+and after the window, until L4: its image reads none of the credit tables,
+so it stays valid on the additive `042` schema.
 
 **Preflight (SELECT only, immediately before the run)**, as the application
 role on the read family: `scripts/migration_038_042_preflight.sql`, byte for
@@ -1352,10 +1383,10 @@ arguments of "Files" above and no `--migrations-read-task-definition`):
    means it still reads `037`.
 
 **Rollback (window 042).** None from the window. A service rollback to the
-rollback target stays valid on the `042` schema (the migrations are
-additive). Each downgrade of 038 to 042 refuses while any of its tables holds
-a row (038 also while `billing_fact_acks` does), so they are not a way back
-once the credit system writes; restoring the snapshot is an owner decision
+rollback target (revision 12) stays valid on the `042` schema (the
+migrations are additive). Each downgrade of 038 to 042 refuses while any of
+its tables holds a row (038 also while `billing_fact_acks` does), so they are
+not a way back once the credit system writes; restoring the snapshot is an owner decision
 of last resort, because it loses every write made after it. SQLSTATE
 `55P03`, `40P01` or `55000` means nothing changed: report and stop.
 
@@ -1611,18 +1642,22 @@ window `037`'s SELECT-only readback program on the same image, roles and
 secret, as a separate revision.
 
 - The service rollback target is the manifest field `rollback_target`
-  (revision 10 since its second documented re-pin, 9 to 10, merged in
-  PR #133 after revision 10 had served, been verified and its observation
-  had closed: no earlier than 6 hours after its deployment completed, so at
-  2026-10-25 07:51 UTC, and in fact at 2026-10-25T12:42Z, the actual closing
-  time recorded by the orchestrator in the manifest marker `closed_at`
-  before the merge ("Merge condition of the re-pin (9 to 10)"), and before
-  the image bump was deployed; revision 9 since the first, gate 6, merged
-  only after revision 9's observation period closed, about 2026-10-23
-  18:30 UTC; revision 8 before). Every code path reads it from there; revision 10 is
-  the last pin the planner allows. The D3 source
-  revision (`task_definition.source_revision`, 8) is a separate, fixed value:
-  revisions 9 and 10 stay derived from it.
+  (revision 11 since the re-pin 10 to 11 of asaas-rollout-opening Group 5b,
+  merged after the owner declared revision 11's observation closed at
+  2026-11-01T01:19Z; revision 10 since its second documented re-pin, 9 to
+  10, merged in PR #133 after revision 10 had served, been verified and its
+  observation had closed: no earlier than 6 hours after its deployment
+  completed, so at 2026-10-25 07:51 UTC, and in fact at 2026-10-25T12:42Z,
+  the actual closing time recorded by the orchestrator in the manifest
+  marker `closed_at` before the merge ("Merge condition of the re-pin (9 to
+  10)"), and before the image bump was deployed; revision 9 since the
+  first, gate 6, merged only after revision 9's observation period closed,
+  about 2026-10-23 18:30 UTC; revision 8 before). Every code path reads it
+  from there. The two safety re-pins (8 to 9, 9 to 10) carried their
+  `repin` note while pending; from 10 on the target follows the live chain
+  with no note ("Re-pinning the rollback target along the live chain"). The
+  D3 source revision (`task_definition.source_revision`, 8) is a separate,
+  fixed value: every later revision stays derived from it.
 - Two gate blocks are facts computed at plan time, not pinned states.
   `F1_residual_5_database_url_fingerprint` (F1 residual 5; it replaced the
   id `F1_group5_deploy_validator_allowlist`, whose check passes since F1
@@ -1953,7 +1988,10 @@ environment name and value, the worker flag included, every secret
 reference, the otel digest, the roles, the sizing and the tags). Any other
 difference blocks (`service_not_on_rollback_target:<ARN>`): an image by tag,
 an image in another repository, a malformed digest, and a rendering that
-changes the image and the flag together. That reason names the serving
+changes the image and the flag together. When the service runs the rollback
+target itself (as revision 10 did here once it was pinned), the same block is
+reported under its own name, `service_on_rollback_target_plan_stuck:<ARN>`
+(asaas-rollout-opening Group 5b). That reason names the serving
 revision (revision 10 here) and does not say which fields differ; it is the
 same in two cases: (a) revision 10 serves and is also the newest, and the
 rendering differs from it in more than the image digest; (b) revision 10
@@ -1995,8 +2033,10 @@ registration (expected `:11`).
    `status: compliant`, `registered_not_deployed:<revision 11 ARN>` and
    `registered_revision_changes_app_image` naming revision 10 and both
    digests. Registering changes nothing in the service. In this step and
-   the next ones, unless the manifest pins revision 10 with no pending
-   re-pin, `plan` also reports the gate block
+   the next ones, unless the manifest's rollback target is the revision the
+   image bump replaces (here revision 10, with no pending re-pin: the
+   content rule of "Re-pinning the rollback target along the live chain"),
+   `plan` also reports the gate block
    `rollback_target_not_repinned_before_image_bump` on `service_deployment`
    (in `gate_blocks`; the plan `status` stays `ready` or `compliant`): do
    not deploy while it is reported.
@@ -2010,12 +2050,14 @@ registration (expected `:11`).
    Deploy only when `plan` does not report
    `rollback_target_not_repinned_before_image_bump`. Afterwards `plan`
    reports `registered_and_deployed:<revision 11 ARN>`, and
-   `rollback_target` stays revision 10. Once revision 11 serves, the gate is
-   reported only while the manifest pins revision 9 (whose bridge digest it
-   compares with the serving image); with revision 8 pinned there is no
-   digest to compare with and no gate, a state the documented order never
-   produces (8 is re-pinned to 9 before migration 036, long before the image
-   bump).
+   `rollback_target` stays revision 10 (until the re-pin to 11). Once
+   revision 11 serves, the gate is reported while the manifest's target is
+   not the revision the serving image replaced (revision 9, whose bridge
+   digest it compares with the serving image and whose worker is off, or any
+   target that differs from revision 11 in more than the image); with
+   revision 8 pinned there is no digest to compare with and no gate, a state
+   the documented order never produces (8 is re-pinned to 9 before migration
+   036, long before the image bump).
 7. **Post-deploy hook.** Once the deployment is `COMPLETED`, run the
    [post-deploy webhook registration hook](#post-deploy-webhook-registration-hook)
    (`reconcile` on the deployed revision). Its failure is the alert
@@ -2029,7 +2071,9 @@ registration (expected `:11`).
    step 5: the counts are the same before and after, and a new alert row,
    or more ASAAS payment effects than outbox rows, is a finding to report.
 
-**Rollback** is the service back to revision 10, the rollback target:
+**Rollback** (history: the image bump of 2026-10-25; L2b's way back is
+revision 12, see "Re-pinning the rollback target along the live chain") was
+the service back to revision 10, the rollback target then:
 `aws ecs update-service ... --task-definition <revision 10 ARN>` (or the
 deployment circuit breaker, automatically), as in
 [`asaas-rollback.md`](./asaas-rollback.md). No revision is registered for
@@ -2065,7 +2109,9 @@ refusing any other name:
 | Live step | Revision | Parameters (`infra/production/asaas-production-wiring.params.yaml`) | `plan` change (`replaces` the serving revision) |
 |---|---|---|---|
 | L2a | the rows `CREDIT_HOT_PATH_ENABLED` and `BILLING_FACT_TRANSPORT_ENABLED` added, both `'false'`, nothing else (the image that serves) | both `'false'`, as the file sets them; `app_image_override` the serving digest | `flag_rows_added: {names, value: 'false'}` |
+| L2c | none: the manifest's `rollback_target` re-pinned from 11 to 12 (L2a's revision), its own reviewed PR, after L2a's observation | unchanged | none |
 | L2b | the app image alone (the image built for this wish) | `app_image_override` the new digest | `app_image` (the image bump) |
+| L4 | none: `rollback_target` re-pinned from 12 to 13 (L2b's revision), its own reviewed PR, after window 042's observation | unchanged | none |
 | L5 | `CREDIT_HOT_PATH_ENABLED` `'true'` alone | its own reviewed PR to `'true'` | `credit_hot_path_flag: {name, from, to}` |
 | L6 | `BILLING_FACT_TRANSPORT_ENABLED` `'true'` alone | its own reviewed PR to `'true'` | `transport_flag: {name, from, to}` |
 | L7 | the AppConfig group alone | `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT`, `APPCONFIG_PROFILE` set | `appconfig_group_added: {names, application, environment, profile, source: sdk}` |
@@ -2077,22 +2123,32 @@ L7 (Decision 4: L7 after L6). It proposes `transport_flag` while the credit
 flag is still `'false'` (L6 before L5), and `appconfig_group_added` with
 both flags `'false'` (L7 before L5 and L6), and it cannot read
 `alembic_version`, so it cannot know whether L3 ran. Keeping the order is the
-operator's and the owner's job (whether the planner should enforce it is an
-open owner decision).
+operator's and the owner's job: the owner decided on 2026-11-01 (Decision 16)
+that the planner does not enforce it, because enforcing it both ways would
+block the containment revision (the credit switch off with the transport
+on). What the planner does check is the way back: each structural deploy
+(L2a, L2b) goes back to the revision it replaces, the rollback target
+re-pinned one reviewed PR at a time (L2c, L4; "Re-pinning the rollback
+target along the live chain").
 
 Rollback and containment, per step:
 
-- **L2a, L2b**: update the service back to the previous revision; `plan`
+- **L2a, L2b**: update the service back to the previous revision, which
+  is the rollback target R (11 for L2a, 12 for L2b and during L3); `plan`
   then reports the revision it left as `registered_not_deployed:<ARN>` (for
   L2a, `registered_not_deployed:<L2a ARN>` with
-  `info.registered_revision_adds_flag_rows`). Rolling L2b back to the
-  rollback pin (revision 10) instead of the previous revision is expected
-  to block with `service_not_on_rollback_target:<revision 10 ARN>`:
-  revision 10 differs from the rendering in the rows and the image, two
-  kinds.
+  `info.registered_revision_adds_flag_rows`), with no gate block. Rolling
+  L2b back to an older revision (11 or 10) instead is expected to block
+  with `service_not_on_rollback_target:<ARN>` naming it: it differs from
+  the rendering in the rows and the image, two kinds.
 - **L5, L6**: the flag flipped back to `'false'` alone, by its own reviewed
   PR, is itself a reviewed kind (`credit_hot_path_flag` or `transport_flag`
-  from `'true'` to `'false'`), proposed and deployed like the flip on.
+  from `'true'` to `'false'`), proposed and deployed like the flip on; a
+  flip is never gated by the rollback target. The target stays 13 during
+  L5 to L7. After L6 a manual rollback to R (13) is a dead end of more than
+  one kind of change: the rendering is R plus two flips, and `plan` blocks
+  with `service_on_rollback_target_plan_stuck:<revision 13 ARN>`. Use the
+  previous revision or the flip back instead.
 - **L7**: containment is the AppConfig configuration set to `false` ("AppConfig
   and opening financial egress (follow-up F2)" below), not a revision.
   Removing the group from the parameters is **not** a reviewed kind: `plan`
@@ -2404,13 +2460,15 @@ own explicit owner approval and is never performed from the manifest.
    [image bump](#the-image-bump-app_image_override) is deployed, edit the
    manifest field to `revision: 10`,
    `effective_after: worker_flag_revision_10_serving_verified_and_observation_closed`,
-   with no `repin` block (a reviewed change; the planner refuses any other
-   value and allows no pin after 10, and 8 to 10 is not a move). Revision 9
+   with no `repin` block (a reviewed change; the planner refused any other
+   value and then allowed no pin after 10, and 8 to 10 is not a move; the
+   pins after 10 came with Group 5b, below). Revision 9
    then validates only with its `repin` note naming revision 10
    (`before: app_image_bump_deployment`, a `why` naming
    `BILLING_FACT_WORKER_ENABLED`). `plan` reports `rollback_target` =
    revision 10 and checks it as above; unless the manifest pins revision 10
-   with no pending re-pin, it reports the gate block
+   with no pending re-pin (since Group 5b: unless the target is the revision
+   the image change replaces, by content), it reports the gate block
    `rollback_target_not_repinned_before_image_bump` on `service_deployment`
    for a proposed or registered image bump, and for a serving one when
    revision 9 is pinned (an image other than revision 9's bridge digest).
@@ -2529,6 +2587,204 @@ own explicit owner approval and is never performed from the manifest.
 9. **Gate: rollout transitions.** These are not planned until the credit
    system exists. See
    [Preconditions before any future transition request](#preconditions-before-any-future-transition-request).
+
+### Re-pinning the rollback target along the live chain
+
+asaas-rollout-opening Group 5b (Decision 15). From revision 10 on, the
+manifest field `rollback_target` follows the live chain so that each
+structural deploy goes back to **the revision it replaces**: L2a (the two
+staged rows) goes back to revision 11; L2b (the image containing 042) and
+window `042` (L3) go back to revision 12, L2a's revision and the last before
+that image; from L4 on the target is revision 13, L2b's revision. During the
+flips L5 to L7 it stays 13, and the way back from a flip is the flip back or
+the previous revision. Each move is its own small reviewed PR of the
+manifest (an ASAAS invariant file: the owner's sign-off, merged by a human),
+in this order: 10 to 11 (Group 5b itself), L2a, L2a's observation (6 h), 11
+to 12 (L2c), L2b, its observation (6 h or more), L3, its observation (24 h),
+12 to 13 (L4), L5. The chain never skips revision 11.
+
+| `revision` | `effective_after` | The way back from |
+|---|---|---|
+| 10 | `worker_flag_revision_10_serving_verified_and_observation_closed` | the image bump to revision 11 (history) |
+| 11 | `e7b_revision_11_serving_verified_and_observation_closed` | L2a |
+| 12 | `staged_rows_revision_12_serving_verified_and_observation_closed` | L2b and window `042` (L3) |
+| 13 | `credit_image_revision_13_serving_verified_and_window_042_observed` | L4 on (the flips L5 to L7) |
+| above 13 | `revision_serving_verified_and_observation_closed` | a hotfix image during the canary |
+
+None of them carries a `repin` block. `check-manifest` refuses one on 10 or
+above, refuses 7 (any revision below 8), a swapped `effective_after` and any
+other key; 8 and 9 still validate only with their safety notes, as before.
+The planner's `ROLLBACK_TARGET_PINS` and `ROLLBACK_REPIN_WHY_NAMES` (indexed
+by the revision a safety re-pin moves to) are checked on import: an
+inconsistent pair never loads.
+
+**The content rule (`service_deployment`).** A `flag_rows_added` or
+`app_image` change, proposed (the rendering), registered and not deployed
+(the newest revision) or in service (relative to the target: for the rows,
+the serving revision carries a staged row and the target none; for the
+image, the serving revision runs another app image than the target's),
+passes only when the target the manifest names, as read by
+`DescribeTaskDefinition`:
+
+- is `ACTIVE`, with its app image pinned by digest;
+- carries exactly one `BILLING_FACT_WORKER_ENABLED` row, and it is `'true'`
+  (a way back never turns the worker off);
+- differs from the change's revision in that change's kind alone (the
+  planner's `reviewed_change`), with no pending safety re-pin;
+- and, for a proposed or registered change, is the revision the service
+  runs (its `taskDefinition` equals the target's ARN).
+
+For a proposed or registered change, together these prove that the target is
+the revision the change replaces. For a change already in service the
+identity is by content alone, so two revisions can qualify (a stray `ACTIVE`
+revision 12 that differs from L2b's revision in the image alone passes as
+its target once L2b serves): there only the stop rule and the review of the
+re-pin PR decide, and no digest and no revision number of the chain is in
+the code. Otherwise
+`plan` reports the gate block `rollback_target_not_repinned_before_image_bump`
+(the image) or `rollback_target_not_repinned_before_flag_rows` (the rows) on
+`service_deployment` (in `gate_blocks`), and
+`info.rollback_target_content_rule` lists each gated change with its `kind`,
+its `change` (`proposed`, `registered` or `serving`) and what `failed`:
+`target_not_active_and_digest_pinned`,
+`target_worker_flag_not_exactly_one_true`,
+`target_differs_from_the_change_in_more_than_its_kind`,
+`target_repin_pending`, `service_not_on_target`. Do not deploy while either
+block is reported. **Flag flips are never gated by the target** (the worker,
+the credit switch, the transport, and the AppConfig group): a flip adds no
+verdict of its own, and while a flip is proposed or registered the changes
+in service are still listed, each with `"gating": false`, and block nothing,
+even off the documented chain (a skipped L4 re-pin, or a flip on top of a
+hotfix), so the containment revision is always proposable (Decision 16).
+Only a target with a pending safety re-pin (9) still gates a flip, as
+before. With nothing to deploy, a change in service two kinds away from the
+target still reports the image gate. With revision 8 pinned (a tag) no
+change in service is detected, as before.
+
+**An unusable target: only containment passes** (owner decision,
+2026-11-01). When the target is unusable (`INACTIVE`, missing, `ACTIVE` but
+not pinned by digest, or a read naming another ARN than the manifest's
+revision), `plan` reports
+`rollback_target_revision_unusable` on `service_deployment` for every deploy
+except a flip that turns a flag off: the credit switch, the transport or the
+worker from `'true'` to `'false'` (the serving or newest revision's value
+against the rendering's), reported as
+`info.rollback_target_unusable_containment_flip`. The exception covers every
+one of those conditions, not only an `INACTIVE` or missing target. Turning a
+flag on, an
+image change, the staged rows and the AppConfig group stay blocked until the
+target is repaired; a direction that cannot be told fails closed. The block
+is a gate block (in `gate_blocks`; the plan `status` stays `ready` or
+`compliant`): do not deploy while it is reported.
+
+With the target on 11, L2a is proposed, registered and served with no gate
+block; with 9 or 10 the rows gate blocks. With the target on 12, L2b and
+window `042` pass; with 9, 10 or 11 the image gate blocks. After L4 (target
+13) an image change from 13 passes. After L2b (target 12), rolling back to
+12 reports `registered_not_deployed:<revision 13 ARN>` with no gate block;
+rolling back to 11 or 10 reports `service_not_on_rollback_target:<ARN>`
+naming it. After L2a (target 11), rolling back to 11 reports
+`registered_not_deployed:<revision 12 ARN>`. When the service runs its own
+target and the plan cannot move from it, `plan` blocks with
+`service_on_rollback_target_plan_stuck:<ARN>`, not with
+`service_not_on_rollback_target:<ARN>` naming the target itself. After L6, a
+manual rollback to R (13) is such a dead end of more than one kind of change
+(the rendering is 13 plus two flips): use the previous revision or the flip
+back.
+
+**A hotfix image during the canary (L5 to L10).** The serving revision then
+differs from 13 by flags, so no image change from it passes with the target
+on 13. First re-pin the manifest to the serving revision (any revision above
+13, `effective_after: revision_serving_verified_and_observation_closed`; a
+manifest PR with the evidence below, never a code PR), then plan the image
+change; with the target on 13, or on a revision that does not serve, `plan`
+reports the image gate. Each of these re-pins (to the serving revision, and
+later to the hotfix revision) has its floor 6 h after that revision's
+deployment `COMPLETED`, and only once a read-only `plan` (with the owner's
+go) shows `rollback_target_active_and_digest_pinned` on it. Once the hotfix
+revision has served and its observation has closed, re-pin to it before the
+next flip is deployed: a
+flip deployed on top of it with the target still on the revision before
+leaves a serving revision two kinds away from the target, which the image
+gate reports. While the worker runs `'false'` (a containment flip), no
+revision qualifies as the rollback target (it must carry the worker
+`'true'`), so no image change passes, re-pinned or not: turn the worker back
+on first, or stop and return to the owner.
+
+**Stop rule (defence in depth; identity is by content).** A read-only read
+before L2a confirms that the newest revision of the family is 11, and before
+L2b that it is 12; L2a's verification confirms that the revision it
+registered is 12, and L2b's that it is 13. Any other number stops everything
+and returns to the owner (Group 5b is amended first). `plan` backs it by
+content (the content rule and the service on the target): a stray `ACTIVE`
+revision 12 that pushed L2a to 13 is refused while the service runs 13, and
+so is a second, identical registration of L2a.
+
+**Evidence and merge condition of each re-pin.** The PR records, in the
+manifest comment on `rollback_target`, the target's app image digest and
+its `request_sha256`, defined as
+`_sha256(_request_from_response(<DescribeTaskDefinition
+neurostack-staging-app:<N> with include TAGS>))` (not the plan's
+`rendered_request_sha256`), read only with the owner's explicit go at the
+moment of the read, and one marker `# closed_at: YYYY-MM-DDTHH:MMZ` per
+re-pin: the actual closing time of that revision's observation, at or after
+the floor of that re-pin. The floors: 10 to 11, revision 11's deployment
+`COMPLETED` + 6 h (the 9 to 10 precedent); 11 to 12 (L2c), L2a's deployment
+`COMPLETED` + 6 h; 12 to 13 (L4), window `042`'s verified post-read + 24 h
+(L3's observation), and never before L2b's deployment `COMPLETED` + 6 h;
+above 13 (the canary hotfix: the re-pin to the serving revision, and later
+the re-pin to the hotfix revision), 6 h after the deployment of the revision
+that becomes the target `COMPLETED`, and only once a read-only `plan` (with
+the owner's go) shows `rollback_target_active_and_digest_pinned` on it. It
+updates both runbooks and their goldens in the same PR, and merges only
+after that observation has closed.
+
+**Done when (the L2c and L4 PRs).** `check-manifest` passes, and a
+read-only `plan` (with the owner's go at the moment of the reads) shows
+`rollback_target_active_and_digest_pinned` on the new target; for L2c also
+no image gate (`rollback_target_not_repinned_before_image_bump`) for the
+L2b rendering.
+
+**Re-pin checklist (the L2c and L4 PRs).** Moving the repository manifest
+off its current pin makes these tests fail, and the PR updates each to the
+new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
+13) it is a starting point, to confirm by running the runbook readers, since
+it depends on how L2c rewrote these tests: in
+`tests/scripts/test_asaas_migration_window.py`,
+`test_the_reviewed_manifest_is_pinned_to_revision_11` and the `MANIFEST`
+line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
+`042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
+in `tests/scripts/test_asaas_production_wiring.py`,
+`test_manifest_and_template_validate`,
+`test_rollback_target_is_re_pinned_to_revision_11_without_a_note`,
+`test_manifest_validator_rejects_an_invalid_rollback_target`,
+`test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
+`test_the_repository_parameters_propose_the_l2a_rows_revision`,
+`test_a_rollback_revision_must_be_spelled_in_plain_decimal` and
+`test_the_manifest_carries_one_closed_at_marker_per_re_pin` (the marker count
+follows the manifest's pin, so the PR adds its `closed_at` marker, with that
+re-pin's floor, and the test's floor table).
+
+**History (10 to 11).** Revision 11 (the E7b image bump, deployment
+`COMPLETED` 2026-10-25 15:06:57Z, so the floor was 2026-10-25T21:07Z) was
+declared observed and stable by the owner at 2026-11-01T01:19Z, recorded as
+the manifest's second `closed_at` marker with its image digest and its
+`request_sha256` (read only on 2026-11-01: `ACTIVE`, exactly one
+`BILLING_FACT_WORKER_ENABLED` `'true'`, no staged row, no `APPCONFIG_*`
+name). The re-pin merged with Group 5b, before L2a.
+
+**The windows.** `036` and `037` keep requiring revision 10, by number
+only: with the reviewed manifest past 10 they cannot run again (production
+is at `037`; they would run only after a snapshot restore, planned with a
+manifest at 10). Window `042` requires revision 12 by number and by content
+("Window 042: migrations 038-042").
+
+**The circuit breaker.** ECS rolls a failed deployment back to the last
+completed one. With this order that is the target itself for L2a (11) and
+L2b (12); the two diverge only after L4: for the flips from L6 on, the
+breaker goes back to the previous flip's revision, not to R (13). Both are
+safe service states; after L6 the documented way back is the previous
+revision or the flip back (R leaves `plan` stuck).
 
 ### Webhook exposure and registration (D4)
 
@@ -3249,11 +3505,15 @@ and a new binary to the image supply chain.
 - **F3, webhook registration entry point.** Resolved by
   `python -m src.ops.asaas_webhook` (see D4 above). The deploy hook that
   launches it after each deployment is separate work.
-- **Re-pinning after later deployments.** The manifest and the planner pin
+- **Re-pinning after later deployments (done, asaas-rollout-opening
+  Group 5b).** The manifest and the planner pin
   revision 8 as the D3 source (`task_definition.source_revision`, fixed). The
   rollback target is the separate manifest field `rollback_target`, which the
-  planner reads; its only allowed moves are 8 to 9 (gate 6) and then 9 to 10
-  (before the image bump), and 10 is the last pin. From a serving registered
+  planner reads; its safety re-pins were 8 to 9 (gate 6) and then 9 to 10
+  (before the image bump), and since Group 5b it follows the live chain
+  (10 to 11, then 12 and 13, open above;
+  [Re-pinning the rollback target along the live chain](#re-pinning-the-rollback-target-along-the-live-chain)),
+  each move a manifest PR alone. From a serving registered
   D3 revision, `plan` proposes a new revision only for the worker flag alone
   or for the app image digest alone
   ([the image bump](#the-image-bump-app_image_override)). When any other
@@ -3269,9 +3529,11 @@ and a new binary to the image supply chain.
   2026-10-24, revisions 9 and 10, on that image, served on the 037 schema
   after that, and revision 11, on the E7b image, has served since
   2026-10-25 15:04Z, according to the operator's readbacks)
-  is a reviewed change to `ROLLBACK_TARGET_PINS` in the planner, to the
+  was a reviewed change to `ROLLBACK_TARGET_PINS` in the planner, to the
   manifest field and to `rollback_target_revision` of windows `036` and
-  `037` in `scripts/asaas_migration_window.py`.
+  `037` in `scripts/asaas_migration_window.py`; Group 5b made the code
+  change once (the pins 11, 12 and 13, open above, the content rule, window
+  `042` at 12), so each later re-pin is the manifest field alone.
 - **Terraform drift (owner or infra question).** The execution role and the
   task definition family were tagged `ManagedBy=terraform`. Owner approval A4
   (2026-10-19) moves the two ECS roles to `ManagedBy=manual`. Every new

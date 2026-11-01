@@ -131,12 +131,24 @@ RULE_RELATIONS_GONE = "relations_gone"
 # the migrations revision carries the bridge image. 036, 037 and 042 (every
 # window after the first; the table guard below refuses anything else): the
 # image containing the migration runs on every service task and is the
-# migrations revision's image, by digest; the manifest's rollback_target is
-# its last pin, revision 10 (the planner's WORKER_FLAG_REVISION, re-pinned
-# from 9 before the image bump; a test pins the two equal), with no pending
-# re-pin.
+# migrations revision's image, by digest, and the manifest's rollback_target
+# is the window's rollback_target_revision, with no pending re-pin, ACTIVE,
+# by digest. Two modes (asaas-rollout-opening Group 5b):
+# - by number only, up to the last safety pin (ROLLBACK_LAST_SAFETY_PIN, the
+#   planner's WORKER_FLAG_REVISION 10; a test pins the two equal): 036 and
+#   037. Production is at 037 and the manifest moved past 10, so these two
+#   can run again only with a manifest at 10, after a snapshot restore.
+# - by number and by content above it: 042 requires revision 12 (live step
+#   L2a's revision, the last before 042's image) AND that the target carry
+#   exactly one BILLING_FACT_WORKER_ENABLED row, 'true', and differ from the
+#   revision the service runs (the one running the image containing 042, L2b)
+#   in the app image alone (the planner's reviewed_change). That is what the
+#   tool proves, by content; that the target is the very revision L2b
+#   replaced comes from the planner's L2b gate (the service on the target)
+#   and the runbook's stop rule, not from this check.
 IMAGE_RULE_BRIDGE = "migrations_revision_on_bridge_image"
 IMAGE_RULE_DEPLOYED = "service_runs_the_migrations_image"
+ROLLBACK_LAST_SAFETY_PIN = 10
 PHASES = ("register", "snapshot", "pre_read", "run", "verify", "post_read")
 
 
@@ -380,7 +392,7 @@ WINDOW_042 = MigrationWindow(
     command=("alembic", "upgrade", "042"),
     snapshot_prefix="pre-038-042-",
     image_rule=IMAGE_RULE_DEPLOYED,
-    rollback_target_revision=10,
+    rollback_target_revision=12,
     started_by="neurostack-migration-window-042",
     pre_read=ReadSpec(
         phase="pre",
@@ -1618,7 +1630,7 @@ def _snapshot(
 
 def _rollback_target(
     reads: _Reads,
-    window: MigrationWindow,
+    context: Context,
     checks: hook._Checks,
     manifest: Path | None,
 ) -> dict[str, Any]:
@@ -1626,8 +1638,11 @@ def _rollback_target(
 
     Read through the planner (its strict loader and full manifest validation),
     imported here only: the planner imports this module's window table.
+    Above the last safety pin (042) the target is also checked by content
+    against the service revision (_rollback_target_replaced).
     """
 
+    window = context.window
     if window.rollback_target_revision is None:
         return {}
     from scripts import asaas_production_wiring as wiring
@@ -1643,7 +1658,7 @@ def _rollback_target(
     except wiring.WiringError:
         checks.check(False, "manifest_valid", "manifest_invalid")
         return {}
-    info = {"rollback_target_revision": pins.rollback_revision}
+    info: dict[str, Any] = {"rollback_target_revision": pins.rollback_revision}
     if not checks.check(
         pins.rollback_revision == window.rollback_target_revision
         and pins.rollback_repin_before is None,
@@ -1652,13 +1667,10 @@ def _rollback_target(
     ):
         return info
     arn = pins.rollback_task_definition_arn
-    definition = _definition(
-        reads.get(
-            "ecs", "DescribeTaskDefinition", describe_task_definition_request(arn)
-        ),
-        arn,
-        APP_TASK_FAMILY,
+    response = reads.get(
+        "ecs", "DescribeTaskDefinition", describe_task_definition_request(arn)
     )
+    definition = _definition(response, arn, APP_TASK_FAMILY)
     rows = definition.get("containerDefinitions") if definition else None
     apps = [
         row
@@ -1674,7 +1686,72 @@ def _rollback_target(
         "rollback_target_revision_active_digest_pinned",
         "rollback_target_revision_unusable",
     )
+    # An unreadable target (missing read: status incomplete) has no content to
+    # check; only a target that was read is weighed by content.
+    if window.rollback_target_revision > ROLLBACK_LAST_SAFETY_PIN and (
+        definition is not None
+    ):
+        info["rollback_target_change_to_service_revision"] = _rollback_target_replaced(
+            reads, context, response, apps, checks, wiring
+        )
     return info
+
+
+def _rollback_target_replaced(
+    reads: _Reads,
+    context: Context,
+    target_response: Any,
+    apps: list[dict[str, Any]],
+    checks: hook._Checks,
+    wiring: Any,
+) -> str | None:
+    """The target, by content: exactly one BILLING_FACT_WORKER_ENABLED row,
+    'true', in it, and the service revision (``--service-task-definition``,
+    the one running the image that contains the window's migration) differs
+    from it in the app image alone (the planner's ``reviewed_change``). Both
+    are this tool's reads of DescribeTaskDefinition, made the same way;
+    anything else is ``rollback_target_not_repinned``, an unparseable service
+    read too (a ``WiringError``, never a crash). Provenance (the revision L2b
+    replaced) is the planner's L2b gate and the stop rule. Returns the kind
+    of the difference."""
+
+    environment = apps[0].get("environment") if len(apps) == 1 else None
+    workers = [
+        row
+        for row in (environment if isinstance(environment, list) else [])
+        if isinstance(row, dict) and row.get("name") == wiring.WORKER_FLAG_PARAMETER
+    ]
+    checks.check(
+        len(workers) == 1 and workers[0].get("value") == "true",
+        "rollback_target_worker_flag_true",
+        "rollback_target_not_repinned",
+    )
+    service_response = reads.get(
+        "ecs",
+        "DescribeTaskDefinition",
+        describe_task_definition_request(context.service_task_definition),
+    )
+    change = None
+    # The identity guard: a read of another revision is never compared. It is
+    # defence in depth: _service_image already blocks such a read
+    # (service_task_definition_identity_mismatch), so the plan never passes.
+    if (
+        _definition(service_response, context.service_task_definition, APP_TASK_FAMILY)
+        is not None
+    ):
+        try:
+            change = wiring.reviewed_change(
+                target_response, wiring._request_from_response(service_response)
+            )
+        except wiring.WiringError:
+            change = None
+    kind = change[0] if change is not None else None
+    checks.check(
+        kind == "app_image",
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+        "rollback_target_not_repinned",
+    )
+    return kind
 
 
 def _freshness(readback: WindowReadback, checks: hook._Checks, now: datetime) -> int:
@@ -2914,7 +2991,7 @@ def _shared_preconditions(
         "expected_digest": expected_digest,
         "service_tasks": tasks_info,
         "running": running,
-        "manifest": _rollback_target(reads, window, checks, manifest),
+        "manifest": _rollback_target(reads, context, checks, manifest),
     }
 
 
