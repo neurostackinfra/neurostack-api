@@ -1,94 +1,61 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useId, useRef, forwardRef } from "react";
 import {
+  AlertTriangle,
   CreditCard,
-  CheckCircle2,
-  Wallet,
-  Zap,
-  FileText,
-  Plus,
-  Star,
   Loader2,
   ArrowRight,
-  Tag,
   X,
-  Clock,
   RefreshCw,
   ShieldCheck,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { useI18n } from "@/context/i18n";
 import {
-  CreditBalancePanel,
-  PlanUsageSummary,
-  isCreditSummary,
-  readCredit,
-  type BillingUsage,
-  type CreditLoad,
-  type CreditSummary,
-} from "@/components/plan-usage-summary";
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
+import { useI18n } from "@/context/i18n";
+import { PlanUsageSummary } from "@/components/plan-usage-summary";
+import {
+  CreditsAndTopups,
+  type CreditHistoryState,
+  type CreditsPanelState,
+  type TopupMethod,
+} from "@/components/billing/credits-and-topups";
+import { PlanComparison } from "@/components/billing/plan-comparison";
+import { SubscriptionOverview } from "@/components/billing/subscription-overview";
+import type { Txt } from "@/components/billing/format";
 import { navigateToHostedCheckout } from "./billing-navigation";
+import {
+  UUID_PATTERN,
+  authHeaders,
+  isBillingCatalog,
+  isBillingSummary,
+  isCheckoutSession,
+  isCreditCatalog,
+  isCreditLots,
+  isCreditSummary,
+  readBilling,
+  readCredits,
+  type BillingCatalog,
+  type BillingLoad,
+  type BillingSummary,
+  type CheckoutSession,
+  type CreditCatalog,
+  type CreditLots,
+  type CreditSummary,
+} from "./billing-contract";
+import { deriveBillingView, deriveTopupState } from "./billing-view";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-interface BillingSummary {
-  plan: string | null;
-  usage: BillingUsage | null;
-  active_clinics: number;
-  free_tier: number;
-  extra_clinics: number;
-  base_price: number;
-  extra_price: number;
-  total_monthly: number;
-  total_annual: number;
-  discount_pct: number;
-  subscription_status: string;
-  billing_cycle: string;
-  // Group 6b read contract: true only when the server read back that
-  // detached top-ups are commercially open (never set by the browser).
-  topup_commercial_enabled?: boolean;
-}
-
-// `CheckoutResponse` in `src/api/schemas/billing.py`.
-interface CheckoutSession {
-  ok?: boolean;
-  checkout_session_id: string;
-  kind: "subscription" | "topup";
-  state: string;
-  checkout_url?: string | null;
-}
-
 interface SubscriptionPlan {
   offerId: string;
-  name: "Plus" | "Pro" | "Max";
+  name: string;
 }
-
-// Monthly offers of the immutable catalog in `src/services/billing_catalog.py`.
-// Only `offer_id` is sent: price, cycle, clinics and coupon terms are resolved
-// by the server, and the amount is shown on the hosted checkout.
-const SUBSCRIPTION_PLANS: readonly SubscriptionPlan[] = [
-  { offerId: "plan_plus_monthly_v1", name: "Plus" },
-  { offerId: "plan_pro_monthly_v1", name: "Pro" },
-  { offerId: "plan_max_monthly_v1", name: "Max" },
-];
-
-interface TopupPackage {
-  offerId: string;
-  credits: number;
-}
-
-// Detached top-ups of the same immutable catalog (card or PIX). Only
-// `offer_id` and `method` are sent: price, credits, validity and the builder
-// are resolved by the server; the amount is shown on the hosted checkout.
-const TOPUP_PACKAGES: readonly TopupPackage[] = [
-  { offerId: "package_credits_500_v1", credits: 500 },
-  { offerId: "package_credits_1000_v1", credits: 1000 },
-  { offerId: "package_credits_2000_v1", credits: 2000 },
-  { offerId: "package_credits_4000_v1", credits: 4000 },
-];
-type TopupMethod = "credit_card" | "pix";
 
 // `_LIVE_STATES` in `src/services/billing_checkout.py`: the session is still open.
 const LIVE_CHECKOUT_STATES = new Set([
@@ -102,8 +69,6 @@ const LIVE_CHECKOUT_STATES = new Set([
 // Only the opaque session UUID returned by the API is remembered, so the page
 // can re-read that session from the server after the hosted checkout returns.
 const CHECKOUT_SESSION_STORAGE_KEY = "ns_billing_checkout_session";
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -114,10 +79,6 @@ function useToken() {
   } catch {
     return "";
   }
-}
-
-function authHeaders(token: string) {
-  return { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
 }
 
 function readStoredSessionId(): string | null {
@@ -138,34 +99,11 @@ function storeSessionId(value: string | null) {
   }
 }
 
-function isCheckoutSession(value: unknown): value is CheckoutSession {
-  if (!value || typeof value !== "object") return false;
-  const data = value as Record<string, unknown>;
-  return (
-    typeof data.checkout_session_id === "string" &&
-    UUID_PATTERN.test(data.checkout_session_id) &&
-    (data.kind === "subscription" || data.kind === "topup") &&
-    typeof data.state === "string" &&
-    (data.checkout_url === undefined ||
-      data.checkout_url === null ||
-      typeof data.checkout_url === "string")
-  );
-}
-
 /** The backend-built hosted URL, followed only for an `active` HTTPS session. */
 function hostedCheckoutUrl(session: CheckoutSession | null): string | null {
   if (!session || session.state !== "active" || !session.checkout_url) return null;
   try {
     return new URL(session.checkout_url).protocol === "https:" ? session.checkout_url : null;
-  } catch {
-    return null;
-  }
-}
-
-async function readDetail(res: Response): Promise<string | null> {
-  try {
-    const data = (await res.json()) as { detail?: unknown };
-    return typeof data.detail === "string" ? data.detail : null;
   } catch {
     return null;
   }
@@ -187,8 +125,6 @@ function removeReturnMarker() {
     `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`,
   );
 }
-
-type Txt = (p: string, e: string) => string;
 
 function checkoutStateLabel(state: string, txt: Txt) {
   const labels: Record<string, [string, string]> = {
@@ -216,7 +152,7 @@ function checkoutStateLabel(state: string, txt: Txt) {
 }
 
 /** Top-up outcomes that differ from the subscription copy. */
-function topupErrorMessage(status: number, detail: string | null, txt: Txt) {
+function topupErrorMessage(status: number, txt: Txt) {
   if (status === 409 || status === 503) {
     return txt(
       "Recargas estão indisponíveis no momento. Nenhuma cobrança foi criada.",
@@ -229,7 +165,7 @@ function topupErrorMessage(status: number, detail: string | null, txt: Txt) {
       "The server could not confirm whether the checkout was created with the provider. Do not pay again; wait a few minutes and refresh the page.",
     );
   }
-  return checkoutErrorMessage(status, detail, txt);
+  return checkoutErrorMessage(status, txt);
 }
 
 /** `attachment; filename="..."` of the export, or a fixed fallback. */
@@ -240,23 +176,13 @@ function exportFilename(disposition: string | null): string {
 }
 
 /** Simple translated copy per route outcome; backend codes are never shown. */
-function checkoutErrorMessage(status: number, detail: string | null, txt: Txt) {
+function checkoutErrorMessage(status: number, txt: Txt) {
   switch (status) {
     case 202:
       return txt(
         "O servidor não conseguiu confirmar se o checkout foi criado no provedor. Não pague novamente. Para retomar o checkout existente, clique em assinar de novo no mesmo plano: o servidor devolve a sessão já aberta. Ou aguarde alguns minutos e atualize a página.",
         "The server could not confirm whether the checkout was created with the provider. Do not pay again. To resume the existing checkout, click subscribe again on the same plan: the server returns the session already open. Or wait a few minutes and refresh the page.",
       );
-    case 400:
-      return detail === "billing_checkout_coupon_not_eligible"
-        ? txt(
-            "Este cupom não pode ser usado nesta assinatura. Nenhuma cobrança foi criada.",
-            "This coupon cannot be used for this subscription. No charge was created.",
-          )
-        : txt(
-            "Cupom inválido, expirado ou esgotado. Nenhuma cobrança foi criada.",
-            "Invalid, expired or exhausted coupon. No charge was created.",
-          );
     case 401:
       return txt(
         "Sua sessão expirou. Entre novamente para continuar.",
@@ -295,17 +221,35 @@ function checkoutErrorMessage(status: number, detail: string | null, txt: Txt) {
   }
 }
 
-function SectionDivider({ num, label }: { num: string; label: string }) {
+/** Area heading; the number is decorative, the heading names the area. */
+// `tabIndex={-1}`: focus lands here after a retry removes the retry button.
+const AreaHeading = forwardRef<HTMLHeadingElement, { id: string; num: string; label: string }>(function AreaHeading(
+  { id, num, label },
+  ref,
+) {
   return (
     <div className="flex items-center gap-3">
-      <div className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/20 shrink-0">
-        <span className="text-[9px] font-bold text-emerald-500">{num}</span>
+      <div
+        aria-hidden="true"
+        className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500/20 shrink-0"
+      >
+        <span className="text-[9px] font-bold text-emerald-800 dark:text-emerald-500">{num}</span>
       </div>
-      <span className="text-[10px] font-bold uppercase tracking-widest text-emerald-500">{label}</span>
-      <div className="flex-1 h-px bg-emerald-500/20" />
+      <h2
+        ref={ref}
+        id={id}
+        tabIndex={-1}
+        className="text-[10px] font-bold uppercase tracking-widest text-emerald-700 focus:outline-none dark:text-emerald-500"
+      >
+        {label}
+      </h2>
+      <div aria-hidden="true" className="flex-1 h-px bg-emerald-500/20" />
     </div>
   );
-}
+});
+
+/** Marks the header's persistent polite live region (payment notices). */
+const BILLING_STATUS_REGION = "billing-status";
 
 // ── Main Component ───────────────────────────────────────────────────────────
 
@@ -314,18 +258,14 @@ export default function Billing() {
   const txt = useCallback<Txt>((p, e) => (locale === "en" ? e : p), [locale]);
   const token = useToken();
 
-  // State
-  const [summary, setSummary] = useState<BillingSummary | null>(null);
-  const [loading, setLoading] = useState(true);
+  // State: one load per authoritative resource, owned by this page only.
+  const [summary, setSummary] = useState<BillingLoad<BillingSummary>>({ status: "loading" });
+  const [catalog, setCatalog] = useState<BillingLoad<BillingCatalog>>({ status: "loading" });
   const [returnedFromCheckout] = useState(hasReturnMarker);
 
   // Checkout state
   const [showCheckout, setShowCheckout] = useState(false);
   const [selectedPlan, setSelectedPlan] = useState<SubscriptionPlan | null>(null);
-  const [couponCode, setCouponCode] = useState("");
-  const [validatedCoupon, setValidatedCoupon] = useState<{ code: string; percent: number } | null>(null);
-  const [couponError, setCouponError] = useState("");
-  const [couponLoading, setCouponLoading] = useState(false);
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [trackedSession, setTrackedSession] = useState<CheckoutSession | null>(null);
@@ -335,37 +275,65 @@ export default function Billing() {
   // blocked until it is read (or the server says it does not exist).
   const [unreadSessionId, setUnreadSessionId] = useState<string | null>(readStoredSessionId);
   const checkoutRef = useRef<HTMLDivElement>(null);
-  const topupRef = useRef<HTMLDivElement>(null);
+  // A retry button unmounts while its read is loading; focus moves to the
+  // heading of what is being re-read instead of falling to <body>.
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const plansHeadingRef = useRef<HTMLHeadingElement>(null);
+  const creditsHeadingRef = useRef<HTMLHeadingElement>(null);
+  // A checkout POST answered 200 without a provider URL unmounts the button
+  // that sent it; focus then moves to the checkout status card (not <body>).
+  const checkoutStatusRef = useRef<HTMLDivElement>(null);
+  const checkoutStatusLabelId = useId();
+  const focusCheckoutStatus = useRef(false);
 
-  // Credits (Group 6): read from the ledger only; hidden while unavailable.
-  const [credit, setCredit] = useState<CreditLoad<CreditSummary>>({ status: "loading" });
-  const [topupPackage, setTopupPackage] = useState<TopupPackage | null>(null);
-  const [topupMethod, setTopupMethod] = useState<TopupMethod | null>(null);
+  // Credits: read from the ledger only. `unavailable` is the credit switch
+  // being off (feature absent); every other failure stays visible.
+  const [credit, setCredit] = useState<BillingLoad<CreditSummary>>({ status: "loading" });
+  const [lots, setLots] = useState<BillingLoad<CreditLots>>({ status: "loading" });
+  const [creditCatalog, setCreditCatalog] = useState<BillingLoad<CreditCatalog>>({ status: "loading" });
   const [topupLoading, setTopupLoading] = useState(false);
   const [topupError, setTopupError] = useState<string | null>(null);
   const [exportState, setExportState] = useState<"idle" | "loading" | "unavailable" | "error">(
     "idle",
   );
 
-  // Fetch summary
+  // Fetch summary: a failed or refused read stays a failure, never a default.
+  // A re-read keeps the last good answer on screen (no area flickers away);
+  // a retry after a failure shows loading.
   const fetchSummary = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetch("/v1/billing/summary", { headers: authHeaders(token) });
-      if (res.ok) {
-        setSummary(await res.json());
-      }
-    } catch {
-      // Checkout stays unavailable until the server state is read.
-    } finally {
-      setLoading(false);
-    }
+    setSummary((prev) => (prev.status === "ok" ? prev : { status: "loading" }));
+    setSummary(await readBilling("/v1/billing/summary", token, isBillingSummary));
+  }, [token]);
+
+  // The backend-owned catalog: every price, credit and clinic shown for a plan.
+  const fetchCatalog = useCallback(async () => {
+    setCatalog({ status: "loading" });
+    setCatalog(await readBilling("/v1/billing/catalog", token, isBillingCatalog));
+  }, [token]);
+
+  // The lots: the only credit history of the contract (no cursor, no paging).
+  const fetchLots = useCallback(async () => {
+    setLots((prev) => (prev.status === "ok" ? prev : { status: "loading" }));
+    setLots(await readCredits("/v1/credits/lots", token, isCreditLots));
   }, [token]);
 
   // The credit summary: the ledger's figures, never anticipated by the page.
+  // A re-read keeps the last ledger answer on screen until the new one
+  // arrives; a retry after a failure shows loading. The lots and the
+  // packages are read only once the ledger answered: with the switch off
+  // there is nothing more to ask.
   const fetchCredit = useCallback(async () => {
-    setCredit(await readCredit("/v1/credits/summary", token, isCreditSummary));
-  }, [token]);
+    setCredit((prev) => (prev.status === "ok" ? prev : { status: "loading" }));
+    const result = await readCredits("/v1/credits/summary", token, isCreditSummary);
+    setCredit(result);
+    if (result.status !== "ok") return;
+    await Promise.all([
+      fetchLots(),
+      (async () => {
+        setCreditCatalog(await readCredits("/v1/credits/catalog", token, isCreditCatalog));
+      })(),
+    ]);
+  }, [token, fetchLots]);
 
   // Read (or ask the server to reconcile) one checkout session by its UUID.
   const fetchSession = useCallback(
@@ -434,55 +402,92 @@ export default function Billing() {
     if (initialReadStarted.current) return;
     initialReadStarted.current = true;
     void fetchSummary();
+    void fetchCatalog();
     // After a checkout return or a PIX QR code the ledger is re-read like
     // the order: a grant shows only once the server applied it.
     void fetchCredit();
     const storedSessionId = readStoredSessionId();
     if (storedSessionId) void fetchSession(storedSessionId);
-  }, [fetchSummary, fetchSession, fetchCredit]);
+  }, [fetchSummary, fetchCatalog, fetchSession, fetchCredit]);
 
-  // Plan values are intentionally not displayed until pricing is finalized;
-  // the backend computes the checkout amount, shown on the hosted checkout.
-  const subscriptionStatus = summary?.subscription_status ?? "trial";
+  useEffect(() => {
+    if (focusCheckoutStatus.current && checkoutStatusRef.current) {
+      focusCheckoutStatus.current = false;
+      checkoutStatusRef.current.focus();
+    }
+  });
+
+  // ── Derived state: the commercial view is read only in `billing-view` ────
+  const {
+    summaryData,
+    subscription,
+    accessDenied,
+    overviewState,
+    usageState,
+    plans,
+    comparisonState,
+    plansNotice,
+    contextAlert,
+  } = deriveBillingView({ summary, catalog, txt });
+
+  // Pending signals, all read from the server: this tab's tracked session
+  // (or a stored id not yet read back) and the summary's `live_session`, the
+  // builder's newest live attempt, which survives a redirect, a refresh and
+  // another tab. Any of them blocks subscribing and top-ups until the server
+  // reports otherwise; none of them ever confirms a subscription or credits.
+  const liveSession = summaryData?.checkout.live_session ?? null;
   const sessionInProgress =
     trackedSession !== null && LIVE_CHECKOUT_STATES.has(trackedSession.state);
-  const checkoutBlocked =
-    summary === null ||
-    summary.subscription_status === "active" ||
-    sessionInProgress ||
-    unreadSessionId !== null;
-  const trackedCheckoutUrl = hostedCheckoutUrl(trackedSession);
-  // Top-ups are offered only when the credit switch is effective (the
-  // ledger answered) AND the server read back `topup_commercial_enabled`.
-  const topupOffered =
-    credit.status === "ok" && summary?.topup_commercial_enabled === true;
-  const topupBlocked =
-    summary === null || sessionInProgress || unreadSessionId !== null;
-
-  // Validate coupon
-  const handleApplyCoupon = async () => {
-    const code = couponCode.trim();
-    if (!code) return;
-    setCouponLoading(true);
-    setCouponError("");
-    setValidatedCoupon(null);
-    try {
-      const res = await fetch(`/v1/billing/coupon/${encodeURIComponent(code)}`, {
-        headers: authHeaders(token),
-      });
-      const data = await res.json();
-      if (res.ok && data.valid && typeof data.discount_percent === "number") {
-        setValidatedCoupon({ code: data.code ?? code, percent: data.discount_percent });
-        setCouponError("");
-      } else {
-        setCouponError(data.message || txt("Cupom inválido", "Invalid coupon"));
-      }
-    } catch {
-      setCouponError(txt("Erro ao validar cupom", "Error validating coupon"));
-    } finally {
-      setCouponLoading(false);
-    }
-  };
+  const checkoutLive = sessionInProgress || unreadSessionId !== null || liveSession !== null;
+  const checkoutBlocked = summaryData === null || checkoutLive;
+  const checkoutBlockedReason = checkoutLive
+    ? txt(
+        "Há um checkout em andamento nesta conta. Novas assinaturas ficam bloqueadas até o servidor confirmar o estado dele.",
+        "A checkout is in progress on this account. New subscriptions stay blocked until the server confirms its state.",
+      )
+    : null;
+  // The status card shows the tracked session, or else the summary's live
+  // attempt (which carries no provider URL, so it offers no hosted link).
+  const shownSession: CheckoutSession | null =
+    trackedSession &&
+    (sessionInProgress || liveSession === null || liveSession.checkout_session_id === trackedSession.checkout_session_id)
+      ? trackedSession
+      : liveSession
+        ? {
+            checkout_session_id: liveSession.checkout_session_id,
+            kind: liveSession.kind,
+            state: liveSession.state,
+            checkout_url: null,
+          }
+        : trackedSession;
+  const trackedCheckoutUrl = hostedCheckoutUrl(shownSession);
+  const shownIsLive =
+    shownSession !== null &&
+    (LIVE_CHECKOUT_STATES.has(shownSession.state) ||
+      shownSession.checkout_session_id === liveSession?.checkout_session_id);
+  const topup = deriveTopupState({ summary, credit, creditCatalog, checkoutLive, txt });
+  // Areas 02 and 03 appear only once the summary was read, or failed with an
+  // explicit state: never while it may still answer 401/403.
+  const summarySettled =
+    summary.status === "ok" || summary.status === "unavailable" || summary.status === "error";
+  // `503 {"code": "credit_unavailable"}` (and only that answer) is the credit
+  // switch being off: a feature not launched, so area 03 does not exist at
+  // all. Every other credit failure keeps the area with its own error.
+  const creditsLaunched = credit.status !== "unavailable";
+  const creditsState: CreditsPanelState =
+    credit.status === "ok"
+      ? { status: "ready", summary: credit.data }
+      : credit.status === "loading"
+        ? { status: "loading" }
+        : credit.status === "forbidden" || credit.status === "unauthorized"
+          ? { status: "forbidden" }
+          : { status: "error" };
+  const historyState: CreditHistoryState =
+    lots.status === "ok"
+      ? { status: "ready", lots: lots.data.lots }
+      : lots.status === "loading"
+        ? { status: "loading" }
+        : { status: "error" };
 
   // Checkout: exactly one POST; the browser never activates anything.
   const handleCheckout = async () => {
@@ -493,61 +498,60 @@ export default function Billing() {
       const res = await fetch("/v1/billing/checkout", {
         method: "POST",
         headers: authHeaders(token),
-        body: JSON.stringify({
-          offer_id: selectedPlan.offerId,
-          method: "credit_card",
-          ...(validatedCoupon ? { coupon_code: validatedCoupon.code } : {}),
-        }),
+        body: JSON.stringify({ offer_id: selectedPlan.offerId, method: "credit_card" }),
       });
       // 202 is an `ok` status but carries only a reconciliation code.
       if (res.status !== 200) {
-        const detail = await readDetail(res);
-        if (res.status === 400) setValidatedCoupon(null);
-        setCheckoutError(checkoutErrorMessage(res.status, detail, txt));
+        setCheckoutError(checkoutErrorMessage(res.status, txt));
         return;
       }
       const data: unknown = await res.json();
       if (!isCheckoutSession(data)) {
-        setCheckoutError(checkoutErrorMessage(0, null, txt));
+        setCheckoutError(checkoutErrorMessage(0, txt));
         return;
       }
       setTrackedSession(data);
       storeSessionId(LIVE_CHECKOUT_STATES.has(data.state) ? data.checkout_session_id : null);
       const url = hostedCheckoutUrl(data);
       if (url) navigateToHostedCheckout(url);
+      else focusCheckoutStatus.current = true;
     } catch {
-      setCheckoutError(checkoutErrorMessage(0, null, txt));
+      setCheckoutError(checkoutErrorMessage(0, txt));
     } finally {
       setCheckoutLoading(false);
     }
   };
 
-  // Top-up: exactly one POST of `offer_id` and `method`; nothing else.
-  const handleTopup = async () => {
-    if (!topupOffered || topupBlocked || !topupPackage || !topupMethod || topupLoading) return;
+  // Top-up: exactly one POST of `offer_id` and `method`; nothing else. The
+  // offer must be one the server offered in this very render.
+  const handleTopup = async (offerId: string, method: TopupMethod) => {
+    if (topup.status !== "offered" || topupLoading) return;
+    const offered = topup.packages.find((pkg) => pkg.offerId === offerId);
+    if (!offered || !offered.methods.includes(method)) return;
     setTopupLoading(true);
     setTopupError(null);
     try {
       const res = await fetch("/v1/billing/checkout", {
         method: "POST",
         headers: authHeaders(token),
-        body: JSON.stringify({ offer_id: topupPackage.offerId, method: topupMethod }),
+        body: JSON.stringify({ offer_id: offered.offerId, method }),
       });
       if (res.status !== 200) {
-        setTopupError(topupErrorMessage(res.status, await readDetail(res), txt));
+        setTopupError(topupErrorMessage(res.status, txt));
         return;
       }
       const data: unknown = await res.json();
       if (!isCheckoutSession(data)) {
-        setTopupError(checkoutErrorMessage(0, null, txt));
+        setTopupError(checkoutErrorMessage(0, txt));
         return;
       }
       setTrackedSession(data);
       storeSessionId(LIVE_CHECKOUT_STATES.has(data.state) ? data.checkout_session_id : null);
       const url = hostedCheckoutUrl(data);
       if (url) navigateToHostedCheckout(url);
+      else focusCheckoutStatus.current = true;
     } catch {
-      setTopupError(checkoutErrorMessage(0, null, txt));
+      setTopupError(checkoutErrorMessage(0, txt));
     } finally {
       setTopupLoading(false);
     }
@@ -584,12 +588,10 @@ export default function Billing() {
     }
   };
 
-  const openTopups = () =>
-    topupRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-
-  const openCheckout = (plan: SubscriptionPlan) => {
-    if (checkoutBlocked) return;
-    setSelectedPlan(plan);
+  const openCheckout = (offerId: string) => {
+    const plan = plans.find((item) => item.offerId === offerId);
+    if (checkoutBlocked || !plan?.canSubscribe) return;
+    setSelectedPlan({ offerId: plan.offerId, name: plan.name });
     setShowCheckout(true);
     setCheckoutError(null);
     setTimeout(() => checkoutRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
@@ -597,47 +599,99 @@ export default function Billing() {
 
   // ── Render ───────────────────────────────────────────────────────────────
 
-  return (
-    <div className="space-y-8 max-w-4xl">
-      {/* ── Page header ──────────────────────────────────────────────────── */}
-      <div className="space-y-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-              <CreditCard className="h-5 w-5 text-emerald-500" />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight text-foreground">
-                {txt("Faturamento e Gestão de Assinatura", "Billing & Subscription Management")}
-              </h1>
-              <p className="text-sm font-medium text-foreground/70 mt-0.5">
-                {txt(
-                  "Gerencie seu plano, pagamentos e assinatura NeuroStack",
-                  "Manage your NeuroStack plan, payments and subscription"
-                )}
-              </p>
-            </div>
-          </div>
-          {subscriptionStatus === "active" && (
-            <Badge className="shrink-0 mt-1 bg-emerald-500/15 border-emerald-500/30 text-emerald-400 text-[10px] uppercase tracking-wider px-3 py-1.5">
-              <CheckCircle2 className="h-3 w-3 mr-1.5" />
-              {txt("Assinatura Ativa", "Active Subscription")}
-            </Badge>
-          )}
-          {subscriptionStatus === "trial" && (
-            <Badge variant="outline" className="shrink-0 mt-1 bg-amber-500/10 border-amber-500/30 text-amber-400 text-[10px] uppercase tracking-wider px-3 py-1.5">
-              <Clock className="h-3 w-3 mr-1.5" />
-              Trial
-            </Badge>
-          )}
+  const errorAlert = contextAlert?.tone === "error" ? contextAlert : null;
+  const statusNotice = contextAlert?.tone === "status" ? contextAlert.message : null;
+
+  const header = (
+    <header className="space-y-2">
+      <Breadcrumb aria-label={txt("Trilha de navegação", "Breadcrumb")}>
+        <BreadcrumbList className="text-xs">
+          <BreadcrumbItem>NeuroStack</BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbPage>{txt("Financeiro", "Finance")}</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+          <CreditCard className="h-5 w-5 text-emerald-500" aria-hidden="true" />
+        </div>
+        <div>
+          <h1 ref={titleRef} tabIndex={-1} className="text-2xl font-bold tracking-tight text-foreground focus:outline-none">
+            {txt("Pagamento", "Payment")}
+          </h1>
+          <p className="text-sm font-medium text-foreground/70 mt-0.5">
+            {txt(
+              "Acompanhe sua assinatura, o consumo do plano e seus créditos.",
+              "Track your subscription, plan usage and credits.",
+            )}
+          </p>
         </div>
       </div>
+      {errorAlert && (
+        <div
+          data-testid="billing-context-alert"
+          role="alert"
+          className="flex flex-wrap items-start gap-3 rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <span className="flex-1">{errorAlert.message}</span>
+          {errorAlert.retry && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="gap-1.5"
+              onClick={() => {
+                titleRef.current?.focus();
+                void fetchSummary();
+              }}
+            >
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              {txt("Tentar novamente", "Try again")}
+            </Button>
+          )}
+        </div>
+      )}
+      {/* Mounted empty from the first render so a notice written into it is
+          announced; it takes the status role and the visible box only while
+          it holds a message (empty, `-mt-2` cancels the header spacing). */}
+      <div
+        data-live-region={BILLING_STATUS_REGION}
+        aria-live="polite"
+        aria-atomic="true"
+        {...(statusNotice ? { role: "status", "data-testid": "billing-context-alert" } : {})}
+        className={
+          statusNotice
+            ? "flex flex-wrap items-start gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-800 dark:text-amber-300"
+            : "-mt-2"
+        }
+      >
+        {statusNotice && (
+          <>
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="flex-1">{statusNotice}</span>
+          </>
+        )}
+      </div>
+    </header>
+  );
+
+  // Denied access shows nothing financial: no plan, catalog, usage or credit.
+  if (accessDenied) {
+    return <div className="space-y-8 max-w-4xl">{header}</div>;
+  }
+
+  return (
+    <div className="space-y-8 max-w-4xl">
+      {header}
 
       {/* ── Hosted checkout return / tracked session (server state only) ── */}
       {returnedFromCheckout && (
         <Card className="border-amber-500/30 bg-amber-500/5">
           <CardContent className="pt-5 flex items-start gap-3 text-sm">
-            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-400" />
             <span>
               {txt(
                 "Você voltou do checkout hospedado. O retorno não confirma pagamento: o estado exibido é relido do servidor e só muda depois que o provedor confirmar.",
@@ -674,12 +728,21 @@ export default function Billing() {
           </CardContent>
         </Card>
       )}
-      {trackedSession && (
-        <Card className="border-amber-500/30 bg-amber-500/5" role="status">
+      {shownSession && (
+        <Card
+          ref={checkoutStatusRef}
+          tabIndex={-1}
+          aria-labelledby={checkoutStatusLabelId}
+          className="border-amber-500/30 bg-amber-500/5 focus:outline-none"
+          role="status"
+          data-testid="checkout-status"
+        >
           <CardContent className="pt-5 space-y-3 text-sm">
-            <p className="font-semibold text-foreground">{checkoutStateLabel(trackedSession.state, txt)}</p>
+            <p id={checkoutStatusLabelId} className="font-semibold text-foreground">
+              {checkoutStateLabel(shownSession.state, txt)}
+            </p>
             <p className="text-xs text-muted-foreground">
-              {trackedSession.kind === "topup"
+              {shownSession.kind === "topup"
                 ? txt(
                     "Este estado vem do servidor. Os créditos só entram no saldo depois que o pagamento for confirmado e registrado; o retorno do checkout ou o QR do PIX não adicionam créditos.",
                     "This state comes from the server. Credits only reach the balance once the payment is confirmed and recorded; returning from checkout or a PIX QR code adds no credits.",
@@ -689,8 +752,8 @@ export default function Billing() {
                     "This state comes from the server. The subscription only shows as active after the provider confirms.",
                   )}
             </p>
-            {trackedSession.state === "reconciliation_required" && (
-              <p className="text-xs font-medium text-amber-400">
+            {shownSession.state === "reconciliation_required" && (
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
                 {txt(
                   "Não inicie outro checkout enquanto esta verificação estiver aberta.",
                   "Do not start another checkout while this verification is open.",
@@ -700,35 +763,35 @@ export default function Billing() {
             <div className="flex flex-wrap gap-2">
               {trackedCheckoutUrl && (
                 <Button size="sm" className="gap-1.5" onClick={() => navigateToHostedCheckout(trackedCheckoutUrl)}>
-                  <ArrowRight className="h-3.5 w-3.5" />
+                  <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
                   {txt("Abrir checkout hospedado", "Open hosted checkout")}
                 </Button>
               )}
-              {LIVE_CHECKOUT_STATES.has(trackedSession.state) && (
+              {shownIsLive && (
                 <Button
                   variant="outline"
                   size="sm"
                   className="gap-1.5"
                   disabled={sessionLoading}
                   onClick={() => {
-                    void fetchSession(trackedSession.checkout_session_id);
+                    void fetchSession(shownSession.checkout_session_id);
                     void fetchSummary();
                     void fetchCredit();
                   }}
                 >
-                  <RefreshCw className="h-3.5 w-3.5" />
+                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                   {txt("Atualizar estado", "Refresh state")}
                 </Button>
               )}
-              {(trackedSession.state === "creating" || trackedSession.state === "reconciliation_required") && (
+              {(shownSession.state === "creating" || shownSession.state === "reconciliation_required") && (
                 <Button
                   variant="outline"
                   size="sm"
                   className="gap-1.5"
                   disabled={sessionLoading}
-                  onClick={() => void fetchSession(trackedSession.checkout_session_id, true)}
+                  onClick={() => void fetchSession(shownSession.checkout_session_id, true)}
                 >
-                  <ShieldCheck className="h-3.5 w-3.5" />
+                  <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
                   {txt("Verificar com o provedor", "Verify with the provider")}
                 </Button>
               )}
@@ -737,285 +800,128 @@ export default function Billing() {
         </Card>
       )}
 
-      {/* ── Section 01: Plano Atual ──────────────────────────────────────── */}
-      <div className="space-y-3">
-        <SectionDivider num="01" label={txt("Plano Atual", "Current Plan")} />
+      {/* ── Area 01: Assinatura e uso ───────────────────────────────────── */}
+      <section aria-labelledby="billing-area-subscription" className="space-y-3" data-testid="billing-area">
+        <AreaHeading id="billing-area-subscription" num="01" label={txt("Assinatura e uso", "Subscription and usage")} />
+        <SubscriptionOverview state={overviewState} locale={locale} />
+        <PlanUsageSummary
+          state={usageState}
+          locale={locale}
+          variant="billing"
+        />
+      </section>
 
+      {summarySettled && (
+        <>
+          {/* ── Area 02: Planos ─────────────────────────────────────────────── */}
+          <section aria-labelledby="billing-area-plans" className="space-y-3" data-testid="billing-area">
+            <AreaHeading ref={plansHeadingRef} id="billing-area-plans" num="02" label={txt("Planos", "Plans")} />
+            <PlanComparison
+              state={comparisonState}
+              locale={locale}
+              onSubscribe={openCheckout}
+              onRetry={() => {
+                plansHeadingRef.current?.focus();
+                void fetchCatalog();
+              }}
+              actionBlockedReason={checkoutBlockedReason}
+              notice={plansNotice}
+            />
 
-        {loading ? (
-          <Card className="border-border/60 bg-card">
-            <CardContent className="pt-5 flex items-center justify-center py-12">
-              <Loader2 className="h-6 w-6 animate-spin text-emerald-500" />
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {/* Monthly card subscriptions (catalog offers) */}
-            {SUBSCRIPTION_PLANS.map((plan) => (
-              <Card key={plan.offerId} className="border-emerald-500/30 bg-gradient-to-b from-emerald-500/5 to-transparent relative">
-                <CardContent className="pt-6 space-y-4">
-                  <div className="flex items-center gap-2">
-                    <Star className="h-5 w-5 text-emerald-500" />
-                    <p className="text-lg font-bold text-foreground">NeuroStack {plan.name}</p>
-                  </div>
-                  <div className="text-xs text-muted-foreground space-y-1.5 border-t border-border/40 pt-3">
-                    <p className="text-foreground/80 font-medium">
-                      {txt("Assinatura mensal no cartão de crédito", "Monthly credit card subscription")}
+            {showCheckout && selectedPlan && !checkoutBlocked && (
+              <div ref={checkoutRef}>
+                <Card className="border-emerald-500/20 bg-card">
+                  <CardHeader className="pb-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <CreditCard className="h-4 w-4 text-emerald-500" aria-hidden="true" />
+                        <CardTitle className="text-sm font-semibold text-foreground">
+                          {txt(`Finalizar Assinatura NeuroStack ${selectedPlan.name}`, `Complete NeuroStack ${selectedPlan.name} Subscription`)}
+                        </CardTitle>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={txt("Fechar", "Close")}
+                        onClick={() => setShowCheckout(false)}
+                        className="h-7 w-7 p-0"
+                      >
+                        <X className="h-4 w-4" aria-hidden="true" />
+                      </Button>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-5">
+                    {/* Monthly card only, on the provider-hosted checkout */}
+                    <p className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
+                      {txt(
+                        "Assinatura mensal no cartão de crédito. Os dados do cartão são informados somente no checkout hospedado do ASAAS, que exibe o valor final calculado pelo servidor.",
+                        "Monthly credit card subscription. Card details are entered only on the ASAAS-hosted checkout, which shows the final amount computed by the server.",
+                      )}
                     </p>
-                  </div>
-                  {subscriptionStatus === "active" ? (
-                    <Button disabled variant="outline" className="w-full opacity-60 cursor-not-allowed">
-                      {txt("Gerenciar Assinatura", "Manage Subscription")}
-                    </Button>
-                  ) : (
+
+                    {/* Pay button */}
                     <Button
                       className="w-full gap-2"
-                      disabled={checkoutBlocked}
-                      onClick={() => openCheckout(plan)}
+                      onClick={() => void handleCheckout()}
+                      disabled={checkoutLoading}
                     >
-                      <Zap className="h-4 w-4" />
-                      {txt(`Assinar ${plan.name}`, `Subscribe to ${plan.name}`)}
+                      {checkoutLoading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ArrowRight className="h-4 w-4" />
+                      )}
+                      {txt("Continuar para o checkout seguro", "Continue to secure checkout")}
                     </Button>
-                  )}
-                </CardContent>
-              </Card>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {summary?.usage && (
-        <PlanUsageSummary
-          usage={summary.usage}
-          locale={locale}
-          {...(topupOffered ? { creditPurchase: { enabled: true, onBuy: openTopups } } : {})}
-        />
-      )}
-
-      {/* ── Section 02: Credits ─────────────────────────────────────────── */}
-      <div className="space-y-3" ref={topupRef}>
-        <SectionDivider num="02" label={txt("Recarga de Créditos (Add-ons)", "Credit Top-Up (Add-ons)")} />
-        {credit.status === "ok" && (
-          <CreditBalancePanel
-            summary={credit.data}
-            locale={locale}
-            exportAction={{
-              onExport: () => void handleExport(),
-              disabled: exportState === "unavailable",
-              loading: exportState === "loading",
-              message:
-                exportState === "unavailable"
-                  ? txt(
-                      "Exportação indisponível no momento.",
-                      "Export is unavailable right now.",
-                    )
-                  : exportState === "error"
-                    ? txt(
-                        "Não foi possível exportar agora. Tente novamente.",
-                        "The export failed. Try again.",
-                      )
-                    : null,
-            }}
-          />
-        )}
-        {topupOffered ? (
-          <Card className="border-emerald-500/20 bg-card" data-testid="topup-offer">
-            <CardHeader className="pb-3">
-              <div className="flex items-center gap-2">
-                <Wallet className="h-4 w-4 text-emerald-500" />
-                <CardTitle className="text-sm font-semibold text-foreground">
-                  {txt("Recargas de créditos", "Credit top-ups")}
-                </CardTitle>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <p className="text-xs text-muted-foreground">
-                {txt(
-                  "Recarga avulsa, válida por 6 meses, paga no checkout hospedado do ASAAS. Os créditos entram no saldo somente depois que o pagamento for confirmado.",
-                  "One-off top-up, valid for 6 months, paid on the ASAAS-hosted checkout. Credits reach the balance only after the payment is confirmed.",
-                )}
-              </p>
-              <div className="grid grid-cols-2 gap-2 md:grid-cols-4" role="group" aria-label={txt("Pacote", "Package")}>
-                {TOPUP_PACKAGES.map((item) => (
-                  <Button
-                    key={item.offerId}
-                    type="button"
-                    variant={topupPackage?.offerId === item.offerId ? "default" : "outline"}
-                    aria-pressed={topupPackage?.offerId === item.offerId}
-                    disabled={topupBlocked}
-                    onClick={() => setTopupPackage(item)}
-                  >
-                    {txt(
-                      `${item.credits.toLocaleString("pt-BR")} créditos`,
-                      `${item.credits.toLocaleString("en-US")} credits`,
+                    {checkoutError && (
+                      <p role="alert" className="text-sm text-destructive mt-2">{checkoutError}</p>
                     )}
-                  </Button>
-                ))}
+                  </CardContent>
+                </Card>
               </div>
-              <div className="flex gap-2" role="group" aria-label={txt("Forma de pagamento", "Payment method")}>
-                {(["credit_card", "pix"] as const).map((method) => (
-                  <Button
-                    key={method}
-                    type="button"
-                    size="sm"
-                    variant={topupMethod === method ? "default" : "outline"}
-                    aria-pressed={topupMethod === method}
-                    disabled={topupBlocked}
-                    onClick={() => setTopupMethod(method)}
-                  >
-                    {method === "pix" ? "PIX" : txt("Cartão de crédito", "Credit card")}
-                  </Button>
-                ))}
-              </div>
-              <Button
-                className="w-full gap-2"
-                disabled={topupBlocked || !topupPackage || !topupMethod || topupLoading}
-                onClick={() => void handleTopup()}
-              >
-                {topupLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                {txt("Comprar recarga", "Buy top-up")}
-              </Button>
-              {topupError && (
-                <p role="alert" className="text-sm text-destructive">{topupError}</p>
-              )}
-            </CardContent>
-          </Card>
-        ) : (
-        <Card className="border-border/60 bg-card opacity-80">
-          <CardHeader className="pb-3">
-            <div className="flex items-center gap-2">
-              <Wallet className="h-4 w-4 text-emerald-500" />
-              <CardTitle className="text-sm font-semibold text-foreground">
-                {txt("Recargas de créditos", "Credit top-ups")}
-              </CardTitle>
-              <Badge variant="outline" className="text-[9px] text-muted-foreground ml-auto">
-                {txt("Indisponível", "Unavailable")}
-              </Badge>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Button disabled size="sm" variant="outline" className="gap-2 opacity-50 cursor-not-allowed border-border/60 w-full">
-              <Plus className="h-3.5 w-3.5" />
-              {txt("Recargas indisponíveis", "Top-ups unavailable")}
-            </Button>
-          </CardContent>
-        </Card>
-        )}
-      </div>
+            )}
+          </section>
 
-      {/* ── Section 03: Checkout ──────────────────────────────────────────── */}
-      {showCheckout && selectedPlan && !checkoutBlocked && (
-        <div ref={checkoutRef} className="space-y-3">
-          <SectionDivider num="03" label={txt("Checkout / Pagamento", "Checkout / Payment")} />
-          <Card className="border-emerald-500/20 bg-card">
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <CreditCard className="h-4 w-4 text-emerald-500" />
-                  <CardTitle className="text-sm font-semibold text-foreground">
-                    {txt(`Finalizar Assinatura NeuroStack ${selectedPlan.name}`, `Complete NeuroStack ${selectedPlan.name} Subscription`)}
-                  </CardTitle>
-                </div>
-                <Button variant="ghost" size="sm" onClick={() => setShowCheckout(false)} className="h-7 w-7 p-0">
-                  <X className="h-4 w-4" />
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-5">
-              {/* Coupon input */}
-              <div className="space-y-2">
-                <label htmlFor="billing-coupon" className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
-                  <Tag className="h-3 w-3" />
-                  {txt("Cupom de Desconto", "Discount Coupon")}
-                </label>
-                <div className="flex gap-2">
-                  <Input
-                    id="billing-coupon"
-                    value={couponCode}
-                    maxLength={50}
-                    onChange={(e) => {
-                      setCouponCode(e.target.value.toUpperCase());
-                      setValidatedCoupon(null);
-                    }}
-                    placeholder={txt("Digite o código do cupom", "Enter coupon code")}
-                    className="font-mono uppercase text-sm"
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleApplyCoupon()}
-                    disabled={couponLoading || !couponCode.trim()}
-                    className="shrink-0 px-4"
-                  >
-                    {couponLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : txt("Aplicar", "Apply")}
-                  </Button>
-                </div>
-                {couponError && <p className="text-xs text-red-500 font-medium">{couponError}</p>}
-                {validatedCoupon && (
-                  <div className="flex items-center gap-2 text-xs">
-                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
-                    <span className="text-emerald-400 font-semibold">
-                      {txt(`Cupom aplicado: ${validatedCoupon.percent}% de desconto`, `Coupon applied: ${validatedCoupon.percent}% off`)}
-                    </span>
-                    <button type="button" aria-label={txt("Remover cupom", "Remove coupon")} onClick={() => { setValidatedCoupon(null); setCouponCode(""); }} className="text-muted-foreground hover:text-foreground">
-                      <X className="h-3 w-3" />
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Monthly card only, on the provider-hosted checkout */}
-              <p className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
-                {txt(
-                  "Assinatura mensal no cartão de crédito. Os dados do cartão são informados somente no checkout hospedado do ASAAS, que exibe o valor final calculado pelo servidor.",
-                  "Monthly credit card subscription. Card details are entered only on the ASAAS-hosted checkout, which shows the final amount computed by the server.",
-                )}
-              </p>
-
-              {/* Pay button */}
-              <Button
-                className="w-full gap-2"
-                onClick={() => void handleCheckout()}
-                disabled={checkoutLoading}
-              >
-                {checkoutLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <ArrowRight className="h-4 w-4" />
-                )}
-                {txt("Continuar para o checkout seguro", "Continue to secure checkout")}
-              </Button>
-              {checkoutError && (
-                <p role="alert" className="text-sm text-destructive mt-2">{checkoutError}</p>
-              )}
-            </CardContent>
-          </Card>
-        </div>
+          {/* ── Area 03: Créditos e recargas (absent while credits are not launched) ── */}
+          {creditsLaunched && (
+            <section aria-labelledby="billing-area-credits" className="space-y-3" data-testid="billing-area">
+              <AreaHeading
+                ref={creditsHeadingRef}
+                id="billing-area-credits"
+                num="03"
+                label={txt("Créditos e recargas", "Credits and top-ups")}
+              />
+              <CreditsAndTopups
+                state={creditsState}
+                history={historyState}
+                topup={topup}
+                locale={locale}
+                onRetry={() => {
+                  creditsHeadingRef.current?.focus();
+                  void fetchCredit();
+                }}
+                onRetryHistory={() => {
+                  creditsHeadingRef.current?.focus();
+                  void fetchLots();
+                }}
+                exportAction={{
+                  onExport: () => void handleExport(),
+                  disabled: exportState === "unavailable",
+                  loading: exportState === "loading",
+                  message:
+                    exportState === "unavailable"
+                      ? txt("Exportação indisponível no momento.", "Export is unavailable right now.")
+                      : exportState === "error"
+                        ? txt("Não foi possível exportar agora. Tente novamente.", "The export failed. Try again.")
+                        : null,
+                }}
+                onBuy={(offerId, method) => void handleTopup(offerId, method)}
+                buying={topupLoading}
+                buyError={topupError}
+              />
+            </section>
+          )}
+        </>
       )}
-
-      {/* ── Section 04: Invoice History (skeleton) ────────────────────────── */}
-      <div className="space-y-3">
-        <SectionDivider num="04" label={txt("Histórico de Faturas", "Invoice History")} />
-        <Card className="border-border/60 bg-card opacity-80">
-          <CardHeader className="pb-3">
-            <div className="flex items-center gap-2">
-              <FileText className="h-4 w-4 text-emerald-500" />
-              <CardTitle className="text-sm font-semibold text-foreground">
-                {txt("Transações Recentes", "Recent Transactions")}
-              </CardTitle>
-              <Badge variant="outline" className="text-[9px] text-muted-foreground ml-auto">Roadmap</Badge>
-            </div>
-          </CardHeader>
-          <CardContent>
-            <div className="py-6 text-center">
-              <FileText className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
-              <p className="text-xs text-muted-foreground">
-                {txt("Histórico de faturas estará disponível em breve", "Invoice history will be available soon")}
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
     </div>
   );
 }

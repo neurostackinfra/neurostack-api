@@ -4,8 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CreditAllocationNotice,
   PlanUsageSummary,
-  formatCredits,
-  isCreditSummary,
+  isCreditReservations,
   readCredit,
   type BillingUsage,
 } from "./plan-usage-summary";
@@ -132,6 +131,86 @@ describe("<PlanUsageSummary />", () => {
   });
 });
 
+// ── Payments page variant and read states (tela-pagamentos Group 1) ─────────
+
+const zeroUsage: BillingUsage = {
+  ...usage,
+  traces: { used: 0, included: 300, extra_credits: 0, available: 300, overage: 0, percent_used: 0 },
+  storage: {
+    rag: { ...usage.storage.rag, used_bytes: 0, used_mb: 0, available_mb: 64, limit_mb: 64, overage_bytes: 0, overage_mb: 0, percent_used: 0 },
+    media: { ...usage.storage.media, used_bytes: 0, used_mb: 0, available_mb: 32, limit_mb: 32, overage_bytes: 0, overage_mb: 0, percent_used: 0 },
+  },
+};
+
+describe("<PlanUsageSummary /> states", () => {
+  afterEach(cleanup);
+
+  it.each(["pt", "en"] as const)("gives loading, unavailable and error their own copy and no figure (%s)", (locale) => {
+    const texts = (["loading", "unavailable", "error"] as const).map((status) => {
+      const { unmount } = render(<PlanUsageSummary state={{ status }} locale={locale} variant="billing" />);
+      const card = screen.getByTestId("plan-usage");
+      expect(card).toHaveAttribute("data-state", status);
+      const text = card.textContent ?? "";
+      // No number, unit, percentage, progress bar or purchase action.
+      expect(text).not.toMatch(/\d|MB|%/);
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button")).not.toBeInTheDocument();
+      unmount();
+      return text;
+    });
+    expect(new Set(texts).size).toBe(3);
+  });
+
+  it("announces loading as a polite status", () => {
+    render(<PlanUsageSummary state={{ status: "loading" }} locale="pt" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Carregando o uso do plano");
+  });
+
+  it("shows zero usage as data, not as an empty or failed state", () => {
+    render(<PlanUsageSummary state={{ status: "ready", usage: zeroUsage }} locale="pt" variant="billing" />);
+    expect(screen.getByTestId("plan-usage")).toHaveAttribute("data-state", "ready");
+    expect(screen.getByRole("group", { name: "Traces do mês" })).toHaveTextContent(/Usado0Limite300Disponível300/);
+    expect(screen.getByRole("group", { name: "Armazenamento RAG" })).toHaveTextContent(/Usado0 MBLimite64 MB/);
+    expect(screen.getByRole("group", { name: "Armazenamento de mídias" })).toHaveTextContent(/Usado0 MBLimite32 MB/);
+    expect(document.body.textContent ?? "").not.toContain("—");
+  });
+
+  it("orders RAG, Traces and Media on the payments page and drops the legacy plan badge", () => {
+    render(<PlanUsageSummary usage={usage} locale="en" variant="billing" />);
+    expect(screen.getAllByRole("group").map((group) => group.getAttribute("aria-label"))).toEqual([
+      "RAG storage",
+      "Monthly traces",
+      "Media storage",
+    ]);
+    expect(screen.queryByText("builder_pro")).not.toBeInTheDocument();
+    expect(screen.queryByText(/No plan/)).not.toBeInTheDocument();
+  });
+
+  it("has no dead purchase button or coming-soon badge on the payments page while top-ups are closed", () => {
+    render(<PlanUsageSummary usage={usage} locale="pt" variant="billing" />);
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(screen.queryByText("Em breve")).not.toBeInTheDocument();
+    cleanup();
+
+    const onBuy = vi.fn();
+    render(
+      <PlanUsageSummary usage={usage} locale="pt" variant="billing" creditPurchase={{ enabled: true, onBuy }} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /comprar créditos/i }));
+    expect(onBuy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the dashboard card unchanged by default", () => {
+    render(<PlanUsageSummary usage={usage} locale="pt" />);
+    expect(screen.getAllByRole("group").map((group) => group.getAttribute("aria-label"))).toEqual([
+      "Traces do mês",
+      "Armazenamento RAG",
+      "Armazenamento de mídias",
+    ]);
+    expect(screen.getByText("builder_pro")).toBeInTheDocument();
+  });
+});
+
 // ── Credits (neurostack-credit-system Group 6) ──────────────────────────────
 
 describe("<PlanUsageSummary /> credit purchase", () => {
@@ -187,20 +266,14 @@ describe("credit reads", () => {
     localStorage.clear();
   });
 
-  it("formats integer millicredits as credits", () => {
-    expect(formatCredits(1_500, "pt")).toBe("1,5");
-    expect(formatCredits(496_000, "en")).toBe("496");
-    expect(formatCredits(1, "pt")).toBe("0,001");
-  });
-
   it.each([
     [503, { code: "credit_unavailable" }],
     [403, { detail: { code: "credit_scope_forbidden" } }],
     [500, { error: "internal_server_error" }],
-    [200, { balance: "not a summary" }],
+    [200, { reservations: "not a list" }],
   ])("hides a credit read answered %s", async (status, body) => {
     vi.stubGlobal("fetch", vi.fn(async () => reply(body, status)));
-    expect(await readCredit("/v1/credits/summary", "t", isCreditSummary)).toEqual({
+    expect(await readCredit("/v1/credits/reservations", "t", isCreditReservations)).toEqual({
       status: "hidden",
     });
   });
@@ -212,7 +285,7 @@ describe("credit reads", () => {
         throw new TypeError("network");
       }),
     );
-    expect(await readCredit("/v1/credits/summary", "t", isCreditSummary)).toEqual({
+    expect(await readCredit("/v1/credits/reservations", "t", isCreditReservations)).toEqual({
       status: "hidden",
     });
   });
