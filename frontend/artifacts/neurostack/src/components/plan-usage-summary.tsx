@@ -100,6 +100,8 @@ interface UsageMeterProps {
   icon: ElementType;
   iconClassName: string;
   extraDetail?: string;
+  /** `billing` wraps the label; the dashboard keeps its original truncation. */
+  wrapLabel: boolean;
 }
 
 function clampPercent(value: number): number {
@@ -148,6 +150,7 @@ function UsageMeter({
   icon: Icon,
   iconClassName,
   extraDetail,
+  wrapLabel,
 }: UsageMeterProps) {
   const progressValue = clampPercent(percentUsed);
 
@@ -160,8 +163,15 @@ function UsageMeter({
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 min-w-0">
           <Icon className={`h-4 w-4 shrink-0 ${iconClassName}`} />
-          {/* Wraps instead of truncating: a label is never cut off. */}
-          <p className="text-sm font-semibold leading-tight text-foreground break-words">
+          {/* Payments page: wraps instead of truncating, a label is never cut
+              off. Dashboard (default): the original truncating label. */}
+          <p
+            className={
+              wrapLabel
+                ? "text-sm font-semibold leading-tight text-foreground break-words"
+                : "text-sm font-semibold text-foreground truncate"
+            }
+          >
             {label}
           </p>
         </div>
@@ -226,10 +236,12 @@ function UsageStateCard({
   state,
   locale,
   className,
+  variant,
 }: {
   state: Exclude<PlanUsageState, { status: "ready" }>;
   locale: "pt" | "en";
   className: string;
+  variant: "dashboard" | "billing";
 }) {
   const txt = (pt: string, en: string) => (locale === "en" ? en : pt);
   const message =
@@ -246,8 +258,7 @@ function UsageStateCard({
           );
   return (
     <Card
-      data-testid="plan-usage"
-      data-state={state.status}
+      {...cardTestAttributes(variant, state.status)}
       className={`border-indigo-500/25 bg-gradient-to-br from-indigo-950/15 to-transparent ${className}`.trim()}
     >
       <CardHeader className="pb-3">
@@ -271,11 +282,19 @@ function UsageStateCard({
   );
 }
 
+/**
+ * The payments page's test hooks. The dashboard (default) card renders with
+ * no data attributes, exactly as before the payments page existed.
+ */
+function cardTestAttributes(variant: "dashboard" | "billing", status: PlanUsageState["status"]) {
+  return variant === "billing" ? { "data-testid": "plan-usage", "data-state": status } : {};
+}
+
 export function PlanUsageSummary(props: PlanUsageSummaryProps) {
   const { locale, className = "", creditPurchase, variant = "dashboard" } = props;
   const state: PlanUsageState = props.state ?? { status: "ready", usage: props.usage };
   if (state.status !== "ready") {
-    return <UsageStateCard state={state} locale={locale} className={className} />;
+    return <UsageStateCard state={state} locale={locale} className={className} variant={variant} />;
   }
   return (
     <UsageReady
@@ -338,6 +357,7 @@ function UsageReady({
       icon={Activity}
       iconClassName="text-indigo-400"
       extraDetail={traceExtraDetail}
+      wrapLabel={billing}
     />
   );
   const ragMeter = (
@@ -357,6 +377,7 @@ function UsageReady({
       locale={locale}
       icon={Database}
       iconClassName="text-blue-400"
+      wrapLabel={billing}
     />
   );
   const mediaMeter = (
@@ -376,6 +397,7 @@ function UsageReady({
       locale={locale}
       icon={FolderOpen}
       iconClassName="text-sky-400"
+      wrapLabel={billing}
     />
   );
   const meters = billing ? [ragMeter, traceMeter, mediaMeter] : [traceMeter, ragMeter, mediaMeter];
@@ -384,8 +406,7 @@ function UsageReady({
 
   return (
     <Card
-      data-testid="plan-usage"
-      data-state="ready"
+      {...cardTestAttributes(variant, "ready")}
       className={`border-indigo-500/25 bg-gradient-to-br from-indigo-950/15 to-transparent ${className}`.trim()}
     >
       <CardHeader className="pb-3">

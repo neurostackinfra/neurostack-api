@@ -307,7 +307,9 @@ const TOPUP_METHODS: readonly TopupMethod[] = ["credit_card", "pix"];
  *   flag that is false, a summary that failed or is loading (inconclusive),
  *   a credit switch that is off, a failed credit read: nothing is offered.
  *   There is no revoked/lease signal in the contract, so "revoked" is the
- *   flag read back false.
+ *   flag read back false. Also `hidden` when the ledger is not applicable
+ *   (`creditLedgerStanding` answers `not_applicable`: a standalone tenant
+ *   with no credit account), under every lifecycle state.
  * - `blocked` (no action, a textual reason) while the ledger is on hold
  *   (`creditLedgerStanding`: any reason other than `standalone`, under any
  *   lifecycle state, or the `pending` state itself), while a checkout is live
@@ -336,7 +338,11 @@ export function deriveTopupState({
     return { status: "hidden" };
   }
   if (credit.status !== "ok") return { status: "hidden" };
-  if (creditLedgerStanding(credit.data.state) !== "standing") {
+  const standing = creditLedgerStanding(credit.data.state);
+  // A standalone tenant has no credit account: nothing to top up and nothing
+  // to explain next to "Não se aplica", under every lifecycle state.
+  if (standing === "not_applicable") return { status: "hidden" };
+  if (standing !== "standing") {
     return {
       status: "blocked",
       reason: txt(

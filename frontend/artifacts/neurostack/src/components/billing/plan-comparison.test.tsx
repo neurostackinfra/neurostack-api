@@ -238,7 +238,7 @@ describe("<PlanComparison />", () => {
     expect(scroll.className).toContain("overflow-x-auto");
     expect(scroll.className).not.toMatch(/overflow-hidden|overflow-clip/);
     // The table layout and the hidden cell labels switch on the same breakpoint.
-    const breakpoint = "@min-[44rem]:";
+    const breakpoint = "@min-[48rem]:";
     expect(PLAN_TABLE_CLASSES.table).toContain(`${breakpoint}table`);
     expect(PLAN_TABLE_CLASSES.head).toContain(`${breakpoint}table-header-group`);
     for (const row of rows()) {

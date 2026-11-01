@@ -461,8 +461,24 @@ describe("deriveTopupState", () => {
     expect(result.status === "blocked" && result.reason).toMatch(/pendência financeira/);
   });
 
-  it("offers no top-up to a standalone-only ledger under a lifecycle state", () => {
-    expect(topup({ credit: credit("grace", ["standalone"]) }).status).toBe("blocked");
+  // A not-applicable ledger (standalone tenant, no credit account) has nothing
+  // to top up: no action and no hold notice next to "Não se aplica", even with
+  // the flag on and the packages listed (`openSummary`), in every state.
+  it.each(["pending", "active", "grace", "suspended", "deletion_due"] as const)(
+    "is hidden, with no action and no notice, for a not-applicable ledger in %s",
+    (state) => {
+      expect(creditLedgerStanding({ state, pending_reasons: ["standalone"] })).toBe("not_applicable");
+      expect(topup({ credit: credit(state, ["standalone"]) })).toEqual({ status: "hidden" });
+      // A live checkout or an unread catalog does not bring a notice back.
+      expect(topup({ credit: credit(state, ["standalone"]), checkoutLive: true })).toEqual({ status: "hidden" });
+      expect(topup({ credit: credit(state, ["standalone"]), creditCatalog: { status: "error" } })).toEqual({ status: "hidden" });
+    },
+  );
+
+  it("is hidden for pending + standalone next to another reason (not applicable), blocked for that pair elsewhere", () => {
+    expect(topup({ credit: credit("pending", ["standalone", "quarantine"]) })).toEqual({ status: "hidden" });
+    const hold = topup({ credit: credit("grace", ["standalone", "quarantine"]) });
+    expect(hold.status === "blocked" && hold.reason).toMatch(/pendência financeira/);
   });
 
   it("is hidden while the packages are loading: loading is not an error", () => {
