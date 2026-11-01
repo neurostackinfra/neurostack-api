@@ -116,6 +116,13 @@ describe("billing contract guards", () => {
   it("accepts a catalog of integer offers and rejects a malformed one", () => {
     expect(isBillingCatalog({ catalog_version_id: "v1", offers: [offer(), offer({ kind: "topup" })] })).toBe(true);
     expect(isBillingCatalog({ catalog_version_id: "v1", offers: [] })).toBe(true);
+    // `display_name`: absent (older server), null (package) or a non-empty name.
+    for (const ok of [undefined, null, "Pro"]) {
+      expect(isBillingCatalog({ catalog_version_id: "v1", offers: [offer({ display_name: ok })] })).toBe(true);
+    }
+    for (const bad of ["", "   ", 7, {}]) {
+      expect(isBillingCatalog({ catalog_version_id: "v1", offers: [offer({ display_name: bad })] })).toBe(false);
+    }
     expect(isBillingCatalog({ catalog_version_id: "v1", offers: [offer({ kind: "addon" })] })).toBe(false);
     expect(isBillingCatalog({ catalog_version_id: "v1", offers: [offer({ credits: "10" })] })).toBe(false);
     expect(isBillingCatalog({ catalog_version_id: "v1", offers: [offer({ amount_cents: 9.9 })] })).toBe(false);

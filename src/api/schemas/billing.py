@@ -208,6 +208,8 @@ class BillingCatalogOfferResponse(BaseModel):
     credits: int = Field(..., gt=0)
     included_clinics: int = Field(..., ge=0)
     additional_clinic_amount_cents: int = Field(..., ge=0)
+    # Customer-facing name of a subscription plan; null for a credit package.
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=40)
 
 
 class BillingCatalogResponse(BaseModel):

@@ -41,7 +41,7 @@ from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
 from src.repositories.database import get_db_session
 from src.services.asaas import AsaasClient
-from src.services.billing_catalog import catalog_snapshot
+from src.services.billing_catalog import OFFER_DISPLAY_NAMES, catalog_snapshot
 from src.services.billing_checkout import (
     BillingCheckoutService,
     CheckoutCouponRejected,
@@ -343,6 +343,7 @@ async def billing_catalog(
                 credits=offer["credits"],
                 included_clinics=offer["included_clinics"],
                 additional_clinic_amount_cents=offer["additional_clinic_amount_cents"],
+                display_name=OFFER_DISPLAY_NAMES.get(offer["offer_id"]),
             )
             for offer in offers
         ],

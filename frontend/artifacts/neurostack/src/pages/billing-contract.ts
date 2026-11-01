@@ -59,6 +59,9 @@ export interface CatalogOffer {
   credits: number;
   included_clinics: number;
   additional_clinic_amount_cents: number;
+  // Customer-facing plan name owned by the backend; absent (older server) or
+  // null (a credit package) means "no name sent", never an empty string.
+  display_name?: string | null;
 }
 
 export interface BillingCatalog {
@@ -309,7 +312,10 @@ function isCatalogOffer(value: unknown): value is CatalogOffer {
     isInteger(value.amount_cents) &&
     isInteger(value.credits) &&
     isInteger(value.included_clinics) &&
-    isInteger(value.additional_clinic_amount_cents)
+    isInteger(value.additional_clinic_amount_cents) &&
+    (value.display_name === undefined ||
+      value.display_name === null ||
+      (typeof value.display_name === "string" && value.display_name.trim().length > 0))
   );
 }
 

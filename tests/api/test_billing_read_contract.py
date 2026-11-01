@@ -185,6 +185,7 @@ _EXPECTED_CATALOG = {
             "credits": 5_000,
             "included_clinics": 1,
             "additional_clinic_amount_cents": 20_000,
+            "display_name": "Plus",
         },
         {
             "offer_id": "plan_pro_monthly_v1",
@@ -194,6 +195,7 @@ _EXPECTED_CATALOG = {
             "credits": 15_000,
             "included_clinics": 3,
             "additional_clinic_amount_cents": 15_000,
+            "display_name": "Pro",
         },
         {
             "offer_id": "plan_max_monthly_v1",
@@ -203,6 +205,7 @@ _EXPECTED_CATALOG = {
             "credits": 35_000,
             "included_clinics": 10,
             "additional_clinic_amount_cents": 10_000,
+            "display_name": "Max",
         },
         {
             "offer_id": "package_credits_500_v1",
@@ -212,6 +215,7 @@ _EXPECTED_CATALOG = {
             "credits": 500,
             "included_clinics": 0,
             "additional_clinic_amount_cents": 0,
+            "display_name": None,
         },
         {
             "offer_id": "package_credits_1000_v1",
@@ -221,6 +225,7 @@ _EXPECTED_CATALOG = {
             "credits": 1_000,
             "included_clinics": 0,
             "additional_clinic_amount_cents": 0,
+            "display_name": None,
         },
         {
             "offer_id": "package_credits_2000_v1",
@@ -230,6 +235,7 @@ _EXPECTED_CATALOG = {
             "credits": 2_000,
             "included_clinics": 0,
             "additional_clinic_amount_cents": 0,
+            "display_name": None,
         },
         {
             "offer_id": "package_credits_4000_v1",
@@ -239,6 +245,7 @@ _EXPECTED_CATALOG = {
             "credits": 4_000,
             "included_clinics": 0,
             "additional_clinic_amount_cents": 0,
+            "display_name": None,
         },
     ],
 }
@@ -387,6 +394,23 @@ def test_catalog_route_returns_the_closed_versioned_snapshot(client) -> None:
     # Internal snapshot fields never leave the backend.
     assert "cycle" not in response.text
     assert "additional_clinic_credit_grant" not in response.text
+
+
+def test_catalog_names_the_plans_and_leaves_packages_unnamed() -> None:
+    from src.services.billing_catalog import (
+        OFFER_DISPLAY_NAMES,
+        catalog_snapshot,
+        validate_billing_catalog,
+    )
+
+    names = {
+        offer["offer_id"]: offer["display_name"] for offer in _EXPECTED_CATALOG["offers"]  # type: ignore[index]
+    }
+    assert [k for k, v in names.items() if v] == list(OFFER_DISPLAY_NAMES)
+    assert [v for v in names.values() if v] == ["Plus", "Pro", "Max"]
+    # The label is outside the persisted, byte-pinned snapshot.
+    assert all("display_name" not in offer for offer in catalog_snapshot()["offers"])  # type: ignore[union-attr]
+    validate_billing_catalog()
 
 
 def test_catalog_route_ignores_client_supplied_identity(client) -> None:
