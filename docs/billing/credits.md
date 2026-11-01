@@ -125,34 +125,71 @@ code never creates an order.
 
 ## UI
 
-`frontend/artifacts/neurostack/src/components/plan-usage-summary.tsx`
-holds the shared credit types and panels; every credit read goes through
-`readCredit`, which hides the panel on **any** answer other than a valid
-`200` (`503 credit_unavailable`, a refusal, an error, a network failure).
+The billing page is `frontend/artifacts/neurostack/src/pages/billing.tsx`
+("Pagamento"); its credit area is
+`src/components/billing/credits-and-topups.tsx` (`CreditsAndTopups`), fed
+only by the page. The page reads the credit routes through `readCredits`
+(`src/pages/billing-contract.ts`), which keeps the outcomes apart:
+`unavailable` is **only** `503 {"code": "credit_unavailable"}`; another 5xx,
+a network failure or a body that fails the contract guard (including a
+catalog whose `millicredits_per_credit` is not 1,000) is an error: a failed
+credit summary or lots read is shown with a retry, a failed catalog read
+blocks the top-up with a text reason and no retry control; `401`/`403` are
+refusals. What may be shown or bought is derived in
+`src/pages/billing-view.ts`, from server readbacks only.
 
-- **Billing** (`/billing`, builder): one `GET /v1/credits/summary` per visit
-  (and on "Atualizar estado"). With it: the balance by origin (monthly
-  allowance, next cycle's allowance, top-ups, debt, cycle reservations, net
-  available), expiries, open debt, the window's allocations, the capacity
-  used and the thresholds, the consumption (charged, or estimated and not
-  charged while observational), the state notice (pending, grace with the
-  suspension deadline, suspended, deletion due, with "Exporte seus dados
-  até ...") and the export button. Without it the page is the `main` page.
-- **Top-ups** are offered only when the credit summary answered **and**
-  `GET /v1/billing/summary` read back `topup_commercial_enabled: true`;
-  otherwise the section keeps the disabled "Recargas indisponíveis" card. The
-  page sends `offer_id` and `method` only, follows the backend-built
-  `checkout_url` of an `active` session, and blocks a new purchase while a
-  checkout is live or unread. The subscription stays in its own section,
-  card only.
+- **Reads** (`/billing`, builder): one `GET /v1/credits/summary` per visit
+  (and on "Atualizar estado"); only after it answered `200`, the lots
+  (`GET /v1/credits/lots`) and the credit catalog (`GET /v1/credits/catalog`).
+  Nothing is polled, cached or paginated.
+- **Credits not launched**: with `503 credit_unavailable` the whole area
+  "Créditos e recargas" is absent (heading, number and any line); the page
+  shows "Assinatura e uso" and "Planos" (01, 02) and asks nothing more. Any
+  other credit failure keeps the area with an announced error and a retry.
+- **Balance**: the balance by origin (monthly allowance, next cycle's
+  allowance, top-ups, debt, cycle reservations, net available), expiries,
+  open debt, the window's allocations, the capacity used and the thresholds,
+  the consumption (charged, or estimated and not charged while
+  observational), the lifecycle notice (grace with the suspension deadline,
+  suspended, deletion due, with "Exporte seus dados até ...") and the export
+  button.
+- **Hold**: `creditLedgerStanding` (`billing-view.ts`) is the single rule.
+  The `pending` state, or **any** `pending_reasons` entry other than
+  `standalone` (`quarantine`, `reconciliation`, a reason the UI does not
+  know) under **every** lifecycle state (`active`, `grace`, `suspended`,
+  `deletion_due`), puts the ledger on hold: the balance figures are withheld,
+  each reason is named as text, the lifecycle's deadline and export date
+  stay, the history labels spendable lots "Retido", and the top-up is
+  blocked with its reason. `standalone` (no builder) as the **only** reason,
+  under any state, reads "Não se aplica", without figures or history,
+  and offers no top-up action; next to another reason it reads "Não se
+  aplica" under `pending` and is a hold under any other state.
+- **History**: the lots are the only history source (date, origin, credits,
+  status, "Expira em"), newest first, unpaginated; `lot_id` is never
+  rendered.
+- **Top-ups** (`deriveTopupState`): `Recarregar` exists only when
+  `GET /v1/billing/summary` read back `topup_commercial_enabled: true`, the
+  credit summary answered, the ledger is not on hold, no checkout is live
+  (the summary's `live_session` or this tab's stored session, read or not
+  yet read: it blocks subscribing too) and the credit catalog answered; the
+  packages are the catalog's, filtered by `summary.checkout.available_offer_ids`.
+  While the catalog is loading nothing is shown; a failed catalog read is a
+  blocked state with its reason. A closed sale has no card or dead button
+  (there is no "Recargas indisponíveis" card). The client sends only
+  `offer_id` and `method`, follows the backend-built `checkout_url` of an
+  `active` session, and otherwise moves focus to the checkout status. The
+  subscription stays in "Planos", card only.
 - **After a return or a PIX QR code** the page re-reads the order
   (`GET /v1/billing/checkout/{id}`) and the ledger (`GET
   /v1/credits/summary`); it never adds a package to the balance by itself
   and never polls.
 - **Export**: the button calls `GET /v1/credits/export` with the builder
   session and downloads the ZIP; a `503` makes it unavailable.
-- **Knowledge base and media**: a builder or super admin viewing a clinic
-  sees that clinic's builder's RAG or media allocation of the current window
+- **Knowledge base and media**:
+  `src/components/plan-usage-summary.tsx` keeps only the allocation notice
+  (`readCredit`, which hides it on any answer other than a valid `200`): a
+  builder or super admin viewing a clinic sees that clinic's builder's RAG
+  or media allocation of the current window
   (`GET /v1/credits/reservations?tenant_id=...`); clinic admins read nothing
   and, with the switch off, nothing renders.
 
@@ -168,6 +205,11 @@ holds the shared credit types and panels; every credit read goes through
   `POSTGRES_SMOKE_DATABASE_URL`).
 - Forced switch: `pytest -p tests.credit_switch_forced_plugin ...` counts
   the credit read snapshots in its summary.
-- UI: `src/pages/billing.test.tsx` (panels, states, export, top-ups, return),
+- UI (under `frontend/artifacts/neurostack/`): `src/pages/billing.test.tsx`
+  (page: reads, absent area, hold, top-ups, focus, return),
+  `src/pages/billing-view.test.ts` (`creditLedgerStanding`,
+  `deriveTopupState`, plan marker), `src/pages/billing-contract.test.ts`
+  (guards, `readCredits`), `src/components/billing/credits-and-topups.test.tsx`,
   `src/components/plan-usage-summary.test.tsx`,
-  `src/pages/knowledge-base.test.tsx`, `src/pages/midias.test.tsx`.
+  `src/pages/knowledge-base.test.tsx`, `src/pages/midias.test.tsx`, and the
+  Playwright suite `tests/e2e/billing.spec.ts`.
