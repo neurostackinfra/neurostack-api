@@ -822,7 +822,8 @@ publica uma nova versão). Resposta igual para todo builder.
       "amount_cents": 99900,
       "credits": 5000,
       "included_clinics": 1,
-      "additional_clinic_amount_cents": 20000
+      "additional_clinic_amount_cents": 20000,
+      "display_name": "Plus"
     },
     {
       "offer_id": "package_credits_500_v1",
@@ -831,11 +832,16 @@ publica uma nova versão). Resposta igual para todo builder.
       "amount_cents": 10000,
       "credits": 500,
       "included_clinics": 0,
-      "additional_clinic_amount_cents": 0
+      "additional_clinic_amount_cents": 0,
+      "display_name": null
     }
   ]
 }
 ```
+
+`display_name` é o nome de exibição do plano (`Plus`, `Pro`, `Max`), `null` nos
+pacotes de créditos. Ele não faz parte do snapshot persistido nem do hash do
+catálogo: renomear um plano não cria nova `catalog_version_id`.
 
 `offers` traz as sete ofertas na ordem canônica (Plus, Pro, Max e os pacotes
 de 500/1000/2000/4000 créditos). `kind` é `subscription` (mensal) ou `topup`

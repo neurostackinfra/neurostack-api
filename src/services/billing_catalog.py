@@ -50,6 +50,19 @@ _OFFERS = (
     BillingOffer("package_credits_4000_v1", 80_000, 4_000, 0, 0, "DETACHED"),
 )
 
+# Customer-facing plan names. Deliberately NOT a field of ``BillingOffer``:
+# ``snapshot()`` is persisted with each checkout and ``catalog_snapshot_bytes``
+# is compared byte for byte by the release contract, so a label edit must
+# never change either.  Only subscription offers carry a name; a detached
+# package is described by its credits.
+OFFER_DISPLAY_NAMES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "plan_plus_monthly_v1": "Plus",
+        "plan_pro_monthly_v1": "Pro",
+        "plan_max_monthly_v1": "Max",
+    }
+)
+
 BILLING_CATALOG: Final[Mapping[str, BillingOffer]] = MappingProxyType(
     {offer.offer_id: offer for offer in _OFFERS}
 )
@@ -92,6 +105,10 @@ def validate_billing_catalog() -> None:
     if len(_OFFERS) != 7 or tuple(BILLING_CATALOG) != expected_ids:
         raise RuntimeError("invalid_billing_catalog")
     if any(offer.additional_clinic_credit_grant != 0 for offer in _OFFERS):
+        raise RuntimeError("invalid_billing_catalog")
+    if {o.offer_id for o in _OFFERS if o.cycle != "DETACHED"} != set(
+        OFFER_DISPLAY_NAMES
+    ) or any(not name.strip() for name in OFFER_DISPLAY_NAMES.values()):
         raise RuntimeError("invalid_billing_catalog")
     if any(
         offer.amount_cents <= 0

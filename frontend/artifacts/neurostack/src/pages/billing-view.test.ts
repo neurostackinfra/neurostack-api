@@ -241,6 +241,20 @@ describe("deriveBillingView", () => {
     expect(Object.keys(PLAN_NAMES)).toEqual([PLUS, PRO, MAX]);
   });
 
+  it("shows the name the catalog sends, ahead of the local fallback, for a new offer", () => {
+    const fresh = "plan_future_monthly_v9";
+    const named = { ...offer(fresh, 1_000, 10, 1, 100), display_name: "Ultra" };
+    const v = view(
+      ok(summaryData({ subscription: subscription({ offer_id: fresh }), checkout: { available_offer_ids: [fresh], live_session: null, available: true } })),
+      ok({ catalog_version_id: VERSION, offers: [named, { ...offer(PRO, 2_000, 20, 3, 200), display_name: "Pro Renomeado" }] }),
+    );
+    expect(v.plans.map((plan) => plan.name)).toEqual(["Ultra", "Pro Renomeado"]);
+    expect(v.overviewState).toMatchObject({ subscription: { planName: "Ultra" } });
+    // Without a catalog name the three launch offers keep their local name.
+    expect(planName(PRO, null)).toBe("Pro");
+    expect(planName(PRO, undefined)).toBe("Pro");
+  });
+
   it("keeps zero values as zero", () => {
     const zero = offer(PRO, 0, 0, 0, 0);
     const v = view(ok({ ...activeSummary, active_clinics: 0, subscription: subscription({ amount_cents: 0 }) }), ok({

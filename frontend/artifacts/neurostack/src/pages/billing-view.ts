@@ -18,17 +18,19 @@ import type {
 // fetch, no React, no storage. Every value comes from the two authoritative
 // reads; a failed, refused or malformed read stays its own state.
 
-// Display names of the catalog's subscription offers. Only the name lives
-// here: price, credits, clinics, currency and order come from the catalog,
-// and an offer missing from this map is shown by its catalog id.
+// Fallback display names for an older server that sends no `display_name`.
+// The backend catalog owns the name; this map only keeps the three launch
+// offers readable during a rolling deploy. Price, credits, clinics, currency
+// and order always come from the catalog, and an offer named by neither the
+// catalog nor this map is shown by its catalog id.
 export const PLAN_NAMES: Readonly<Record<string, string>> = {
   plan_plus_monthly_v1: "Plus",
   plan_pro_monthly_v1: "Pro",
   plan_max_monthly_v1: "Max",
 };
 
-export function planName(offerId: string): string {
-  return PLAN_NAMES[offerId] ?? offerId;
+export function planName(offerId: string, catalogName?: string | null): string {
+  return catalogName || PLAN_NAMES[offerId] || offerId;
 }
 
 /** Header alert: only actionable states take one; a stable state has none. */
@@ -176,7 +178,11 @@ export function deriveBillingView({
           status: "ready",
           subscription: subscription
             ? {
-                planName: planName(subscription.offer_id),
+                planName: planName(
+                  subscription.offer_id,
+                  catalogData?.offers.find((o) => o.offer_id === subscription.offer_id)
+                    ?.display_name,
+                ),
                 status: subscription.status,
                 paymentState: subscription.payment_state,
                 amountCents: subscription.amount_cents,
@@ -210,7 +216,7 @@ export function deriveBillingView({
     .filter((offer) => offer.kind === "subscription")
     .map((offer) => ({
       offerId: offer.offer_id,
-      name: planName(offer.offer_id),
+      name: planName(offer.offer_id, offer.display_name),
       currency: offer.currency,
       amountCents: offer.amount_cents,
       credits: offer.credits,
