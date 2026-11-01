@@ -398,8 +398,23 @@ def test_the_wiring_analysis_sees_every_way_to_reach_the_consumer(
     assert not _reaches_the_consumer(probe, module="src.services.billing_probe")
 
 
+def _credit_writer_files() -> list[Path]:
+    """The credit modules plus the credit one-off tasks (``src/ops/credit_*``):
+    the tasks are swept for ASAAS writes only, never added to the set of
+    modules allowed to import the fact handler."""
+
+    return sorted({*_credit_files(), *_ROOT.glob("src/ops/credit_*.py")})
+
+
+def test_the_asaas_write_sweep_covers_the_credit_tasks() -> None:
+    swept = {path.relative_to(_ROOT).as_posix() for path in _credit_writer_files()}
+    assert "src/ops/credit_enforcement.py" in swept
+
+
 @pytest.mark.parametrize(
-    "path", _credit_files(), ids=lambda path: path.relative_to(_ROOT).as_posix()
+    "path",
+    _credit_writer_files(),
+    ids=lambda path: path.relative_to(_ROOT).as_posix(),
 )
 def test_credit_code_writes_no_asaas_table_but_the_ack(path: Path) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

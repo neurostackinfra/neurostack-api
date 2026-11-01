@@ -1035,6 +1035,73 @@ async def test_the_route_transaction_is_ended_before_the_writer(store: _Store) -
     assert await end_route_transaction(Stuck()) is False
 
 
+def _dropped(reason: str) -> float:
+    """``neurostack_credit_observational_write_dropped_total{reason}``."""
+
+    from prometheus_client import REGISTRY
+
+    return (
+        REGISTRY.get_sample_value(
+            "neurostack_credit_observational_write_dropped_total", {"reason": reason}
+        )
+        or 0.0
+    )
+
+
+@pytest.fixture
+def drops_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The switch effective for the drop counter (inert otherwise)."""
+
+    from src.services import credit_rollout
+
+    monkeypatch.setattr(credit_rollout, "credit_switch_effective", lambda: True)
+
+
+class _BusyRoute:
+    """A route session whose transaction cannot be ended."""
+
+    def in_transaction(self) -> bool:
+        return True
+
+    async def rollback(self) -> None:
+        raise RuntimeError("connection lost")
+
+
+@pytest.mark.parametrize("writer", ["decision", "meta_file_handoff"])
+async def test_a_route_busy_discard_moves_the_drop_counter(
+    drops_counted: None, writer: str
+) -> None:
+    """``route_busy`` returns before the writer runs: still one counted
+    discard, from both entry points that end the route transaction."""
+
+    ingress = _ingress(uuid4(), uuid4())
+    before = _dropped("route_busy")
+    if writer == "decision":
+        outcome = await credit_metering.record_webhook_decision(
+            ingress, _BusyRoute(), SimpleNamespace(event_id=uuid4())
+        )
+    else:
+        outcome = await credit_metering.record_meta_file_handoff(
+            ingress, _BusyRoute(), SimpleNamespace(id=uuid4()), note="probe"
+        )
+    assert outcome == "route_busy"
+    assert _dropped("route_busy") == before + 1
+
+
+async def test_a_failed_write_moves_the_drop_counter(
+    drops_counted: None, logs: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.repositories import database
+
+    monkeypatch.setattr(database, "_session_factory", None)
+    before = _dropped("failed")
+    outcome = await record_observational_trace(
+        _ingress(uuid4(), uuid4()), anchor_id=uuid4(), decision={}, deliverable=True
+    )
+    assert outcome == "failed"
+    assert _dropped("failed") == before + 1
+
+
 @pytest.mark.parametrize("pending", ["new", "dirty", "deleted"])
 async def test_the_route_transaction_is_never_rolled_back_over_pending_writes(
     store: _Store, logs: _Recorder, pending: str

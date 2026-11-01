@@ -3513,3 +3513,68 @@ async def test_a_pending_reply_of_an_ended_session_never_reaches_the_provider(
     assert str(row) not in sender.sent
     state, payload, _attempts = await _outbox_state(enforced_direct, row)
     assert state == "failed" and "phone" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Every discard of the observational writer moves the drop counter (AC L949).
+# ---------------------------------------------------------------------------
+
+
+def _dropped(reason: str) -> float:
+    from prometheus_client import REGISTRY
+
+    return (
+        REGISTRY.get_sample_value(
+            "neurostack_credit_observational_write_dropped_total", {"reason": reason}
+        )
+        or 0.0
+    )
+
+
+@pytest.mark.parametrize(
+    "path", ["pool_exhausted", "failed", "route_busy_decision", "route_busy_handoff"]
+)
+async def test_every_writer_discard_moves_the_drop_counter_on_postgres(
+    pool: _Pool,
+    direct: AsyncEngine,
+    logs: _Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from src.services import credit_rollout
+
+    monkeypatch.setattr(credit_rollout, "credit_switch_effective", lambda: True)
+    seeded = await _tenant(direct)
+    reason = "route_busy" if path.startswith("route_busy") else path
+    before = _dropped(reason)
+    if path == "pool_exhausted":
+        held = [await pool.engine.connect() for _ in range(5)]
+        try:
+            outcome, _elapsed = await _write(pool, _ingress(seeded))
+        finally:
+            for connection in held:
+                await connection.close()
+    elif path == "failed":
+        # ``ck_credit_ingress_claims_payload_sha256`` (PostgreSQL-only).
+        bad = replace(_ingress(seeded), payload_sha256="not-a-sha256")
+        outcome, _elapsed = await _write(pool, bad)
+    else:
+        # A real route session holding an un-flushed ORM change: the writer
+        # must not roll it back, so it never runs (``route_pending_writes``).
+        async with pool.sessions() as route:
+            route.add(Builder(id=uuid4(), name="Pending route write"))
+            await route.execute(text("SELECT 1"))
+            if path == "route_busy_decision":
+                outcome = await credit_metering.record_webhook_decision(
+                    _ingress(seeded), route, SimpleNamespace(event_id=uuid4())
+                )
+            else:
+                outcome = await credit_metering.record_meta_file_handoff(
+                    _ingress(seeded), route, SimpleNamespace(id=uuid4()), note="probe"
+                )
+            await route.rollback()
+    assert outcome == reason
+    assert _dropped(reason) == before + 1
+    assert await _rows(direct, seeded.tenant_id) == ([], [])

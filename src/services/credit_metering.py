@@ -834,6 +834,16 @@ async def _write_steps(
         raise
 
 
+def _route_busy() -> ObservationalOutcome:
+    """The writer never ran: the route's transaction could not be ended
+    (logged by :func:`end_route_transaction`); still a counted discard."""
+
+    from src.services.credit_rollout import record_observational_write_drop
+
+    record_observational_write_drop("route_busy")
+    return "route_busy"
+
+
 async def record_observational_trace(
     ingress: ObservationalIngress,
     *,
@@ -942,7 +952,7 @@ async def _record_response(
         )
         return None
     if not await end_route_transaction(db):
-        return "route_busy"
+        return _route_busy()
     event_id, projection = decided
     return await record_observational_trace(
         ingress, anchor_id=event_id, decision=projection, deliverable=deliverable
@@ -972,7 +982,7 @@ async def record_meta_file_handoff(
         )
         return None
     if not await end_route_transaction(db):
-        return "route_busy"
+        return _route_busy()
     return await record_observational_trace(
         ingress,
         anchor_id=handoff_id,

@@ -1147,6 +1147,11 @@ def test_an_injected_writer_failure_is_logged_and_swallowed(
             budget_seconds=0.2 if failure == "timeout" else 5,
         )
 
+    from src.services import credit_rollout
+
+    monkeypatch.setattr(credit_rollout, "credit_switch_effective", lambda: True)
+    reasons = ("failed", "timeout", "tenant_gone", "enforced")
+    before = {reason: _dropped(reason) for reason in reasons}
     outcome = run(client, scenario())
     assert (
         outcome
@@ -1158,13 +1163,37 @@ def test_an_injected_writer_failure_is_logged_and_swallowed(
             "gone": "tenant_gone",
         }[failure]
     )
+    # Every discard is counted under its reason; ``enforced`` (the steady
+    # state after the enforcement) is not a discard.
+    assert {reason: _dropped(reason) - before[reason] for reason in reasons} == {
+        reason: 1.0 if reason == outcome and outcome != "enforced" else 0.0
+        for reason in reasons
+    }
     assert run(client, _rows(CreditObservationalEffect)) == []
     assert run(client, _rows(CreditAllocation)) == []
 
 
+def _dropped(reason: str) -> float:
+    """``neurostack_credit_observational_write_dropped_total{reason}``."""
+
+    from prometheus_client import REGISTRY
+
+    return (
+        REGISTRY.get_sample_value(
+            "neurostack_credit_observational_write_dropped_total", {"reason": reason}
+        )
+        or 0.0
+    )
+
+
 def test_the_observational_writer_refuses_a_route_session_with_pending_writes(
-    client: Any, world: World
+    client: Any, world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from src.services import credit_rollout
+
+    monkeypatch.setattr(credit_rollout, "credit_switch_effective", lambda: True)
+    before = _dropped("route_busy")
+
     async def scenario() -> str:
         session = get_db_session()
         try:
@@ -1182,6 +1211,7 @@ def test_the_observational_writer_refuses_a_route_session_with_pending_writes(
             await session.close()
 
     assert run(client, scenario()) == "route_busy"
+    assert _dropped("route_busy") == before + 1  # a counted discard
 
 
 def test_object_copy_worker_is_inert_without_the_effective_runtime(

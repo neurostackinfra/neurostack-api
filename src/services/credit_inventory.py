@@ -1905,6 +1905,11 @@ async def _run_observational(
         tenant_id=str(tenant_id),
         error_type=error_type,
     )
+    # Every discard is counted (closed reason vocabulary, no tenant label),
+    # as by the Group 3a trace writer.
+    from src.services.credit_rollout import record_observational_write_drop
+
+    record_observational_write_drop(outcome)
     return outcome
 
 
