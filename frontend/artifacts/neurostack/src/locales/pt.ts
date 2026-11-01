@@ -22,7 +22,7 @@ export const pt: Record<TranslationKey, string> = {
   nav_rlhf: "Auditoria RLHF",
   nav_consulting: "Consultoria Comercial",
   nav_media: "Mídias & Ativos",
-  nav_billing: "Assinatura & Pagamento",
+  nav_billing: "Pagamento",
   investor_sales_cta: "Falar com comercial",
   badge_coming_soon: "Em breve",
   builder_roadmap_certification_title: "Certificação e co-branding NeuroStack",
