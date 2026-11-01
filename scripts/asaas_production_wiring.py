@@ -89,26 +89,51 @@ D3_SOURCE_TASK_DEFINITION_ARN = task_definition_arn(TASK_FAMILY, D3_SOURCE_REVIS
 # The bridge-image D3 revision the rollback target was first re-pinned to.
 BRIDGE_REVISION = 9
 # The worker-flag revision (revision 9 with BILLING_FACT_WORKER_ENABLED 'true',
-# same bridge image) the rollback target is re-pinned to next: the way back
-# from the image bump that starts from it.
+# same bridge image) the rollback target was re-pinned to next: the way back
+# from the image bump that started from it. It is the last SAFETY re-pin.
 WORKER_FLAG_REVISION = 10
 # The service rollback target lives in the manifest (rollback_target); these
-# are the only pins it may hold and the documented step at which each one takes
-# effect, in order (8, 9, 10; none is skipped). Revision 8 runs code that reads
-# columns migration 036 drops, so the re-pin to 9 must happen before 036, and
-# only once revision 9 has served and its observation period closed (until
-# then 8 is the safe way back). Revision 9 carries the worker flag 'false', so
-# a rollback to it from an image bump would also turn the worker off: the
-# re-pin to 10 must happen before the image bump is deployed, and only once
-# revision 10 has served, been verified and its observation closed.
+# are the pins it may hold and the documented step at which each one takes
+# effect. Two of them are SAFETY re-pins, each with its mandatory repin note
+# while it is pending: revision 8 runs code that reads columns migration 036
+# drops, so the re-pin to 9 must happen before 036, and only once revision 9
+# has served and its observation period closed (until then 8 is the safe way
+# back). Revision 9 carries the worker flag 'false', so a rollback to it from
+# an image bump would also turn the worker off: the re-pin to 10 must happen
+# before the image bump is deployed, and only once revision 10 has served,
+# been verified and its observation closed.
+#
+# From revision 10 on the target follows the live chain, one reviewed re-pin
+# at a time and with no note (asaas-rollout-opening Group 5b): each
+# structural deploy goes back to THE REVISION IT REPLACES. Revision 11 (the
+# E7b image bump of revision 10) is the way back from live step L2a;
+# revision 12 (L2a: revision 11 plus the two staged flag rows at 'false', the
+# last revision before migration 042's image) from L2b and during window 042
+# (L3); revision 13 (L2b: revision 12 with the image containing 042) once
+# window 042 is observed (L4). Above 13 any revision may be pinned with the
+# generic effective step (a hotfix image during the canary re-pins the
+# target to the serving revision first). The pin's identity is proved where
+# it is used, by content (_rollback_content_failures and the window tool's
+# _rollback_target), never by a digest or a number in code.
 ROLLBACK_EFFECTIVE_INITIAL = "initial_d3_planning_2026_10_18"
 ROLLBACK_EFFECTIVE_BRIDGE = "bridge_revision_9_serving_verified_and_observation_closed"
 ROLLBACK_EFFECTIVE_WORKER_FLAG = (
     "worker_flag_revision_10_serving_verified_and_observation_closed"
 )
+ROLLBACK_EFFECTIVE_E7B = "e7b_revision_11_serving_verified_and_observation_closed"
+ROLLBACK_EFFECTIVE_STAGED_ROWS = (
+    "staged_rows_revision_12_serving_verified_and_observation_closed"
+)
+ROLLBACK_EFFECTIVE_CREDIT_IMAGE = (
+    "credit_image_revision_13_serving_verified_and_window_042_observed"
+)
+# The effective step of every revision above the last named pin.
+ROLLBACK_EFFECTIVE_SERVING = "revision_serving_verified_and_observation_closed"
 ROLLBACK_REPIN_BEFORE = "migration_036"
 ROLLBACK_REPIN_BEFORE_IMAGE_BUMP = "app_image_bump_deployment"
 # revision -> (effective_after, (next revision, its effective_after, before) | None)
+# The second element is a pending SAFETY re-pin (the manifest must carry it as
+# its repin note); None means no note, and none is accepted.
 ROLLBACK_TARGET_PINS: dict[int, tuple[str, tuple[int, str, str] | None]] = {
     D3_SOURCE_REVISION: (
         ROLLBACK_EFFECTIVE_INITIAL,
@@ -123,7 +148,37 @@ ROLLBACK_TARGET_PINS: dict[int, tuple[str, tuple[int, str, str] | None]] = {
         ),
     ),
     WORKER_FLAG_REVISION: (ROLLBACK_EFFECTIVE_WORKER_FLAG, None),
+    11: (ROLLBACK_EFFECTIVE_E7B, None),
+    12: (ROLLBACK_EFFECTIVE_STAGED_ROWS, None),
+    13: (ROLLBACK_EFFECTIVE_CREDIT_IMAGE, None),
 }
+ROLLBACK_LAST_NAMED_PIN = max(ROLLBACK_TARGET_PINS)
+# The largest app revision number the planner reads (_APP_REVISION_ARN).
+ROLLBACK_PIN_MAX = 999_999_999
+
+
+def rollback_target_pin(
+    revision: Any,
+) -> tuple[str, tuple[int, str, str] | None] | None:
+    """(effective_after, pending safety re-pin) a rollback target revision
+    must carry, or None when the planner never accepts it as a target.
+
+    The named pins (8 to 13) carry their own effective step; every revision
+    above them, up to the largest app revision the planner reads, carries
+    the generic one with no re-pin. Anything else (7 and below, a bool, a
+    string) is never a target.
+    """
+
+    if type(revision) is not int:
+        return None
+    pin = ROLLBACK_TARGET_PINS.get(revision)
+    if pin is not None:
+        return pin
+    if ROLLBACK_LAST_NAMED_PIN < revision <= ROLLBACK_PIN_MAX:
+        return ROLLBACK_EFFECTIVE_SERVING, None
+    return None
+
+
 # New revisions (app and migrations) carry ManagedBy=manual: owner approval A4
 # (2026-10-19) moved the two ECS roles to manual management; no code manages the
 # task definitions or the service.
@@ -630,9 +685,28 @@ def _cfn_tag(name: str) -> Callable[[_StrictLoader, yaml.Node], dict[str, Any]]:
     return construct
 
 
+class _SpelledInt(int):
+    """An integer the YAML source spells other than plain decimal (YAML 1.1
+    reads ``014`` as 12, ``1:10`` as 70 and ``0xE``, ``1_4``, ``+14``,
+    ``0b1110`` or ``!!int '14'`` as 14). It is an int everywhere else; it
+    is never a rollback target revision (``rollback_target_pin`` requires
+    ``type(...) is int``), so such a ``revision:`` fails closed."""
+
+
+_PLAIN_DECIMAL = re.compile(r"0|-?[1-9][0-9]*")
+
+
+def _construct_int(loader: _StrictLoader, node: yaml.ScalarNode) -> int:
+    value = loader.construct_yaml_int(node)
+    if node.style is None and _PLAIN_DECIMAL.fullmatch(node.value) is not None:
+        return int(value)
+    return _SpelledInt(value)
+
+
 _StrictLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
 )
+_StrictLoader.add_constructor("tag:yaml.org,2002:int", _construct_int)
 for _tag, _name in (
     ("!Ref", "Ref"),
     ("!Equals", "Fn::Equals"),
@@ -769,23 +843,68 @@ def _expected_migrations_section() -> dict[str, Any]:
     }
 
 
-# What the ``why`` of a pending re-pin must name, by its ``before`` step: the
-# reason the pin it leaves is unsafe from that step on.
-ROLLBACK_REPIN_WHY_NAMES: Mapping[str, str] = {
-    ROLLBACK_REPIN_BEFORE: "036",
-    ROLLBACK_REPIN_BEFORE_IMAGE_BUMP: WORKER_FLAG_PARAMETER,
+# What the ``why`` of a pending safety re-pin must name, by the revision it
+# re-pins TO: the reason the pin it leaves is unsafe from its ``before`` step
+# on. Every re-pin of ROLLBACK_TARGET_PINS has exactly one entry (checked on
+# import below).
+ROLLBACK_REPIN_WHY_NAMES: Mapping[int, str] = {
+    BRIDGE_REVISION: "036",
+    WORKER_FLAG_REVISION: WORKER_FLAG_PARAMETER,
 }
 
 
+def _assert_rollback_table() -> None:
+    """The pin table is one chain (8 to 13, then open), its safety re-pins
+    lead to the next pin with that pin's own effective step and come before
+    every pin without a note, each re-pin has exactly one ``why`` name, and
+    no two pins share an effective step. Checked on import, so a widened or
+    inconsistent table never loads."""
+
+    revisions = sorted(ROLLBACK_TARGET_PINS)
+    _require(
+        revisions == list(range(D3_SOURCE_REVISION, ROLLBACK_LAST_NAMED_PIN + 1))
+        and ROLLBACK_LAST_NAMED_PIN < ROLLBACK_PIN_MAX,
+        "rollback_table_not_one_chain",
+    )
+    steps = [effective for effective, _repin in ROLLBACK_TARGET_PINS.values()]
+    steps.append(ROLLBACK_EFFECTIVE_SERVING)
+    _require(len(set(steps)) == len(steps), "rollback_table_effective_after_reused")
+    repinned_to: list[int] = []
+    noted = True
+    for revision in revisions:
+        _effective, repin = ROLLBACK_TARGET_PINS[revision]
+        if repin is None:
+            noted = False
+            continue
+        _require(noted, "rollback_table_repin_after_an_open_pin")
+        target, effective, before = repin
+        _require(
+            target == revision + 1
+            and ROLLBACK_TARGET_PINS[target][0] == effective
+            and isinstance(before, str)
+            and bool(before),
+            "rollback_table_repin_invalid",
+        )
+        repinned_to.append(target)
+    _require(
+        sorted(ROLLBACK_REPIN_WHY_NAMES) == repinned_to
+        and all(
+            isinstance(name, str) and bool(name)
+            for name in ROLLBACK_REPIN_WHY_NAMES.values()
+        ),
+        "rollback_table_why_names_mismatch",
+    )
+
+
+_assert_rollback_table()
+
+
 def _validate_rollback_target(section: Any) -> None:
-    """Only the pinned revisions, each with its documented effective step."""
+    """Only the accepted revisions, each with its documented effective step;
+    the repin note exactly on the pins whose safety re-pin is pending."""
 
     revision = section.get("revision") if isinstance(section, dict) else None
-    pin = (
-        ROLLBACK_TARGET_PINS.get(revision)
-        if type(revision) is int and not isinstance(revision, bool)
-        else None
-    )
+    pin = rollback_target_pin(revision)
     _require(pin is not None, "manifest_rollback_target_invalid")
     assert isinstance(section, dict) and pin is not None
     effective_after, repin = pin
@@ -795,13 +914,18 @@ def _validate_rollback_target(section: Any) -> None:
         "manifest_rollback_target_invalid",
     )
     if repin is not None:
+        # Unreachable while the import check holds; never a bare KeyError.
+        why = ROLLBACK_REPIN_WHY_NAMES.get(repin[0])
+        _require(why is not None, "rollback_repin_why_missing")
+        assert why is not None
         note = section["repin"]
         _require(
             isinstance(note, dict)
             and set(note) == {"revision", "effective_after", "before", "why"}
+            and type(note["revision"]) is int
             and (note["revision"], note["effective_after"], note["before"]) == repin
             and isinstance(note["why"], str)
-            and ROLLBACK_REPIN_WHY_NAMES[repin[2]] in note["why"],
+            and why in note["why"],
             "manifest_rollback_target_invalid",
         )
 
@@ -3075,6 +3199,13 @@ def _plan_task_definition(
             **_newest_entry(*newest_change),
             "serving": current,
         }
+    elif current == pins.rollback_task_definition_arn:
+        # The service runs its own rollback target and the plan cannot move
+        # from it (e.g. rolled back by hand to R after L6: the rendering is
+        # R plus two flips). Not "off the rollback target": a dead end of
+        # more than one kind of change; the way out is the previous revision
+        # or the flag flip back (runbook).
+        step.blocks.append(f"service_on_rollback_target_plan_stuck:{current}")
     else:
         step.blocks.append(f"service_not_on_rollback_target:{current}")
     return rendered, diff, rendered
@@ -3510,19 +3641,71 @@ def _preview_secret_arn(name: str) -> str:
     return f"arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:{name}-PREVEW"
 
 
+def _deployed_kinds(revision: _Step) -> list[tuple[str, str, Any]]:
+    """(kind, where, entry) of each reviewed change the plan deploys: proposed
+    (a register_task_definition change) or registered and not deployed (the
+    newest revision, reported in the revision step's info)."""
+
+    kinds: list[tuple[str, str, Any]] = []
+    for change in revision.changes:
+        for kind in _SERVING_INFO_KEYS:
+            if kind in change:
+                kinds.append((kind, "proposed", change[kind]))
+    for kind, key in _SERVING_INFO_KEYS.items():
+        if key in revision.info:
+            kinds.append((kind, "registered", revision.info[key]))
+    return kinds
+
+
+# The kinds of change the rollback target never gates (Decision 16): a flag
+# flip (the worker, the credit switch, the transport) and the AppConfig group.
+ROLLBACK_UNGATED_KINDS = (*FLAG_CHANGE_KEYS.values(), "appconfig_group_added")
+
+
+def _deploys_only_a_flip(revision: _Step) -> bool:
+    """Whether the plan deploys a change and every one is a flip kind."""
+
+    kinds = _deployed_kinds(revision)
+    return bool(kinds) and all(kind in ROLLBACK_UNGATED_KINDS for kind, *_ in kinds)
+
+
+def _disabling_flip(revision: _Step) -> dict[str, Any] | None:
+    """The one flag flip the plan deploys when it turns a flag off: its
+    ``from`` (the serving or newest revision's value) is exactly 'true' and
+    its ``to`` (the rendering's) exactly 'false'. None for anything else: an
+    enabling flip, any other value, an image, the rows, the AppConfig group,
+    nothing to deploy or more than one change (the direction cannot be
+    determined: fail closed)."""
+
+    kinds = _deployed_kinds(revision)
+    if len(kinds) != 1:
+        return None
+    kind, where, entry = kinds[0]
+    if (
+        kind in FLAG_CHANGE_KEYS.values()
+        and isinstance(entry, dict)
+        and entry.get("from") == "true"
+        and entry.get("to") == "false"
+    ):
+        return {"kind": kind, "change": where, "from": "true", "to": "false"}
+    return None
+
+
 def _plan_rollback_target(
-    deployment: _Step, readback: dict[str, Any], pins: ManifestPins
+    deployment: _Step, revision: _Step, readback: dict[str, Any], pins: ManifestPins
 ) -> None:
-    """The manifest's rollback target: where a failed deployment goes back to."""
+    """The manifest's rollback target: where a failed deployment goes back to.
+
+    An unusable target (not ``ACTIVE``, unreadable, or not the manifest's
+    revision pinned by digest) blocks every deploy except containment (owner
+    decision, 2026-11-01): a flip of the worker, the credit switch or the
+    transport from 'true' to 'false' (_disabling_flip). Enabling, an image,
+    the staged rows and the AppConfig group wait for the target's repair."""
 
     deployment.info["rollback_target"] = pins.rollback_task_definition_arn
     deployment.info["rollback_target_effective_after"] = pins.rollback_effective_after
     deployment.info["rollback_target_must_repin_before"] = pins.rollback_repin_before
-    response = (
-        readback.get("source_task_definition")
-        if pins.rollback_revision == D3_SOURCE_REVISION
-        else readback.get("rollback_task_definition")
-    )
+    response = _rollback_target_response(readback, pins)
     definition = response.get("taskDefinition") if isinstance(response, dict) else None
     app = _source_app_container(response) or {}
     image = app.get("image")
@@ -3547,7 +3730,11 @@ def _plan_rollback_target(
             else "rollback_target_active_on_initial_tagged_revision"
         )
     else:
-        deployment.blocks.append("rollback_target_revision_unusable")
+        containment = _disabling_flip(revision)
+        if containment is None:
+            deployment.blocks.append("rollback_target_revision_unusable")
+        else:
+            deployment.info["rollback_target_unusable_containment_flip"] = containment
 
 
 def _serving_image_moved_off_rollback_target(
@@ -3584,6 +3771,217 @@ def _serving_image_moved_off_rollback_target(
         and _ECR_DIGEST_REFERENCE.fullmatch(target) is not None
         and target != serving
     )
+
+
+def _rollback_target_response(readback: dict[str, Any], pins: ManifestPins) -> Any:
+    """The DescribeTaskDefinition readback of the manifest's rollback target."""
+
+    if pins.rollback_revision == D3_SOURCE_REVISION:
+        return readback.get("source_task_definition")
+    return readback.get("rollback_task_definition")
+
+
+def _serving_revision_response(readback: dict[str, Any], current: str) -> Any:
+    """The read holding the revision the service runs, other than the D3
+    source and the rollback target (the newest, or the serving read); None
+    when no read holds exactly that revision."""
+
+    latest = readback.get("latest_task_definition")
+    response = (
+        latest
+        if current == _task_definition_arn_of(latest)
+        else readback.get("serving_task_definition")
+    )
+    return response if _task_definition_arn_of(response) == current else None
+
+
+def _staged_row_names(response: Any) -> set[str]:
+    """The staged flag names the app environment of a readback carries."""
+
+    environment = (_source_app_container(response) or {}).get("environment")
+    rows = environment if isinstance(environment, list) else []
+    return {
+        str(row.get("name"))
+        for row in rows
+        if isinstance(row, dict) and row.get("name") in STAGED_FLAG_PARAMETERS
+    }
+
+
+def _serving_rows_off_rollback_target(
+    readback: dict[str, Any], service: dict[str, Any] | None, pins: ManifestPins
+) -> Any:
+    """The serving revision's readback when it carries a staged flag row and
+    the rollback target carries none: a rows change (L2a) that already
+    serves. None otherwise; with the target already on a revision with the
+    rows there is no rows change in service. Revision 8 never counts, as for
+    the image (_serving_image_moved_off_rollback_target)."""
+
+    current = service.get("taskDefinition") if isinstance(service, dict) else None
+    if (
+        pins.rollback_revision == D3_SOURCE_REVISION
+        or not isinstance(current, str)
+        or current == pins.rollback_task_definition_arn
+    ):
+        return None
+    serving = _serving_revision_response(readback, current)
+    if serving is None or not _staged_row_names(serving):
+        return None
+    if _staged_row_names(_rollback_target_response(readback, pins)):
+        return None
+    return serving
+
+
+def _request_or_none(response: Any) -> dict[str, Any] | None:
+    try:
+        return _request_from_response(response)
+    except WiringError:
+        return None
+
+
+# The two kinds of change the rollback target gates (Group 5b content rule)
+# and the gate block each one reports. Flag flips (worker, credit switch,
+# transport) and the AppConfig group are never gated by the target: a
+# containment flip must always be deployable (Decision 16), so with a flip
+# deployed the changes in service only report (_plan_rollback_content_rule).
+ROLLBACK_GATED_KINDS: Mapping[str, str] = {
+    "app_image": "rollback_target_not_repinned_before_image_bump",
+    "flag_rows_added": "rollback_target_not_repinned_before_flag_rows",
+}
+
+
+def _gated_changes(
+    revision: _Step,
+    readback: dict[str, Any],
+    service: dict[str, Any] | None,
+    candidate: dict[str, Any] | None,
+    pins: ManifestPins,
+) -> list[tuple[str, str, dict[str, Any] | None]]:
+    """(kind, where, request of the change's revision) of every gated change
+    the plan sees: proposed (the rendering), registered and not deployed
+    (the newest revision) or in service (the revision the service runs,
+    relative to the rollback target)."""
+
+    gated: list[tuple[str, str, dict[str, Any] | None]] = []
+    for change in revision.changes:
+        for kind in ROLLBACK_GATED_KINDS:
+            if kind in change:
+                gated.append((kind, "proposed", candidate))
+    for kind in ROLLBACK_GATED_KINDS:
+        if _SERVING_INFO_KEYS[kind] in revision.info:
+            gated.append(
+                (
+                    kind,
+                    "registered",
+                    _request_or_none(readback.get("latest_task_definition")),
+                )
+            )
+    current = service.get("taskDefinition") if isinstance(service, dict) else None
+    if isinstance(current, str) and _serving_image_moved_off_rollback_target(
+        readback, service, pins
+    ):
+        gated.append(
+            (
+                "app_image",
+                "serving",
+                _request_or_none(_serving_revision_response(readback, current)),
+            )
+        )
+    rows = _serving_rows_off_rollback_target(readback, service, pins)
+    if rows is not None:
+        gated.append(("flag_rows_added", "serving", _request_or_none(rows)))
+    return gated
+
+
+def _rollback_content_failures(
+    target_response: Any,
+    request: dict[str, Any] | None,
+    kind: str,
+    pins: ManifestPins,
+) -> list[str]:
+    """Why the rollback target is not the way back from this change: [] when
+    it is.
+
+    The content rule (asaas-rollout-opening Group 5b): the target the
+    manifest names, as read by DescribeTaskDefinition, is ACTIVE with its app
+    image pinned by digest, carries exactly one BILLING_FACT_WORKER_ENABLED
+    row and that row is 'true' (a way back never turns the worker off), and
+    differs from the change's revision in that change's kind alone
+    (reviewed_change); a target with a pending safety re-pin never is. The
+    caller adds, for a proposed or registered change, that the service runs
+    the target itself: with both, the target is the revision the change
+    replaces.
+    """
+
+    failures: list[str] = []
+    if pins.rollback_repin_before is not None:
+        failures.append("target_repin_pending")
+    definition = (
+        target_response.get("taskDefinition")
+        if isinstance(target_response, dict)
+        else None
+    )
+    app = _source_app_container(target_response) or {}
+    image = app.get("image")
+    if not (
+        isinstance(definition, dict)
+        and definition.get("taskDefinitionArn") == pins.rollback_task_definition_arn
+        and definition.get("status") == "ACTIVE"
+        and isinstance(image, str)
+        and _ECR_DIGEST_REFERENCE.fullmatch(image) is not None
+    ):
+        failures.append("target_not_active_and_digest_pinned")
+    environment = app.get("environment")
+    workers = [
+        row
+        for row in (environment if isinstance(environment, list) else [])
+        if isinstance(row, dict) and row.get("name") == WORKER_FLAG_PARAMETER
+    ]
+    if not (len(workers) == 1 and workers[0].get("value") == "true"):
+        failures.append("target_worker_flag_not_exactly_one_true")
+    change = reviewed_change(target_response, request) if request is not None else None
+    if change is None or change[0] != kind:
+        failures.append("target_differs_from_the_change_in_more_than_its_kind")
+    return failures
+
+
+def _plan_rollback_content_rule(
+    deployment: _Step,
+    revision: _Step,
+    readback: dict[str, Any],
+    service: dict[str, Any] | None,
+    candidate: dict[str, Any] | None,
+    pins: ManifestPins,
+) -> None:
+    """Gate every app image and staged-rows change on the rollback target
+    being the revision it replaces (_rollback_content_failures, plus the
+    service on the target for a change not yet serving).
+
+    When the plan deploys a flip (ROLLBACK_UNGATED_KINDS) the changes in
+    service are still reported, with ``"gating": false``, and never block:
+    a containment flip is always deployable (Decision 16), wherever the
+    target is. A target with a pending safety re-pin (9, the worker 'false')
+    still gates them, as before."""
+
+    target_response = _rollback_target_response(readback, pins)
+    current = service.get("taskDefinition") if isinstance(service, dict) else None
+    flip = _deploys_only_a_flip(revision) and pins.rollback_repin_before is None
+    verdicts: list[dict[str, Any]] = []
+    for kind, where, request in _gated_changes(
+        revision, readback, service, candidate, pins
+    ):
+        failures = _rollback_content_failures(target_response, request, kind, pins)
+        if where != "serving" and current != pins.rollback_task_definition_arn:
+            failures.append("service_not_on_target")
+        verdict: dict[str, Any] = {"kind": kind, "change": where, "failed": failures}
+        gating = not (flip and where == "serving")
+        if not gating:
+            verdict["gating"] = False
+        verdicts.append(verdict)
+        reason = ROLLBACK_GATED_KINDS[kind]
+        if failures and gating and reason not in deployment.blocks:
+            deployment.blocks.append(reason)
+    if verdicts:
+        deployment.info["rollback_target_content_rule"] = verdicts
 
 
 def _plan_gates(
@@ -3641,23 +4039,22 @@ def _plan_gates(
         )
 
     deployment = steps["service_deployment"]
-    _plan_rollback_target(deployment, readback, pins)
-    # The re-pin to revision 10 is due before an image bump is deployed. Only
-    # rollback target 10 with no pending re-pin is the good state: with any
-    # other pin (9 with its note, or 8) a proposed, registered or serving
-    # image bump would leave a revision without the worker (or older code) as
-    # the way back.
-    revision = steps["task_definition_revision"]
-    repinned = (
-        pins.rollback_revision == WORKER_FLAG_REVISION
-        and pins.rollback_repin_before is None
+    _plan_rollback_target(deployment, steps["task_definition_revision"], readback, pins)
+    # Each structural deploy (an image change, the staged rows) goes back to
+    # the revision it replaces, re-pinned one reviewed PR at a time: a
+    # proposed, registered or serving change of either kind passes only when
+    # the rollback target is that revision, by content. With the target 9
+    # (the worker 'false'), 8 (a tag) or a revision the change does not
+    # replace, the way back would turn the worker off, run older code or
+    # undo more than the change.
+    _plan_rollback_content_rule(
+        deployment,
+        steps["task_definition_revision"],
+        readback,
+        service,
+        candidate,
+        pins,
     )
-    if not repinned and (
-        any("app_image" in change for change in revision.changes)
-        or "registered_revision_changes_app_image" in revision.info
-        or _serving_image_moved_off_rollback_target(readback, service, pins)
-    ):
-        deployment.blocks.append("rollback_target_not_repinned_before_image_bump")
     config = (service or {}).get("deploymentConfiguration") or {}
     breaker = config.get("deploymentCircuitBreaker") or {}
     if (

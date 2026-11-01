@@ -23,10 +23,14 @@ maps the dropped legacy tables: its ORM deletion of a builder
 `relation "billing_migrations" does not exist` and rolls back; its other
 paths do not touch them. See "Migration 037" in
 [`asaas-deployment.md`](./asaas-deployment.md). Revision 10, the rollback
-target, meets this rule (operator evidence, recorded in the wish): its image,
-the bridge digest `sha256:18358ce7…` that revisions 9 and 10 run, was built
-from commit `67b9b51c`, the merge of #126, which contains migration 037 and
-the E6 code.
+target until 2026-11-01, meets this rule (operator evidence, recorded in the
+wish): its image, the bridge digest `sha256:18358ce7…` that revisions 9 and
+10 run, was built from commit `67b9b51c`, the merge of #126, which contains
+migration 037 and the E6 code. The later targets meet it too: revisions 11
+and 12 run the E7b image, built from `main` `143ca9db`, which contains that
+merge (`git merge-base --is-ancestor 67b9b51c 143ca9db`, verified), and
+revision 13 runs the image of live step L1 of the asaas-rollout-opening
+wish, built for this release.
 
 The schema is forward-only. After 037 the only way back for the database is
 a restore from a snapshot (`pre-037-2026-10-24`, `pre-036-2026-10-24` or
@@ -41,7 +45,8 @@ service `neurostack-staging-app` serves revision 11 (the image bump of
 revision 10, deployed 2026-10-25 15:04Z, `COMPLETED` 15:06:57Z),
 `BILLING_FACT_WORKER_ENABLED=true`, `alembic_version` `037` (the post-read
 of window `037`, 2026-10-24; not read again since revision 11 was
-deployed), and the rollback target is revision 10.
+deployed), and the rollback target is revision 11 (re-pinned from 10 on
+2026-11-01, asaas-rollout-opening Group 5b).
 
 Billing rollout is `disabled` (all four rows in the post-read of window
 `037`, 2026-10-24) and `topup_commercial_enabled=false`. While it
@@ -72,6 +77,26 @@ after.
   not consult the rollout state. Refunds and subscription cancellations are
   manual provider operations with their own approval; no automated
   cleanup/refund saga exists.
+- **A flag flip off, even with an unusable rollback target.** Turning the
+  credit switch (`CREDIT_HOT_PATH_ENABLED`), the transport
+  (`BILLING_FACT_TRANSPORT_ENABLED`) or the worker
+  (`BILLING_FACT_WORKER_ENABLED`) from `'true'` to `'false'` is a task
+  definition revision of its own. It is never gated by the rollback target
+  (a target with a pending safety re-pin, 9, aside), and it is the only
+  deploy that passes when the target is unusable
+  (`INACTIVE`, missing, `ACTIVE` but not pinned by digest, or a read naming
+  another ARN than the manifest's revision; owner decision, 2026-11-01):
+  `plan` then reports
+  `info.rollback_target_unusable_containment_flip` instead of
+  `rollback_target_revision_unusable`. Turning a flag on, an image change,
+  the staged rows and the AppConfig group stay blocked until the target is
+  repaired ([`asaas-deployment.md`](./asaas-deployment.md), "Re-pinning the
+  rollback target along the live chain"). The block is a gate block (in
+  `gate_blocks`; the plan `status` stays `ready` or `compliant`): do not
+  deploy while it is reported. While the worker runs `'false'` (a
+  containment flip), no revision qualifies as the rollback target (it must
+  carry the worker `'true'`), so no image change passes, re-pinned or not:
+  turn the worker back on first, or stop and return to the owner.
 
 ## Application rollback outline
 
@@ -93,9 +118,9 @@ after.
 
 The rollback target is the manifest field `rollback_target`
 (`infra/production/asaas-production-wiring.yaml`), which `plan` reports as
-`rollback_target`. It went through three phases, each move a reviewed
-manifest change; both re-pins are merged, and the field reads revision 10
-(dates are operator-recorded evidence):
+`rollback_target`. It went through four phases, each move a reviewed
+manifest change; the three re-pins are merged, and the field reads revision
+11 (dates are operator-recorded evidence):
 
 1. **Revision 8, until the first re-pin merged**
    (`arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-app:8`),
@@ -124,16 +149,38 @@ manifest change; both re-pins are merged, and the field reads revision 10
    ([`asaas-deployment.md`](./asaas-deployment.md), "Merge condition of the
    re-pin (9 to 10)"). The re-pin merged before the image bump (revision 11,
    a new app image digest) was deployed, at 2026-10-25 15:04 UTC: a rollback
-   to revision 9 would also turn the worker off. Revision 11 serves now, and
-   the way back is revision 10
+   to revision 9 would also turn the worker off. Revision 11 then served,
+   and the way back was revision 10
    ([`asaas-deployment.md`](./asaas-deployment.md), "The image bump").
+4. **Revision 11, since the third re-pin** (`neurostack-staging-app:11`,
+   the E7b image bump of revision 10, the worker on, deployment `COMPLETED`
+   2026-10-25 15:06:57 UTC). The third re-pin (manifest field to
+   `revision: 11`,
+   `effective_after: e7b_revision_11_serving_verified_and_observation_closed`,
+   no `repin` block; asaas-rollout-opening Group 5b) merged after the owner
+   declared revision 11 observed and stable at 2026-11-01T01:19Z, the
+   manifest's second marker `closed_at`, and before live step L2a: the way
+   back from L2a is the revision it replaces. Revision 11 serves now; it is
+   the way back once L2a is deployed.
+
+From revision 10 on the target follows the live chain, one reviewed re-pin
+at a time and with no `repin` note, so that each structural deploy goes back
+to **the revision it replaces** ([`asaas-deployment.md`](./asaas-deployment.md),
+"Re-pinning the rollback target along the live chain"): 11 for L2a; 12 (L2a's
+revision, the last before the image containing 042) for L2b and during
+window 042 (L3), re-pinned in L2c after L2a's observation; 13 (L2b's
+revision) from L4 on, re-pinned after window 042's observation. During the
+flips L5 to L7 the target stays 13, and the way back from a flip is the flip
+back or the previous revision. A hotfix image during the canary first
+re-pins the target to the serving revision (any revision above 13), by a
+manifest PR alone.
 
 **Revision 8 is unsafe after migration 036**: it reads columns 036 drops,
-and 036 ran on 2026-10-24, so roll back to the field's revision (10 since
-the second re-pin), never to 8. Read "revision R" below as the field's
-current value, revision 10 (check with `plan`, `rollback_target`); it was
-revision 8 in phase 1 and revision 9 in phase 2. A failed post-deploy
-webhook registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a
+and 036 ran on 2026-10-24, so roll back to the field's revision (11 since
+the third re-pin), never to 8. Read "revision R" below as the field's
+current value, revision 11 (check with `plan`, `rollback_target`); it was
+revision 8 in phase 1, revision 9 in phase 2 and revision 10 in phase 3. A
+failed post-deploy webhook registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a
 reason to roll back.
 
 - **Before the service deployment gate**, nothing needed rolling back. The
@@ -151,7 +198,12 @@ reason to roll back.
   `/health` never passes. The exact failed-task count that trips the breaker
   is computed by ECS from that setting and was not verified here. Read back
   the service afterwards: one PRIMARY deployment on the last completed
-  revision, `COMPLETED`.
+  revision, `COMPLETED`. In the live order of the asaas-rollout-opening wish
+  that revision is the rollback target itself for L2a (11) and L2b (12); the
+  two diverge only after L4: for the flips from L6 on, the breaker goes back
+  to the previous flip's revision (14 for a failed L6), not to R (13). Both
+  are safe service states; after L6 the documented way back is the previous
+  revision or the flip back (R leaves `plan` stuck).
 - **Manual rollback (separately approved; it is a deployment).**
 
   ```bash
@@ -161,12 +213,17 @@ reason to roll back.
     --services neurostack-staging-app
   ```
 
-  `R` is the rollback target, `10` since the second re-pin (it was `8` until
-  the first re-pin merged and `9` until the second); never `8`, because
-  migration 036 has run.
+  `R` is the rollback target, `11` since the third re-pin (it was `8` until
+  the first re-pin merged, `9` until the second and `10` until the third);
+  never `8`, because migration 036 has run. Along the live chain R becomes
+  `12` (L2c) and then `13` (L4). After L6 do not roll back by hand to R
+  (13): the rendering is then R plus two flips, a dead end of more than one
+  kind of change for `plan`
+  (`service_on_rollback_target_plan_stuck:<revision 13 ARN>`); go back to the
+  previous revision, or deploy the flip back.
 
-  **Verify:** `plan` shows `current_task_definition` on revision R, the target
-  group is healthy, `GET /ready` returns 200 on every task, and
+  **Verify:** `plan` shows `current_task_definition` on the revision rolled
+  back to (R, or after L6 the previous revision), the target group is healthy, `GET /ready` returns 200 on every task, and
   `GET /v1/admin/billing/rollout/readback` is still `disabled`.
 - **IAM and secret.** The stack `neurostack-asaas-production-wiring` (applied
   2026-10-18) owns the policy `asaas-production-wiring-secret-read` and the

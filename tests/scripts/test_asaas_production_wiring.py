@@ -765,8 +765,10 @@ def _plan(
     # The fixture world is the D3 world of 2026-10-18 (the service on revision
     # 8, revision 9 not yet registered), planned against the manifest of that
     # time: rollback_target 8 with its re-pin note. The reviewed manifest has
-    # been re-pinned since (8 to 9, then 9 to 10); the tests below that plan
-    # the later states pass the pins they need (_worker_pins).
+    # been re-pinned since (the safety re-pins 8 to 9 and 9 to 10, then 10 to
+    # 11 by asaas-rollout-opening Group 5b; 12 and 13 follow by the live
+    # chain); the tests below that plan the later states pass the pins they
+    # need (_worker_pins).
     pins = pins if pins is not None else _initial_pins()
     aws = wiring.ReadOnlyAws(fake.transport)
     readback = wiring.collect_readback(aws, parameters, pins=pins)
@@ -1856,8 +1858,8 @@ def test_unknown_parameter_is_rejected() -> None:
 def test_manifest_and_template_validate() -> None:
     manifest, parameters, digests = wiring.load_inputs(MANIFEST, PARAMS)
     assert manifest["rollback_target"] == {
-        "revision": 10,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
+        "revision": 11,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_E7B,
     }
     assert "rollback_task_definition_revision" not in manifest["target"]
     assert parameters is not None
@@ -2775,7 +2777,8 @@ def test_manifest_validator_pins_the_managed_by_override(value: Any) -> None:
 
 # ---------------------------------------------------------------------------
 # T2: the rollback target is a manifest field, re-pinned 8 -> 9 before 036,
-# then 9 -> 10 before the image bump is deployed
+# then 9 -> 10 before the image bump is deployed (the two safety re-pins),
+# then along the live chain 10 -> 11 -> 12 -> 13 and open above 13 (Group 5b)
 # ---------------------------------------------------------------------------
 
 
@@ -2786,38 +2789,320 @@ LIVE_REVISION_9_IMAGE = (
 )
 
 
-def test_rollback_target_is_re_pinned_to_revision_10_without_a_note() -> None:
-    """The reviewed manifest after the second re-pin: revision 10, no note."""
+def test_rollback_target_is_re_pinned_to_revision_11_without_a_note() -> None:
+    """The reviewed manifest after Group 5b's re-pin 10 -> 11: revision 11
+    (the E7b image bump, the way back from live step L2a), no note."""
 
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 10,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
+        "revision": 11,
+        "effective_after": "e7b_revision_11_serving_verified_and_observation_closed",
     }
-    assert wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG == (
-        "worker_flag_revision_10_serving_verified_and_observation_closed"
-    )
     manifest = wiring.validate_manifest(raw)
     assert "repin" not in manifest["rollback_target"]
     pins = _pins()
-    assert pins.rollback_revision == wiring.WORKER_FLAG_REVISION == 10
-    assert pins.rollback_task_definition_arn == REVISION_10_ARN
-    assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG
+    assert pins.rollback_revision == 11
+    assert pins.rollback_task_definition_arn == REVISION_11_ARN
+    assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_E7B
     assert pins.rollback_repin_before is None
     # The D3 source stays revision 8: the re-pins move only the rollback target.
     assert manifest["task_definition"]["source_revision"] == 8
-    # The pins form one chain, 8 -> 9 -> 10, and 10 is the last.
+
+
+def test_the_pins_are_two_safety_re_pins_then_the_live_chain() -> None:
+    """8 -> 9 -> 10 are the safety re-pins (each with its note while
+    pending); 10, 11, 12 and 13 carry no note; above 13 the target is open
+    with the generic effective step."""
+
     assert wiring.ROLLBACK_TARGET_PINS == {
         8: (
-            wiring.ROLLBACK_EFFECTIVE_INITIAL,
-            (9, wiring.ROLLBACK_EFFECTIVE_BRIDGE, "migration_036"),
+            "initial_d3_planning_2026_10_18",
+            (
+                9,
+                "bridge_revision_9_serving_verified_and_observation_closed",
+                "migration_036",
+            ),
         ),
         9: (
-            wiring.ROLLBACK_EFFECTIVE_BRIDGE,
-            (10, wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG, "app_image_bump_deployment"),
+            "bridge_revision_9_serving_verified_and_observation_closed",
+            (
+                10,
+                "worker_flag_revision_10_serving_verified_and_observation_closed",
+                "app_image_bump_deployment",
+            ),
         ),
-        10: (wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG, None),
+        10: ("worker_flag_revision_10_serving_verified_and_observation_closed", None),
+        11: ("e7b_revision_11_serving_verified_and_observation_closed", None),
+        12: ("staged_rows_revision_12_serving_verified_and_observation_closed", None),
+        13: ("credit_image_revision_13_serving_verified_and_window_042_observed", None),
     }
+    assert wiring.ROLLBACK_LAST_NAMED_PIN == 13
+    assert wiring.ROLLBACK_EFFECTIVE_SERVING == (
+        "revision_serving_verified_and_observation_closed"
+    )
+    # Indexed by the revision each safety re-pin moves TO.
+    assert dict(wiring.ROLLBACK_REPIN_WHY_NAMES) == {
+        9: "036",
+        10: "BILLING_FACT_WORKER_ENABLED",
+    }
+    for revision in (14, 15, 100, wiring.ROLLBACK_PIN_MAX):
+        assert wiring.rollback_target_pin(revision) == (
+            "revision_serving_verified_and_observation_closed",
+            None,
+        )
+    assert wiring.ROLLBACK_PIN_MAX == 999_999_999
+    for refused in (7, 0, -1, wiring.ROLLBACK_PIN_MAX + 1, True, False, "11", 11.0):
+        assert wiring.rollback_target_pin(refused) is None, refused
+
+
+# The rollback target the manifest holds at each pin of the live chain.
+CHAIN_TARGETS: dict[int, dict[str, Any]] = {
+    10: {
+        "revision": 10,
+        "effective_after": "worker_flag_revision_10_serving_verified_and_observation_closed",
+    },
+    11: {
+        "revision": 11,
+        "effective_after": "e7b_revision_11_serving_verified_and_observation_closed",
+    },
+    12: {
+        "revision": 12,
+        "effective_after": (
+            "staged_rows_revision_12_serving_verified_and_observation_closed"
+        ),
+    },
+    13: {
+        "revision": 13,
+        "effective_after": (
+            "credit_image_revision_13_serving_verified_and_window_042_observed"
+        ),
+    },
+}
+GENERIC_EFFECTIVE_AFTER = "revision_serving_verified_and_observation_closed"
+
+
+def _chain_target(revision: int) -> dict[str, Any]:
+    if revision in CHAIN_TARGETS:
+        return copy.deepcopy(CHAIN_TARGETS[revision])
+    return {"revision": revision, "effective_after": GENERIC_EFFECTIVE_AFTER}
+
+
+@pytest.mark.parametrize("revision", [10, 11, 12, 13, 14, 15, 16, 100, 999_999_999])
+def test_check_manifest_accepts_every_pin_of_the_chain_and_any_above_13(
+    revision: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    manifest["rollback_target"] = _chain_target(revision)
+    pins = _pins(manifest)
+    assert pins.rollback_revision == revision
+    assert pins.rollback_repin_before is None
+    path = tmp_path / "manifest.yaml"
+    path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    code, out, err = _run(["check-manifest", "--manifest", str(path)], capsys)
+    assert code == 0, err
+    assert json.loads(out)["status"] == "valid"
+
+
+def _refused_targets() -> list[Any]:
+    note = {
+        "revision": 12,
+        "effective_after": CHAIN_TARGETS[12]["effective_after"],
+        "before": "live_step_l2b",
+        "why": "Revision 11 has no staged rows.",
+    }
+    swapped = [
+        {"revision": revision, "effective_after": target["effective_after"]}
+        for revision in (10, 11, 12, 13)
+        for other, target in CHAIN_TARGETS.items()
+        if other != revision
+    ]
+    return [
+        # Below the chain: 7 was never a pin.
+        {"revision": 7, "effective_after": wiring.ROLLBACK_EFFECTIVE_INITIAL},
+        {"revision": 7, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        {"revision": 0, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        {"revision": 1_000_000_000, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        # A swapped effective step: each named pin carries its own only.
+        *swapped,
+        {"revision": 13, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        {"revision": 12, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        {"revision": 14, "effective_after": CHAIN_TARGETS[13]["effective_after"]},
+        {"revision": 14, "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG},
+        {"revision": 11, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
+        # A repin note on 10 or above: none is accepted.
+        *(
+            {**_chain_target(revision), "repin": copy.deepcopy(note)}
+            for revision in (10, 11, 12, 13, 14)
+        ),
+        {
+            **_chain_target(11),
+            "repin": {
+                "revision": 10,
+                "effective_after": wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG,
+                "before": "app_image_bump_deployment",
+                "why": "BILLING_FACT_WORKER_ENABLED",
+            },
+        },
+        # Any other key, or the wrong types.
+        {**_chain_target(11), "note": "x"},
+        {"revision": 11},
+        {"revision": True, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        {"revision": "14", "effective_after": GENERIC_EFFECTIVE_AFTER},
+        {"revision": 14.0, "effective_after": GENERIC_EFFECTIVE_AFTER},
+        # The safety pins still need their notes (as before).
+        {"revision": 8, "effective_after": wiring.ROLLBACK_EFFECTIVE_INITIAL},
+        {"revision": 9, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
+    ]
+
+
+@pytest.mark.parametrize("target", _refused_targets())
+def test_check_manifest_refuses_7_a_swapped_step_and_a_note_from_10_on(
+    target: Any,
+) -> None:
+    manifest = wiring.load_yaml(MANIFEST)
+    manifest["rollback_target"] = copy.deepcopy(target)
+    with pytest.raises(wiring.WiringError, match="manifest_rollback_target_invalid"):
+        wiring.validate_manifest(manifest)
+
+
+def test_a_missing_why_name_is_a_wiring_error_never_a_key_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only reachable when the two tables disagree (the import check below
+    refuses that); the validator still fails closed with a WiringError."""
+
+    wiring.validate_manifest(_initial_manifest())
+    monkeypatch.setattr(wiring, "ROLLBACK_REPIN_WHY_NAMES", {10: "BILLING"})
+    with pytest.raises(wiring.WiringError, match="^rollback_repin_why_missing$"):
+        wiring.validate_manifest(_initial_manifest())
+    monkeypatch.setattr(wiring, "ROLLBACK_REPIN_WHY_NAMES", {})
+    with pytest.raises(wiring.WiringError, match="^rollback_repin_why_missing$"):
+        wiring.validate_manifest(_worker_manifest(9))
+    # The pins without a note never read it.
+    wiring.validate_manifest(_worker_manifest(10))
+
+
+def _table_with(**changes: Any) -> Callable[[pytest.MonkeyPatch], None]:
+    def apply(monkeypatch: pytest.MonkeyPatch) -> None:
+        for name, value in changes.items():
+            monkeypatch.setattr(wiring, name, value)
+
+    return apply
+
+
+PINS = wiring.ROLLBACK_TARGET_PINS
+INCONSISTENT_ROLLBACK_TABLES: dict[
+    str, tuple[Callable[[pytest.MonkeyPatch], None], str]
+] = {
+    "why_entry_missing": (
+        _table_with(ROLLBACK_REPIN_WHY_NAMES={9: "036"}),
+        "rollback_table_why_names_mismatch",
+    ),
+    "why_keyed_by_before_step": (
+        _table_with(
+            ROLLBACK_REPIN_WHY_NAMES={
+                "migration_036": "036",
+                "app_image_bump_deployment": "BILLING_FACT_WORKER_ENABLED",
+            }
+        ),
+        "rollback_table_why_names_mismatch",
+    ),
+    "why_entry_without_a_re_pin": (
+        _table_with(ROLLBACK_REPIN_WHY_NAMES={9: "036", 10: "BILLING", 11: "x"}),
+        "rollback_table_why_names_mismatch",
+    ),
+    "why_name_empty": (
+        _table_with(ROLLBACK_REPIN_WHY_NAMES={9: "036", 10: ""}),
+        "rollback_table_why_names_mismatch",
+    ),
+    "a_pin_missing": (
+        _table_with(ROLLBACK_TARGET_PINS={k: v for k, v in PINS.items() if k != 11}),
+        "rollback_table_not_one_chain",
+    ),
+    "a_pin_below_8": (
+        _table_with(
+            ROLLBACK_TARGET_PINS={7: ("initial_d3_planning_2026_10_18", None), **PINS}
+        ),
+        "rollback_table_not_one_chain",
+    ),
+    "a_reused_step": (
+        _table_with(
+            ROLLBACK_TARGET_PINS={**PINS, 12: (wiring.ROLLBACK_EFFECTIVE_E7B, None)}
+        ),
+        "rollback_table_effective_after_reused",
+    ),
+    "the_generic_step_on_a_named_pin": (
+        _table_with(ROLLBACK_TARGET_PINS={**PINS, 13: (GENERIC_EFFECTIVE_AFTER, None)}),
+        "rollback_table_effective_after_reused",
+    ),
+    "a_re_pin_skipping_a_pin": (
+        _table_with(
+            ROLLBACK_TARGET_PINS={
+                **PINS,
+                9: (PINS[9][0], (11, wiring.ROLLBACK_EFFECTIVE_E7B, "x")),
+            },
+            ROLLBACK_REPIN_WHY_NAMES={9: "036", 11: "x"},
+        ),
+        "rollback_table_repin_invalid",
+    ),
+    "a_re_pin_naming_another_step": (
+        _table_with(
+            ROLLBACK_TARGET_PINS={
+                **PINS,
+                9: (PINS[9][0], (10, wiring.ROLLBACK_EFFECTIVE_E7B, "x")),
+            }
+        ),
+        "rollback_table_repin_invalid",
+    ),
+    "a_note_after_an_open_pin": (
+        _table_with(
+            ROLLBACK_TARGET_PINS={
+                **PINS,
+                11: (PINS[11][0], (12, PINS[12][0], "live_step_l2b")),
+            },
+            ROLLBACK_REPIN_WHY_NAMES={9: "036", 10: "BILLING", 12: "rows"},
+        ),
+        "rollback_table_repin_after_an_open_pin",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(INCONSISTENT_ROLLBACK_TABLES))
+def test_an_inconsistent_rollback_table_cannot_load(
+    case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wiring._assert_rollback_table()
+    patch, reason = INCONSISTENT_ROLLBACK_TABLES[case]
+    patch(monkeypatch)
+    with pytest.raises(wiring.WiringError, match=f"^{reason}$"):
+        wiring._assert_rollback_table()
+
+
+def _import_copy(source: str, monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    """Execute ``source`` as a fresh module (the real one is untouched)."""
+
+    module = types.ModuleType("wiring_import_probe")
+    module.__file__ = str(SCRIPT)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(source, str(SCRIPT), "exec"), module.__dict__)
+    return module
+
+
+def test_a_re_pin_without_a_why_name_fails_the_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The module itself refuses to load with one WHY entry removed."""
+
+    source = SCRIPT.read_text(encoding="utf-8")
+    entry = "    WORKER_FLAG_REVISION: WORKER_FLAG_PARAMETER,\n"
+    assert source.count(entry) == 1
+    loaded = _import_copy(source, monkeypatch)
+    assert loaded.ROLLBACK_REPIN_WHY_NAMES == wiring.ROLLBACK_REPIN_WHY_NAMES
+    with pytest.raises(
+        ValueError, match="^rollback_table_why_names_mismatch$"
+    ) as raised:
+        _import_copy(source.replace(entry, ""), monkeypatch)
+    assert type(raised.value).__name__ == "WiringError"
 
 
 def test_revision_9_is_a_pin_with_its_pending_re_pin_to_10() -> None:
@@ -2897,23 +3182,23 @@ def test_repinned_rollback_target_9_flows_through_the_plan() -> None:
         ({"image": LIVE_IMAGE}, "rollback_target_revision_unusable"),
     ],
 )
+@pytest.mark.parametrize("revision", [10, 11, 14])
 def test_repinned_rollback_target_must_be_active_and_digest_pinned(
-    changes: dict[str, Any], reason: str | None
+    changes: dict[str, Any], reason: str | None, revision: int
 ) -> None:
     fake = FakeAws(applied=True)
-    target = _task_definition(
-        REVISION_10_ARN, image=changes.get("image", LIVE_REVISION_9_IMAGE)
-    )
+    arn = SOURCE_ARN.rsplit(":", 1)[0] + f":{revision}"
+    target = _task_definition(arn, image=changes.get("image", LIVE_REVISION_9_IMAGE))
     if "status" in changes:
         target["taskDefinition"]["status"] = changes["status"]
     fake.put(
         "ecs",
         "DescribeTaskDefinition",
-        {"taskDefinition": "neurostack-staging-app:10", "include": ["TAGS"]},
+        {"taskDefinition": f"neurostack-staging-app:{revision}", "include": ["TAGS"]},
         target,
     )
-    plan, _rendered = _plan(fake, pins=_pins())
-    assert plan["target"]["rollback_target"] == REVISION_10_ARN
+    plan, _rendered = _plan(fake, pins=_worker_pins(revision))
+    assert plan["target"]["rollback_target"] == arn
     deployment = _step(plan, "service_deployment")
     if reason is None:
         assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
@@ -2932,9 +3217,12 @@ def _set_rollback(**values: Any) -> Callable[[dict[str, Any]], None]:
         _set_rollback(revision=7),
         _set_rollback(revision=8),
         _set_rollback(revision=9),
-        _set_rollback(revision=11),
+        _set_rollback(revision=10),
+        _set_rollback(revision=12),
+        _set_rollback(revision=14),
         _set_rollback(revision=True),
         _set_rollback(revision="9"),
+        _set_rollback(effective_after=wiring.ROLLBACK_EFFECTIVE_SERVING),
         _set_rollback(effective_after="whenever"),
         _set_rollback(effective_after=wiring.ROLLBACK_EFFECTIVE_INITIAL),
         _set_rollback(repin=copy.deepcopy(INITIAL_ROLLBACK_TARGET["repin"])),
@@ -4181,7 +4469,8 @@ WORKER_FLAG = "BILLING_FACT_WORKER_ENABLED"
 REVISION_10_ARN = SOURCE_ARN.rsplit(":", 1)[0] + ":10"
 # Every rollback target the manifest may hold, set explicitly: these tests do
 # not depend on which one the reviewed manifest carries. Revision 9 names its
-# pending re-pin to 10 (before the image bump is deployed).
+# pending re-pin to 10 (before the image bump is deployed). The live chain
+# (10 and on, no note) is CHAIN_TARGETS / _chain_target.
 WORKER_ROLLBACK_TARGETS: dict[int, dict[str, Any]] = {
     8: {
         "revision": 8,
@@ -4227,7 +4516,11 @@ WORKER_WORLDS = [("d3", 8), ("bridge", 8), ("bridge", 9)]
 
 def _worker_manifest(rollback: int) -> dict[str, Any]:
     manifest: dict[str, Any] = wiring.load_yaml(MANIFEST)
-    manifest["rollback_target"] = copy.deepcopy(WORKER_ROLLBACK_TARGETS[rollback])
+    manifest["rollback_target"] = (
+        copy.deepcopy(WORKER_ROLLBACK_TARGETS[rollback])
+        if rollback in WORKER_ROLLBACK_TARGETS
+        else _chain_target(rollback)
+    )
     return manifest
 
 
@@ -5406,12 +5699,16 @@ BRIDGE_IMAGE = f"{STAGING_REPOSITORY}@{BRIDGE_DIGEST}"
 NEW_IMAGE = f"{STAGING_REPOSITORY}@{NEW_DIGEST}"
 OTHER_DIGEST = "sha256:" + "3" * 64
 OTHER_IMAGE = f"{STAGING_REPOSITORY}@{OTHER_DIGEST}"
+# A hotfix image during the canary (Group 5b), in the same repository.
+HOTFIX_DIGEST = "sha256:" + "5" * 64
+HOTFIX_IMAGE = f"{STAGING_REPOSITORY}@{HOTFIX_DIGEST}"
 
 
 def _with_images(fake: FakeAws) -> FakeAws:
-    """ECR knows the bridge, the new and one other digest of neurostack-staging."""
+    """ECR knows the bridge, the new, one other and a hotfix digest of
+    neurostack-staging."""
 
-    for digest in (BRIDGE_DIGEST, NEW_DIGEST, OTHER_DIGEST):
+    for digest in (BRIDGE_DIGEST, NEW_DIGEST, OTHER_DIGEST, HOTFIX_DIGEST):
         fake.put(
             "ecr",
             "DescribeImages",
@@ -5719,7 +6016,11 @@ def test_only_an_image_digest_difference_becomes_an_image_bump(refusal: str) -> 
     step = _step(plan, "task_definition_revision")
     assert plan["status"] == "blocked"
     assert step["changes"] == []
-    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_10_ARN}"]
+    # The service runs its own rollback target (10): the stuck state has its
+    # own name, never "not on the rollback target" naming the target itself.
+    assert step["blocks"] == [
+        f"service_on_rollback_target_plan_stuck:{REVISION_10_ARN}"
+    ]
     assert "rollback_target_not_repinned_before_image_bump" not in (
         _step(plan, "service_deployment")["blocks"]
     )
@@ -5744,7 +6045,15 @@ def test_a_rendering_by_tag_is_never_an_image_bump() -> None:
     step = _step(plan, "task_definition_revision")
     assert plan["status"] == "blocked"
     assert step["changes"] == []
-    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_10_ARN}"]
+    assert step["blocks"] == [
+        f"service_on_rollback_target_plan_stuck:{REVISION_10_ARN}"
+    ]
+    # With the target on another revision, the generic reason names the
+    # serving revision.
+    plan, _rendered = _image_plan(_live_flag_world(), image=None, rollback=9)
+    assert _step(plan, "task_definition_revision")["blocks"] == [
+        f"service_not_on_rollback_target:{REVISION_10_ARN}"
+    ]
 
 
 def test_app_image_change_is_exactly_one_digest_move() -> None:
@@ -5819,7 +6128,9 @@ def test_a_drifted_serving_revision_is_never_the_image_stuck_state() -> None:
     plan, _rendered = _image_plan(fake, image=BRIDGE_IMAGE, rollback=10)
     step = _step(plan, "task_definition_revision")
     assert plan["status"] == "blocked"
-    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_10_ARN}"]
+    assert step["blocks"] == [
+        f"service_on_rollback_target_plan_stuck:{REVISION_10_ARN}"
+    ]
     assert "newest_revision_app_image" not in step["info"]
 
 
@@ -5862,8 +6173,10 @@ def test_a_serving_image_from_another_repository_is_gated_like_a_bump(
     rollback: int,
 ) -> None:
     """Revision 11, registered and deployed outside the planner with an app
-    image in another repository: with rollback target 9 the gate blocks, with
-    10 it does not."""
+    image in another repository: with rollback target 9 the gate blocks, and
+    since the content rule (Group 5b) with 10 too, on purpose: an image in
+    another repository is never an app image change from the target, so 10
+    is not the revision it replaced."""
 
     digest = "sha256:" + "4" * 64
     image = f"{REGISTRY}/neurostack-other@{digest}"
@@ -5886,7 +6199,11 @@ def test_a_serving_image_from_another_repository_is_gated_like_a_bump(
         in _step(plan, "task_definition_revision")["compliant"]
     )
     gate = "rollback_target_not_repinned_before_image_bump"
-    assert (gate in _step(plan, "service_deployment")["blocks"]) == (rollback == 9)
+    deployment = _step(plan, "service_deployment")
+    assert gate in deployment["blocks"]
+    [verdict] = deployment["info"]["rollback_target_content_rule"]
+    assert verdict["kind"] == "app_image" and verdict["change"] == "serving"
+    assert "target_differs_from_the_change_in_more_than_its_kind" in verdict["failed"]
 
 
 def test_a_flag_change_never_reports_the_image_bump_gate() -> None:
@@ -5899,13 +6216,16 @@ def test_a_flag_change_never_reports_the_image_bump_gate() -> None:
     )
 
 
-def test_the_rollback_target_may_be_re_pinned_from_9_to_10_only() -> None:
+def test_the_safety_re_pins_stay_8_to_9_and_9_to_10() -> None:
+    """The two safety re-pins behave as before Group 5b; the live chain from
+    10 on is test_check_manifest_accepts_every_pin_of_the_chain_and_any_above_13."""
+
     for revision in (8, 9, 10):
         wiring.validate_manifest(_worker_manifest(revision))
     flag = wiring.ROLLBACK_EFFECTIVE_WORKER_FLAG
     note_to_10 = copy.deepcopy(WORKER_ROLLBACK_TARGETS[9]["repin"])
     invalid: list[dict[str, Any]] = [
-        # 10 is the last pin: no re-pin from it, no revision after it.
+        # 10 is the last safety pin: no note from it; 11 has its own step.
         {**WORKER_ROLLBACK_TARGETS[10], "repin": {**note_to_10, "revision": 11}},
         {"revision": 11, "effective_after": flag},
         {"revision": 10, "effective_after": wiring.ROLLBACK_EFFECTIVE_BRIDGE},
@@ -5955,15 +6275,18 @@ def _repository_params_with_image(directory: Path, image: str) -> Path:
 def test_the_repository_parameters_propose_the_image_bump(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The live state (revision 10 serving the bridge image with 'true', the
-    newest), the reviewed manifest (rollback target 10) and the repository
-    file with only the apply-time image set to the new digest: plan proposes
-    one new revision whose only difference from revision 10 is the app image,
+    """The live state of 2026-10-25 (revision 10 serving the bridge image
+    with 'true', the newest), the manifest of that time (rollback target 10,
+    reviewed until Group 5b re-pinned it to 11) and the repository file with
+    only the apply-time image set to the new digest: plan proposes one new
+    revision whose only difference from revision 10 is the app image,
     render-taskdef prints it and check passes. With the bridge digest instead,
     revision 10 is registered and deployed."""
 
     fake = _live_flag_world()
     snapshot = fake.snapshot(tmp_path / "readback.json")
+    manifest_10 = tmp_path / "manifest-10.yaml"
+    manifest_10.write_text(yaml.safe_dump(_worker_manifest(10)), encoding="utf-8")
     outputs: dict[str, dict[str, str]] = {}
     for image in (NEW_IMAGE, BRIDGE_IMAGE):
         params = _repository_params_with_image(tmp_path, image)
@@ -5977,7 +6300,7 @@ def test_the_repository_parameters_propose_the_image_bump(
                     "--readback-file",
                     str(snapshot),
                     "--manifest",
-                    str(MANIFEST),
+                    str(manifest_10),
                 ],
                 capsys,
             )
@@ -6038,8 +6361,8 @@ def test_the_repository_parameters_propose_the_image_bump(
     )
 
 
-# Statements of the rollback target from before the 9 -> 10 re-pin; none may
-# come back while the manifest pins 10.
+# Statements of the rollback target from before the 9 -> 10 re-pin, and of
+# the closed table before Group 5b; none may come back.
 RETIRED_ROLLBACK_STATEMENTS = (
     "revision 9 is the last pin the planner allows",
     "its only allowed move is 8 to 9",
@@ -6047,33 +6370,58 @@ RETIRED_ROLLBACK_STATEMENTS = (
     "rollback_target stays revision 9",
     "re-pinned to revision 9, `ACTIVE`",
     "`rollback_target` revision 9 with no pending re-pin",
+    "Revision 10 is the final pin of the planner",
+    "revision 10 is the last pin the planner allows",
+    "and 10 is the last pin",
+    "allows no pin after 10",
+    "Window 042 goes back to the same revision",
+    "`rollback_target` revision 10 with no pending re-pin, `ACTIVE`, by digest",
 )
 
 
 # The observation of revision 10 closes 6 h after its deployment completed
 # (2026-10-25 01:51 UTC).
 REPIN_9_TO_10_EARLIEST_CLOSE = datetime.datetime(2026, 10, 25, 7, 51)
+# Revision 11's deployment completed at 2026-10-25 15:06:57 UTC: by the 9 ->
+# 10 precedent (6 h after COMPLETED, rounded up to the minute) its
+# observation closes no earlier than 21:07.
+REPIN_10_TO_11_EARLIEST_CLOSE = datetime.datetime(2026, 10, 25, 21, 7)
+# One `# closed_at:` marker per re-pin in the manifest comment, in file order,
+# each with its own floor (the re-pins 11 -> 12 and 12 -> 13 of live steps
+# L2c and L4 append theirs).
+REPIN_CLOSE_FLOORS = (
+    ("9 to 10", REPIN_9_TO_10_EARLIEST_CLOSE),
+    ("10 to 11", REPIN_10_TO_11_EARLIEST_CLOSE),
+)
 
 
-def _closed_at_is_valid(value: str) -> bool:
-    """The manifest marker: the placeholder, or YYYY-MM-DDTHH:MMZ at or after
-    the earliest close."""
+def _expected_closed_at_markers(revision: int) -> int:
+    """How many `# closed_at:` markers the manifest carries with the target
+    on ``revision``: one per re-pin from 9 to 10 on (8 -> 9 predates the
+    marker), so 10 -> 1, 11 -> 2, 12 -> 3, 13 -> 4; above 13 at least 4 (one
+    more per later re-pin; the caller checks the lower bound)."""
 
-    if value == "<filled in at merge>":
-        return True
+    return max(0, min(revision, wiring.ROLLBACK_LAST_NAMED_PIN) - 9)
+
+
+def _closed_at_is_valid(value: str, floor: datetime.datetime) -> bool:
+    """A manifest marker: YYYY-MM-DDTHH:MMZ at or after its re-pin's floor.
+    The placeholder is history (the 9 -> 10 PR before its merge): every
+    marker on main is an actual closing time."""
+
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z", value) is None:
         return False
     try:
         closed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%MZ")
     except ValueError:
         return False
-    return closed >= REPIN_9_TO_10_EARLIEST_CLOSE
+    return closed >= floor
 
 
 @pytest.mark.parametrize(
     "value,valid",
     [
-        ("<filled in at merge>", True),
+        ("<filled in at merge>", False),
         ("2026-10-25T07:51Z", True),
         ("2026-10-25T23:59Z", True),
         ("2026-10-26T00:10Z", True),
@@ -6093,7 +6441,217 @@ def _closed_at_is_valid(value: str) -> bool:
 def test_the_closed_at_marker_accepts_only_a_close_at_or_after_07_51(
     value: str, valid: bool
 ) -> None:
-    assert _closed_at_is_valid(value) is valid
+    assert _closed_at_is_valid(value, REPIN_9_TO_10_EARLIEST_CLOSE) is valid
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ("2026-10-25T21:07Z", True),
+        ("2026-11-01T01:19Z", True),
+        ("2026-10-25T21:06Z", False),
+        # The 9 -> 10 close and revision 11's own COMPLETED are too early.
+        ("2026-10-25T12:42Z", False),
+        ("2026-10-25T15:06Z", False),
+        ("2026-10-25T15:07Z", False),
+        ("<filled in at merge>", False),
+        ("2026-11-01T1:19Z", False),
+    ],
+)
+def test_the_10_to_11_marker_accepts_only_a_close_at_or_after_21_07(
+    value: str, valid: bool
+) -> None:
+    assert _closed_at_is_valid(value, REPIN_10_TO_11_EARLIEST_CLOSE) is valid
+
+
+def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
+    text = MANIFEST.read_text(encoding="utf-8")
+    marker = re.compile(r"^# closed_at: (?P<value>.+)$", re.MULTILINE)
+    values = marker.findall(text)
+    # The count follows the manifest's own pin: a re-pin PR that forgets its
+    # marker fails here.
+    revision = wiring.load_yaml(MANIFEST)["rollback_target"]["revision"]
+    expected = _expected_closed_at_markers(revision)
+    if revision > wiring.ROLLBACK_LAST_NAMED_PIN:
+        assert len(values) >= expected, (revision, values)
+    else:
+        assert len(values) == expected, (revision, values)
+    assert [_expected_closed_at_markers(n) for n in (9, 10, 11, 12, 13, 14)] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        4,
+    ]
+    assert expected == len(REPIN_CLOSE_FLOORS) == 2
+    for (name, floor), value in zip(REPIN_CLOSE_FLOORS, values, strict=True):
+        assert _closed_at_is_valid(value, floor), (name, value)
+    assert values == ["2026-10-25T12:42Z", "2026-11-01T01:19Z"]
+    # In order: each marker follows its own re-pin's text and precedes the
+    # field; each later close is after the earlier one.
+    positions = [m.start() for m in marker.finditer(text)]
+    assert (
+        text.index("Then re-pinned from revision 9 to the worker-flag revision 10")
+        < positions[0]
+        < text.index("Re-pinned from revision 10 to\n# revision 11")
+        < positions[1]
+        < text.index("\nrollback_target:\n")
+    )
+    closes = [datetime.datetime.strptime(v, "%Y-%m-%dT%H:%MZ") for v in values]
+    assert closes == sorted(closes)
+    # The 10 -> 11 close is after revision 11's deployment completed.
+    assert closes[1] > datetime.datetime(2026, 10, 25, 15, 6, 57)
+
+
+# The read-only evidence of revision 11 the 10 -> 11 re-pin records (the
+# orchestrator's read with the owner's go, 2026-11-01).
+REVISION_11_REQUEST_SHA256 = (
+    "d173600cf8bcf2428b6662b79200fc03a645ea6c243bb4bb6ec78bc4429561d3"
+)
+E7B_DIGEST = "sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159"
+
+
+def _manifest_comment() -> str:
+    """The manifest's comment lines, joined into one flat text."""
+
+    lines = MANIFEST.read_text(encoding="utf-8").splitlines()
+    return " ".join(
+        line.strip()[1:].strip() for line in lines if line.strip().startswith("#")
+    )
+
+
+def test_the_10_to_11_re_pin_records_its_request_sha256_and_image_digest() -> None:
+    comment = _manifest_comment()
+    hashes = re.findall(r"request_sha256 ([0-9a-f]+)\b", comment)
+    assert hashes == [REVISION_11_REQUEST_SHA256]
+    assert re.fullmatch(r"[0-9a-f]{64}", hashes[0])
+    assert MANIFEST.read_text(encoding="utf-8").count(E7B_DIGEST) == 1
+    assert f"app image {E7B_DIGEST}," in comment
+    # Each in the 10 -> 11 text, before the field.
+    assert (
+        comment.index("Re-pinned from revision 10 to revision 11")
+        < comment.index(E7B_DIGEST)
+        < comment.index(REVISION_11_REQUEST_SHA256)
+        < comment.index("closed_at: 2026-11-01T01:19Z")
+    )
+    assert (
+        "defined as _sha256(_request_from_response(<DescribeTaskDefinition"
+        " neurostack-staging-app:11 with include TAGS>)) in"
+        " scripts/asaas_production_wiring.py (not the plan's"
+        " rendered_request_sha256)" in comment
+    )
+
+
+def test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time() -> None:
+    must = wiring.load_yaml(MANIFEST)["context"]["must"]
+    assert (
+        "The service rollback target is the field rollback_target; code paths"
+        " read it from here and it moves one reviewed re-pin at a time, 8 to 9"
+        " and 9 to 10 being the safety re-pins (each with its mandatory repin"
+        " note while pending), 10 to 11 and later owner re-pins with no note (11"
+        " recorded in this manifest; 12 and 13 are separate PRs of the live"
+        " sequence), and above 13 any serving revision with effective_after"
+        " revision_serving_verified_and_observation_closed." in must
+    )
+    assert not [line for line in must if "(8 to 9, then 9 to 10)." in line]
+
+
+def test_the_042_window_preconditions_name_revision_12_by_content() -> None:
+    [step] = [
+        step
+        for step in wiring.load_yaml(MANIFEST)["steps"]
+        if step["id"] == "migrations_038_042"
+    ]
+    targets = [line for line in step["preconditions"] if "rollback_target" in line]
+    assert targets == [
+        "rollback_target is revision 12 with no pending re-pin (L2a's revision,"
+        " re-pinned from 11 by live step L2c, before L2b), ACTIVE, its app image"
+        " pinned by digest, with exactly one BILLING_FACT_WORKER_ENABLED row,"
+        " 'true', and differing from the revision the service runs (L2b's, on"
+        " the image containing 042) in the app image alone; the migrations are"
+        " additive, so it stays a valid way back with the schema at 042."
+    ]
+    assert targets[0].split(" with ", 1)[0] == (
+        f"rollback_target is revision {mw.WINDOW_042.rollback_target_revision}"
+    )
+
+
+def test_the_strict_loader_leaves_yaml_safe_loader_alone() -> None:
+    """The plain-decimal rule is the planner's own loader's: importing the
+    planner never changes PyYAML's SafeLoader."""
+
+    assert wiring._StrictLoader is not yaml.SafeLoader
+    assert (
+        yaml.SafeLoader.yaml_constructors["tag:yaml.org,2002:int"]
+        is yaml.constructor.SafeConstructor.construct_yaml_int
+    )
+    assert type(yaml.safe_load("a: 014")["a"]) is int
+    assert yaml.safe_load("a: 014")["a"] == 12
+    assert type(yaml.load("a: 014", Loader=wiring._StrictLoader)["a"]) is not int
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["014", "0xE", "1_4", "+14", "0b1110", "!!int '14'", '!!int "14"', "1:10"],
+)
+def test_a_rollback_revision_must_be_spelled_in_plain_decimal(
+    spelling: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """YAML 1.1 reads these as integers (12, 14 or 70): each is refused, the
+    plain decimal is accepted."""
+
+    text = MANIFEST.read_text(encoding="utf-8")
+    field = (
+        "rollback_target:\n  revision: 11\n"
+        "  effective_after: e7b_revision_11_serving_verified_and_observation_closed\n"
+    )
+    assert field in text
+    generic = f"  effective_after: {GENERIC_EFFECTIVE_AFTER}\n"
+    for revision, effective, refused in (
+        (spelling, generic, True),
+        ("14", generic, False),
+        ("70" if spelling == "1:10" else None, generic, False),
+    ):
+        if revision is None:
+            continue
+        path = tmp_path / f"manifest-{refused}.yaml"
+        path.write_text(
+            text.replace(
+                field, f"rollback_target:\n  revision: {revision}\n{effective}"
+            ),
+            encoding="utf-8",
+        )
+        if refused:
+            assert (
+                type(wiring.load_yaml(path)["rollback_target"]["revision"]) is not int
+            )
+            with pytest.raises(
+                wiring.WiringError, match="manifest_rollback_target_invalid"
+            ):
+                wiring.validate_manifest(wiring.load_yaml(path))
+            code, out, _err = _run(["check-manifest", "--manifest", str(path)], capsys)
+            assert code != 0 and "manifest_rollback_target_invalid" in out + _err
+        else:
+            pins = _pins(wiring.load_yaml(path))
+            assert pins.rollback_revision == int(revision)
+
+
+@pytest.mark.parametrize("spelling", ["0x9", "+9", "!!int '9'"])
+def test_a_safety_re_pin_note_revision_must_be_spelled_in_plain_decimal(
+    spelling: str, tmp_path: Path
+) -> None:
+    manifest_text = yaml.safe_dump(_worker_manifest(8))
+    assert "    revision: 9\n" in manifest_text
+    path = tmp_path / "manifest.yaml"
+    path.write_text(
+        manifest_text.replace("    revision: 9\n", f"    revision: {spelling}\n"),
+        encoding="utf-8",
+    )
+    with pytest.raises(wiring.WiringError, match="manifest_rollback_target_invalid"):
+        wiring.validate_manifest(wiring.load_yaml(path))
+    path.write_text(manifest_text, encoding="utf-8")
+    assert _pins(wiring.load_yaml(path)).rollback_repin_before == "migration_036"
 
 
 def test_the_runbook_documents_the_image_bump() -> None:
@@ -6122,7 +6680,7 @@ def test_the_runbook_documents_the_image_bump() -> None:
         " `worker_flag`",
         "`registered_revision_changes_app_image` naming revision 10",
         "`rollback_target` stays revision 10",
-        "**Rollback** is the service back to revision 10, the rollback target",
+        "was the service back to revision 10, the rollback target then",
         "No revision is registered for it",
         "`newest_revision_differs_only_in_app_image:<newest ARN>`",
         "Recovery is an owner decision, carried out by the operator and never by"
@@ -6159,9 +6717,14 @@ def test_the_runbook_documents_the_image_bump() -> None:
         " before any later protected deploy.",
         "or, when its image is the one wanted, set the override to its digest"
         " and deploy it (step 6)",
-        "unless the manifest pins revision 10 with no pending re-pin, `plan` also"
+        "unless the manifest's rollback target is the revision the image bump"
+        " replaces (here revision 10, with no pending re-pin: the content rule of"
+        ' "Re-pinning the rollback target along the live chain"), `plan` also'
         " reports the gate block `rollback_target_not_repinned_before_image_bump`"
         " on `service_deployment`",
+        "When the service runs the rollback target itself (as revision 10 did"
+        " here once it was pinned), the same block is reported under its own"
+        " name, `service_on_rollback_target_plan_stuck:<ARN>`",
         "Deploy only when `plan` does not report"
         " `rollback_target_not_repinned_before_image_bump`.",
         "with revision 8 pinned there is no digest to compare with and no gate, a"
@@ -6185,7 +6748,8 @@ def test_the_runbook_documents_the_image_bump() -> None:
         f"(`before: {wiring.ROLLBACK_REPIN_BEFORE_IMAGE_BUMP}`",
         "**before** the [image bump](#the-image-bump-app_image_override) is"
         " deployed",
-        "allows no pin after 10, and 8 to 10 is not a move",
+        "then allowed no pin after 10, and 8 to 10 is not a move; the pins after"
+        " 10 came with Group 5b, below",
         "**Merge condition of the re-pin (9 to 10).** The manifest edit above"
         " merges only after revision 10's observation has closed: **6 hours after"
         " its deployment completed (2026-10-25 01:51 UTC), so at 2026-10-25"
@@ -6225,32 +6789,37 @@ def test_the_runbook_documents_the_image_bump() -> None:
     ):
         for retired in RETIRED_ROLLBACK_STATEMENTS:
             assert retired not in text, (path.name, retired)
-    assert "Revision 10 is the final pin of the planner" in manifest_text
-    # The 9 -> 10 re-pin merges only after the 6 h observation closes; the
-    # orchestrator fills the actual closing time into this one marker before
-    # the merge (it is never invented here).
+    # The 9 -> 10 re-pin merged only after the 6 h observation closed; the
+    # orchestrator filled the actual closing time into its marker before the
+    # merge (it is never invented here). One marker per re-pin since:
+    # test_the_manifest_carries_one_closed_at_marker_per_re_pin.
     assert "so at 2026-10-25 07:51 UTC" in manifest_text
-    marker = re.compile(r"^# closed_at: (?P<value>.+)$", re.MULTILINE)
-    [value] = marker.findall(MANIFEST.read_text(encoding="utf-8"))
-    assert _closed_at_is_valid(value), value
     for text in (manifest_text, runbook):
         assert "closed_at: YYYY-MM-DDTHH:MMZ" in text
     rollback_doc = _flat(ROOT / "docs/runbooks/asaas-rollback.md")
     for text in (runbook, rollback_doc):
         assert "2026-10-25 07:51 UTC" in text
         assert "manifest marker `closed_at` before the merge" in text
-    # The new digest is an apply-time input: no procedure, parameter, manifest
-    # or tool names it. Since revision 11 serves (2026-10-25), the runbook's
-    # state section records it as operator evidence, and only there.
+    # The new digest is an apply-time input: no procedure, parameter or tool
+    # names it. Since revision 11 serves (2026-10-25), the runbook's state
+    # section records it as operator evidence, and only there; since the
+    # re-pin 10 -> 11 (Group 5b) the manifest records it once, as that
+    # re-pin's evidence in the comment on rollback_target, never as a value.
     for path in (
         WORKER_FLAG_CONFIGURATION,
         ROOT / "docs/runbooks/asaas-rollback.md",
         PARAMS,
-        MANIFEST,
         SCRIPT,
         ROOT / "scripts/asaas_migration_window.py",
     ):
         assert NEW_DIGEST[7:] not in path.read_text(encoding="utf-8"), path.name
+    manifest_lines = MANIFEST.read_text(encoding="utf-8").splitlines()
+    [evidence_line] = [line for line in manifest_lines if NEW_DIGEST[7:] in line]
+    assert evidence_line == f"# image {NEW_DIGEST},"
+    assert manifest_lines.index(evidence_line) < manifest_lines.index(
+        "rollback_target:"
+    )
+    assert NEW_DIGEST[7:] not in json.dumps(wiring.load_yaml(MANIFEST))
     raw_runbook = WORKER_FLAG_RUNBOOK.read_text(encoding="utf-8")
     state = _runbook_state_section()
     assert NEW_DIGEST in state
@@ -6331,11 +6900,14 @@ def _staged_world(serving: str, *revisions: tuple[str, dict[str, Any]]) -> FakeA
 
 
 def _staged_plan(
-    fake: FakeAws, image: str, **changes: Any
+    fake: FakeAws, image: str, *, rollback: int, **changes: Any
 ) -> tuple[dict[str, Any], Any]:
+    """Plan with the rollback target the live chain holds at that step: 11
+    for L2a, 12 for L2b and L3, 13 from L4 on (Group 5b)."""
+
     return _plan(
         fake,
-        pins=_worker_pins(10),
+        pins=_worker_pins(rollback),
         app_image_override=image,
         **{WORKER_FLAG: "true", **changes},
     )
@@ -6704,7 +7276,7 @@ def test_every_stage_passes_the_protected_path_validators(
 
 def test_l2a_proposes_the_two_rows_alone_on_the_serving_image() -> None:
     fake = _staged_world(REVISION_11_ARN)
-    plan, rendered = _staged_plan(fake, NEW_IMAGE)
+    plan, rendered = _staged_plan(fake, NEW_IMAGE, rollback=11)
     step = _task_step(plan)
     assert plan["status"] == "ready", plan["blocks"]
     assert step["state"] == "would_change" and step["blocks"] == []
@@ -6753,11 +7325,15 @@ def test_l2a_proposes_the_two_rows_alone_on_the_serving_image() -> None:
 def test_l2a_never_shares_its_revision_with_another_change(
     image: str, changes: dict[str, Any]
 ) -> None:
-    plan, _rendered = _staged_plan(_staged_world(REVISION_11_ARN), image, **changes)
+    plan, _rendered = _staged_plan(
+        _staged_world(REVISION_11_ARN), image, rollback=11, **changes
+    )
     step = _task_step(plan)
     assert plan["status"] == "blocked"
     assert step["changes"] == []
-    assert step["blocks"] == [f"service_not_on_rollback_target:{REVISION_11_ARN}"]
+    assert step["blocks"] == [
+        f"service_on_rollback_target_plan_stuck:{REVISION_11_ARN}"
+    ]
 
 
 def test_one_staged_row_without_the_other_is_never_a_reviewed_change() -> None:
@@ -6777,7 +7353,7 @@ def test_one_staged_row_without_the_other_is_never_a_reviewed_change() -> None:
 def test_the_l2a_revision_is_reported_until_and_after_it_serves() -> None:
     rows = _staged_rendering(NEW_IMAGE)
     fake = _staged_world(REVISION_11_ARN, (STAGED_ARNS[12], rows))
-    plan, _rendered = _staged_plan(fake, NEW_IMAGE)
+    plan, _rendered = _staged_plan(fake, NEW_IMAGE, rollback=11)
     step = _task_step(plan)
     assert plan["status"] == "compliant", plan["blocks"]
     assert f"registered_not_deployed:{STAGED_ARNS[12]}" in step["compliant"]
@@ -6787,7 +7363,7 @@ def test_the_l2a_revision_is_reported_until_and_after_it_serves() -> None:
         "value": "false",
     }
     _serve(fake, STAGED_ARNS[12])
-    plan, _rendered = _staged_plan(fake, NEW_IMAGE)
+    plan, _rendered = _staged_plan(fake, NEW_IMAGE, rollback=11)
     assert f"registered_and_deployed:{STAGED_ARNS[12]}" in _task_step(plan)["compliant"]
 
 
@@ -6801,7 +7377,7 @@ def test_a_newest_revision_without_the_rows_blocks_under_its_own_name() -> None:
         (STAGED_ARNS[12], rows),
         (STAGED_ARNS[13], _without_staged_rows(rows)),
     )
-    plan, _rendered = _staged_plan(fake, NEW_IMAGE)
+    plan, _rendered = _staged_plan(fake, NEW_IMAGE, rollback=12)
     step = _task_step(plan)
     assert plan["status"] == "blocked"
     assert step["blocks"] == [
@@ -6821,7 +7397,7 @@ def test_a_newest_revision_without_the_rows_blocks_under_its_own_name() -> None:
 def test_l2b_moves_the_image_alone_and_keeps_the_rows() -> None:
     rows = _staged_rendering(NEW_IMAGE)
     fake = _staged_world(STAGED_ARNS[12], (STAGED_ARNS[12], rows))
-    plan, rendered = _staged_plan(fake, L1_IMAGE)
+    plan, rendered = _staged_plan(fake, L1_IMAGE, rollback=12)
     [change] = _task_step(plan)["changes"]
     assert plan["status"] == "ready", plan["blocks"]
     assert change["replaces"] == STAGED_ARNS[12]
@@ -6862,7 +7438,7 @@ def test_l5_and_l6_flip_one_staged_flag_alone(
 ) -> None:
     serving = _staged_rendering(L1_IMAGE, **serving_changes)
     fake = _staged_world(STAGED_ARNS[13], (STAGED_ARNS[13], serving))
-    plan, rendered = _staged_plan(fake, L1_IMAGE, **changes)
+    plan, rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **changes)
     step = _task_step(plan)
     assert plan["status"] == "ready", plan["blocks"]
     [change] = step["changes"]
@@ -6877,7 +7453,7 @@ def test_l5_and_l6_flip_one_staged_flag_alone(
     _put_app_revision(
         fake, STAGED_ARNS[14], _registered_as(STAGED_ARNS[14], rendered), latest=True
     )
-    plan, _again = _staged_plan(fake, L1_IMAGE, **changes)
+    plan, _again = _staged_plan(fake, L1_IMAGE, rollback=13, **changes)
     assert _task_step(plan)["info"][f"registered_revision_changes_{key}"] == {
         "serving": STAGED_ARNS[13],
         "from": _env(serving)[name],
@@ -6886,6 +7462,25 @@ def test_l5_and_l6_flip_one_staged_flag_alone(
     assert "rollback_target_not_repinned_before_image_bump" not in (
         _step(plan, "service_deployment")["blocks"]
     )
+    # As at HEAD before Group 5b: with the target still on 10 (the bridge
+    # image, no staged row; 13 serving is two kinds away from it) the flip,
+    # proposed or registered, never reports a gate block, and the plan is
+    # not blocked by the target.
+    for registered in (False, True):
+        world = _staged_world(
+            STAGED_ARNS[13],
+            (STAGED_ARNS[13], serving),
+            *([(STAGED_ARNS[14], rendered)] if registered else []),
+        )
+        plan, _again = _staged_plan(world, L1_IMAGE, rollback=10, **changes)
+        deployment = _step(plan, "service_deployment")
+        assert "rollback_target_not_repinned_before_image_bump" not in (
+            deployment["blocks"]
+        )
+        assert "rollback_target_not_repinned_before_flag_rows" not in (
+            deployment["blocks"]
+        )
+        assert plan["status"] != "blocked", (registered, plan["blocks"])
 
 
 @pytest.mark.parametrize(
@@ -6902,32 +7497,9 @@ def test_two_changes_never_share_a_revision(
 ) -> None:
     serving = _staged_rendering(L1_IMAGE)
     fake = _staged_world(STAGED_ARNS[13], (STAGED_ARNS[13], serving))
-    plan, _rendered = _staged_plan(fake, image, **changes)
+    plan, _rendered = _staged_plan(fake, image, rollback=13, **changes)
     assert _task_step(plan)["blocks"] == [
-        f"service_not_on_rollback_target:{STAGED_ARNS[13]}"
-    ]
-
-
-def test_rolling_l2b_back_to_the_pin_blocks_and_to_l2a_is_registered_not_deployed() -> (
-    None
-):
-    """After L2b (rows at 12, the image at 13): the service back on L2a's
-    revision reports 13 registered, not deployed; back on the rollback pin
-    (revision 10, without the rows and on the bridge image) it blocks, as the
-    runbook says."""
-
-    revisions = (
-        (STAGED_ARNS[12], _staged_rendering(NEW_IMAGE)),
-        (STAGED_ARNS[13], _staged_rendering(L1_IMAGE)),
-    )
-    plan, _rendered = _staged_plan(_staged_world(STAGED_ARNS[12], *revisions), L1_IMAGE)
-    assert plan["status"] != "blocked", plan["blocks"]
-    assert f"registered_not_deployed:{STAGED_ARNS[13]}" in (
-        _task_step(plan)["compliant"]
-    )
-    plan, _rendered = _staged_plan(_staged_world(REVISION_10_ARN, *revisions), L1_IMAGE)
-    assert _task_step(plan)["blocks"] == [
-        f"service_not_on_rollback_target:{REVISION_10_ARN}"
+        f"service_on_rollback_target_plan_stuck:{STAGED_ARNS[13]}"
     ]
 
 
@@ -6937,7 +7509,7 @@ def test_a_newest_revision_differing_only_in_a_staged_flag_blocks() -> None:
     fake = _staged_world(
         STAGED_ARNS[13], (STAGED_ARNS[13], serving), (STAGED_ARNS[14], abandoned)
     )
-    plan, _rendered = _staged_plan(fake, L1_IMAGE)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13)
     step = _task_step(plan)
     assert step["blocks"] == [
         f"newest_revision_differs_only_in_credit_hot_path_flag:{STAGED_ARNS[14]}"
@@ -6955,9 +7527,20 @@ def test_a_newest_revision_differing_only_in_a_staged_flag_blocks() -> None:
 ON = {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true"}
 
 
+def _canary_history() -> tuple[tuple[str, dict[str, Any]], ...]:
+    """L2b's revision 13 (the rollback target from L4 on) and L5's 14."""
+
+    return (
+        (STAGED_ARNS[13], _staged_rendering(L1_IMAGE)),
+        (STAGED_ARNS[14], _staged_rendering(L1_IMAGE, **{CREDIT_FLAG: "true"})),
+    )
+
+
 def _l7_world(applications: list[dict[str, Any]] | None = None) -> FakeAws:
     fake = _staged_world(
-        STAGED_ARNS[15], (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON))
+        STAGED_ARNS[15],
+        *_canary_history(),
+        (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON)),
     )
     fake.put(
         "appconfig",
@@ -6975,7 +7558,7 @@ def _l7_world(applications: list[dict[str, Any]] | None = None) -> FakeAws:
 
 
 def test_l7_adds_the_appconfig_group_alone() -> None:
-    plan, rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON, **APPCONFIG)
+    plan, rendered = _staged_plan(_l7_world(), L1_IMAGE, rollback=13, **ON, **APPCONFIG)
     step = _task_step(plan)
     assert plan["status"] == "ready", plan["blocks"]
     [change] = step["changes"]
@@ -7011,7 +7594,7 @@ def test_l7_adds_the_appconfig_group_alone() -> None:
     }
     assert list(added) == sorted(added)
     # Before L7 it lists no APPCONFIG_* name.
-    plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON)
+    plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, rollback=13, **ON)
     assert not [
         name
         for name in plan["task_definition_diff"]["app_environment_added"]
@@ -7048,7 +7631,9 @@ def test_l7_adds_the_appconfig_group_alone() -> None:
 def test_l7_needs_the_named_appconfig_application(
     applications: list[dict[str, Any]], reason: str
 ) -> None:
-    plan, rendered = _staged_plan(_l7_world(applications), L1_IMAGE, **ON, **APPCONFIG)
+    plan, rendered = _staged_plan(
+        _l7_world(applications), L1_IMAGE, rollback=13, **ON, **APPCONFIG
+    )
     egress = _step(plan, "financial_egress_closed")
     assert plan["status"] == "blocked"
     assert reason in egress["blocks"]
@@ -7059,7 +7644,7 @@ def test_l7_needs_the_named_appconfig_application(
 
 def test_l7_accepts_the_application_by_id_and_refuses_an_unreadable_listing() -> None:
     by_id = {**APPCONFIG, "APPCONFIG_APPLICATION": "abc1234"}
-    plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON, **by_id)
+    plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, rollback=13, **ON, **by_id)
     assert "appconfig_application_exists:abc1234" in (
         _step(plan, "financial_egress_closed")["compliant"]
     )
@@ -7069,14 +7654,14 @@ def test_l7_accepts_the_application_by_id_and_refuses_an_unreadable_listing() ->
     ):
         fake = _l7_world()
         fake.put("appconfig", "ListApplications", {}, response)
-        plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON, **APPCONFIG)
+        plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **ON, **APPCONFIG)
         assert "appconfig_applications_unreadable" in (
             _step(plan, "financial_egress_closed")["blocks"]
         )
 
 
 def test_until_l7_egress_stays_closed_by_absence_even_with_an_application() -> None:
-    plan, rendered = _staged_plan(_l7_world(), L1_IMAGE, **ON)
+    plan, rendered = _staged_plan(_l7_world(), L1_IMAGE, rollback=13, **ON)
     egress = _step(plan, "financial_egress_closed")
     assert egress["state"] == "compliant"
     assert egress["info"]["stage"] == "closed_by_absence"
@@ -7107,14 +7692,14 @@ def test_nulled_appconfig_params_never_read_as_closed_while_the_group_serves(
     ]
     if newer_clean_revision:
         revisions.append((L7_SERVING_ARN, _staged_rendering(L1_IMAGE, **ON)))
-    fake = _staged_world(STAGED_ARNS[16], *revisions)
+    fake = _staged_world(STAGED_ARNS[16], *_canary_history(), *revisions)
     fake.put(
         "appconfig",
         "ListApplications",
         {},
         {"Items": [{"Id": "abc1234", "Name": "neurostack-staging"}]},
     )
-    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **ON)
     egress = _step(plan, "financial_egress_closed")
     assert plan["status"] == "blocked"
     assert egress["state"] == "blocked"
@@ -7130,6 +7715,7 @@ def test_the_serving_revision_carrying_the_group_with_the_group_rendered_is_comp
 ):
     fake = _staged_world(
         STAGED_ARNS[16],
+        *_canary_history(),
         (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON)),
         (STAGED_ARNS[16], _staged_rendering(L1_IMAGE, **ON, **APPCONFIG)),
     )
@@ -7139,7 +7725,7 @@ def test_the_serving_revision_carrying_the_group_with_the_group_rendered_is_comp
         {},
         {"Items": [{"Id": "abc1234", "Name": "neurostack-staging"}]},
     )
-    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON, **APPCONFIG)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **ON, **APPCONFIG)
     egress = _step(plan, "financial_egress_closed")
     assert egress["state"] == "compliant", egress["blocks"]
     assert "appconfig_group_complete_in_serving" in egress["compliant"]
@@ -7158,7 +7744,9 @@ def test_a_serving_revision_with_other_appconfig_names_or_unreadable_is_not_clos
     serving_rows: tuple[tuple[str, str], ...] | None, stage: str, reason: str | None
 ) -> None:
     fake = _staged_world(
-        STAGED_ARNS[15], (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON))
+        STAGED_ARNS[15],
+        *_canary_history(),
+        (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON)),
     )
     serving_arn = STAGED_ARNS[14]
     _put_app_revision(
@@ -7174,7 +7762,7 @@ def test_a_serving_revision_with_other_appconfig_names_or_unreadable_is_not_clos
         latest=False,
     )
     _serve(fake, serving_arn)
-    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **ON)
     egress = _step(plan, "financial_egress_closed")
     assert egress["state"] == "blocked"
     assert egress["blocks"] == [reason or "appconfig_names_in_serving"]
@@ -7188,7 +7776,9 @@ def test_a_serving_read_holding_another_revision_is_unreadable() -> None:
     :14 is closed by absence."""
 
     fake = _staged_world(
-        STAGED_ARNS[15], (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON))
+        STAGED_ARNS[15],
+        *_canary_history(),
+        (STAGED_ARNS[15], _staged_rendering(L1_IMAGE, **ON)),
     )
     _put_app_revision(
         fake,
@@ -7197,7 +7787,7 @@ def test_a_serving_read_holding_another_revision_is_unreadable() -> None:
         latest=False,
     )
     _serve(fake, STAGED_ARNS[14])
-    plan, _rendered = _staged_plan(fake, L1_IMAGE, **ON)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **ON)
     egress = _step(plan, "financial_egress_closed")
     assert egress["state"] == "blocked"
     assert egress["blocks"] == ["serving_task_definition_unreadable"]
@@ -7210,11 +7800,13 @@ def test_the_appconfig_group_never_shares_its_revision() -> None:
         {**APPCONFIG},  # with the credit switch and the transport off again
         {**ON, **APPCONFIG, WORKER_FLAG: "false"},
     ):
-        plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, **changes)
+        plan, _rendered = _staged_plan(_l7_world(), L1_IMAGE, rollback=13, **changes)
         assert _task_step(plan)["blocks"] == [
             f"service_not_on_rollback_target:{STAGED_ARNS[15]}"
         ]
-    plan, _rendered = _staged_plan(_l7_world(), NEW_IMAGE, **ON, **APPCONFIG)
+    plan, _rendered = _staged_plan(
+        _l7_world(), NEW_IMAGE, rollback=13, **ON, **APPCONFIG
+    )
     assert _task_step(plan)["blocks"] == [
         f"service_not_on_rollback_target:{STAGED_ARNS[15]}"
     ]
@@ -7303,10 +7895,21 @@ def test_the_runbook_says_the_planner_checks_one_kind_not_the_order() -> None:
         " (L7 before L5 and L6)",
         "it cannot read `alembic_version`, so it cannot know whether L3 ran",
         "Keeping the order is the operator's and the owner's job",
+        "the owner decided on 2026-11-01 (Decision 16) that the planner does not"
+        " enforce it, because enforcing it both ways would block the containment"
+        " revision (the credit switch off with the transport on)",
         "`registered_not_deployed:<L2a ARN>`",
-        "Rolling L2b back to the rollback pin (revision 10) instead of the"
-        " previous revision is expected to block with"
-        " `service_not_on_rollback_target:<revision 10 ARN>`",
+        "update the service back to the previous revision, which is the rollback"
+        " target R (11 for L2a, 12 for L2b and during L3)",
+        "Rolling L2b back to an older revision (11 or 10) instead is expected to"
+        " block with `service_not_on_rollback_target:<ARN>` naming it",
+        "a flip is never gated by the rollback target",
+        "After L6 a manual rollback to R (13) is a dead end of more than one kind"
+        " of change",
+        "`service_on_rollback_target_plan_stuck:<revision 13 ARN>`",
+        "Use the previous revision or the flip back instead.",
+        "| L2c | none: the manifest's `rollback_target` re-pinned from 11 to 12",
+        "| L4 | none: `rollback_target` re-pinned from 12 to 13",
         "the flag flipped back to `'false'` alone, by its own reviewed PR, is"
         " itself a reviewed kind",
         "containment is the AppConfig configuration set to `false`",
@@ -7318,6 +7921,7 @@ def test_the_runbook_says_the_planner_checks_one_kind_not_the_order() -> None:
         "a case variant of any of these names",
     ):
         assert phrase in section, phrase
+    assert "open owner decision" not in section
 
 
 def test_the_hook_section_lists_the_staged_and_appconfig_checks() -> None:
@@ -7334,3 +7938,1019 @@ def test_the_hook_section_lists_the_staged_and_appconfig_checks() -> None:
         "three identifiers matching the planner's pattern",
     ):
         assert phrase in section, phrase
+
+
+# ---------------------------------------------------------------------------
+# asaas-rollout-opening Group 5b: the rollback target chain (10 -> 11 -> 12 ->
+# 13, open above) and the content rule of service_deployment
+# ---------------------------------------------------------------------------
+
+ROWS_GATE = "rollback_target_not_repinned_before_flag_rows"
+IMAGE_GATE = "rollback_target_not_repinned_before_image_bump"
+DIFFERS = "target_differs_from_the_change_in_more_than_its_kind"
+OFF_TARGET = "service_not_on_target"
+
+
+def _arn(revision: int) -> str:
+    return SOURCE_ARN.rsplit(":", 1)[0] + f":{revision}"
+
+
+def _live(revision: int) -> dict[str, Any]:
+    """The request of each revision the live chain registers from 12 on
+    (10 and 11, without the staged rows, come from _staged_world)."""
+
+    renderings: dict[int, Callable[[], dict[str, Any]]] = {
+        # L2a: revision 11 plus the two rows at 'false'.
+        12: lambda: _staged_rendering(NEW_IMAGE),
+        # L2b: revision 12 with the image containing 042.
+        13: lambda: _staged_rendering(L1_IMAGE),
+        # L5, L6: one flag each.
+        14: lambda: _staged_rendering(L1_IMAGE, **{CREDIT_FLAG: "true"}),
+        15: lambda: _staged_rendering(L1_IMAGE, **ON),
+        # A hotfix image during the canary.
+        16: lambda: _staged_rendering(HOTFIX_IMAGE, **ON),
+    }
+    return renderings[revision]()
+
+
+def _chain_world(
+    serving: int, *registered: int, requests: dict[int, Any] | None = None
+) -> FakeAws:
+    """Revisions 10 and 11, then each of ``registered`` as the live chain
+    registers it (``requests`` replaces one), the last the newest; the
+    service on ``serving``."""
+
+    requests = requests or {}
+    return _staged_world(
+        _arn(serving),
+        *((_arn(n), requests[n] if n in requests else _live(n)) for n in registered),
+    )
+
+
+def _with_revision_9(fake: FakeAws) -> FakeAws:
+    """Revision 9 as it was registered: the bridge image, the worker 'false'."""
+
+    _put_app_revision(
+        fake,
+        NEXT_ARN,
+        _registered_as(
+            NEXT_ARN,
+            _without_staged_rows(
+                _staged_rendering(BRIDGE_IMAGE, **{WORKER_FLAG: "false"})
+            ),
+        ),
+        latest=False,
+    )
+    return fake
+
+
+def _gate(plan: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
+    """(the content rule's gate blocks, its verdicts) on service_deployment."""
+
+    deployment = _step(plan, "service_deployment")
+    return (
+        [b for b in deployment["blocks"] if b in (ROWS_GATE, IMAGE_GATE)],
+        deployment["info"].get("rollback_target_content_rule", []),
+    )
+
+
+def _verdict(kind: str, change: str, *failed: str) -> dict[str, Any]:
+    return {"kind": kind, "change": change, "failed": list(failed)}
+
+
+# -- L2a, L2b, L3, after L4: the target is the revision the deploy replaces --
+
+
+def test_l2a_goes_back_to_revision_11_the_revision_it_replaces() -> None:
+    plan, _rendered = _staged_plan(_chain_world(11), NEW_IMAGE, rollback=11)
+    [change] = _task_step(plan)["changes"]
+    assert change["replaces"] == REVISION_11_ARN and "flag_rows_added" in change
+    assert _gate(plan) == ([], [_verdict("flag_rows_added", "proposed")])
+    deployment = _step(plan, "service_deployment")
+    assert deployment["info"]["rollback_target"] == REVISION_11_ARN
+    assert deployment["info"]["rollback_target_must_repin_before"] is None
+    assert "rollback_target_active_and_digest_pinned" in deployment["compliant"]
+    # Registered, not deployed.
+    plan, _rendered = _staged_plan(_chain_world(11, 12), NEW_IMAGE, rollback=11)
+    assert f"registered_not_deployed:{STAGED_ARNS[12]}" in _task_step(plan)["compliant"]
+    assert _gate(plan) == ([], [_verdict("flag_rows_added", "registered")])
+    # Serving: revision 12 differs from the target 11 in the rows alone.
+    plan, _rendered = _staged_plan(_chain_world(12, 12), NEW_IMAGE, rollback=11)
+    assert f"registered_and_deployed:{STAGED_ARNS[12]}" in _task_step(plan)["compliant"]
+    assert _gate(plan) == ([], [_verdict("flag_rows_added", "serving")])
+    assert plan["status"] == "compliant", plan["blocks"]
+
+
+@pytest.mark.parametrize("rollback", [9, 10])
+def test_l2a_with_an_older_target_blocks(rollback: int) -> None:
+    plan, _rendered = _staged_plan(
+        _with_revision_9(_chain_world(11)), NEW_IMAGE, rollback=rollback
+    )
+    assert "flag_rows_added" in _task_step(plan)["changes"][0]
+    blocks, verdicts = _gate(plan)
+    assert ROWS_GATE in blocks
+    [rows] = [v for v in verdicts if v["kind"] == "flag_rows_added"]
+    assert rows["change"] == "proposed"
+    assert DIFFERS in rows["failed"] and OFF_TARGET in rows["failed"]
+    if rollback == 10:
+        # Exactly: the rows change gates (no verdict is "gating": false, the
+        # rows are not a flip), and 11 serving is 10 plus the image alone.
+        assert (blocks, verdicts) == (
+            [ROWS_GATE],
+            [
+                _verdict("flag_rows_added", "proposed", DIFFERS, OFF_TARGET),
+                _verdict("app_image", "serving"),
+            ],
+        )
+    if rollback == 9:
+        # The way back would turn the worker off, and 9's re-pin is pending.
+        assert "target_worker_flag_not_exactly_one_true" in rows["failed"]
+        assert "target_repin_pending" in rows["failed"]
+
+
+def test_l2b_and_l3_go_back_to_revision_12_l2a_s_revision() -> None:
+    plan, _rendered = _staged_plan(_chain_world(12, 12), L1_IMAGE, rollback=12)
+    [change] = _task_step(plan)["changes"]
+    assert change["replaces"] == STAGED_ARNS[12] and "app_image" in change
+    assert _gate(plan) == ([], [_verdict("app_image", "proposed")])
+    plan, _rendered = _staged_plan(_chain_world(12, 12, 13), L1_IMAGE, rollback=12)
+    assert f"registered_not_deployed:{STAGED_ARNS[13]}" in _task_step(plan)["compliant"]
+    assert _gate(plan) == ([], [_verdict("app_image", "registered")])
+    # L3: revision 13 serves; the target 12 differs from it in the image
+    # alone, and carries the rows (no rows change in service).
+    plan, _rendered = _staged_plan(_chain_world(13, 12, 13), L1_IMAGE, rollback=12)
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert _gate(plan) == ([], [_verdict("app_image", "serving")])
+
+
+@pytest.mark.parametrize("rollback", [9, 10, 11])
+def test_l2b_with_an_older_target_blocks(rollback: int) -> None:
+    plan, _rendered = _staged_plan(
+        _with_revision_9(_chain_world(12, 12)), L1_IMAGE, rollback=rollback
+    )
+    assert "app_image" in _task_step(plan)["changes"][0]
+    blocks, verdicts = _gate(plan)
+    assert IMAGE_GATE in blocks
+    [image] = [v for v in verdicts if v["change"] == "proposed"]
+    assert image["kind"] == "app_image"
+    assert DIFFERS in image["failed"] and OFF_TARGET in image["failed"]
+    if rollback == 11:
+        # Only the image change blocks: revision 12 serving is 11 plus the
+        # rows alone.
+        assert image["failed"] == [DIFFERS, OFF_TARGET]
+        assert blocks == [IMAGE_GATE]
+
+
+def test_an_image_change_after_l4_passes_with_the_target_on_13() -> None:
+    plan, _rendered = _staged_plan(_chain_world(13, 12, 13), HOTFIX_IMAGE, rollback=13)
+    [change] = _task_step(plan)["changes"]
+    assert change["replaces"] == STAGED_ARNS[13] and "app_image" in change
+    assert _gate(plan) == ([], [_verdict("app_image", "proposed")])
+
+
+# -- The canary: flips never gated; a hotfix image only after the re-pin -----
+
+
+@pytest.mark.parametrize(
+    "serving,registered,changes,key",
+    [
+        # L5 proposed, then registered, then serving.
+        (13, (12, 13), {CREDIT_FLAG: "true"}, "credit_hot_path_flag"),
+        (13, (12, 13, 14), {CREDIT_FLAG: "true"}, None),
+        (14, (12, 13, 14), {CREDIT_FLAG: "true"}, None),
+        # L6, and the containment flips back from it.
+        (14, (12, 13, 14), ON, "transport_flag"),
+        (15, (12, 13, 14, 15), {CREDIT_FLAG: "true"}, "transport_flag"),
+        (15, (12, 13, 14, 15), {TRANSPORT_FLAG: "true"}, "credit_hot_path_flag"),
+        # The worker off, alone.
+        (13, (12, 13), {WORKER_FLAG: "false"}, "worker_flag"),
+        # L7: the AppConfig group added alone.
+        (15, (12, 13, 14, 15), {**ON, **APPCONFIG}, "appconfig_group_added"),
+    ],
+)
+def test_flag_flips_are_never_gated_by_the_target(
+    serving: int, registered: tuple[int, ...], changes: dict[str, str], key: str | None
+) -> None:
+    fake = _chain_world(serving, *registered)
+    _with_appconfig_application(fake)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **changes)
+    step = _task_step(plan)
+    if key is not None:
+        [change] = step["changes"]
+        assert key in change
+    assert step["blocks"] == []
+    assert _gate(plan) == ([], [])
+    expected = "ready" if key is not None else "compliant"
+    assert plan["status"] == expected, plan["blocks"]
+
+
+def test_a_flip_passes_where_an_image_change_is_gated_by_the_same_target() -> None:
+    """The same target (13, INACTIVE) and service (13): the flip is never
+    weighed against it; the image change is, and only condition (a) fails."""
+
+    fake = _chain_world(13, 12, 13)
+    target = _registered_as(STAGED_ARNS[13], _live(13))
+    target["taskDefinition"]["status"] = "INACTIVE"
+    _put_app_revision(fake, STAGED_ARNS[13], target, latest=True)
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=13, **{CREDIT_FLAG: "true"})
+    assert "credit_hot_path_flag" in _task_step(plan)["changes"][0]
+    assert _gate(plan) == ([], [])
+    assert (
+        "rollback_target_revision_unusable"
+        in _step(plan, "service_deployment")["blocks"]
+    )
+    plan, _rendered = _staged_plan(fake, HOTFIX_IMAGE, rollback=13)
+    assert _gate(plan) == (
+        [IMAGE_GATE],
+        [_verdict("app_image", "proposed", "target_not_active_and_digest_pinned")],
+    )
+
+
+def test_a_hotfix_image_during_the_canary_passes_only_after_the_re_pin() -> None:
+    """After L6 the service runs 15, which differs from 13 by two flags: a
+    hotfix image (16) needs the manifest re-pinned to the serving revision
+    first (any revision above 13, the generic effective step), never a code
+    change."""
+
+    fake = _chain_world(15, 12, 13, 14, 15)
+    for rollback in (13, 14):
+        plan, _rendered = _staged_plan(fake, HOTFIX_IMAGE, rollback=rollback, **ON)
+        assert "app_image" in _task_step(plan)["changes"][0]
+        blocks, verdicts = _gate(plan)
+        assert blocks == [IMAGE_GATE], rollback
+        assert verdicts == [_verdict("app_image", "proposed", DIFFERS, OFF_TARGET)]
+    assert _worker_pins(15).rollback_effective_after == GENERIC_EFFECTIVE_AFTER
+    plan, rendered = _staged_plan(fake, HOTFIX_IMAGE, rollback=15, **ON)
+    assert plan["status"] == "ready", plan["blocks"]
+    assert _gate(plan) == ([], [_verdict("app_image", "proposed")])
+    assert wiring.renderable(plan, rendered) is rendered
+    # Registered as 16, then serving.
+    plan, _rendered = _staged_plan(
+        _chain_world(15, 12, 13, 14, 15, 16), HOTFIX_IMAGE, rollback=15, **ON
+    )
+    assert _gate(plan) == ([], [_verdict("app_image", "registered")])
+    serving = _chain_world(16, 12, 13, 14, 15, 16)
+    plan, _rendered = _staged_plan(serving, HOTFIX_IMAGE, rollback=15, **ON)
+    assert _gate(plan) == ([], [_verdict("app_image", "serving")])
+    # Deployed without the re-pin: 13 is two kinds away from 16.
+    plan, _rendered = _staged_plan(serving, HOTFIX_IMAGE, rollback=13, **ON)
+    assert _gate(plan) == ([IMAGE_GATE], [_verdict("app_image", "serving", DIFFERS)])
+
+
+# -- A flip is never gated by the target, off the documented chain too -------
+
+
+def _with_appconfig_application(fake: FakeAws) -> FakeAws:
+    """The AppConfig application L7 names (read only when the group renders)."""
+
+    fake.put(
+        "appconfig",
+        "ListApplications",
+        {},
+        {"Items": [{"Id": "abc1234", "Name": "neurostack-staging"}]},
+    )
+    return fake
+
+
+def _ungated(kind: str, *failed: str) -> dict[str, Any]:
+    return {**_verdict(kind, "serving", *failed), "gating": False}
+
+
+# Every flip from a serving revision, as (the serving changes, the proposed
+# changes, the plan's change key): the containment flips back off, the worker
+# off, a flip back on, and the AppConfig group added. Each serving revision
+# carries one flag the target lacks, so it is two kinds away from it.
+_FLIPS_FROM = {
+    "credit_off": ({CREDIT_FLAG: "true"}, {}, "credit_hot_path_flag"),
+    "transport_off": ({TRANSPORT_FLAG: "true"}, {}, "transport_flag"),
+    "worker_off": (
+        {CREDIT_FLAG: "true"},
+        {CREDIT_FLAG: "true", WORKER_FLAG: "false"},
+        "worker_flag",
+    ),
+    "credit_on": ({TRANSPORT_FLAG: "true"}, ON, "credit_hot_path_flag"),
+    "appconfig_added": (
+        {CREDIT_FLAG: "true"},
+        {CREDIT_FLAG: "true", **APPCONFIG},
+        "appconfig_group_added",
+    ),
+}
+
+
+@pytest.mark.parametrize("flip", sorted(_FLIPS_FROM))
+def test_trap_a_a_flip_after_a_skipped_l4_re_pin_is_never_gated(flip: str) -> None:
+    """L4's re-pin skipped: L5 (and L6) served with the target still on 12,
+    every plan green (flips are never gated). The containment flip back, from
+    the serving revision two kinds away from 12, must still be deployable:
+    the change in service is reported with ``gating: false`` and blocks
+    nothing."""
+
+    serving_changes, changes, key = _FLIPS_FROM[flip]
+    serving = _staged_rendering(L1_IMAGE, **serving_changes)
+    fake = _with_appconfig_application(
+        _chain_world(14, 12, 13, 14, requests={14: serving})
+    )
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=12, **changes)
+    [change] = _task_step(plan)["changes"]
+    assert key in change and change["replaces"] == STAGED_ARNS[14]
+    assert plan["status"] == "ready", plan["blocks"]
+    assert _step(plan, "service_deployment")["blocks"] == []
+    # 14 runs another image than 12: a change in service, reported only.
+    assert _gate(plan) == ([], [_ungated("app_image", DIFFERS)])
+    # Registered, not deployed: the same.
+    _put_app_revision(fake, _arn(15), _registered_as(_arn(15), _rendered), latest=True)
+    plan, _again = _staged_plan(fake, L1_IMAGE, rollback=12, **changes)
+    assert f"registered_not_deployed:{_arn(15)}" in _task_step(plan)["compliant"]
+    assert _gate(plan) == ([], [_ungated("app_image", DIFFERS)])
+    assert plan["status"] != "blocked", plan["blocks"]
+
+
+@pytest.mark.parametrize("flip", sorted(_FLIPS_FROM))
+def test_trap_b_a_flip_after_the_hotfix_flow_is_never_gated(flip: str) -> None:
+    """The hotfix flow: re-pin to 15, the hotfix 16 (green), then a flip 17
+    (green). With the service on 17 and the target on 15 (two kinds away:
+    the image and a flag), every later flip, containment included, passes."""
+
+    serving_changes, changes, key = _FLIPS_FROM[flip]
+    seventeen = _staged_rendering(HOTFIX_IMAGE, **serving_changes)
+    fake = _with_appconfig_application(
+        _chain_world(17, 12, 13, 14, 15, 16, 17, requests={17: seventeen})
+    )
+    plan, _rendered = _staged_plan(fake, HOTFIX_IMAGE, rollback=15, **changes)
+    [change] = _task_step(plan)["changes"]
+    assert key in change and change["replaces"] == _arn(17)
+    assert plan["status"] == "ready", plan["blocks"]
+    assert _step(plan, "service_deployment")["blocks"] == []
+    assert _gate(plan) == ([], [_ungated("app_image", DIFFERS)])
+
+
+def test_a_target_with_a_pending_safety_re_pin_still_gates_a_flip() -> None:
+    """Target 9 (the worker 'false', its re-pin to 10 pending) with the
+    service on another image: the flip is blocked by the image in service,
+    as before Group 5b for 8 and 9."""
+
+    fake = _with_revision_9(_chain_world(13, 12, 13))
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=9, **{CREDIT_FLAG: "true"})
+    assert "credit_hot_path_flag" in _task_step(plan)["changes"][0]
+    blocks, verdicts = _gate(plan)
+    assert IMAGE_GATE in blocks
+    [image] = [v for v in verdicts if v["kind"] == "app_image"]
+    assert image["change"] == "serving" and "gating" not in image
+    assert "target_repin_pending" in image["failed"]
+
+
+def test_a_steady_state_two_kinds_from_the_target_still_reports_the_image_gate() -> (
+    None
+):
+    """Nothing deployed (the service runs the rendering) with the serving
+    revision two kinds away from the target: the change in service still
+    gates, so the next image change waits for the re-pin."""
+
+    serving = _staged_rendering(L1_IMAGE, **{CREDIT_FLAG: "true"})
+    fake = _chain_world(14, 12, 13, 14, requests={14: serving})
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=12, **{CREDIT_FLAG: "true"})
+    assert f"registered_and_deployed:{STAGED_ARNS[14]}" in (
+        _task_step(plan)["compliant"]
+    )
+    assert _gate(plan) == ([IMAGE_GATE], [_verdict("app_image", "serving", DIFFERS)])
+
+
+# -- An unusable target: only containment passes (owner decision 2026-11-01) --
+
+UNUSABLE = "rollback_target_revision_unusable"
+UNUSABLE_PROBLEMS = ["inactive", "missing", "tag_image", "arn_mismatch"]
+
+
+def _unusable(fake: FakeAws, problem: str) -> int:
+    """Make the rollback target unusable; returns the revision to pin. The
+    target is 13 (INACTIVE; ACTIVE but its app image by tag; or its read
+    naming another ARN) or 18, a revision that does not exist. Every
+    condition that raises rollback_target_revision_unusable (owner decision
+    (a), 2026-11-01)."""
+
+    if problem in ("inactive", "tag_image", "arn_mismatch"):
+        target = _registered_as(STAGED_ARNS[13], _live(13))
+        if problem == "inactive":
+            target["taskDefinition"]["status"] = "INACTIVE"
+        elif problem == "tag_image":
+            for container in target["taskDefinition"]["containerDefinitions"]:
+                if container["name"] == "app":
+                    container["image"] = STAGING_REPOSITORY + ":hotfix-tag"
+        else:
+            target["taskDefinition"]["taskDefinitionArn"] = STAGED_ARNS[12]
+        _put_app_revision(fake, STAGED_ARNS[13], target, latest=False)
+        return 13
+    fake.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        {"taskDefinition": "neurostack-staging-app:18", "include": ["TAGS"]},
+        {"__error_code__": "ClientException"},
+    )
+    return 18
+
+
+# (serving changes, proposed changes, the flip's key): each turns one flag
+# from 'true' to 'false', or (enabling) from 'false' to 'true'.
+_DISABLING = {
+    "credit": ({CREDIT_FLAG: "true"}, {}, "credit_hot_path_flag"),
+    "transport": (ON, {CREDIT_FLAG: "true"}, "transport_flag"),
+    "worker": ({}, {WORKER_FLAG: "false"}, "worker_flag"),
+}
+_ENABLING = {
+    "credit": ({}, {CREDIT_FLAG: "true"}, "credit_hot_path_flag"),
+    "transport": ({CREDIT_FLAG: "true"}, ON, "transport_flag"),
+    "worker": ({WORKER_FLAG: "false"}, {}, "worker_flag"),
+}
+
+
+def _flip_world(serving_changes: dict[str, str]) -> FakeAws:
+    """The service on 14 (13 plus ``serving_changes``), 14 the newest."""
+
+    return _with_appconfig_application(
+        _chain_world(
+            14,
+            12,
+            13,
+            14,
+            requests={14: _staged_rendering(L1_IMAGE, **serving_changes)},
+        )
+    )
+
+
+@pytest.mark.parametrize("problem", UNUSABLE_PROBLEMS)
+@pytest.mark.parametrize("flag", sorted(_DISABLING))
+def test_an_unusable_target_lets_only_a_disabling_flip_pass(
+    flag: str, problem: str
+) -> None:
+    serving_changes, changes, key = _DISABLING[flag]
+    fake = _flip_world(serving_changes)
+    rollback = _unusable(fake, problem)
+    plan, rendered = _staged_plan(fake, L1_IMAGE, rollback=rollback, **changes)
+    [change] = _task_step(plan)["changes"]
+    assert change[key]["from"] == "true" and change[key]["to"] == "false"
+    deployment = _step(plan, "service_deployment")
+    assert deployment["blocks"] == []
+    assert plan["status"] == "ready", plan["blocks"]
+    assert UNUSABLE not in deployment["blocks"]
+    assert deployment["info"]["rollback_target_unusable_containment_flip"] == {
+        "kind": key,
+        "change": "proposed",
+        "from": "true",
+        "to": "false",
+    }
+    assert "rollback_target_active_and_digest_pinned" not in deployment["compliant"]
+    # Registered, not deployed: the same containment, still passing.
+    _put_app_revision(fake, _arn(15), _registered_as(_arn(15), rendered), latest=True)
+    plan, _again = _staged_plan(fake, L1_IMAGE, rollback=rollback, **changes)
+    deployment = _step(plan, "service_deployment")
+    assert deployment["blocks"] == []
+    assert plan["status"] != "blocked", plan["blocks"]
+    assert (
+        deployment["info"]["rollback_target_unusable_containment_flip"]["change"]
+        == "registered"
+    )
+
+
+@pytest.mark.parametrize("problem", UNUSABLE_PROBLEMS)
+@pytest.mark.parametrize(
+    "case",
+    [
+        *(f"enable_{flag}" for flag in sorted(_ENABLING)),
+        "appconfig_added",
+        "image",
+        "nothing_to_deploy",
+    ],
+)
+def test_an_unusable_target_blocks_enabling_an_image_and_the_appconfig_group(
+    case: str, problem: str
+) -> None:
+    if case.startswith("enable_"):
+        serving_changes, changes, key = _ENABLING[case.removeprefix("enable_")]
+        image = L1_IMAGE
+    elif case == "appconfig_added":
+        serving_changes, changes, key = ON, {**ON, **APPCONFIG}, "appconfig_group_added"
+        image = L1_IMAGE
+    elif case == "image":
+        serving_changes, changes, key = {}, {}, "app_image"
+        image = HOTFIX_IMAGE
+    else:
+        serving_changes, changes, key = {}, {}, None
+        image = L1_IMAGE
+    fake = _flip_world(serving_changes)
+    rollback = _unusable(fake, problem)
+    plan, _rendered = _staged_plan(fake, image, rollback=rollback, **changes)
+    if key is not None:
+        [change] = _task_step(plan)["changes"]
+        assert key in change
+    deployment = _step(plan, "service_deployment")
+    assert UNUSABLE in deployment["blocks"]
+    assert {"step": "service_deployment", "reason": UNUSABLE} in plan["gate_blocks"]
+    assert "rollback_target_unusable_containment_flip" not in deployment["info"]
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # Values other than exactly 'true' -> 'false': the direction cannot
+        # be told, so it fails closed.
+        [("credit_hot_path_flag", {"from": "TRUE", "to": "false"})],
+        [("credit_hot_path_flag", {"from": "true", "to": "False"})],
+        [("transport_flag", {"from": None, "to": "false"})],
+        [("worker_flag", {"to": "false"})],
+        [("worker_flag", "true->false")],
+        # Off to off, or on to on, is no direction.
+        [("worker_flag", {"from": "false", "to": "false"})],
+        # Not a flag flip, or more than one change.
+        [("flag_rows_added", {"from": "true", "to": "false"})],
+        [("appconfig_group_added", {"from": "true", "to": "false"})],
+        [
+            ("credit_hot_path_flag", {"from": "true", "to": "false"}),
+            ("transport_flag", {"from": "true", "to": "false"}),
+        ],
+        [],
+    ],
+)
+def test_a_flip_of_undetermined_direction_is_never_containment(
+    entries: list[tuple[str, Any]],
+) -> None:
+    revision = wiring._Step("task_definition_revision", "in_scope")
+    for kind, entry in entries:
+        revision.changes.append({"action": "register_task_definition", kind: entry})
+    assert wiring._disabling_flip(revision) is None
+    disabling = wiring._Step("task_definition_revision", "in_scope")
+    disabling.info["registered_revision_changes_transport_flag"] = {
+        "serving": _arn(15),
+        "from": "true",
+        "to": "false",
+    }
+    assert wiring._disabling_flip(disabling) == {
+        "kind": "transport_flag",
+        "change": "registered",
+        "from": "true",
+        "to": "false",
+    }
+
+
+# -- The service runs the target itself: a stray or a double registration ----
+
+
+def test_a_stray_active_revision_12_that_displaces_l2a_to_13_is_refused() -> None:
+    """A stray revision 12 (the bridge image plus the rows, the worker on)
+    registered before L2a, so L2a landed on 13; the manifest wrongly pinned
+    to 12. By content alone the stray passes (it differs from the L2b
+    rendering in the image alone); the service runs 13, not the target."""
+
+    stray = _staged_rendering(BRIDGE_IMAGE)
+    fake = _chain_world(13, 12, 13, requests={12: stray, 13: _live(12)})
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=12)
+    assert "app_image" in _task_step(plan)["changes"][0]
+    blocks, verdicts = _gate(plan)
+    assert blocks == [IMAGE_GATE]
+    assert _verdict("app_image", "proposed", OFF_TARGET) in verdicts
+
+
+def test_a_double_registration_of_l2a_is_refused_until_the_target_serves() -> None:
+    fake = _chain_world(13, 12, 13, requests={13: _live(12)})
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=12)
+    assert _gate(plan) == (
+        [IMAGE_GATE],
+        [_verdict("app_image", "proposed", OFF_TARGET)],
+    )
+
+
+@pytest.mark.parametrize("problem", ["inactive", "missing"])
+def test_an_inactive_or_missing_target_blocks_the_change(problem: str) -> None:
+    fake = _chain_world(12, 12)
+    if problem == "inactive":
+        target = _registered_as(STAGED_ARNS[12], _live(12))
+        target["taskDefinition"]["status"] = "INACTIVE"
+        _put_app_revision(fake, STAGED_ARNS[12], target, latest=True)
+        rollback = 12
+        expected = ["target_not_active_and_digest_pinned"]
+    else:
+        rollback = 17
+        fake.put(
+            "ecs",
+            "DescribeTaskDefinition",
+            {"taskDefinition": "neurostack-staging-app:17", "include": ["TAGS"]},
+            {"__error_code__": "ClientException"},
+        )
+        expected = [
+            "target_not_active_and_digest_pinned",
+            "target_worker_flag_not_exactly_one_true",
+            DIFFERS,
+            OFF_TARGET,
+        ]
+    plan, _rendered = _staged_plan(fake, L1_IMAGE, rollback=rollback)
+    deployment = _step(plan, "service_deployment")
+    assert "rollback_target_revision_unusable" in deployment["blocks"]
+    blocks, verdicts = _gate(plan)
+    assert verdicts[0] == _verdict("app_image", "proposed", *expected)
+    if problem == "inactive":
+        assert (blocks, verdicts) == ([IMAGE_GATE], verdicts[:1])
+    else:
+        # Fail closed: an unreadable target carries no rows, so the serving
+        # rows revision (12) is a rows change it cannot be the way back from.
+        assert blocks == [IMAGE_GATE, ROWS_GATE]
+        assert verdicts[1:] == [
+            _verdict(
+                "flag_rows_added",
+                "serving",
+                "target_not_active_and_digest_pinned",
+                "target_worker_flag_not_exactly_one_true",
+                DIFFERS,
+            )
+        ]
+
+
+# -- Each condition of the content rule, alone -------------------------------
+
+
+def _content_failures(
+    target: dict[str, Any], request: Any, kind: str = "app_image", **pin_changes: Any
+) -> list[str]:
+    pins = dataclasses.replace(_worker_pins(12), **pin_changes)
+    return wiring._rollback_content_failures(target, request, kind, pins)
+
+
+def _with_worker_rows(request: dict[str, Any], *values: str) -> dict[str, Any]:
+    out = copy.deepcopy(request)
+    app = evidence._container_map(out)["app"]
+    app["environment"] = [r for r in app["environment"] if r["name"] != WORKER_FLAG] + [
+        {"name": WORKER_FLAG, "value": value} for value in values
+    ]
+    return out
+
+
+def test_each_condition_of_the_content_rule_blocks_alone() -> None:
+    rows, image = _live(12), _live(13)
+    target = _registered_as(STAGED_ARNS[12], rows)
+    assert _content_failures(target, image) == []
+    # (a) ACTIVE, the revision the manifest names, pinned by digest.
+    inactive = copy.deepcopy(target)
+    inactive["taskDefinition"]["status"] = "INACTIVE"
+    assert _content_failures(inactive, image) == ["target_not_active_and_digest_pinned"]
+    elsewhere = _registered_as(REVISION_11_ARN, rows)
+    assert _content_failures(elsewhere, image) == [
+        "target_not_active_and_digest_pinned"
+    ]
+    tagged_rows = _staged_rendering(None)
+    tagged = _registered_as(STAGED_ARNS[12], _without_staged_rows(tagged_rows))
+    assert _content_failures(tagged, tagged_rows, "flag_rows_added") == [
+        "target_not_active_and_digest_pinned"
+    ]
+    # (b) exactly one BILLING_FACT_WORKER_ENABLED row, 'true': the old
+    # protection (an image change never goes back to the worker off), now
+    # for every pin.
+    for values in (("false",), (), ("true", "true"), ("true", "false"), ("TRUE",)):
+        assert _content_failures(
+            _registered_as(STAGED_ARNS[12], _with_worker_rows(rows, *values)),
+            _with_worker_rows(image, *values),
+        ) == ["target_worker_flag_not_exactly_one_true"], values
+    # (c) the change's kind alone.
+    assert _content_failures(target, image, "flag_rows_added") == [DIFFERS]
+    assert _content_failures(target, _live(14)) == [DIFFERS]
+    assert _content_failures(target, rows) == [DIFFERS]
+    assert _content_failures(target, None) == [DIFFERS]
+    # A pending safety re-pin is never the good state either.
+    assert _content_failures(
+        target, image, rollback_repin_before="app_image_bump_deployment"
+    ) == ["target_repin_pending"]
+
+
+def test_the_rows_change_in_service_is_relative_to_the_target() -> None:
+    # L2a serving with the target still 10 (not re-pinned to 11): 12 is 10
+    # plus the rows AND another image; both kinds block.
+    plan, _rendered = _staged_plan(_chain_world(12, 12), NEW_IMAGE, rollback=10)
+    blocks, verdicts = _gate(plan)
+    assert blocks == [IMAGE_GATE, ROWS_GATE]
+    assert verdicts == [
+        _verdict("app_image", "serving", DIFFERS),
+        _verdict("flag_rows_added", "serving", DIFFERS),
+    ]
+    # With the target on the rows revision there is no rows change in service.
+    plan, _rendered = _staged_plan(_chain_world(13, 12, 13), L1_IMAGE, rollback=12)
+    assert [v["kind"] for v in _gate(plan)[1]] == ["app_image"]
+    plan, _rendered = _staged_plan(_chain_world(12, 12), NEW_IMAGE, rollback=12)
+    assert _gate(plan) == ([], [])
+
+
+def test_revision_8_keeps_no_serving_change_and_gates_a_proposed_one() -> None:
+    """The D3 source is pinned by tag: as before, no change in service is
+    detected against it, and a proposed or registered change never passes."""
+
+    plan, _rendered = _staged_plan(_chain_world(12, 12), L1_IMAGE, rollback=8)
+    blocks, verdicts = _gate(plan)
+    assert blocks == [IMAGE_GATE]
+    assert [v["change"] for v in verdicts] == ["proposed"]
+    assert "target_not_active_and_digest_pinned" in verdicts[0]["failed"]
+
+
+# -- Rolling back along the chain --------------------------------------------
+
+
+def test_rolling_l2b_back_to_12_is_registered_not_deployed_and_to_11_or_10_blocks() -> (
+    None
+):
+    plan, _rendered = _staged_plan(_chain_world(12, 12, 13), L1_IMAGE, rollback=12)
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert f"registered_not_deployed:{STAGED_ARNS[13]}" in _task_step(plan)["compliant"]
+    assert _gate(plan) == ([], [_verdict("app_image", "registered")])
+    for back in (11, 10):
+        plan, _rendered = _staged_plan(
+            _chain_world(back, 12, 13), L1_IMAGE, rollback=12
+        )
+        assert _task_step(plan)["blocks"] == [
+            f"service_not_on_rollback_target:{_arn(back)}"
+        ]
+
+
+def test_rolling_l2a_back_to_11_is_registered_not_deployed() -> None:
+    plan, _rendered = _staged_plan(_chain_world(11, 12), NEW_IMAGE, rollback=11)
+    assert plan["status"] == "compliant", plan["blocks"]
+    assert f"registered_not_deployed:{STAGED_ARNS[12]}" in _task_step(plan)["compliant"]
+    assert _gate(plan) == ([], [_verdict("flag_rows_added", "registered")])
+
+
+@pytest.mark.parametrize(
+    "serving,registered,rollback,image,changes",
+    [
+        # After L6, rolled back by hand to the target 13: the rendering is 13
+        # plus two flips.
+        (13, (12, 13, 14, 15), 13, L1_IMAGE, ON),
+        # L2b rolled back to an older target (11): 13 is 11 plus the rows and
+        # the image.
+        (11, (12, 13), 11, L1_IMAGE, {}),
+    ],
+)
+def test_the_service_on_its_own_target_with_a_stuck_plan_has_its_own_reason(
+    serving: int,
+    registered: tuple[int, ...],
+    rollback: int,
+    image: str,
+    changes: dict[str, str],
+) -> None:
+    plan, _rendered = _staged_plan(
+        _chain_world(serving, *registered), image, rollback=rollback, **changes
+    )
+    assert _task_step(plan)["blocks"] == [
+        f"service_on_rollback_target_plan_stuck:{_arn(serving)}"
+    ]
+    assert "service_not_on_rollback_target" not in json.dumps(plan)
+
+
+def test_the_planner_code_names_no_chain_revision_outside_the_pin_table() -> None:
+    """Identity by content: the gate and the window check read the manifest
+    pin, never a revision number or a digest of the chain."""
+
+    source = SCRIPT.read_text(encoding="utf-8")
+    table = source[
+        source.index("ROLLBACK_TARGET_PINS: dict[") : source.index(
+            "ROLLBACK_LAST_NAMED_PIN ="
+        )
+    ]
+    rest = source.replace(table, "")
+    for revision in ("11", "12", "13"):
+        assert not re.search(rf"\brevision\s*==\s*{revision}\b", rest)
+        assert not re.search(rf"rollback_revision\s*[=!<>]=?\s*{revision}\b", rest)
+    assert NEW_DIGEST[7:] not in source
+    assert "WORKER_FLAG_REVISION and" not in source
+
+
+# The tests the L2c and L4 PRs update when the repository manifest moves off
+# its current pin (measured for 11 to 12: each fails then). The runbook's
+# checklist names exactly these (test_the_runbook_documents_the_rollback_target_chain).
+RE_PIN_CHECKLIST = (
+    "test_the_reviewed_manifest_is_pinned_to_revision_11",
+    "test_036_037_and_042_refuse_a_rollback_target_not_repinned",
+    "test_without_a_manifest_the_tool_reads_the_reviewed_one",
+    "test_manifest_and_template_validate",
+    "test_rollback_target_is_re_pinned_to_revision_11_without_a_note",
+    "test_manifest_validator_rejects_an_invalid_rollback_target",
+    "test_render_taskdef_refuses_the_image_stuck_state_with_its_reason",
+    "test_the_repository_parameters_propose_the_l2a_rows_revision",
+    "test_a_rollback_revision_must_be_spelled_in_plain_decimal",
+    # Its marker count follows the manifest's pin (measured too).
+    "test_the_manifest_carries_one_closed_at_marker_per_re_pin",
+)
+
+
+def test_the_runbook_documents_the_rollback_target_chain() -> None:
+    runbook = _flat(WORKER_FLAG_RUNBOOK)
+    raw = WORKER_FLAG_RUNBOOK.read_text(encoding="utf-8")
+    heading = "### Re-pinning the rollback target along the live chain"
+    assert f"\n{heading}\n" in raw
+    assert (
+        raw.index("### Ordered procedure")
+        < raw.index(heading)
+        < raw.index("### Webhook exposure and registration (D4)")
+    )
+    assert "(#re-pinning-the-rollback-target-along-the-live-chain)" in runbook
+    section = _between(runbook, heading, "### Webhook exposure and registration (D4)")
+    for revision in (10, 11, 12, 13):
+        assert f"| {revision} | `{CHAIN_TARGETS[revision]['effective_after']}` |" in (
+            section
+        )
+    assert f"| above 13 | `{GENERIC_EFFECTIVE_AFTER}` |" in section
+    for phrase in (
+        "each structural deploy goes back to **the revision it replaces**",
+        "L2a (the two staged rows) goes back to revision 11",
+        "window `042` (L3) go back to revision 12, L2a's revision and the last"
+        " before that image",
+        "from L4 on the target is revision 13, L2b's revision",
+        "the way back from a flip is the flip back or the previous revision",
+        "in this order: 10 to 11 (Group 5b itself), L2a, L2a's observation (6 h),"
+        " 11 to 12 (L2c), L2b, its observation (6 h or more), L3, its observation"
+        " (24 h), 12 to 13 (L4), L5. The chain never skips revision 11.",
+        "`check-manifest` refuses one on 10 or above, refuses 7 (any revision"
+        " below 8), a swapped `effective_after` and any other key",
+        "checked on import: an inconsistent pair never loads",
+        "is `ACTIVE`, with its app image pinned by digest;",
+        "carries exactly one `BILLING_FACT_WORKER_ENABLED` row, and it is `'true'`"
+        " (a way back never turns the worker off);",
+        "differs from the change's revision in that change's kind alone",
+        "for a proposed or registered change, is the revision the service runs",
+        "no digest and no revision number of the chain is in the code",
+        "`rollback_target_not_repinned_before_image_bump` (the image) or"
+        " `rollback_target_not_repinned_before_flag_rows` (the rows)",
+        "`info.rollback_target_content_rule`",
+        "`target_not_active_and_digest_pinned`,"
+        " `target_worker_flag_not_exactly_one_true`,"
+        " `target_differs_from_the_change_in_more_than_its_kind`,"
+        " `target_repin_pending`, `service_not_on_target`",
+        "**Flag flips are never gated by the target**",
+        "(Decision 16)",
+        "rolling back to 12 reports `registered_not_deployed:<revision 13 ARN>`"
+        " with no gate block; rolling back to 11 or 10 reports"
+        " `service_not_on_rollback_target:<ARN>` naming it",
+        "rolling back to 11 reports `registered_not_deployed:<revision 12 ARN>`",
+        "`service_on_rollback_target_plan_stuck:<ARN>`",
+        "After L6, a manual rollback to R (13) is such a dead end of more than one"
+        " kind of change (the rendering is 13 plus two flips): use the previous"
+        " revision or the flip back.",
+        "**A hotfix image during the canary (L5 to L10).**",
+        "First re-pin the manifest to the serving revision (any revision above"
+        " 13, `effective_after: revision_serving_verified_and_observation_closed`;"
+        " a manifest PR with the evidence below, never a code PR)",
+        "re-pin to it before the next flip is deployed",
+        "**Stop rule (defence in depth; identity is by content).**",
+        "before L2a confirms that the newest revision of the family is 11, and"
+        " before L2b that it is 12; L2a's verification confirms that the revision"
+        " it registered is 12, and L2b's that it is 13",
+        "a stray `ACTIVE` revision 12 that pushed L2a to 13 is refused while the"
+        " service runs 13",
+        "`_sha256(_request_from_response(<DescribeTaskDefinition"
+        " neurostack-staging-app:<N> with include TAGS>))` (not the plan's"
+        " `rendered_request_sha256`)",
+        "one marker `# closed_at: YYYY-MM-DDTHH:MMZ` per re-pin",
+        "**History (10 to 11).**",
+        "so the floor was 2026-10-25T21:07Z",
+        "declared observed and stable by the owner at 2026-11-01T01:19Z",
+        "`036` and `037` keep requiring revision 10, by number only: with the"
+        " reviewed manifest past 10 they cannot run again",
+        "Window `042` requires revision 12 by number and by content",
+        "the two diverge only after L4",
+        # Each move is reviewed and merged by a human (R20).
+        "Each move is its own small reviewed PR of the manifest (an ASAAS"
+        " invariant file: the owner's sign-off, merged by a human)",
+        # Identity: what the content rule proves, and what it cannot (A-L6).
+        "For a proposed or registered change, together these prove that the"
+        " target is the revision the change replaces. For a change already in"
+        " service the identity is by content alone, so two revisions can qualify",
+        "there only the stop rule and the review of the re-pin PR decide,",
+        "`plan` backs it by content (the content rule and the service on the"
+        " target)",
+        # A flip never blocks, off the chain too (A-H1).
+        "while a flip is proposed or registered the changes in service are still"
+        ' listed, each with `"gating": false`, and block nothing, even off the'
+        " documented chain (a skipped L4 re-pin, or a flip on top of a hotfix)",
+        "Only a target with a pending safety re-pin (9) still gates a flip, as"
+        " before.",
+        # The unusable target: only containment (owner decision, 2026-11-01).
+        "**An unusable target: only containment passes** (owner decision,"
+        " 2026-11-01).",
+        "for every deploy except a flip that turns a flag off: the credit switch,"
+        " the transport or the worker from `'true'` to `'false'`",
+        "`info.rollback_target_unusable_containment_flip`",
+        # Owner decision (a): every condition that raises the block.
+        "When the target is unusable (`INACTIVE`, missing, `ACTIVE` but not"
+        " pinned by digest, or a read naming another ARN than the manifest's"
+        " revision), `plan` reports",
+        "The exception covers every one of those conditions, not only an"
+        " `INACTIVE` or missing target.",
+        # Owner decision (b): the floor of a re-pin above 13.
+        "above 13 (the canary hotfix: the re-pin to the serving revision, and"
+        " later the re-pin to the hotfix revision), 6 h after the deployment of"
+        " the revision that becomes the target `COMPLETED`, and only once a"
+        " read-only `plan` (with the owner's go) shows"
+        " `rollback_target_active_and_digest_pinned` on it.",
+        "Each of these re-pins (to the serving revision, and later to the hotfix"
+        " revision) has its floor 6 h after that revision's deployment"
+        " `COMPLETED`, and only once a read-only `plan` (with the owner's go)"
+        " shows `rollback_target_active_and_digest_pinned` on it.",
+        # R09: the merge condition.
+        "It updates both runbooks and their goldens in the same PR, and merges"
+        " only after that observation has closed.",
+        "Turning a flag on, an image change, the staged rows and the AppConfig"
+        " group stay blocked until the target is repaired; a direction that"
+        " cannot be told fails closed. The block is a gate block (in"
+        " `gate_blocks`; the plan `status` stays `ready` or `compliant`): do not"
+        " deploy while it is reported.",
+        # With nothing to deploy the change in service still gates (D11).
+        "With nothing to deploy, a change in service two kinds away from the"
+        " target still reports the image gate.",
+        # No image hotfix while the worker is contained (by spec).
+        "While the worker runs `'false'` (a containment flip), no revision"
+        " qualifies as the rollback target (it must carry the worker `'true'`),"
+        " so no image change passes, re-pinned or not: turn the worker back on"
+        " first, or stop and return to the owner.",
+        # Each re-pin's own closed_at floor (B-M3).
+        "The floors: 10 to 11, revision 11's deployment `COMPLETED` + 6 h (the 9"
+        " to 10 precedent); 11 to 12 (L2c), L2a's deployment `COMPLETED` + 6 h;"
+        " 12 to 13 (L4), window `042`'s verified post-read + 24 h (L3's"
+        " observation), and never before L2b's deployment `COMPLETED` + 6 h;",
+        # Done when, and the checklist of the L2c and L4 PRs (B-L9, B-O1).
+        "**Done when (the L2c and L4 PRs).** `check-manifest` passes, and a"
+        " read-only `plan` (with the owner's go at the moment of the reads) shows"
+        " `rollback_target_active_and_digest_pinned` on the new target; for L2c"
+        " also no image gate (`rollback_target_not_repinned_before_image_bump`)"
+        " for the L2b rendering.",
+        "**Re-pin checklist (the L2c and L4 PRs).** Moving the repository"
+        " manifest off its current pin makes these tests fail, and the PR updates"
+        " each to the new target. For L2c (11 to 12) the list below was measured;"
+        " for L4 (12 to 13) it is a starting point, to confirm by running the"
+        " runbook readers, since it depends on how L2c rewrote these tests:",
+        # The breaker after L6 (B-L6).
+        "Both are safe service states; after L6 the documented way back is the"
+        " previous revision or the flip back (R leaves `plan` stuck).",
+    ):
+        assert phrase in section, phrase
+    checklist = _between(
+        section, "**Re-pin checklist (the L2c and L4 PRs).**", "**History (10 to 11).**"
+    )
+    sources = "".join(
+        (ROOT / "tests" / "scripts" / name).read_text(encoding="utf-8")
+        for name in (
+            "test_asaas_production_wiring.py",
+            "test_asaas_migration_window.py",
+        )
+    )
+    # Both directions: the checklist names exactly RE_PIN_CHECKLIST, and each
+    # is a real test.
+    named = re.findall(r"`(test_\w+)`", checklist)
+    assert sorted(named) == sorted(RE_PIN_CHECKLIST), named
+    assert len(named) == len(set(named)), named
+    for name in RE_PIN_CHECKLIST:
+        assert f"\ndef {name}(" in sources, name
+    for retired in (
+        "`plan` enforces the same",
+        "Together these prove that the target is the revision the change" " replaces;",
+        "are valid ways back",
+        "its floor (6 hours after its deployment completed, by the 9 to 10"
+        " precedent)",
+        "Moving the repository manifest off 11",
+        "(`INACTIVE`, missing, or not the manifest's revision pinned by digest)",
+    ):
+        assert retired not in runbook, retired
+    # Window 042's preconditions: by content, provenance elsewhere, until L4
+    # (R16, B-L7).
+    for phrase in (
+        "The tool also checks it by content: exactly one"
+        " `BILLING_FACT_WORKER_ENABLED` row in it, `'true'`, and the service"
+        " revision differing from it in the app image alone",
+        "That proves the content, not the provenance: that revision 12 is the"
+        " very revision L2b replaced comes from the planner's L2b gate (the"
+        " service on the target) and the stop rule.",
+        "Revision 12 is the way back during and after the window, until L4: its"
+        " image reads none of the credit tables",
+        # The image bump's rollback line is history (B-L8).
+        "**Rollback** (history: the image bump of 2026-10-25; L2b's way back is"
+        ' revision 12, see "Re-pinning the rollback target along the live'
+        ' chain") was the service back to revision 10, the rollback target then',
+    ):
+        assert phrase in runbook, phrase
+    assert "tool also checks that it is the revision L2b replaced" not in runbook
+    # The follow-up is done; the closed table is history.
+    assert "- **Re-pinning after later deployments (done, asaas-rollout-opening" in raw
+    assert "Group 5b made the code change once" in runbook
+    # The window table and the 042 preconditions name revision 12.
+    table_042 = next(
+        line
+        for line in raw.splitlines()
+        if line.startswith("| `042` | `migrations_038_042`")
+    )
+    assert "`rollback_target` revision 12 (L2a's, re-pinned in L2c), `ACTIVE`" in (
+        table_042
+    )
+    assert "re-pinned from 11 by live step L2c" in runbook
+    assert "(`rollback_target_worker_flag_true`)" in runbook
+    assert (
+        "(`rollback_target_is_the_revision_the_service_revision_replaced`)" in runbook
+    )
+    # E6: the new targets run an image of this release.
+    assert (
+        "revisions 11 and 12 run the E7b image, built from `main` `143ca9db`,"
+        " which contains that merge (`git merge-base --is-ancestor 67b9b51c"
+        " 143ca9db`, verified), and revision 13 runs the image of live step L1"
+        in runbook
+    )
