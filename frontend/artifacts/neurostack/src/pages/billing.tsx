@@ -293,29 +293,53 @@ export default function Billing() {
   const [creditCatalog, setCreditCatalog] = useState<BillingLoad<CreditCatalog>>({ status: "loading" });
   const [topupLoading, setTopupLoading] = useState(false);
   const [topupError, setTopupError] = useState<string | null>(null);
+  // The top-up POST answered 202 (outcome unknown): no second purchase is
+  // offered from this page until it is reloaded.
+  const [topupUncertain, setTopupUncertain] = useState(false);
   const [exportState, setExportState] = useState<"idle" | "loading" | "unavailable" | "error">(
     "idle",
+  );
+
+  // Stale-response guard: each read takes a ticket and only the newest ticket
+  // of its resource may write state, so a slow earlier answer (a retry that
+  // overtook the first read, a re-read after a checkout return) can never
+  // overwrite a newer one.
+  const tickets = useRef<Record<string, number>>({});
+  const takeTicket = useCallback((key: string) => {
+    tickets.current[key] = (tickets.current[key] ?? 0) + 1;
+    return tickets.current[key];
+  }, []);
+  const isNewest = useCallback(
+    (key: string, ticket: number) => tickets.current[key] === ticket,
+    [],
   );
 
   // Fetch summary: a failed or refused read stays a failure, never a default.
   // A re-read keeps the last good answer on screen (no area flickers away);
   // a retry after a failure shows loading.
   const fetchSummary = useCallback(async () => {
+    const ticket = takeTicket("summary");
     setSummary((prev) => (prev.status === "ok" ? prev : { status: "loading" }));
-    setSummary(await readBilling("/v1/billing/summary", token, isBillingSummary));
-  }, [token]);
+    const result = await readBilling("/v1/billing/summary", token, isBillingSummary);
+    if (isNewest("summary", ticket)) setSummary(result);
+    return result;
+  }, [token, takeTicket, isNewest]);
 
   // The backend-owned catalog: every price, credit and clinic shown for a plan.
   const fetchCatalog = useCallback(async () => {
+    const ticket = takeTicket("catalog");
     setCatalog({ status: "loading" });
-    setCatalog(await readBilling("/v1/billing/catalog", token, isBillingCatalog));
-  }, [token]);
+    const result = await readBilling("/v1/billing/catalog", token, isBillingCatalog);
+    if (isNewest("catalog", ticket)) setCatalog(result);
+  }, [token, takeTicket, isNewest]);
 
   // The lots: the only credit history of the contract (no cursor, no paging).
   const fetchLots = useCallback(async () => {
+    const ticket = takeTicket("lots");
     setLots((prev) => (prev.status === "ok" ? prev : { status: "loading" }));
-    setLots(await readCredits("/v1/credits/lots", token, isCreditLots));
-  }, [token]);
+    const result = await readCredits("/v1/credits/lots", token, isCreditLots);
+    if (isNewest("lots", ticket)) setLots(result);
+  }, [token, takeTicket, isNewest]);
 
   // The credit summary: the ledger's figures, never anticipated by the page.
   // A re-read keeps the last ledger answer on screen until the new one
@@ -323,21 +347,26 @@ export default function Billing() {
   // packages are read only once the ledger answered: with the switch off
   // there is nothing more to ask.
   const fetchCredit = useCallback(async () => {
+    const ticket = takeTicket("credit");
     setCredit((prev) => (prev.status === "ok" ? prev : { status: "loading" }));
     const result = await readCredits("/v1/credits/summary", token, isCreditSummary);
+    if (!isNewest("credit", ticket)) return;
     setCredit(result);
     if (result.status !== "ok") return;
     await Promise.all([
       fetchLots(),
       (async () => {
-        setCreditCatalog(await readCredits("/v1/credits/catalog", token, isCreditCatalog));
+        const catalogTicket = takeTicket("creditCatalog");
+        const packages = await readCredits("/v1/credits/catalog", token, isCreditCatalog);
+        if (isNewest("creditCatalog", catalogTicket)) setCreditCatalog(packages);
       })(),
     ]);
-  }, [token, fetchLots]);
+  }, [token, fetchLots, takeTicket, isNewest]);
 
   // Read (or ask the server to reconcile) one checkout session by its UUID.
   const fetchSession = useCallback(
     async (sessionId: string, reconcile = false) => {
+      const ticket = takeTicket("session");
       setSessionLoading(true);
       setSessionError(null);
       try {
@@ -348,6 +377,7 @@ export default function Billing() {
             ? { method: "POST", headers: authHeaders(token) }
             : { headers: authHeaders(token) },
         );
+        if (!isNewest("session", ticket)) return;
         if (res.status === 404) {
           // Unknown and foreign IDs are indistinguishable 404s: forget it.
           storeSessionId(null);
@@ -366,6 +396,7 @@ export default function Billing() {
           return;
         }
         const data: unknown = res.status === 200 ? await res.json() : null;
+        if (!isNewest("session", ticket)) return;
         if (!isCheckoutSession(data)) {
           setSessionError(
             txt(
@@ -380,6 +411,7 @@ export default function Billing() {
         // Terminal sessions are shown once and then forgotten.
         storeSessionId(LIVE_CHECKOUT_STATES.has(data.state) ? data.checkout_session_id : null);
       } catch {
+        if (!isNewest("session", ticket)) return;
         setSessionError(
           txt(
             "Não foi possível ler o estado do checkout no servidor. Tente novamente mais tarde.",
@@ -387,10 +419,10 @@ export default function Billing() {
           ),
         );
       } finally {
-        setSessionLoading(false);
+        if (isNewest("session", ticket)) setSessionLoading(false);
       }
     },
-    [token, txt],
+    [token, txt, takeTicket, isNewest],
   );
 
   // One read of each authoritative resource per visit. The `?checkout=`
@@ -401,11 +433,16 @@ export default function Billing() {
     removeReturnMarker();
     if (initialReadStarted.current) return;
     initialReadStarted.current = true;
-    void fetchSummary();
     void fetchCatalog();
     // After a checkout return or a PIX QR code the ledger is re-read like
-    // the order: a grant shows only once the server applied it.
-    void fetchCredit();
+    // the order: a grant shows only once the server applied it. The credit
+    // reads wait for the summary: an account it refuses (401/403) has no
+    // business asking the ledger, and the page shows no credit area for it.
+    void (async () => {
+      const read = await fetchSummary();
+      if (read.status === "unauthorized" || read.status === "forbidden") return;
+      await fetchCredit();
+    })();
     const storedSessionId = readStoredSessionId();
     if (storedSessionId) void fetchSession(storedSessionId);
   }, [fetchSummary, fetchCatalog, fetchSession, fetchCredit]);
@@ -465,7 +502,14 @@ export default function Billing() {
     shownSession !== null &&
     (LIVE_CHECKOUT_STATES.has(shownSession.state) ||
       shownSession.checkout_session_id === liveSession?.checkout_session_id);
-  const topup = deriveTopupState({ summary, credit, creditCatalog, checkoutLive, txt });
+  const topup = deriveTopupState({
+    summary,
+    credit,
+    creditCatalog,
+    checkoutLive,
+    topupUncertain,
+    txt,
+  });
   // Areas 02 and 03 appear only once the summary was read, or failed with an
   // explicit state: never while it may still answer 401/403.
   const summarySettled =
@@ -536,6 +580,10 @@ export default function Billing() {
         headers: authHeaders(token),
         body: JSON.stringify({ offer_id: offered.offerId, method }),
       });
+      if (res.status === 202) {
+        setTopupUncertain(true);
+        return;
+      }
       if (res.status !== 200) {
         setTopupError(topupErrorMessage(res.status, txt));
         return;

@@ -325,6 +325,7 @@ export function deriveTopupState({
   credit,
   creditCatalog,
   checkoutLive,
+  topupUncertain = false,
   txt,
 }: {
   summary: BillingLoad<BillingSummary>;
@@ -332,6 +333,13 @@ export function deriveTopupState({
   creditCatalog: BillingLoad<CreditCatalog>;
   /** A checkout is open or unread (summary `live_session`, tracked or stored session). */
   checkoutLive: boolean;
+  /**
+   * This page's own top-up POST answered 202: the server could not say whether
+   * the provider created the checkout. Offering the purchase again could pay
+   * twice, so the area stays closed until the page is reloaded and the
+   * server's own reads (summary `live_session`) take over.
+   */
+  topupUncertain?: boolean;
   txt: Txt;
 }): TopupState {
   if (summary.status !== "ok" || summary.data.topup_commercial_enabled !== true) {
@@ -348,6 +356,16 @@ export function deriveTopupState({
       reason: txt(
         "Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.",
         "Top-ups are unavailable while the server is verifying a financial pending item.",
+      ),
+    };
+  }
+  if (topupUncertain) {
+    return {
+      status: "blocked",
+      announce: true,
+      reason: txt(
+        "O servidor não conseguiu confirmar se o checkout da recarga foi criado no provedor. Não pague novamente: a recarga fica indisponível até você atualizar a página e o servidor confirmar o estado dele.",
+        "The server could not confirm whether the top-up checkout was created with the provider. Do not pay again: top-ups stay unavailable until you refresh the page and the server confirms its state.",
       ),
     };
   }

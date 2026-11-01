@@ -102,10 +102,10 @@
   --secondary: 214 32% 91%;
   --secondary-foreground: 222 47% 11%;
   --muted: 210 40% 96%;
-  --muted-foreground: 215 16% 47%;
+  --muted-foreground: 215 16% 43%; /* >= 4.5:1 also on --muted (was 4.30:1) */
   --accent: 199 89% 39%; /* #0284C7 */
   --accent-foreground: 0 0% 100%;
-  --destructive: 0 84% 60%;
+  --destructive: 0 72% 45%; /* text 5.8:1 on white, white-on 5.8:1 (was 3.78:1) */
   --destructive-foreground: 0 0% 100%;
 
   --input: 214 32% 91%;

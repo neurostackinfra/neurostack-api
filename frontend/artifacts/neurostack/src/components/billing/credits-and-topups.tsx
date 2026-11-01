@@ -72,7 +72,7 @@ export interface TopupPackageItem {
 /** Decided by the page from server readbacks (`deriveTopupState`). */
 export type TopupState =
   | { status: "hidden" }
-  | { status: "blocked"; reason: string }
+  | { status: "blocked"; reason: string; announce?: boolean }
   | { status: "offered"; packages: TopupPackageItem[] };
 
 export interface ExportAction {
@@ -589,6 +589,9 @@ function TopupSection({
     return (
       <p
         data-testid="topup-blocked"
+        // Only the outcome of the user's own click is announced; a block that
+        // was already there on load stays a quiet, static notice.
+        role={topup.announce ? "alert" : undefined}
         className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
       >
         <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />

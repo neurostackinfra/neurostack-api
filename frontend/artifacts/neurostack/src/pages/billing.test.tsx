@@ -1476,17 +1476,20 @@ describe("Billing credits", () => {
 
   it.each([
     // A summary that never answers: the router returns the pending promise.
-    ["is loading", (() => new Promise<Response>(() => {})) as unknown as Route],
-    ["failed", () => response({}, 500)],
-  ] as Array<[string, Route]>)("exposes no top-up action while the billing summary %s", async (_label, answer) => {
+    // The ledger is read only once the summary answered without a refusal, so
+    // a summary still loading has not asked it yet.
+    ["is loading", (() => new Promise<Response>(() => {})) as unknown as Route, 0],
+    ["failed", () => response({}, 500), 1],
+  ] as Array<[string, Route, number]>)("exposes no top-up action while the billing summary %s", async (_label, answer, creditReads) => {
     routeFetch(fetchMock, {
       "GET /v1/billing/summary": answer,
       [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
     });
     renderBilling();
 
-    await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1));
+    await waitFor(() => expect(calls(fetchMock, "GET", CATALOG)).toHaveLength(1));
     await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(creditReads);
     expect(screen.queryByRole("button", { name: /Recarregar/ })).not.toBeInTheDocument();
     expect(screen.queryByTestId("topup-offer")).not.toBeInTheDocument();
   });
@@ -1621,6 +1624,87 @@ describe("Billing credits", () => {
     expect(metric("Recargas")).toHaveTextContent("496 créditos");
     expect(await screen.findByTestId("topup-blocked")).toHaveTextContent(/checkout em andamento/);
     expect(sessionStorage.getItem(SESSION_KEY)).toBe(SESSION_ID);
+  });
+
+  it("closes the top-up when the POST answers an uncertain 202, announced, and never offers a second purchase", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(topupSummary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+      "POST /v1/billing/checkout": () =>
+        response({ detail: "billing_checkout_reconciliation_required" }, 202),
+    });
+    renderBilling();
+
+    await openTopup();
+    const packages = screen.getByRole("group", { name: "Pacote" });
+    fireEvent.click(within(packages).getByRole("button", { name: /^2\.000 créditos/ }));
+    fireEvent.click(within(screen.getByRole("group", { name: "Forma de pagamento" })).getByRole("button", { name: "PIX" }));
+    fireEvent.click(screen.getByRole("button", { name: /Ir para o pagamento da recarga/i }));
+
+    const blocked = await screen.findByTestId("topup-blocked");
+    expect(blocked).toHaveAttribute("role", "alert");
+    expect(blocked).toHaveTextContent(/Não pague novamente/);
+    // The purchase panel is gone: nothing left to click twice.
+    expect(screen.queryByTestId("topup-offer")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Recarregar|Ir para o pagamento da recarga/i })).not.toBeInTheDocument();
+    expect(calls(fetchMock, "POST", "/v1/billing/checkout")).toHaveLength(1);
+    expect(navigateToHostedCheckout).not.toHaveBeenCalled();
+  });
+
+  it("does not announce a top-up block that was already there on load", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () =>
+        response(
+          summaryFixture({
+            topup_commercial_enabled: true,
+            checkout: {
+              available_offer_ids: [PLUS, PRO, MAX, ...TOPUP_IDS],
+              live_session: { checkout_session_id: SESSION_ID, kind: "topup", state: "active", offer_id: "package_credits_500_v1" },
+              available: true,
+            },
+          }),
+        ),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(creditSummary()),
+    });
+    renderBilling();
+
+    expect(await screen.findByTestId("topup-blocked")).not.toHaveAttribute("role");
+  });
+
+  it("keeps the newest ledger read when an earlier one answers last", async () => {
+    sessionStorage.setItem(SESSION_KEY, SESSION_ID);
+    let reads = 0;
+    let answerSlow: (value: Response) => void = () => {};
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(topupSummary),
+      [`GET ${CREDIT_SUMMARY}`]: () => {
+        reads += 1;
+        if (reads === 2) {
+          return new Promise<Response>((resolve) => (answerSlow = resolve)) as unknown as Response;
+        }
+        return response(
+          reads === 1
+            ? creditSummary({ balance: { topup_available_mc: 0, available_mc: 10_000 } })
+            : creditSummary({ balance: { topup_available_mc: 500_000 } }),
+        );
+      },
+      [`GET /v1/billing/checkout/${SESSION_ID}`]: () =>
+        response({ ...session("active", HOSTED_URL), kind: "topup" }),
+    });
+    renderBilling();
+    await screen.findByTestId("credit-panel");
+
+    // Refresh twice: the first ledger read is slow, the second answers at once.
+    fireEvent.click(screen.getByRole("button", { name: /Atualizar estado/i }));
+    await waitFor(() => expect(reads).toBe(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Atualizar estado/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /Atualizar estado/i }));
+    await waitFor(() => expect(metric("Recargas")).toHaveTextContent("500 créditos"));
+
+    // The older answer arrives last, showing the grant as not yet applied.
+    answerSlow(response(creditSummary({ balance: { topup_available_mc: 0, available_mc: 10_000 } })));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(metric("Recargas")).toHaveTextContent("500 créditos");
   });
 
   it("returns focus to Recarregar when the top-up panel closes", async () => {
@@ -2098,8 +2182,11 @@ describe("Pagamento page", () => {
     const alert = await screen.findByTestId("billing-context-alert");
     expect(alert).toHaveAttribute("role", "alert");
     expect(alert).toHaveTextContent(message);
-    await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(1));
     await waitFor(() => expect(calls(fetchMock, "GET", CATALOG)).toHaveLength(1));
+    // A refused summary never goes on to ask the ledger anything.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(0);
+    expect(calls(fetchMock, "GET", CREDIT_LOTS)).toHaveLength(0);
     expect(screen.queryAllByTestId("billing-area")).toHaveLength(0);
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(screen.queryByTestId("credit-panel")).not.toBeInTheDocument();
@@ -2375,9 +2462,9 @@ describe("Pagamento page", () => {
     });
     renderBilling();
 
-    // The other reads already answered; the summary has not.
-    await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_LOTS)).toHaveLength(1));
+    // The catalog answered; the summary has not, so the ledger is not asked yet.
     await waitFor(() => expect(calls(fetchMock, "GET", CATALOG)).toHaveLength(1));
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(0);
     expect(areaHeadings()).toEqual(["Assinatura e uso"]);
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(screen.queryByTestId("credit-panel")).not.toBeInTheDocument();
@@ -2385,6 +2472,8 @@ describe("Pagamento page", () => {
 
     answer(response({ detail: "Builder access required" }, 403));
     expect(await screen.findByTestId("billing-context-alert")).toHaveTextContent(/não tem acesso/);
+    expect(calls(fetchMock, "GET", CREDIT_SUMMARY)).toHaveLength(0);
+    expect(calls(fetchMock, "GET", CREDIT_LOTS)).toHaveLength(0);
     expect(screen.queryAllByTestId("billing-area")).toHaveLength(0);
     expect(screen.queryByTestId("credit-panel")).not.toBeInTheDocument();
     expect(document.body.textContent ?? "").not.toMatch(/R\$|\d\s*créditos|NeuroStack (Plus|Pro|Max)/);

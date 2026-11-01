@@ -138,6 +138,17 @@ async def _ensure_webhook_ready() -> None:
     await ASAAS_WEBHOOK_READINESS.ensure_fresh(
         _read_back_webhook_readiness, timeout=WEBHOOK_READBACK_WAIT_SECONDS
     )
+    verdict = ASAAS_WEBHOOK_READINESS.verdict
+    if not ASAAS_WEBHOOK_READINESS.is_ready():
+        # The 503 body is a fixed code; the operator needs the reason.  The
+        # reasons are a closed vocabulary (no URL, token or provider payload).
+        logger.warning(
+            "Checkout blocked: webhook not ready",
+            reasons=(
+                list(verdict.reasons) if verdict is not None else []
+            )
+            or ["unverified_or_expired"],
+        )
     ASAAS_WEBHOOK_READINESS.require_ready()
 
 

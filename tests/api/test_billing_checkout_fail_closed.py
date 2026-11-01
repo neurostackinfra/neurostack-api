@@ -20,6 +20,7 @@ from src.api.schemas.billing import CheckoutRequest
 from src.models.billing import BillingCheckoutSession
 from src.services import billing_checkout as checkout_module
 from src.services.asaas import CheckoutCreated
+from src.services.billing_webhook import WebhookNotReady
 from src.services.egress_policy import EgressPolicy
 
 
@@ -389,3 +390,25 @@ async def test_ineligible_subscription_maps_to_one_fixed_409(
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == "billing_checkout_not_eligible"
+
+
+@pytest.mark.asyncio
+async def test_closed_webhook_gate_logs_its_reasons_before_the_fixed_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 503 body stays fixed; the operator log names why the gate is closed."""
+
+    gate = billing.ASAAS_WEBHOOK_READINESS
+    gate.reset()
+    gate.record(billing.WebhookReadiness(False, ("url_mismatch", "token_missing")))
+    monkeypatch.setattr(gate, "ensure_fresh", AsyncMock(return_value=None))
+    warning = MagicMock()
+    monkeypatch.setattr(billing.logger, "warning", warning)
+    try:
+        with pytest.raises(WebhookNotReady):
+            await billing._ensure_webhook_ready()
+    finally:
+        gate.reset()
+
+    warning.assert_called_once()
+    assert warning.call_args.kwargs["reasons"] == ["url_mismatch", "token_missing"]
