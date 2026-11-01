@@ -9,7 +9,7 @@ JSON diff: what would change, what is already compliant and what blocks.
 live D3 source revision, with secrets as ARN references only, the otel image
 pinned by digest and ``ManagedBy=manual``. ``check`` runs the existing rollout
 evidence validators against that request. ``render-migrations-taskdef
---window 035|036|037 --purpose migrate|read`` (both required, no default)
+--window 035|036|037|042 --purpose migrate|read`` (both required, no default)
 prints a new ``neurostack-staging-migrations`` revision that bakes exactly
 that window's ``alembic upgrade <window>`` (``migrate``) or, for window 037
 only, its SELECT-only readback program run as the migration role (``read``);
@@ -17,8 +17,13 @@ revision 3 is only read.
 The windows are the table of ``scripts/asaas_migration_window.py``, which also
 runs them. The service rollback target is the manifest field
 ``rollback_target``. Once the service runs a registered D3 revision, a new
-revision is proposed only for one reviewed difference at a time: the worker
-flag alone, or the app image digest alone (the image bump).
+revision is proposed only for one reviewed difference at a time: one flag
+value alone (the worker flag; the credit switch and the transport of
+asaas-rollout-opening), the two staged flag rows added alone at "false", the
+AppConfig group added alone, or the app image digest alone (the image bump).
+The financial egress step knows two stages: closed by the absence of any
+APPCONFIG_* name, then the complete AppConfig group (source sdk) naming an
+application that exists.
 
 Every AWS request passes through :class:`ReadOnlyAws`, which allows only an
 exact list of Describe/Get/List operations and never ``GetSecretValue``;
@@ -203,13 +208,60 @@ EMAIL_PARAMETER = "ASAAS_WEBHOOK_NOTIFICATION_EMAIL"
 # outbox worker flag").
 WORKER_FLAG_PARAMETER = "BILLING_FACT_WORKER_ENABLED"
 WORKER_FLAG_VALUES = ("false", "true")
+# asaas-rollout-opening Decisions 12 and 13: two more reviewed flags of the
+# same form (exactly the string "false" or "true"), rendered from live step
+# L2a on. Both rows enter together, both "false", in a revision of their own
+# that changes nothing else, the serving image included (Settings ignores
+# names it does not know, so the rows change no behaviour); later each value
+# flips alone, in a revision of its own: the credit switch at L5, the
+# transport at L6. Every render carries both (they are required parameters).
+CREDIT_FLAG_PARAMETER = "CREDIT_HOT_PATH_ENABLED"
+TRANSPORT_FLAG_PARAMETER = "BILLING_FACT_TRANSPORT_ENABLED"
+STAGED_FLAG_PARAMETERS = (TRANSPORT_FLAG_PARAMETER, CREDIT_FLAG_PARAMETER)
+STAGED_FLAG_INITIAL_VALUE = "false"
+FLAG_PARAMETERS = (WORKER_FLAG_PARAMETER, *STAGED_FLAG_PARAMETERS)
+# The key a revision that flips one flag alone carries in the plan.
+FLAG_CHANGE_KEYS: Mapping[str, str] = {
+    WORKER_FLAG_PARAMETER: "worker_flag",
+    CREDIT_FLAG_PARAMETER: "credit_hot_path_flag",
+    TRANSPORT_FLAG_PARAMETER: "transport_flag",
+}
 IMAGE_PARAMETER = "app_image_override"
 REQUIRED_PARAMETERS = (
     RETURN_URL_PARAMETER,
     WEBHOOK_URL_PARAMETER,
     EMAIL_PARAMETER,
     WORKER_FLAG_PARAMETER,
+    CREDIT_FLAG_PARAMETER,
+    TRANSPORT_FLAG_PARAMETER,
 )
+# Decision 14: the F2 AppConfig group (live step L7), all or none and only in
+# a revision of its own. Three reviewed parameters, all set or all null, and
+# two names the planner writes itself, never parameters: APPCONFIG_ENABLED
+# "true" and APPCONFIG_SOURCE "sdk" (the only source: the task runs exactly
+# app and otel, so no Agent container exists). It is the one exception to
+# the forbidden prefix APPCONFIG_, and only as this complete group in the app
+# environment: APPCONFIG_ORIGIN, APPCONFIG_TOKEN and any other APPCONFIG_*
+# name stay forbidden everywhere.
+APPCONFIG_APPLICATION_PARAMETER = "APPCONFIG_APPLICATION"
+APPCONFIG_PARAMETERS = (
+    APPCONFIG_APPLICATION_PARAMETER,
+    "APPCONFIG_ENVIRONMENT",
+    "APPCONFIG_PROFILE",
+)
+APPCONFIG_SOURCE_VALUE = "sdk"
+# environment name -> ("parameter", parameter name) | ("value", literal)
+APPCONFIG_GROUP: Mapping[str, tuple[str, str]] = {
+    "APPCONFIG_APPLICATION": ("parameter", "APPCONFIG_APPLICATION"),
+    "APPCONFIG_ENABLED": ("value", "true"),
+    "APPCONFIG_ENVIRONMENT": ("parameter", "APPCONFIG_ENVIRONMENT"),
+    "APPCONFIG_PROFILE": ("parameter", "APPCONFIG_PROFILE"),
+    "APPCONFIG_SOURCE": ("value", APPCONFIG_SOURCE_VALUE),
+}
+# An AppConfig application, environment or configuration profile, by name or
+# ID: what the SDK source passes as the identifier (no space, no separator a
+# shell or URL would read).
+_APPCONFIG_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RETURN_PATH = "/billing"
 WEBHOOK_PATH = "/v1/billing/webhook/asaas"
 # environment name -> ("parameter", parameter name) | ("value", literal)
@@ -218,16 +270,20 @@ ADDED_ENVIRONMENT: dict[str, tuple[str, str]] = {
     "ASAAS_CHECKOUT_RETURN_URL": ("parameter", RETURN_URL_PARAMETER),
     "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": ("parameter", EMAIL_PARAMETER),
     "BILLING_FACT_WORKER_ENABLED": ("parameter", WORKER_FLAG_PARAMETER),
+    "BILLING_FACT_TRANSPORT_ENABLED": ("parameter", TRANSPORT_FLAG_PARAMETER),
+    "CREDIT_HOT_PATH_ENABLED": ("parameter", CREDIT_FLAG_PARAMETER),
 }
 ADDED_SECRETS = tuple(row[0] for row in SECRET_REFERENCES)
 FORBIDDEN_NAME_PREFIXES = ("ABACATEPAY_", "APPCONFIG_")
 FORBIDDEN_NAMES = frozenset({"SPA_ENABLED", "SPA_DIST_DIR"})
-# Three production migration windows, each its own separately approved step:
+# Four production migration windows, each its own separately approved step:
 # the window table of scripts/asaas_migration_window.py is the single source
 # (command, alembic_version before and after, snapshot name, readback, image
 # prerequisite). Each window bakes exactly ``alembic upgrade <window>``, never
 # the head, so 036 and 037 only ever run on their own owner instruction, 036
-# before 037, after a fresh SELECT showing zero legacy rows.
+# before 037, after a fresh SELECT showing zero legacy rows, and 042 (the
+# credit schema, 038 to 042 in one window) only after the image containing
+# 042 serves (asaas-rollout-opening, live steps L2 then L3).
 MIGRATION_WINDOWS = migration_window.WINDOWS
 STEPS: tuple[tuple[str, str], ...] = (
     ("secret_access_stack", "d3_apply"),
@@ -240,6 +296,7 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("webhook_exposure_and_registration", "separate_approval"),
     (migration_window.WINDOW_036.manifest_step, "separate_approval"),
     (migration_window.WINDOW_037.manifest_step, "separate_approval"),
+    (migration_window.WINDOW_042.manifest_step, "separate_approval"),
     ("rollout_transitions", "separate_approval"),
 )
 # What each window leaves to a later window (printed by plan).
@@ -254,9 +311,13 @@ MIGRATIONS_EXCLUDED: Mapping[str, str] = {
         "instruction after 036 is verified"
     ),
     "037": (
-        "038 (the additive credit schema, neurostack-credit-system): no "
-        "window yet; its ASAAS migration window is an entry condition of "
-        "that wish's Group 8"
+        "038-042 (the additive credit schema, neurostack-credit-system): "
+        "their own window (migrations_038_042), on its own explicit owner "
+        "instruction after the image containing 042 serves"
+    ),
+    "042": (
+        "043 and later: none is written; a later revision needs its own "
+        "window in the table"
     ),
 }
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)
@@ -655,10 +716,17 @@ def _expected_parameters_section() -> dict[str, Any]:
                 "path": WEBHOOK_PATH,
             },
             EMAIL_PARAMETER: {"validator": "operator_email", "path": None},
-            WORKER_FLAG_PARAMETER: {"validator": "exact_false_or_true", "path": None},
+            **{
+                name: {"validator": "exact_false_or_true", "path": None}
+                for name in FLAG_PARAMETERS
+            },
         },
         "optional": {
-            IMAGE_PARAMETER: {"validator": "ecr_image_digest_reference", "path": None}
+            IMAGE_PARAMETER: {"validator": "ecr_image_digest_reference", "path": None},
+            **{
+                name: {"validator": "appconfig_identifier_all_or_none", "path": None}
+                for name in APPCONFIG_PARAMETERS
+            },
         },
     }
 
@@ -672,6 +740,10 @@ def _expected_task_definition_section() -> dict[str, Any]:
         "app_environment_added": {
             name: {kind: reference}
             for name, (kind, reference) in ADDED_ENVIRONMENT.items()
+        },
+        "app_environment_appconfig_group": {
+            name: {kind: reference}
+            for name, (kind, reference) in APPCONFIG_GROUP.items()
         },
         "forbidden_name_prefixes": list(FORBIDDEN_NAME_PREFIXES),
         "forbidden_names": sorted(FORBIDDEN_NAMES),
@@ -988,17 +1060,15 @@ def validate_parameters(raw: Any) -> dict[str, Any]:
     )
     values = raw["parameters"]
     _require(isinstance(values, dict), "parameters_invalid")
-    allowed = set(REQUIRED_PARAMETERS) | {IMAGE_PARAMETER}
+    allowed = set(REQUIRED_PARAMETERS) | {IMAGE_PARAMETER} | set(APPCONFIG_PARAMETERS)
     unknown = sorted(set(values) - allowed)
     _require(not unknown, f"parameter_unknown:{','.join(unknown)}")
     # A YAML boolean (true, yes, on, True...) or a number is a present but
     # invalid flag, never a missing one: the reviewed value is the quoted
     # environment string itself.
-    flag = values.get(WORKER_FLAG_PARAMETER)
-    _require(
-        flag is None or isinstance(flag, str),
-        f"parameter_invalid:{WORKER_FLAG_PARAMETER}",
-    )
+    for name in FLAG_PARAMETERS:
+        flag = values.get(name)
+        _require(flag is None or isinstance(flag, str), f"parameter_invalid:{name}")
     output: dict[str, Any] = {}
     for name in REQUIRED_PARAMETERS:
         value = values.get(name)
@@ -1027,10 +1097,26 @@ def validate_parameters(raw: Any) -> dict[str, Any]:
         and _OPERATOR_EMAIL.fullmatch(email) is not None,
         f"parameter_invalid:{EMAIL_PARAMETER}",
     )
+    for name in FLAG_PARAMETERS:
+        _require(output[name] in WORKER_FLAG_VALUES, f"parameter_invalid:{name}")
+    # The AppConfig group: all three null (no group rendered) or all three
+    # reviewed identifiers (the complete group rendered); never a part.
+    appconfig = [values.get(name) for name in APPCONFIG_PARAMETERS]
     _require(
-        output[WORKER_FLAG_PARAMETER] in WORKER_FLAG_VALUES,
-        f"parameter_invalid:{WORKER_FLAG_PARAMETER}",
+        all(value is None for value in appconfig)
+        or all(value is not None for value in appconfig),
+        "parameter_invalid:appconfig_group_partial",
     )
+    for name, value in zip(APPCONFIG_PARAMETERS, appconfig):
+        _require(
+            value is None
+            or (
+                isinstance(value, str)
+                and _APPCONFIG_IDENTIFIER.fullmatch(value) is not None
+            ),
+            f"parameter_invalid:{name}",
+        )
+        output[name] = value
     image = values.get(IMAGE_PARAMETER)
     _require(
         image is None
@@ -1561,20 +1647,81 @@ def _names(container: dict[str, Any], field: str) -> list[str]:
     return [str(name) for name in names]
 
 
+def appconfig_group_values(request: Any) -> dict[str, str] | None:
+    """The AppConfig group's values when the app environment carries exactly
+    the complete group: each of its five names once, ``APPCONFIG_ENABLED``
+    "true", ``APPCONFIG_SOURCE`` "sdk", the three identifiers reviewed. None
+    otherwise (absent, partial, another value, a malformed request)."""
+
+    containers = (
+        request.get("containerDefinitions") if isinstance(request, dict) else None
+    )
+    apps = [
+        container
+        for container in (containers if isinstance(containers, list) else [])
+        if isinstance(container, dict) and container.get("name") == APP_CONTAINER
+    ]
+    if len(apps) != 1 or not isinstance(apps[0].get("environment", []), list):
+        return None
+    rows = [
+        row
+        for row in apps[0].get("environment", [])
+        if isinstance(row, dict) and row.get("name") in APPCONFIG_GROUP
+    ]
+    values = {str(row["name"]): row.get("value") for row in rows}
+    if len(rows) != len(APPCONFIG_GROUP) or set(values) != set(APPCONFIG_GROUP):
+        return None
+    for name, (kind, reference) in APPCONFIG_GROUP.items():
+        value = values[name]
+        if kind == "value" and value != reference:
+            return None
+        if kind == "parameter" and not (
+            isinstance(value, str) and _APPCONFIG_IDENTIFIER.fullmatch(value)
+        ):
+            return None
+    return {name: str(value) for name, value in sorted(values.items())}
+
+
 def forbidden_names_in(request: dict[str, Any]) -> list[str]:
-    """Every forbidden env/secret name in any container (empty when clean)."""
+    """Every forbidden env/secret name in any container (empty when clean).
+
+    The AppConfig group is exempt from the forbidden prefix only as the
+    complete, valid group (``appconfig_group_values``) in the app
+    environment: a partial or altered group, a group name anywhere else, and
+    every other ``APPCONFIG_*`` name are reported.
+    """
 
     containers = request.get("containerDefinitions")
     _require(isinstance(containers, list), "task_definition_containers_invalid")
     assert isinstance(containers, list)
+    exempt = set(APPCONFIG_GROUP) if appconfig_group_values(request) else set()
     found: list[str] = []
     for container in containers:
         _require(isinstance(container, dict), "task_definition_container_invalid")
         for field in ("environment", "secrets"):
             for name in _names(container, field):
+                if (
+                    container.get("name") == APP_CONTAINER
+                    and field == "environment"
+                    and name in exempt
+                ):
+                    continue
                 if name in FORBIDDEN_NAMES or name.startswith(FORBIDDEN_NAME_PREFIXES):
                     found.append(name)
     return sorted(found)
+
+
+def appconfig_names_in(request: dict[str, Any]) -> list[str]:
+    """Every ``APPCONFIG_*`` env/secret name in any container."""
+
+    return sorted(
+        name
+        for container in request.get("containerDefinitions") or []
+        if isinstance(container, dict)
+        for field in ("environment", "secrets")
+        for name in _names(container, field)
+        if name.startswith("APPCONFIG_")
+    )
 
 
 def apply_tag_overrides(
@@ -1632,7 +1779,7 @@ def render_task_definition(
     env_names = _names(app, "environment")
     secret_names = _names(app, "secrets")
     _require(
-        not (set(ADDED_ENVIRONMENT) | set(ADDED_SECRETS))
+        not (set(ADDED_ENVIRONMENT) | set(ADDED_SECRETS) | set(APPCONFIG_GROUP))
         & (set(env_names) | set(secret_names)),
         "source_already_has_added_name",
     )
@@ -1650,10 +1797,23 @@ def render_task_definition(
         value = parameters[reference] if kind == "parameter" else reference
         _require(isinstance(value, str) and value != "", f"parameter_missing:{name}")
         _require(
-            reference != WORKER_FLAG_PARAMETER or value in WORKER_FLAG_VALUES,
+            reference not in FLAG_PARAMETERS or value in WORKER_FLAG_VALUES,
             f"parameter_invalid:{reference}",
         )
         environment.append({"name": name, "value": value})
+    # The AppConfig group, only when its three parameters are set (all or
+    # none: validate_parameters refuses a part), and then complete.
+    appconfig = [parameters.get(name) for name in APPCONFIG_PARAMETERS]
+    _require(
+        all(value is None for value in appconfig)
+        or all(isinstance(value, str) for value in appconfig),
+        "parameter_invalid:appconfig_group_partial",
+    )
+    if appconfig[0] is not None:
+        for name in sorted(APPCONFIG_GROUP):
+            kind, reference = APPCONFIG_GROUP[name]
+            value = parameters[reference] if kind == "parameter" else reference
+            environment.append({"name": name, "value": value})
     app["environment"] = environment
     secrets = list(app.get("secrets", []))
     for name in sorted(ADDED_SECRETS):
@@ -1666,6 +1826,10 @@ def render_task_definition(
     apply_tag_overrides(request, pins.tag_overrides)
     forbidden = forbidden_names_in(request)
     _require(not forbidden, "forbidden_name_in_rendering:" + ",".join(forbidden))
+    _require(
+        (appconfig[0] is None) == (appconfig_group_values(request) is None),
+        "parameter_invalid:appconfig_group",
+    )
     return request
 
 
@@ -2765,9 +2929,14 @@ def _plan_task_definition(
         else:
             step.compliant.append(f"host_served_over_https:{name}")
 
+    # The AppConfig group too, from L7 on (its three parameters set; all or
+    # none, validate_parameters refuses a part).
+    added_environment = dict(ADDED_ENVIRONMENT)
+    if all(isinstance(parameters.get(name), str) for name in APPCONFIG_PARAMETERS):
+        added_environment.update(APPCONFIG_GROUP)
     diff["app_environment_added"] = {
         name: (parameters[ref] if kind == "parameter" else ref)
-        for name, (kind, ref) in sorted(ADDED_ENVIRONMENT.items())
+        for name, (kind, ref) in sorted(added_environment.items())
     }
     diff["app_secrets_added"] = {
         env: arns.get(env) or "pending:secret_access_stack"
@@ -2824,75 +2993,43 @@ def _plan_task_definition(
             )
         except WiringError:
             latest_matches = False
-    # The service already runs a registered D3 revision that differs from the
-    # rendering in the worker flag alone: a new revision is needed (worker on,
-    # or off again), and once registered it is reported like the D3 one.
-    flag_change = (
-        worker_flag_change(latest_response, rendered)
+    # Once the service runs a registered D3 revision, a new revision is
+    # proposed only for ONE reviewed difference from it (reviewed_change):
+    # one flag value flipped alone (the worker; the credit switch, L5; the
+    # transport, L6), the two staged flag rows added alone at "false" (L2a),
+    # the AppConfig group added alone (L7), or the app image digest moved
+    # alone (the image bump; L2b). Anything else matches no kind and blocks:
+    # an image and a flag never share a revision (owner decision 2026-10-22,
+    # Decision 13), nor do two kinds.
+    serving_registered = isinstance(current, str) and current not in {
+        latest_arn,
+        D3_SOURCE_TASK_DEFINITION_ARN,
+    }
+    change = (
+        reviewed_change(latest_response, rendered)
         if isinstance(current, str)
         and current == latest_arn
         and current != D3_SOURCE_TASK_DEFINITION_ARN
         and not latest_matches
         else None
     )
-    serving_flag_change = (
-        worker_flag_change(_serving_response(readback, current, pins), rendered)
-        if isinstance(current, str)
-        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
-        and latest_matches
+    serving_change = (
+        reviewed_change(_serving_response(readback, str(current), pins), rendered)
+        if serving_registered and latest_matches
         else None
     )
-    # Stuck, never green: the service runs the rendering (or differs from it in
-    # the worker flag alone) while the newest registered revision differs from
-    # the rendering in the worker flag alone, e.g. a flag revision registered
-    # and then abandoned or rolled back. Reported under its own name; what to
-    # do with that newest revision is an owner decision (runbook).
-    newest_flag_change = (
-        worker_flag_change(latest_response, rendered)
-        if isinstance(current, str)
-        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
-        and not latest_matches
-        and _same_but_for_worker_flag(
-            _serving_response(readback, current, pins), rendered
-        )
-        else None
-    )
-    # The image bump, composed the same way: the service runs a registered D3
-    # revision that differs from the rendering in the app image digest alone
-    # (both pinned by digest in the same repository, the worker flag equal).
-    # A rendering that changes the image and the worker flag together matches
-    # neither and blocks: the two never share a revision (owner decision
-    # 2026-10-22).
-    image_change = (
-        app_image_change(latest_response, rendered)
-        if isinstance(current, str)
-        and current == latest_arn
-        and current != D3_SOURCE_TASK_DEFINITION_ARN
-        and not latest_matches
-        else None
-    )
-    serving_image_change = (
-        app_image_change(_serving_response(readback, current, pins), rendered)
-        if isinstance(current, str)
-        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
-        and latest_matches
-        else None
-    )
-    # Stuck, never green, as for the flag: the service runs the rendering (or
-    # differs from it in the app image alone) while the newest registered
-    # revision differs from the rendering in the app image alone, e.g. an image
-    # bump registered and then abandoned, or rolled back with the override set
-    # back to the image the service runs.
-    newest_image_change = (
-        app_image_change(latest_response, rendered)
-        if isinstance(current, str)
-        and current not in {latest_arn, D3_SOURCE_TASK_DEFINITION_ARN}
-        and not latest_matches
-        and _same_but_for_app_image(
-            _serving_response(readback, current, pins), rendered
-        )
-        else None
-    )
+    # Stuck, never green: the service runs the rendering (or differs from it
+    # in one reviewed kind) while the newest registered revision differs from
+    # the rendering in that same kind alone, e.g. a revision registered and
+    # then abandoned or rolled back. Reported under its own name; what to do
+    # with that newest revision is an owner decision (runbook).
+    newest_change = None
+    if serving_registered and not latest_matches:
+        candidate = reviewed_change(latest_response, rendered)
+        if candidate is not None and _same_but_for(
+            candidate[0], _serving_response(readback, str(current), pins), rendered
+        ):
+            newest_change = candidate
     if current == D3_SOURCE_TASK_DEFINITION_ARN:
         if latest_arn == D3_SOURCE_TASK_DEFINITION_ARN:
             step.changes.append(
@@ -2910,63 +3047,32 @@ def _plan_task_definition(
             step.blocks.append(f"newer_revision_differs_from_rendering:{latest_arn}")
     elif isinstance(current, str) and current == latest_arn and latest_matches:
         step.compliant.append(f"registered_and_deployed:{latest_arn}")
-    elif flag_change is not None:
+    elif change is not None:
         step.changes.append(
             {
                 "action": "register_task_definition",
                 "family": TASK_FAMILY,
                 "derived_from": D3_SOURCE_TASK_DEFINITION_ARN,
                 "replaces": current,
-                "worker_flag": {
-                    "name": WORKER_FLAG_PARAMETER,
-                    "from": flag_change[0],
-                    "to": flag_change[1],
-                },
+                change[0]: _change_entry(*change),
                 "request_sha256": diff["rendered_request_sha256"],
                 "service_changes": "none (service_deployment is a separate gate)",
             }
         )
-    elif image_change is not None:
-        step.changes.append(
-            {
-                "action": "register_task_definition",
-                "family": TASK_FAMILY,
-                "derived_from": D3_SOURCE_TASK_DEFINITION_ARN,
-                "replaces": current,
-                "app_image": _image_change_info(image_change),
-                "request_sha256": diff["rendered_request_sha256"],
-                "service_changes": "none (service_deployment is a separate gate)",
-            }
+    elif serving_change is not None:
+        step.compliant.append(f"registered_not_deployed:{latest_arn}")
+        step.info[_SERVING_INFO_KEYS[serving_change[0]]] = {
+            "serving": current,
+            **_serving_entry(*serving_change),
+        }
+    elif newest_change is not None:
+        kind = newest_change[0]
+        step.blocks.append(
+            f"newest_revision_differs_only_in_{_NEWEST_SUFFIXES[kind]}:{latest_arn}"
         )
-    elif serving_flag_change is not None:
-        step.compliant.append(f"registered_not_deployed:{latest_arn}")
-        step.info["registered_revision_changes_worker_flag"] = {
-            "serving": current,
-            "from": serving_flag_change[0],
-            "to": serving_flag_change[1],
-        }
-    elif serving_image_change is not None:
-        step.compliant.append(f"registered_not_deployed:{latest_arn}")
-        step.info["registered_revision_changes_app_image"] = {
-            "serving": current,
-            **_image_change_info(serving_image_change),
-        }
-    elif newest_flag_change is not None:
-        step.blocks.append(f"newest_revision_differs_only_in_worker_flag:{latest_arn}")
-        step.info["newest_revision_worker_flag"] = {
+        step.info[f"newest_revision_{_NEWEST_SUFFIXES[kind]}"] = {
             "newest": latest_arn,
-            "newest_value": newest_flag_change[0],
-            "rendered_value": newest_flag_change[1],
-            "serving": current,
-        }
-    elif newest_image_change is not None:
-        step.blocks.append(f"newest_revision_differs_only_in_app_image:{latest_arn}")
-        newest = _image_change_info(newest_image_change)
-        step.info["newest_revision_app_image"] = {
-            "newest": latest_arn,
-            "repository": newest["repository"],
-            "newest_digest": newest["from"],
-            "rendered_digest": newest["to"],
+            **_newest_entry(*newest_change),
             "serving": current,
         }
     else:
@@ -2977,11 +3083,21 @@ def _plan_task_definition(
 def _same_but_for_worker_flag(response: Any, rendered: dict[str, Any]) -> bool:
     """Whether a registered revision equals the rendering, flag value aside."""
 
+    return _same_but_for(FLAG_CHANGE_KEYS[WORKER_FLAG_PARAMETER], response, rendered)
+
+
+def _same_but_for(kind: str, response: Any, rendered: dict[str, Any]) -> bool:
+    """Whether a registered revision equals the rendering, or differs from it
+    in exactly one reviewed difference of this kind."""
+
     try:
         same = _comparable(_request_from_response(response)) == _comparable(rendered)
     except WiringError:
         return False
-    return same or worker_flag_change(response, rendered) is not None
+    if same:
+        return True
+    change = reviewed_change(response, rendered)
+    return change is not None and change[0] == kind
 
 
 def _serving_response(
@@ -2994,18 +3110,64 @@ def _serving_response(
     return readback.get("serving_task_definition")
 
 
+def _serving_request_for_egress(
+    readback: dict[str, Any], service: dict[str, Any] | None, pins: ManifestPins
+) -> tuple[dict[str, Any] | None, str]:
+    """(request, AppConfig stage) of the revision the service runs.
+
+    Whichever read holds it: the D3 source, the newest registered revision,
+    the rollback target or the serving read (collect_readback reads the
+    serving revision only when no other read holds it). The stage is
+    ``closed_by_absence`` (no APPCONFIG_* name), ``appconfig_group_sdk``
+    (exactly the complete group), ``appconfig_names_not_the_group`` (any
+    other APPCONFIG_* name) or ``unreadable``.
+    """
+
+    current = service.get("taskDefinition") if isinstance(service, dict) else None
+    if not isinstance(current, str):
+        return None, "unreadable"
+    if current == D3_SOURCE_TASK_DEFINITION_ARN:
+        response = readback.get("source_task_definition")
+    elif current == _task_definition_arn_of(readback.get("latest_task_definition")):
+        response = readback.get("latest_task_definition")
+    else:
+        response = _serving_response(readback, current, pins)
+    if _task_definition_arn_of(response) != current:
+        return None, "unreadable"
+    try:
+        request = _request_from_response(response)
+        names = appconfig_names_in(request)
+    except WiringError:
+        return None, "unreadable"
+    if not names:
+        return request, "closed_by_absence"
+    if appconfig_group_values(request) is not None and names == sorted(APPCONFIG_GROUP):
+        return request, "appconfig_group_sdk"
+    return request, "appconfig_names_not_the_group"
+
+
 def worker_flag_change(
     registered_response: Any, rendered: dict[str, Any]
 ) -> tuple[str, str] | None:
-    """(registered value, rendered value) of a worker-flag-only difference.
+    """(registered value, rendered value) of a worker-flag-only difference."""
 
-    A registered revision differs from the rendering in the worker flag alone
-    when both carry it exactly once with a reviewed value ("false" or "true"),
-    the two values differ, and with the rendered value put in its place the
-    revision compares equal to the rendering (every other field, name, value,
-    secret reference, image and tag). Anything else is None.
+    return flag_change(registered_response, rendered, WORKER_FLAG_PARAMETER)
+
+
+def flag_change(
+    registered_response: Any, rendered: dict[str, Any], name: str
+) -> tuple[str, str] | None:
+    """(registered value, rendered value) of a difference in one flag alone.
+
+    A registered revision differs from the rendering in the flag ``name``
+    (one of ``FLAG_PARAMETERS``) alone when both carry it exactly once with a
+    reviewed value ("false" or "true"), the two values differ, and with the
+    rendered value put in its place the revision compares equal to the
+    rendering (every other field, name, value, the other flags, secret
+    reference, image and tag). Anything else is None.
     """
 
+    _require(name in FLAG_PARAMETERS, "flag_unknown")
     try:
         registered = _request_from_response(registered_response)
         registered_app = evidence._container_map(registered)[APP_CONTAINER]
@@ -3016,11 +3178,9 @@ def worker_flag_change(
     except (WiringError, evidence.EvidenceError):
         return None
     rows = [
-        row
-        for row in registered_app.get("environment", [])
-        if row.get("name") == WORKER_FLAG_PARAMETER
+        row for row in registered_app.get("environment", []) if row.get("name") == name
     ]
-    to_value = rendered_env.get(WORKER_FLAG_PARAMETER)
+    to_value = rendered_env.get(name)
     if len(rows) != 1:
         return None
     from_value = rows[0]["value"]
@@ -3036,14 +3196,163 @@ def worker_flag_change(
     return str(from_value), str(to_value)
 
 
+def flag_rows_added(
+    registered_response: Any, rendered: dict[str, Any]
+) -> tuple[str, ...] | None:
+    """The staged flag names of a difference in their rows alone (L2a).
+
+    Decision 13: a registered revision that carries neither staged flag row,
+    against a rendering that carries both, each exactly "false", and that
+    with both rows added compares equal to the rendering (the same image and
+    every other field). One row without the other, a "true", or any other
+    difference is None.
+    """
+
+    try:
+        registered = _request_from_response(registered_response)
+        registered_app = evidence._container_map(registered)[APP_CONTAINER]
+        rendered_env = evidence._env_map(
+            evidence._container_map(rendered)[APP_CONTAINER]
+        )
+        evidence._env_map(registered_app)
+    except (WiringError, evidence.EvidenceError):
+        return None
+    environment = list(registered_app.get("environment", []))
+    if any(row.get("name") in STAGED_FLAG_PARAMETERS for row in environment):
+        return None
+    if any(
+        rendered_env.get(name) != STAGED_FLAG_INITIAL_VALUE
+        for name in STAGED_FLAG_PARAMETERS
+    ):
+        return None
+    registered_app["environment"] = environment + [
+        {"name": name, "value": STAGED_FLAG_INITIAL_VALUE}
+        for name in STAGED_FLAG_PARAMETERS
+    ]
+    if _comparable(registered) != _comparable(rendered):
+        return None
+    return STAGED_FLAG_PARAMETERS
+
+
+def appconfig_group_added(
+    registered_response: Any, rendered: dict[str, Any]
+) -> dict[str, str] | None:
+    """The group's values of a difference in the AppConfig group alone (L7).
+
+    A registered revision without any ``APPCONFIG_*`` name, against a
+    rendering whose app environment carries the complete group
+    (``appconfig_group_values``), that with the group's five rows added
+    compares equal to the rendering. Anything else is None.
+    """
+
+    group = appconfig_group_values(rendered)
+    if group is None:
+        return None
+    try:
+        registered = _request_from_response(registered_response)
+        registered_app = evidence._container_map(registered)[APP_CONTAINER]
+        evidence._env_map(registered_app)
+        present = appconfig_names_in(registered)
+    except (WiringError, evidence.EvidenceError):
+        return None
+    if present:
+        return None
+    registered_app["environment"] = list(registered_app.get("environment", [])) + [
+        {"name": name, "value": value} for name, value in group.items()
+    ]
+    if _comparable(registered) != _comparable(rendered):
+        return None
+    return group
+
+
+def reviewed_change(
+    registered_response: Any, rendered: dict[str, Any]
+) -> tuple[str, Any] | None:
+    """(kind, detail) of the one reviewed difference between a registered
+    revision and the rendering, or None (equal, or any other difference).
+
+    Each kind requires every other field equal, so at most one matches.
+    """
+
+    for name in FLAG_PARAMETERS:
+        values = flag_change(registered_response, rendered, name)
+        if values is not None:
+            return FLAG_CHANGE_KEYS[name], (name, *values)
+    rows = flag_rows_added(registered_response, rendered)
+    if rows is not None:
+        return "flag_rows_added", rows
+    group = appconfig_group_added(registered_response, rendered)
+    if group is not None:
+        return "appconfig_group_added", group
+    image = app_image_change(registered_response, rendered)
+    if image is not None:
+        return "app_image", image
+    return None
+
+
+# How each kind of reviewed difference is reported: the plan's change, the
+# info key of a registered-not-deployed revision, the name of the stuck
+# state (newest_revision_differs_only_in_<suffix>).
+_SERVING_INFO_KEYS: Mapping[str, str] = {
+    **{key: f"registered_revision_changes_{key}" for key in FLAG_CHANGE_KEYS.values()},
+    "flag_rows_added": "registered_revision_adds_flag_rows",
+    "appconfig_group_added": "registered_revision_adds_appconfig_group",
+    "app_image": "registered_revision_changes_app_image",
+}
+_NEWEST_SUFFIXES: Mapping[str, str] = {
+    **{key: key for key in FLAG_CHANGE_KEYS.values()},
+    "flag_rows_added": "flag_rows",
+    "appconfig_group_added": "appconfig_group",
+    "app_image": "app_image",
+}
+
+
+def _appconfig_entry(group: dict[str, str]) -> dict[str, Any]:
+    return {
+        "names": sorted(group),
+        "application": group["APPCONFIG_APPLICATION"],
+        "environment": group["APPCONFIG_ENVIRONMENT"],
+        "profile": group["APPCONFIG_PROFILE"],
+        "source": group["APPCONFIG_SOURCE"],
+    }
+
+
+def _change_entry(kind: str, detail: Any) -> dict[str, Any]:
+    if kind == "app_image":
+        return _image_change_info(detail)
+    if kind == "flag_rows_added":
+        return {"names": list(detail), "value": STAGED_FLAG_INITIAL_VALUE}
+    if kind == "appconfig_group_added":
+        return _appconfig_entry(detail)
+    name, from_value, to_value = detail
+    return {"name": name, "from": from_value, "to": to_value}
+
+
+def _serving_entry(kind: str, detail: Any) -> dict[str, Any]:
+    entry = _change_entry(kind, detail)
+    if kind in FLAG_CHANGE_KEYS.values():
+        entry.pop("name")
+    return entry
+
+
+def _newest_entry(kind: str, detail: Any) -> dict[str, Any]:
+    if kind == "app_image":
+        image = _image_change_info(detail)
+        return {
+            "repository": image["repository"],
+            "newest_digest": image["from"],
+            "rendered_digest": image["to"],
+        }
+    if kind in FLAG_CHANGE_KEYS.values():
+        _name, from_value, to_value = detail
+        return {"newest_value": from_value, "rendered_value": to_value}
+    return _change_entry(kind, detail)
+
+
 def _same_but_for_app_image(response: Any, rendered: dict[str, Any]) -> bool:
     """Whether a registered revision equals the rendering, app image aside."""
 
-    try:
-        same = _comparable(_request_from_response(response)) == _comparable(rendered)
-    except WiringError:
-        return False
-    return same or app_image_change(response, rendered) is not None
+    return _same_but_for("app_image", response, rendered)
 
 
 def app_image_change(
@@ -3455,28 +3764,98 @@ def build_plan(
         source_request = _request_from_response(readback.get("source_task_definition"))
     except WiringError:
         egress.blocks.append("rollback_target_unreadable")
+    # Two stages (Decisions 12 and 14). Until live step L7 the rendering
+    # carries no APPCONFIG_* name: every read of financial_egress_enabled
+    # returns false before any I/O (closed by absence). From L7 on it carries
+    # exactly the complete AppConfig group (source sdk), naming an AppConfig
+    # application that exists; opening egress is then that configuration's
+    # value, set outside this planner under its own approval. The D3 source
+    # revision (labelled rollback_target since D3) never carries any
+    # APPCONFIG_* name, and neither stage accepts a partial or altered group
+    # or any other APPCONFIG_* name. The stage is the rendering's, but egress
+    # is what the SERVING revision reads: closed by absence is reported only
+    # when the revision the service runs carries no APPCONFIG_* name either
+    # (params nulled while the serving task still carries the group is not
+    # closed, and blocks).
+    group = None
+    serving_request, serving_stage = _serving_request_for_egress(
+        readback, service, pins
+    )
+    egress.info["serving_stage"] = serving_stage
     for label, request in (
         ("rollback_target", source_request),
         (evaluated_on, candidate),
+        ("serving", serving_request),
     ):
         if request is None:
             continue
-        names = {
-            name
-            for container in request.get("containerDefinitions") or []
-            if isinstance(container, dict)
-            for field in ("environment", "secrets")
-            for name in _names(container, field)
-        }
-        if any(name.startswith("APPCONFIG_") for name in names):
-            egress.blocks.append(f"appconfig_names_in_{label}")
-        else:
+        names = appconfig_names_in(request)
+        values = appconfig_group_values(request)
+        if not names:
             egress.compliant.append(f"no_appconfig_names_in_{label}")
-    applications = (readback.get("appconfig_applications") or {}).get("Items")
-    egress.info["financial_egress_enabled"] = "false (closed by absence)"
-    egress.info["appconfig_application_count"] = (
-        len(applications) if isinstance(applications, list) else "unreadable"
+        elif (
+            label != "rollback_target"
+            and values is not None
+            and names == sorted(APPCONFIG_GROUP)
+        ):
+            if label == "serving":
+                if group is None:
+                    egress.blocks.append("appconfig_group_serving_not_in_rendering")
+                else:
+                    egress.compliant.append("appconfig_group_complete_in_serving")
+            else:
+                group = values
+                egress.compliant.append(f"appconfig_group_complete_in_{label}")
+        else:
+            egress.blocks.append(f"appconfig_names_in_{label}")
+    if serving_stage == "unreadable":
+        egress.blocks.append("serving_task_definition_unreadable")
+    response = readback.get("appconfig_applications")
+    applications = response.get("Items") if isinstance(response, dict) else None
+    readable = (
+        _error_code(response) is None
+        and isinstance(applications, list)
+        and not (response or {}).get("NextToken")
     )
+    egress.info["appconfig_application_count"] = (
+        len(applications)
+        if readable and isinstance(applications, list)
+        else "unreadable"
+    )
+    if group is None and serving_stage == "closed_by_absence":
+        egress.info["stage"] = "closed_by_absence"
+        egress.info["financial_egress_enabled"] = "false (closed by absence)"
+    elif group is None:
+        egress.info["stage"] = "undetermined"
+        egress.info["financial_egress_enabled"] = (
+            "undetermined: the rendering carries no APPCONFIG_* name but the "
+            f"serving revision's stage is {serving_stage}, so egress is what "
+            "the serving task reads, not absent"
+        )
+    else:
+        application = group[APPCONFIG_APPLICATION_PARAMETER]
+        egress.info["stage"] = "appconfig_group_sdk"
+        egress.info["financial_egress_enabled"] = (
+            "read by the app from AppConfig (source sdk); its value is the "
+            "configuration's, set outside this planner"
+        )
+        egress.info["appconfig"] = _appconfig_entry(group)
+        matches = [
+            item
+            for item in (applications or [])
+            if isinstance(item, dict)
+            and application in (item.get("Name"), item.get("Id"))
+        ]
+        if not readable:
+            egress.blocks.append("appconfig_applications_unreadable")
+        elif len(matches) == 1:
+            egress.compliant.append(f"appconfig_application_exists:{application}")
+        elif matches:
+            # Two applications answer to this name (or one's name is the
+            # other's ID): which one the SDK reads is not knowable here.
+            egress.blocks.append(f"appconfig_application_ambiguous:{application}")
+        else:
+            egress.blocks.append(f"appconfig_application_not_found:{application}")
     task_role_inline = (readback.get("task_inline_policies") or {}).get("PolicyNames")
     task_role_attached = (readback.get("task_attached_policies") or {}).get(
         "AttachedPolicies"
@@ -3487,6 +3866,10 @@ def build_plan(
             "the app receives the three secrets as ECS-injected environment "
             "(execution role); no AppConfig, Secrets Manager or other AWS call "
             "is added to the running app"
+            if group is None
+            else "the secrets need none; the AppConfig group's sdk reads use the "
+            "task role, whose AppConfig grant is live step L7's own IAM change, "
+            "outside this planner"
         ),
         "inline_policy_names": (
             sorted(task_role_inline)
@@ -3534,7 +3917,8 @@ def build_plan(
             "current_task_definition": (service or {}).get("taskDefinition"),
         },
         "parameters": {
-            name: parameters[name] for name in (*REQUIRED_PARAMETERS, IMAGE_PARAMETER)
+            name: parameters.get(name)
+            for name in (*REQUIRED_PARAMETERS, IMAGE_PARAMETER, *APPCONFIG_PARAMETERS)
         },
         "task_definition_diff": diff,
         "steps": ordered,

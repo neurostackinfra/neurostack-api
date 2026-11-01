@@ -1,8 +1,9 @@
-"""Three production migration windows, each applying exactly its own revision.
+"""Four production migration windows, each applying exactly its own revision.
 
-``035`` (migrations 033-035), ``036`` and ``037`` are separate manifest
-steps, each run only on its own explicit owner instruction, 036 before 037,
-after a fresh SELECT showing zero legacy rows. The window table of
+``035`` (migrations 033-035), ``036``, ``037`` and ``042`` (migrations
+038-042, asaas-rollout-opening live step L3) are separate manifest steps,
+each run only on its own explicit owner instruction, 036 before 037, after a
+fresh SELECT showing zero legacy rows, and 042 after 037. The window table of
 ``scripts/asaas_migration_window.py`` is the single source: one constant per
 window, each baking ``alembic upgrade <window>``. ``alembic upgrade head`` in
 any artifact that describes a production window would apply every later
@@ -77,6 +78,11 @@ RUNBOOK_WINDOW_SECTIONS = {
         "subcommands are `scripts/asaas_migration_window.py --window 037`",
         r"^### Rollback \(downgrade 037 -> 036\)",
     ),
+    "042": (
+        "Order (each step stops on any divergence and returns to the owner; the\n"
+        "subcommands are `scripts/asaas_migration_window.py --window 042`",
+        r"^\*\*Rollback \(window 042\)\.\*\*",
+    ),
 }
 
 
@@ -107,10 +113,11 @@ def test_no_production_migration_artifact_says_upgrade_head() -> None:
 
 
 def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
-    assert list(windows.WINDOWS) == ["035", "036", "037"]
+    assert list(windows.WINDOWS) == ["035", "036", "037", "042"]
     assert windows.WINDOWS["035"] is windows.WINDOW_035
     assert windows.WINDOWS["036"] is windows.WINDOW_036
     assert windows.WINDOWS["037"] is windows.WINDOW_037
+    assert windows.WINDOWS["042"] is windows.WINDOW_042
     assert wiring.MIGRATION_WINDOWS is windows.WINDOWS
     for name, window in windows.WINDOWS.items():
         assert window.command == ("alembic", "upgrade", name)
@@ -119,11 +126,13 @@ def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
         ("032", "035"),
         ("035", "036"),
         ("036", "037"),
+        ("037", "042"),
     ]
     assert [w.snapshot_pattern for w in windows.WINDOWS.values()] == [
         "pre-033-035-<date>",
         "pre-036-<date>",
         "pre-037-<date>",
+        "pre-038-042-<date>",
     ]
 
 
@@ -141,7 +150,7 @@ def test_runbook_migrations_gate_pins_035_and_reads_back_alembic_version() -> No
         assert phrase in flat, phrase
 
 
-@pytest.mark.parametrize("name", ["036", "037"])
+@pytest.mark.parametrize("name", ["036", "037", "042"])
 def test_runbook_gate_of_the_later_windows_pins_their_own_revision(name: str) -> None:
     window = windows.WINDOWS[name]
     flat = " ".join(_runbook_window(name).split())
@@ -162,6 +171,9 @@ def test_runbook_gate_of_the_later_windows_pins_their_own_revision(name: str) ->
         assert subcommand in flat, subcommand
     if name == "036":
         assert "`alembic_version` == `035`" in flat
+    elif name == "042":
+        assert "`alembic_version` == `037`, read as the application role" in flat
+        assert "five upgrade lines `037 -> 038`" in flat
     else:
         assert "never the application role" in flat and "eleven `ok`" in flat
 
@@ -221,7 +233,7 @@ def test_deploy_vps_pin_is_the_first_window() -> None:
         assert wiring._UNPINNED_UPGRADE.search(text) is None, name
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042"])
 def test_each_window_text_names_only_its_own_revision(name: str) -> None:
     window = windows.WINDOWS[name]
     texts = {

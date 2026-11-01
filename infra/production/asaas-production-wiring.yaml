@@ -11,7 +11,7 @@
 #   plan             read-only AWS readback compared with this manifest
 #   render-taskdef   the proposed task definition (secrets as references only)
 #   check            the existing evidence validators against that rendering
-#   render-migrations-taskdef --window 035|036|037 --purpose migrate|read
+#   render-migrations-taskdef --window 035|036|037|042 --purpose migrate|read
 #                    a new one-off migrations revision with that window's
 #                    pinned upgrade (migrate), or window 037's SELECT-only
 #                    readback (read); no default window or purpose
@@ -21,22 +21,24 @@
 # webhook_exposure_and_registration).
 #
 # scripts/asaas_migration_window.py (pure, readback files only) holds the
-# window table (035, 036, 037) and plans, renders and verifies each window's
-# snapshot, SELECT-only readbacks and one-off migration task (steps
-# migrations_033_035, migrations_036 and migrations_037).
+# window table (035, 036, 037, 042) and plans, renders and verifies each
+# window's snapshot, SELECT-only readbacks and one-off migration task (steps
+# migrations_033_035, migrations_036, migrations_037 and migrations_038_042).
 schema_version: asaas_production_wiring_manifest.v1
 context:
-  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the D3 source revision and, per migration window, one migrations revision baking that window's pinned upgrade; the post-deploy hook (scripts/asaas_deploy_hook.py) renders the webhook registration task and scripts/asaas_migration_window.py runs the windows; the rollback target is the field rollback_target; financial egress stays closed by the absence of any AppConfig configuration
+  arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the D3 source revision and, per migration window, one migrations revision baking that window's pinned upgrade; the post-deploy hook (scripts/asaas_deploy_hook.py) renders the webhook registration task and scripts/asaas_migration_window.py runs the windows; the rollback target is the field rollback_target; financial egress stays closed by the absence of any AppConfig name until the AppConfig group (source sdk) is rendered in a revision of its own
   must:
     - Read AWS only through Describe*, Get* and List* calls; never call GetSecretValue and never print a secret value.
     - Resolve every secret ARN, random suffix included, from DescribeSecret at plan time.
     - Derive the new revision from the D3 source revision (task_definition.source_revision); change only the names listed under task_definition, the otel image (task_definition.otel_image, a digest) and the tags in task_definition.tag_overrides.
     - BILLING_FACT_WORKER_ENABLED renders its reviewed parameter exactly ('false' or 'true'; the repository value lives in the parameters file and is pinned by tests/scripts/test_asaas_production_wiring.py). A revision that only flips it (worker on, or off again) is its own reviewed parameters edit and owner approval; plan reports it as a register_task_definition change carrying worker_flag.
     - A revision that only moves the app image to another digest of the same repository (the image bump, from the apply-time parameter app_image_override) is its own owner approval; plan reports it as a register_task_definition change carrying app_image. An image and a worker flag change never share a revision.
+    - CREDIT_HOT_PATH_ENABLED and BILLING_FACT_TRANSPORT_ENABLED render their reviewed parameters exactly ('false' or 'true') in every rendering. Their two rows enter together, both 'false', in a revision that changes nothing else, the serving image included (plan change flag_rows_added); afterwards each value flips alone in its own revision (credit_hot_path_flag, transport_flag). A row change, a flag flip and an image change never share a revision.
+    - The AppConfig group (task_definition.app_environment_appconfig_group) is rendered all or none, only when its three parameters are set, in a revision that adds it alone (plan change appconfig_group_added); APPCONFIG_ENABLED is always 'true' and APPCONFIG_SOURCE always sdk, written by the planner, never parameters.
     - The service rollback target is the field rollback_target; code paths read it from here and it moves only through its documented re-pins (8 to 9, then 9 to 10).
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
-    - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names.
-    - Keep financial_egress_enabled closed; opening it is a separate, unwritten follow-up.
+    - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names; the one exception is exactly the complete AppConfig group, in the app environment (APPCONFIG_ORIGIN, APPCONFIG_TOKEN and any other APPCONFIG_ name stay forbidden).
+    - Keep financial_egress_enabled closed by absence until the AppConfig group is rendered; opening it is then the AppConfig configuration's value, set outside this manifest under its own owner approval.
     - Steps with scope separate_approval are never performed from this manifest.
   ref:
     - at: .genie/wishes/asaas-payment-gateway/WISH.md
@@ -129,9 +131,29 @@ parameters:
     BILLING_FACT_WORKER_ENABLED:
       validator: exact_false_or_true
       path: null
+    # The credit switch and the fact transport (asaas-rollout-opening
+    # Decisions 12 and 13): exactly the string 'false' or 'true', rendered in
+    # every revision from live step L2a on.
+    CREDIT_HOT_PATH_ENABLED:
+      validator: exact_false_or_true
+      path: null
+    BILLING_FACT_TRANSPORT_ENABLED:
+      validator: exact_false_or_true
+      path: null
   optional:
     app_image_override:
       validator: ecr_image_digest_reference
+      path: null
+    # The AppConfig group (Decision 14, live step L7): all three null, or all
+    # three AppConfig identifiers (name or ID).
+    APPCONFIG_APPLICATION:
+      validator: appconfig_identifier_all_or_none
+      path: null
+    APPCONFIG_ENVIRONMENT:
+      validator: appconfig_identifier_all_or_none
+      path: null
+    APPCONFIG_PROFILE:
+      validator: appconfig_identifier_all_or_none
       path: null
 
 task_definition:
@@ -152,6 +174,26 @@ task_definition:
     # D3 wiring whatever its value.
     BILLING_FACT_WORKER_ENABLED:
       parameter: BILLING_FACT_WORKER_ENABLED
+    # Rendered from their reviewed parameters in every revision (L2a on).
+    BILLING_FACT_TRANSPORT_ENABLED:
+      parameter: BILLING_FACT_TRANSPORT_ENABLED
+    CREDIT_HOT_PATH_ENABLED:
+      parameter: CREDIT_HOT_PATH_ENABLED
+  # The AppConfig group (Decision 14): rendered all or none, only when the
+  # three parameters are set (live step L7), and the one exception to the
+  # forbidden prefix APPCONFIG_. The source is always sdk: the task runs
+  # exactly app and otel, so there is no AppConfig Agent container.
+  app_environment_appconfig_group:
+    APPCONFIG_APPLICATION:
+      parameter: APPCONFIG_APPLICATION
+    APPCONFIG_ENABLED:
+      value: 'true'
+    APPCONFIG_ENVIRONMENT:
+      parameter: APPCONFIG_ENVIRONMENT
+    APPCONFIG_PROFILE:
+      parameter: APPCONFIG_PROFILE
+    APPCONFIG_SOURCE:
+      value: sdk
   forbidden_name_prefixes:
     - ABACATEPAY_
     - APPCONFIG_
@@ -176,8 +218,8 @@ task_definition:
 # render-migrations-taskdef --window <W> --purpose migrate registers a new
 # revision per window whose command is exactly that window's upgrade (the
 # window table of scripts/asaas_migration_window.py), on the reviewed image
-# (parameters.app_image_override; for 036 and 037 the image deployed on the
-# service, which contains the migration). --purpose read (window 037 only,
+# (parameters.app_image_override; for 036, 037 and 042 the image deployed on
+# the service, which contains the migration). --purpose read (window 037 only,
 # listed under read_revisions) registers a separate read-only revision on the
 # same image, role and secret whose baked command is the window's SELECT-only
 # readback program, which never invokes the migration tool (it reads the
@@ -188,7 +230,7 @@ migrations_task_definition:
   database_secret_name: neurostack/staging/database-url-migrations
   image: app_image_override
   command: per_window_exact_upgrade
-  windows: ['035', '036', '037']
+  windows: ['035', '036', '037', '042']
   read_revisions: ['037']
   # OWNER CONFIRMED on 2026-10-20 (see task_definition.tag_overrides).
   tag_overrides:
@@ -199,14 +241,17 @@ financial_egress:
   initial_state: closed
   mechanism: closed_by_absence
   why: >-
-    The app reads the flag only through the AppConfig Agent at a loopback
-    origin and only when APPCONFIG_ENABLED is true
-    (src/infrastructure/appconfig.py, _request_url). With no APPCONFIG_* name
-    in the task definition every read returns false before any I/O, so
-    checkout creation fails with financial_egress_disabled before any provider
-    POST. No AppConfig application exists in the account (read back
-    2026-10-18). A third Agent container would break the evidence validators,
-    which require exactly app and otel.
+    The app reads the flag from AppConfig only when APPCONFIG_ENABLED is true.
+    With no APPCONFIG_* name in the task definition every read returns false
+    before any I/O, so checkout creation fails with financial_egress_disabled
+    before any provider POST: that is the initial state, and it holds until
+    the AppConfig group of task_definition.app_environment_appconfig_group is
+    rendered (asaas-rollout-opening live step L7, a revision of its own) with
+    the source sdk and an AppConfig application that exists (plan checks it).
+    From then on the configuration's value opens or closes egress, set
+    outside this manifest under its own owner approval. A third Agent
+    container would break the evidence validators, which require exactly app
+    and otel, so the Agent source is never rendered.
 
 steps:
   - id: secret_access_stack
@@ -270,7 +315,8 @@ steps:
     approval: no AWS change
     why: financial egress must stay closed until a separate owner instruction opens it
     preconditions:
-      - No APPCONFIG_* name in the source or the rendered revision.
+      - No APPCONFIG_* name in the source revision.
+      - The rendered revision carries no APPCONFIG_* name (closed by absence) or exactly the complete AppConfig group of task_definition.app_environment_appconfig_group (APPCONFIG_ENABLED 'true', APPCONFIG_SOURCE sdk, from live step L7), naming an AppConfig application that exists; a partial or altered group, or any other APPCONFIG_* name, blocks.
     change: none
     verification:
       - plan reports financial_egress_closed compliant.
@@ -389,6 +435,20 @@ steps:
     verification:
       - verify-result reports exactly the upgrade line 036 -> 037; then the post-read must read back alembic_version == 037 and the four legacy tables gone.
     rollback: none from this step; the 037 downgrade is a separate owner decision (docs/runbooks/asaas-deployment.md); SQLSTATE 55P03, 40P01 or 55000 means nothing changed, report and stop
+
+  - id: migrations_038_042
+    scope: separate_approval
+    approval: separate owner approval required for this window alone (asaas-rollout-opening, live step L3; the run needs the owner's explicit order at the time); not performed by this manifest
+    why: migrations 038 to 042 create the credit schema (neurostack-credit-system); they only add tables, functions, indexes and triggers and alter nothing that existed at 037, so the app deployed before the window stays valid on either schema
+    preconditions:
+      - Window 037 applied and verified first; read back the exact revision with the window's SELECT-only pre-read (scripts/migration_038_042_preflight.sql, application role) and continue only if alembic_version == 037 and every count is 0 (none of the tables or functions 038 to 042 create exists yet).
+      - The image containing 042 is deployed and running on every service task, by digest (live step L2, its own revision after the parameter-rows revision); the window's migrations revision carries that same digest.
+      - rollback_target stays revision 10 with no pending re-pin and revision 10 is ACTIVE; the migrations are additive, so it stays a valid way back with the schema at 042.
+      - Manual RDS snapshot pre-038-042-<date> available and recent before the run.
+    change: register the window's neurostack-staging-migrations revision with render-migrations-taskdef --window 042 --purpose migrate (the deployed image digest, the command baked to exactly `alembic upgrade 042`) and run it once through scripts/asaas_migration_window.py --window 042 (plan, render-run-task, verify-result), with no command override and no propagateTags
+    verification:
+      - verify-result reports exactly the five upgrade lines 037 -> 038 -> 039 -> 040 -> 041 -> 042; then the post-read must read back alembic_version == 042.
+    rollback: none from this step; a service rollback to the rollback target stays valid on the 042 schema; restoring the snapshot is an owner decision of last resort (it loses every write made after it); SQLSTATE 55P03, 40P01 or 55000 means nothing changed, report and stop
 
   - id: rollout_transitions
     scope: separate_approval

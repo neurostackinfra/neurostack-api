@@ -3,7 +3,9 @@
 
 The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one
 read of the production database after the final deploy: ``alembic_version``
-is ``037``; every row of ``billing_rollout_control`` (the four environments)
+is the chosen window's revision (``--window 037`` until the 038-042 window
+has run, live step L3 of asaas-rollout-opening, ``--window 042`` after it;
+required, no default); every row of ``billing_rollout_control`` (the four environments)
 is ``disabled`` with ``topup_commercial_enabled`` false; the four tables and
 ten functions migration 037 dropped are absent; ``billing_subscriptions``
 and ``billing_checkout_sessions`` are empty. It shows that state at the
@@ -32,6 +34,10 @@ requests and verifies results. There is no ``--now``: ``plan`` and
 ``render`` judge freshness against the system clock; ``verify`` does not
 read the clock at all, it judges every time against the recorded reads'
 ``captured_at_utc`` and the task's own timestamps.
+
+Every subcommand takes ``--window 037|042`` (required, given once): the
+program carries it as its label, the read must see exactly that revision, and
+a request, task or file rendered for the other window never verifies.
 
 ``plan``    the preconditions, from the recorded reads: captured within 10
             minutes; the service on ``--service-task-definition`` with one
@@ -65,7 +71,7 @@ import hashlib
 import json
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -86,9 +92,13 @@ from scripts import asaas_migration_window as mw  # noqa: E402
 STARTED_BY = "neurostack-rollout-readback"
 CLIENT_TOKEN_PREFIX = "rollout-readback-"
 # The labels the program carries: the window whose schema it reads, and the
-# readback's own phase (scripts/asaas_migration_window.py recognizes the
-# pair, and only this pair, as a read program).
-READ_WINDOW = mw.WINDOWS[mw.ROLLOUT_READ_WINDOW]
+# readback's own phase (scripts/asaas_migration_window.py recognizes these
+# pairs, and only these, as a read program). The window is always chosen
+# explicitly (``--window``, required): 037 until window 042 has run (live
+# step L3), 042 after it. Nothing here defaults to either.
+READ_WINDOWS: Mapping[str, mw.MigrationWindow] = MappingProxyType(
+    {name: mw.WINDOWS[name] for name in mw.ROLLOUT_READ_WINDOWS}
+)
 READ_PHASE = mw.ROLLOUT_READ_PHASE
 SQL_FILE = "scripts/asaas_rollout_readback.sql"
 RULE_EXPECTED_TABLE = "expected_table"
@@ -138,13 +148,20 @@ EXPECTED_TABLE: tuple[tuple[str, str, str], ...] = (
     *((CHECK_LEGACY_FUNCTION, name, "absent") for name in LEGACY_FUNCTIONS),
     *((check, "", "0") for check in COUNT_CHECKS),
 )
-SPEC = mw.ReadSpec(
-    phase=READ_PHASE,
-    sql_file=SQL_FILE,
-    rule=RULE_EXPECTED_TABLE,
-    checks=CHECKS,
-    role=mw.READ_ROLE_APP,
-    expected_version=READ_WINDOW.after,
+# One spec per window: the same SQL, rule, checks and role; the read must
+# see exactly the window's revision (``READ_WINDOWS[name].after``).
+SPECS: Mapping[str, mw.ReadSpec] = MappingProxyType(
+    {
+        name: mw.ReadSpec(
+            phase=READ_PHASE,
+            sql_file=SQL_FILE,
+            rule=RULE_EXPECTED_TABLE,
+            checks=CHECKS,
+            role=mw.READ_ROLE_APP,
+            expected_version=window.after,
+        )
+        for name, window in READ_WINDOWS.items()
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -189,8 +206,16 @@ def _require(condition: bool, reason: str) -> None:
         raise ReadbackError(reason)
 
 
-def read_summary() -> dict[str, Any]:
-    summary = mw._read_summary(SPEC)
+def read_window(value: Any) -> mw.MigrationWindow:
+    """The window the readback was explicitly chosen for (037 or 042)."""
+
+    _require(isinstance(value, str) and value in READ_WINDOWS, "read_window_unknown")
+    return READ_WINDOWS[str(value)]
+
+
+def read_summary(window: mw.MigrationWindow) -> dict[str, Any]:
+    summary = mw._read_summary(SPECS[window.name])
+    summary["window"] = window.name
     summary["expected_table"] = [list(row) for row in EXPECTED_TABLE]
     return summary
 
@@ -211,13 +236,16 @@ def watch_policy() -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def load_readback(path: Path) -> mw.WindowReadback:
+def load_readback(path: Path, window: str) -> mw.WindowReadback:
     """The recorded reads and the recorded RunTask (record ``read``).
 
     Returned in the window tool's container type so its reader, freshness
-    check and log reader apply unchanged; ``window`` is the program's label.
+    check and log reader apply unchanged; ``window`` is the explicitly chosen
+    window (the program's label), and ``plan`` and ``verify`` refuse a file
+    loaded for another window than their context's.
     """
 
+    chosen = read_window(window)
     try:
         data = path.read_bytes()
     except OSError:
@@ -271,7 +299,7 @@ def load_readback(path: Path) -> mw.WindowReadback:
         hook._reject_secret_material(record["response"])
         records[RECORD_KEY] = copy.deepcopy(record)
     return mw.WindowReadback(
-        window=READ_WINDOW.name,
+        window=chosen.name,
         captured_at=captured_at,
         reads=hook.Readback(
             captured_at=captured_at, reads=MappingProxyType(reads), run_task=None
@@ -287,15 +315,23 @@ def load_readback(path: Path) -> mw.WindowReadback:
 
 @dataclass(frozen=True)
 class Context:
+    window: mw.MigrationWindow
     service_task_definition: str
     read_task_definition: str
 
 
-def make_context(*, service_task_definition: str, read_task_definition: str) -> Context:
+def make_context(
+    *, window: str, service_task_definition: str, read_task_definition: str
+) -> Context:
     return Context(
+        window=read_window(window),
         service_task_definition=mw.validate_service_arn(service_task_definition),
         read_task_definition=mw.validate_read_arn(read_task_definition),
     )
+
+
+def _same_window(readback: mw.WindowReadback, context: Context) -> None:
+    _require(readback.window == context.window.name, "readback_window_mismatch")
 
 
 @dataclass(frozen=True)
@@ -360,19 +396,24 @@ def _read_context(
 
 
 def read_payload() -> bytes:
-    return mw.read_payload(SPEC)
+    """Every SQL text the read runs. The same for both windows (only the
+    revision the judge expects differs; it is never sent): a test keeps
+    each window's spec payload equal to it."""
+
+    return mw.read_payload(SPECS[mw.ROLLOUT_READ_WINDOWS[0]])
 
 
 def payload_sha256() -> str:
     return hashlib.sha256(read_payload()).hexdigest()
 
 
-def read_program() -> str:
-    return mw.program_for_payload(READ_WINDOW, READ_PHASE, read_payload())
+def read_program(window: mw.MigrationWindow) -> str:
+    _require(READ_WINDOWS.get(window.name) is window, "read_window_unknown")
+    return mw.program_for_payload(window, READ_PHASE, read_payload())
 
 
-def read_command() -> list[str]:
-    return ["python", "-c", read_program()]
+def read_command(window: mw.MigrationWindow) -> list[str]:
+    return ["python", "-c", read_program(window)]
 
 
 def _utc_day(moment: datetime) -> date:
@@ -380,7 +421,12 @@ def _utc_day(moment: datetime) -> date:
 
 
 def build_request(
-    network: mw.Network, target: mw.TaskTarget, *, attempt: int, day: date
+    network: mw.Network,
+    target: mw.TaskTarget,
+    *,
+    window: mw.MigrationWindow,
+    attempt: int,
+    day: date,
 ) -> dict[str, Any]:
     """The readback RunTask: the read family, the program as its one command
     override, this tool's ``startedBy``; the ``clientToken`` is derived from
@@ -401,7 +447,7 @@ def build_request(
         "enableExecuteCommand": False,
         "overrides": {
             "containerOverrides": [
-                {"name": target.container, "command": read_command()}
+                {"name": target.container, "command": read_command(window)}
             ]
         },
     }
@@ -415,11 +461,13 @@ def build_request(
             "request": mw._comparable_read_request(request),
         },
     )
-    assert_request_invariants(request, target)
+    assert_request_invariants(request, target, window)
     return request
 
 
-def assert_request_invariants(request: Any, target: mw.TaskTarget) -> None:
+def assert_request_invariants(
+    request: Any, target: mw.TaskTarget, window: mw.MigrationWindow
+) -> None:
     """Defence in depth: the readback can never run anything but the program,
     on anything but the read family, nor widen."""
 
@@ -439,7 +487,7 @@ def assert_request_invariants(request: Any, target: mw.TaskTarget) -> None:
         mw._READ_ARN.fullmatch(target.task_definition_arn) is not None,
         "read_request_invariant:override_only_on_the_read_family",
     )
-    expected = mw.normalized_read_command(read_command())
+    expected = mw.normalized_read_command(read_command(window))
     _require(expected is not None, "read_request_invariant:program_not_recognized")
     overrides = request["overrides"]
     rows = overrides.get("containerOverrides") if isinstance(overrides, dict) else None
@@ -473,6 +521,7 @@ def evaluate_plan(
 ) -> tuple[dict[str, Any], ReadContext | None]:
     """Pure precondition check; the read context is returned only when ready."""
 
+    _same_window(readback, context)
     checks = hook._Checks()
     reads = mw._Reads(readback)
     age = mw._freshness(readback, checks, now)
@@ -500,7 +549,11 @@ def evaluate_plan(
     if read_context is not None:
         try:
             build_request(
-                read_context.network, read_context.target, attempt=1, day=_utc_day(now)
+                read_context.network,
+                read_context.target,
+                window=context.window,
+                attempt=1,
+                day=_utc_day(now),
             )
         except mw.WindowError as exc:
             checks.check(False, "read_request_renderable", str(exc))
@@ -510,11 +563,12 @@ def evaluate_plan(
     document = {
         "schema": PLAN_SCHEMA,
         "status": status,
+        "window": context.window.name,
         "readback_age_seconds": age,
         "checks": list(dict.fromkeys(checks.passed)),
         "blocks": checks.blocks,
         "next_requests": reads.missing,
-        "read": read_summary(),
+        "read": read_summary(context.window),
         "service_task_definition_arn": context.service_task_definition,
         "read_task_definition_arn": context.read_task_definition,
         "deployment_id": read_context.deployment_id if read_context else None,
@@ -627,12 +681,17 @@ def judge_rows(rows: list[list[Any]]) -> tuple[list[str], dict[str, Any]]:
     return reasons, facts
 
 
-def judge(lines: mw._ReadLines) -> tuple[list[str], dict[str, Any]]:
+def judge(
+    lines: mw._ReadLines, window: mw.MigrationWindow
+) -> tuple[list[str], dict[str, Any]]:
     """The window tool's envelope judge (exposure, foreign and malformed
     lines, sequence, end, begin labels and payload digest, row count,
-    ``alembic_version`` 037), then the rows."""
+    ``alembic_version`` exactly the chosen window's revision), then the rows."""
 
-    reasons, report, rows_judgeable = mw.judge_read_envelope(lines, READ_WINDOW, SPEC)
+    _require(READ_WINDOWS.get(window.name) is window, "read_window_unknown")
+    reasons, report, rows_judgeable = mw.judge_read_envelope(
+        lines, window, SPECS[window.name]
+    )
     report["facts"] = None
     if rows_judgeable:
         row_reasons, report["facts"] = judge_rows(lines.rows)
@@ -641,7 +700,10 @@ def judge(lines: mw._ReadLines) -> tuple[list[str], dict[str, Any]]:
 
 
 def _rendered_match(
-    params: Any, read_context: ReadContext, created: datetime | None
+    params: Any,
+    read_context: ReadContext,
+    created: datetime | None,
+    window: mw.MigrationWindow,
 ) -> int | None:
     """The attempt whose rendering (on the task's UTC day or the day before)
     is exactly the recorded request; None when it is not this tool's."""
@@ -655,6 +717,7 @@ def _rendered_match(
             rendered = build_request(
                 read_context.network,
                 read_context.target,
+                window=window,
                 attempt=attempt,
                 day=candidate_day,
             )
@@ -687,7 +750,7 @@ def _verdict_line(document: dict[str, Any]) -> str:
         f"transaction, payload sha256 {document['payload_sha256']}; service "
         f"{_family_revision(document['service_task_definition_arn'])}, deployment "
         f"{document['deployment_id']} COMPLETED. Read in that transaction: "
-        "alembic_version 037. "
+        f"alembic_version {document['expected_alembic_version']}. "
         f"billing_rollout_control {len(facts['billing_rollout_control'])} rows: "
         f"{rows}. Legacy objects of migration 037 absent: "
         f"{facts['legacy_tables_absent']} of {facts['legacy_tables_expected']} "
@@ -705,6 +768,8 @@ def _verdict_line(document: dict[str, Any]) -> str:
 def verify(readback: mw.WindowReadback, context: Context) -> dict[str, Any]:
     """Classify the finished readback task. Pure; any anomaly stops."""
 
+    _same_window(readback, context)
+    window = context.window
     verdict = mw._Verdict()
     record = readback.records.get(RECORD_KEY)
     _require(record is not None, "read_not_recorded")
@@ -751,7 +816,7 @@ def verify(readback: mw.WindowReadback, context: Context) -> dict[str, Any]:
                 hook._timestamp(task.get("createdAt")) if task else None
             )
             if created_hint is not None or described is not None:
-                attempt = _rendered_match(params, read_context, created_hint)
+                attempt = _rendered_match(params, read_context, created_hint, window)
                 if attempt is None:
                     verdict.fail(
                         "read_request_not_rendered_by_this_tool", "evidence_mismatch"
@@ -775,13 +840,13 @@ def verify(readback: mw.WindowReadback, context: Context) -> dict[str, Any]:
                     or task.get("startedBy") != STARTED_BY
                 ):
                     verdict.fail("read_task_identity_mismatch", "evidence_mismatch")
-                if mw.overrides_problem(task, target.container, read_command()):
+                if mw.overrides_problem(task, target.container, read_command(window)):
                     verdict.fail("read_task_overrides_present", "evidence_mismatch")
                 observed = mw.normalized_read_command(
                     mw._override_command(task, target.container)
                 )
                 if observed is None or observed != mw.normalized_read_command(
-                    read_command()
+                    read_command(window)
                 ):
                     verdict.fail("read_task_command_mismatch", "evidence_mismatch")
                 created = hook._timestamp(task.get("createdAt"))
@@ -815,7 +880,7 @@ def verify(readback: mw.WindowReadback, context: Context) -> dict[str, Any]:
                         readback, verdict, task, target.log, task_arn
                     )
                     if messages is not None:
-                        reasons, report = judge(mw.parse_read_lines(messages))
+                        reasons, report = judge(mw.parse_read_lines(messages), window)
                         for reason in reasons:
                             verdict.fail(
                                 reason,
@@ -833,6 +898,7 @@ def verify(readback: mw.WindowReadback, context: Context) -> dict[str, Any]:
     document: dict[str, Any] = {
         "schema": RESULT_SCHEMA,
         "outcome": outcome,
+        "window": window.name,
         "alert": outcome == OUTCOME_STOPPED,
         "alert_kinds": sorted(verdict.kinds) if verdict.reasons else [],
         "reasons": verdict.reasons if verdict.reasons else verdict.in_progress,
@@ -846,7 +912,7 @@ def verify(readback: mw.WindowReadback, context: Context) -> dict[str, Any]:
         "read_task_definition_arn": context.read_task_definition,
         "started_by": STARTED_BY,
         "payload_sha256": payload_sha256(),
-        "expected_alembic_version": SPEC.expected_version,
+        "expected_alembic_version": SPECS[window.name].expected_version,
         "alembic_version": report.get("alembic_version"),
         "facts": report.get("facts"),
         "error_class": report.get("error_class"),
@@ -882,6 +948,9 @@ def _parser() -> mw._Parser:
     for name in ("plan", "render", "verify"):
         sub = subparsers.add_parser(name)
         add = sub.add_argument
+        # Required, no default, given once: 037 before window 042 ran, 042
+        # after it, always the operator's explicit choice.
+        add("--window", required=True, choices=tuple(READ_WINDOWS), action=mw._Once)
         add("--readback-file", type=Path, required=True, action=mw._Once)
         add("--service-task-definition", required=True, action=mw._Once)
         add("--read-task-definition", required=True, action=mw._Once)
@@ -896,10 +965,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         now = _clock()
         _require(now.tzinfo is not None, "now_invalid")
         context = make_context(
+            window=args.window,
             service_task_definition=args.service_task_definition,
             read_task_definition=args.read_task_definition,
         )
-        readback = load_readback(args.readback_file)
+        readback = load_readback(args.readback_file, args.window)
         if args.command in ("plan", "render"):
             document, read_context = evaluate_plan(readback, context, now=now)
             if args.command == "plan":
@@ -915,6 +985,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 build_request(
                     read_context.network,
                     read_context.target,
+                    window=context.window,
                     attempt=args.attempt,
                     day=_utc_day(now),
                 )

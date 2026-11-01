@@ -1,11 +1,12 @@
-"""Production migration windows 035, 036 and 037: pure planner, renderer, verifier.
+"""Production migration windows 035, 036, 037 and 042: pure planner, renderer, verifier.
 
 Every test runs on recorded readback files built here; nothing reaches AWS or
 a database. The Alembic and read-program output the verifiers classify is
 real: ``tests/fixtures/asaas_migration_window/*.json`` holds what the
 alembic CLI and the rendered read program printed against disposable
 PostgreSQL 16 (success per window, 55000 refusals, a 55P03 lock timeout, a
-40P01 deadlock and an unpinned ``upgrade head``).
+40P01 deadlock and an unpinned ``upgrade head``; window 042's runs, from 036 to
+042, captured on 2026-10-31).
 """
 
 from __future__ import annotations
@@ -46,6 +47,8 @@ MIGRATIONS_TD = {
     "035": TD_PREFIX + "neurostack-staging-migrations:4",
     "036": TD_PREFIX + "neurostack-staging-migrations:5",
     "037": TD_PREFIX + "neurostack-staging-migrations:6",
+    # After window 037's read revision (:7).
+    "042": TD_PREFIX + "neurostack-staging-migrations:8",
 }
 READ_TD = TD_PREFIX + "neurostack-staging-consulta:26"
 # Window 037's dedicated read revision (planner --purpose read).
@@ -86,6 +89,7 @@ SNAPSHOT_ID = {
     "035": "pre-033-035-2026-10-22",
     "036": "pre-036-2026-10-22",
     "037": "pre-037-2026-10-22",
+    "042": "pre-038-042-2026-10-22",
 }
 UPGRADE_HEAD = re.compile(r"upgrade\s+heads?\b", re.IGNORECASE)
 # Built by concatenation so repository secret scanners never see a literal.
@@ -111,11 +115,13 @@ GOOD_PRE_READ = {
     "035": "pre_035_at_032",
     "036": "pre_036_at_035",
     "037": "pre_037_at_036_migration_role",
+    "042": "pre_042_at_037",
 }
 GOOD_POST_READ = {
     "035": "post_035_at_035",
     "036": "post_036_at_036",
     "037": "post_037_at_037",
+    "042": "post_042_at_042",
 }
 
 
@@ -861,10 +867,11 @@ def _rows_changed(lines: list[str], index: int, values: list[Any]) -> list[str]:
 
 
 def test_one_constant_per_window_and_nothing_else() -> None:
-    assert list(mw.WINDOWS) == ["035", "036", "037"]
+    assert list(mw.WINDOWS) == ["035", "036", "037", "042"]
     assert mw.WINDOWS["035"] is mw.WINDOW_035
     assert mw.WINDOWS["036"] is mw.WINDOW_036
     assert mw.WINDOWS["037"] is mw.WINDOW_037
+    assert mw.WINDOWS["042"] is mw.WINDOW_042
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     constructed = [
         node
@@ -873,7 +880,7 @@ def test_one_constant_per_window_and_nothing_else() -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "MigrationWindow"
     ]
-    assert len(constructed) == 3
+    assert len(constructed) == 4
     with pytest.raises(TypeError):
         mw.WINDOWS["038"] = mw.WINDOW_037  # type: ignore[index]
 
@@ -935,6 +942,24 @@ def test_one_constant_per_window_and_nothing_else() -> None:
                 "post_read": "S24",
             },
         ),
+        (
+            "042",
+            "037",
+            "042",
+            ("037", "038", "039", "040", "041", "042"),
+            "pre-038-042-",
+            "scripts/migration_038_042_preflight.sql",
+            "zero_counts",
+            "app",
+            {
+                "register": "S25",
+                "snapshot": "S25",
+                "pre_read": "S26",
+                "run": "S26",
+                "verify": "S27",
+                "post_read": "S27",
+            },
+        ),
     ],
 )
 def test_each_window_pins_its_command_versions_snapshot_readback_and_steps(
@@ -987,7 +1012,7 @@ def test_the_pinned_window_is_035_and_no_subcommand_defaults_a_window() -> None:
         assert len(windows) == 1, name
         assert windows[0].required is True, name
         assert windows[0].default is None, name
-        assert tuple(windows[0].choices) == ("035", "036", "037"), name
+        assert tuple(windows[0].choices) == ("035", "036", "037", "042"), name
 
 
 def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
@@ -1002,12 +1027,12 @@ def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
         for older, newer in window.upgrades:
             assert declared[newer] == older, (window.name, older, newer)
     # 038 (the additive credit schema, neurostack-credit-system Group 1a;
-    # owner sign-off 2026-10-26), 039 (inventory), 040 (additional copies) and
+    # owner sign-off 2026-10-26), 039 (inventory), 040 (additional copies),
     # 041 (lifecycle, legal hold, purge and roles, Group 5) and 042
-    # (enforcement cutoff acceptances, Group 7) are the last
-    # written revisions and have no production window yet: their ASAAS
-    # migration window is an entry condition of that wish's Group 8.
-    # No later revision can exist unseen.
+    # (enforcement cutoff acceptances, Group 7) are the last written
+    # revisions, and window 042 (asaas-rollout-opening Group 5, live step
+    # L3) applies exactly them. No later revision can exist unseen: a 043
+    # would need its own window.
     assert declared["038"] == "037"
     assert declared["039"] == "038"
     assert declared["040"] == "039"
@@ -1042,6 +1067,31 @@ def test_an_inconsistent_window_table_cannot_load(
     broken = dataclasses.replace(mw.WINDOW_035, **{field: value})
     table = dict(mw.WINDOWS) | {"035": broken}
     monkeypatch.setattr(mw, "WINDOWS", table)
+    with pytest.raises(mw.WindowError, match="window_table"):
+        mw._assert_window_table()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        # Any window after the first needs the service on the migrations image.
+        ("image_rule", mw.IMAGE_RULE_BRIDGE),
+        ("rollback_target_revision", None),
+        # The start state is exactly 037, the end of the window before it.
+        ("before", "036"),
+        ("chain", ("036", "037", "038", "039", "040", "041", "042")),
+        ("chain", ("037", "038", "039", "040", "042")),
+        ("command", ("alembic", "upgrade", "head")),
+        ("snapshot_prefix", "pre-042-"),
+        ("snapshot_prefix", "pre-037-042-"),
+        ("started_by", "neurostack-migration-window-037"),
+    ],
+)
+def test_an_inconsistent_042_row_cannot_load(
+    field: str, value: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = dataclasses.replace(mw.WINDOW_042, **{field: value})
+    monkeypatch.setattr(mw, "WINDOWS", dict(mw.WINDOWS) | {"042": broken})
     with pytest.raises(mw.WindowError, match="window_table"):
         mw._assert_window_table()
 
@@ -1146,6 +1196,8 @@ def test_target_comes_from_the_hook_and_the_planner_shares_the_family() -> None:
     assert wiring.MIGRATION_WINDOWS is mw.WINDOWS
     assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_036.rollback_target_revision
     assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_037.rollback_target_revision
+    # Window 042 goes back to the same revision: the planner's last pin.
+    assert wiring.WORKER_FLAG_REVISION == mw.WINDOW_042.rollback_target_revision
 
 
 def test_policy_values_and_watch_budgets() -> None:
@@ -1174,17 +1226,28 @@ def test_windows_subcommand_prints_the_table(
     code, out, err = run_cli(["windows"], capsys)
     assert code == 0, err
     rows = json.loads(out)["windows"]
-    assert [row["window"] for row in rows] == ["035", "036", "037"]
+    assert [row["window"] for row in rows] == ["035", "036", "037", "042"]
     assert [row["command"] for row in rows] == [
         ["alembic", "upgrade", "035"],
         ["alembic", "upgrade", "036"],
         ["alembic", "upgrade", "037"],
+        ["alembic", "upgrade", "042"],
     ]
     assert [row["snapshot_name_pattern"] for row in rows] == [
         "pre-033-035-<date>",
         "pre-036-<date>",
         "pre-037-<date>",
+        "pre-038-042-<date>",
     ]
+    assert rows[3]["upgrades"] == [
+        "037 -> 038",
+        "038 -> 039",
+        "039 -> 040",
+        "040 -> 041",
+        "041 -> 042",
+    ]
+    assert rows[3]["image_prerequisite"] == mw.IMAGE_RULE_DEPLOYED
+    assert rows[3]["rollback_target_must_be_revision"] == 10
     assert UPGRADE_HEAD.search(out) is None
 
 
@@ -1193,7 +1256,7 @@ def test_windows_subcommand_prints_the_table(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 def test_plan_is_ready_for_each_window(window: str, tmp_path: Path) -> None:
     world = ready_world(tmp_path, window)
     document = plan(world, tmp_path)
@@ -1238,9 +1301,10 @@ def _blocks(world: World, tmp_path: Path, **kwargs: Any) -> list[str]:
     return list(document["blocks"])
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 def test_plan_refuses_a_wrong_before_version(window: str, tmp_path: Path) -> None:
-    for version in ("032", "035", "036", "037", "034"):
+    # 038, 041 and 042: window 042 partly or wholly applied already.
+    for version in ("032", "035", "036", "037", "034", "038", "041", "042"):
         if version == mw.WINDOWS[window].before:
             continue
         world = World(window)
@@ -1434,7 +1498,7 @@ def test_single_flight_listings_use_the_documented_filters() -> None:
     }
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 @pytest.mark.parametrize("which", [0, 1])
 def test_plan_refuses_an_image_digest_mismatch_on_one_task(
     window: str, which: int, tmp_path: Path
@@ -1536,7 +1600,7 @@ def test_plan_refuses_an_old_task_still_stopping(tmp_path: Path) -> None:
     assert plan(world, tmp_path)["status"] == "ready"
 
 
-@pytest.mark.parametrize("window", ["036", "037"])
+@pytest.mark.parametrize("window", ["036", "037", "042"])
 def test_036_and_037_need_the_deployed_image_in_the_migrations_revision(
     window: str, tmp_path: Path
 ) -> None:
@@ -1564,7 +1628,7 @@ def test_036_and_037_need_the_deployed_image_in_the_migrations_revision(
     assert "service_task_image_digest_mismatch" in blocks
 
 
-@pytest.mark.parametrize("window", ["036", "037"])
+@pytest.mark.parametrize("window", ["036", "037", "042"])
 def test_036_and_037_refuse_a_service_image_by_tag(window: str, tmp_path: Path) -> None:
     world = ready_world(tmp_path, window)
     world.put(
@@ -1746,7 +1810,7 @@ def test_plan_refuses_without_a_recorded_pre_read(tmp_path: Path) -> None:
     assert "pre_read_not_recorded" in document["blocks"]
 
 
-@pytest.mark.parametrize("window", ["036", "037"])
+@pytest.mark.parametrize("window", ["036", "037", "042"])
 def test_036_and_037_refuse_a_rollback_target_not_repinned(
     window: str, tmp_path: Path
 ) -> None:
@@ -1772,7 +1836,7 @@ def test_the_reviewed_manifest_is_re_pinned_to_revision_10() -> None:
     assert pins.rollback_task_definition_arn == LIVE_REVISION_10
 
 
-@pytest.mark.parametrize("window", ["036", "037"])
+@pytest.mark.parametrize("window", ["036", "037", "042"])
 def test_036_and_037_accept_the_live_revision_10_by_digest(
     window: str, tmp_path: Path
 ) -> None:
@@ -1972,7 +2036,7 @@ LIVE_ACCEPTED_RUN_TASK_KEYS = {
 }
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 def test_render_run_task_prints_the_exact_request(window: str, tmp_path: Path) -> None:
     world = ready_world(tmp_path, window)
     request = render_run(world, tmp_path)
@@ -2164,7 +2228,7 @@ def test_render_run_task_refuses_unless_plan_is_ready(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 @pytest.mark.parametrize("phase", ["pre", "post"])
 def test_read_request_is_the_read_program_on_the_right_family(
     window: str, phase: str, tmp_path: Path
@@ -2569,7 +2633,7 @@ def _assert_printable(document: dict[str, Any]) -> None:
     assert FORBIDDEN_IN_OUTPUT.search(json.dumps(document)) is None
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 def test_the_window_success_log_is_applied(window: str, tmp_path: Path) -> None:
     world = completed(tmp_path, window)
     result = verify(world, tmp_path)
@@ -3142,7 +3206,7 @@ def test_verify_result_cli_exit_codes(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 def test_the_real_pre_and_post_reads_verify(window: str, tmp_path: Path) -> None:
     world = World(window)
     world.record_read(tmp_path, "pre")
@@ -3264,6 +3328,105 @@ def test_a_037_table_that_still_exists_stops_the_post_read(tmp_path: Path) -> No
     )
     result = verify_read(world, tmp_path, "post")
     assert "read_relation_still_exists:public_billing_migrations" in result["reasons"]
+
+
+# Window 042 (asaas-rollout-opening Group 5): the start state is exactly 037,
+# with none of the objects 038-042 create. Real runs of the rendered program:
+# at 036 every count is 0 and only the revision stops it; at 042 the revision
+# and every count stop it.
+@pytest.mark.parametrize(
+    "case,version,counts",
+    [
+        ("pre_042_at_036", "036", [0, 0, 0, 0, 0, 0, 0, 0]),
+        ("pre_042_at_042", "042", [15, 3, 3, 13, 1, 4, 2, 1]),
+    ],
+)
+def test_the_042_pre_read_refuses_a_start_state_other_than_037(
+    case: str, version: str, counts: list[int], tmp_path: Path
+) -> None:
+    golden = READS[case]
+    world = World("042")
+    world.record_read(tmp_path, "pre", golden["lines"], exit_code=golden["exit_code"])
+    result = verify_read(world, tmp_path, "pre")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["alembic_version"] == [version]
+    nonzero = [
+        f"read_count_not_zero:{mw._slug(name)}"
+        for name, count in zip(mw.PREFLIGHT_042, counts)
+        if count
+    ]
+    assert result["reasons"] == ["read_alembic_version_mismatch", *nonzero]
+    assert [row["count"] for row in result["rows"]] == counts
+    _assert_printable(result)
+    # The plan never runs the window on such a pre-read.
+    assert "pre_read_not_ok" in _blocks(world, tmp_path)
+
+
+def test_the_042_post_read_at_037_means_nothing_was_applied(tmp_path: Path) -> None:
+    golden = READS["post_042_at_037"]
+    world = World("042")
+    world.record_read(tmp_path, "post", golden["lines"])
+    result = verify_read(world, tmp_path, "post")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["reasons"] == ["post_read_version_is_before_nothing_applied"]
+
+
+@pytest.mark.parametrize("version", ["038", "039", "040", "041", "043"])
+def test_the_042_post_read_refuses_a_partly_applied_or_later_version(
+    version: str, tmp_path: Path
+) -> None:
+    """042 runs five upgrades in one window: a post-read at 038 to 041 (part
+    of them applied) or at 043 is never verified, with the objects 042
+    creates all present."""
+
+    lines = _version_lines(READS["post_042_at_042"]["lines"], version)
+    world = World("042")
+    world.record_read(tmp_path, "post", lines)
+    result = verify_read(world, tmp_path, "post")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["reasons"] == ["read_alembic_version_mismatch"]
+
+
+@pytest.mark.parametrize("index", range(8))
+def test_any_nonzero_count_stops_the_042_preflight(index: int, tmp_path: Path) -> None:
+    lines = READS["pre_042_at_037"]["lines"]
+    name = mw.PREFLIGHT_042[index]
+    world = World("042")
+    world.record_read(tmp_path, "pre", _rows_changed(lines, index, [name, 1]))
+    result = verify_read(world, tmp_path, "pre")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["reasons"] == [f"read_count_not_zero:{mw._slug(name)}"]
+
+
+def test_the_042_success_log_is_exactly_the_five_upgrades(tmp_path: Path) -> None:
+    lines = ALEMBIC["success_042"]["lines"]
+    upgrades = [line for line in lines if "Running upgrade" in line]
+    assert [
+        line.split("Running upgrade ", 1)[1].split(",", 1)[0] for line in upgrades
+    ] == [
+        "037 -> 038",
+        "038 -> 039",
+        "039 -> 040",
+        "040 -> 041",
+        "041 -> 042",
+    ]
+    result = verify(completed(tmp_path, "042"), tmp_path)
+    assert result["outcome"] == "applied", result["reasons"]
+    # Four of the five upgrades (the last line missing) past the log grace
+    # period is not applied: 042 stopped part-way, at 041.
+    world = completed(tmp_path, "042", list(lines[:-1]))
+    assert world.captured_at == CAPTURED_VERIFY
+    assert (
+        datetime.fromisoformat(CAPTURED_VERIFY.replace("Z", "+00:00"))
+        - datetime.fromisoformat(RUN_STOPPED)
+    ).total_seconds() > mw.LOG_GRACE_SECONDS
+    result = verify(world, tmp_path)
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED", result["reasons"]
+    assert "upgrade_lines_mismatch" in result["reasons"]
+    # The same log is outside every other window.
+    for window in ("036", "037"):
+        result = verify(completed(tmp_path, window, list(lines)), tmp_path)
+        assert result["outcome"] == "MIGRATION_WINDOW_STOPPED", window
 
 
 def _line(seq: int, kind: str, **values: Any) -> str:
@@ -3408,7 +3571,7 @@ def _snapshot_args(world: World, tmp_path: Path) -> list[str]:
     return args[:index] + args[index + 2 :]
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
 def test_snapshot_requests_name_the_window_and_carry_no_tags(
     window: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3735,6 +3898,7 @@ def test_script_runs_standalone_without_repository_on_the_path(tmp_path: Path) -
         "035",
         "036",
         "037",
+        "042",
     ]
     # The real clock judges the fixture's capture (2026-10-22): the plan runs
     # standalone (manifest read through the planner) and refuses on freshness
@@ -3839,6 +4003,58 @@ def test_the_036_preflight_file_is_the_runbook_query() -> None:
     assert block == _sql_without_comments("scripts/migration_036_preflight.sql")
 
 
+def test_the_042_preflight_file_is_the_runbook_query() -> None:
+    block = _runbook_block("### Window 042: migrations 038-042")
+    assert block == _sql_without_comments("scripts/migration_038_042_preflight.sql")
+
+
+def _migration_constants(revision: str) -> dict[str, Any]:
+    """CREATED_TABLES / CREATED_FUNCTIONS of one migration, read by AST (the
+    module imports ``alembic.op``, which only exists inside a run)."""
+
+    (path,) = (ROOT / "alembic" / "versions").glob(f"*_{revision}_*.py")
+    found: dict[str, Any] = {}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("CREATED_TABLES", "CREATED_FUNCTIONS")
+        ):
+            found[node.targets[0].id] = ast.literal_eval(node.value)
+    return found
+
+
+def test_the_042_preflight_counts_exactly_what_038_to_042_create() -> None:
+    """Every table and function signature the five migrations declare they
+    create, schema-qualified, each in its own migration's row; none more."""
+
+    sql = _sql_without_comments("scripts/migration_038_042_preflight.sql")
+    rows = {
+        name: re.findall(r"'(public\.[a-z_]+(?:\(\))?)'", body)
+        for name, body in re.findall(
+            r"SELECT '([0-9]{3} (?:tables|functions) present)'(.*?)(?=\nUNION ALL|;\n$)",
+            sql,
+            re.S,
+        )
+    }
+    expected: dict[str, list[str]] = {}
+    for revision in ("038", "039", "040", "041", "042"):
+        constants = _migration_constants(revision)
+        expected[f"{revision} tables present"] = [
+            f"public.{table}" for table in constants["CREATED_TABLES"]
+        ]
+        if "CREATED_FUNCTIONS" in constants:
+            expected[f"{revision} functions present"] = [
+                f"public.{signature}" for signature in constants["CREATED_FUNCTIONS"]
+            ]
+    assert rows == expected
+    assert tuple(rows) == mw.PREFLIGHT_042
+    assert sum(len(names) for names in rows.values()) == 35 + 7
+    assert sql.count("to_regclass(relation) IS NOT NULL") == 5
+    assert sql.count("to_regprocedure(signature) IS NOT NULL") == 3
+
+
 def test_the_035_zero_reads_file_is_the_runbook_query() -> None:
     block = _runbook_block(
         "The zero reads are `scripts/migration_033_035_zero_reads.sql`"
@@ -3857,6 +4073,7 @@ def test_the_035_zero_reads_file_is_the_runbook_query() -> None:
         mw.WINDOW_036.pre_read,
         mw.WINDOW_037.pre_read,
         mw.WINDOW_037.post_read,
+        mw.WINDOW_042.pre_read,
     ],
 )
 def test_each_read_file_names_exactly_the_checks_the_verifier_expects(
@@ -3892,7 +4109,7 @@ def _statement_text(sql: str) -> str:
 
 @pytest.mark.parametrize(
     "window,phase",
-    [(w, p) for w in ("035", "036", "037") for p in ("pre", "post")],
+    [(w, p) for w in ("035", "036", "037", "042") for p in ("pre", "post")],
 )
 def test_every_decoded_payload_is_one_select_only_statement(
     window: str, phase: str
@@ -3960,9 +4177,11 @@ def test_the_runbook_window_table_is_the_module_table() -> None:
         )
     ]
     rows = [
-        line for line in section.splitlines() if re.match(r"^\| `03[567]` \|", line)
+        line
+        for line in section.splitlines()
+        if re.match(r"^\| `0(?:3[567]|42)` \|", line)
     ]
-    assert len(rows) == 3
+    assert len(rows) == 4
     for row, window in zip(rows, mw.WINDOWS.values()):
         cells = [cell.strip() for cell in row.strip("|").split("|")]
         labels = [label for _phase, label in window.plan_steps]

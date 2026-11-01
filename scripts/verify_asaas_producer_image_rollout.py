@@ -114,9 +114,40 @@ D3_ENVIRONMENT_NAMES = frozenset(
 D3_SECRET_NAMES = frozenset(
     {"ASAAS_API_KEY", "ASAAS_WEBHOOK_TOKEN", "BILLING_OBSERVABILITY_SMOKE_TOKEN"}
 )
-FINGERPRINTED_ENVIRONMENT_NAMES = BASE_ENVIRONMENT_NAMES | D3_ENVIRONMENT_NAMES
-# A template or serving revision carries the D3 wiring completely or not at all.
-ENVIRONMENT_NAME_SETS = (BASE_ENVIRONMENT_NAMES, FINGERPRINTED_ENVIRONMENT_NAMES)
+# asaas-rollout-opening (Decisions 12 to 14), the names the planner renders on
+# top of the D3 wiring, mirrored here (the planner's STAGED_FLAG_PARAMETERS and
+# APPCONFIG_GROUP; a test pins them equal, and the deploy hook's mirror too):
+# the two staged flags, both or neither, from live step L2a on; and the
+# AppConfig group, all or none and only with the flags, from L7 on. Their
+# values are not secret and are fingerprinted like the base values.
+STAGED_FLAG_ENVIRONMENT_NAMES = frozenset(
+    {"BILLING_FACT_TRANSPORT_ENABLED", "CREDIT_HOT_PATH_ENABLED"}
+)
+APPCONFIG_ENVIRONMENT_NAMES = frozenset(
+    {
+        "APPCONFIG_APPLICATION",
+        "APPCONFIG_ENABLED",
+        "APPCONFIG_ENVIRONMENT",
+        "APPCONFIG_PROFILE",
+        "APPCONFIG_SOURCE",
+    }
+)
+FINGERPRINTED_ENVIRONMENT_NAMES = (
+    BASE_ENVIRONMENT_NAMES
+    | D3_ENVIRONMENT_NAMES
+    | STAGED_FLAG_ENVIRONMENT_NAMES
+    | APPCONFIG_ENVIRONMENT_NAMES
+)
+# A template or serving revision carries each stage completely or not at all,
+# and a later stage only on top of the earlier ones: the revision 8 base; the
+# D3 wiring (revisions 9 to 11); plus the staged flags (L2a on); plus the
+# AppConfig group (L7 on). Nothing else.
+ENVIRONMENT_NAME_SETS = (
+    BASE_ENVIRONMENT_NAMES,
+    BASE_ENVIRONMENT_NAMES | D3_ENVIRONMENT_NAMES,
+    BASE_ENVIRONMENT_NAMES | D3_ENVIRONMENT_NAMES | STAGED_FLAG_ENVIRONMENT_NAMES,
+    FINGERPRINTED_ENVIRONMENT_NAMES,
+)
 
 
 class RolloutError(ValueError):
