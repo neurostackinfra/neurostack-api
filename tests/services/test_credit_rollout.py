@@ -11,6 +11,7 @@ from src.services.credit_rollout import (
     OBSERVATIONAL_DROP_REASONS,
     BindingCoverage,
     CapabilityReadiness,
+    CreditEnforcementRejected,
     CreditRolloutService,
     cutoff_digest,
 )
@@ -151,3 +152,50 @@ async def test_record_capability_readiness_keeps_all_receipt_fields_null(
     assert row.consumer_compatibility_digest is None
     session.add.assert_called_once_with(row)
     session.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_omitting_the_confirmed_digest_is_a_type_error() -> None:
+    service = CreditRolloutService(Mock(spec=[]))
+    with pytest.raises(TypeError, match="expected_report_digest"):
+        await service.arm_enforcement(set_by="task")  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "digest",
+    [None, "", "a" * 63, "a" * 65, "A" * 64, "g" * 64, " " + "a" * 63, 7],
+    ids=["none", "empty", "short", "long", "uppercase", "non-hex", "space", "int"],
+)
+async def test_a_malformed_confirmed_digest_is_refused_before_any_database_work(
+    digest: object,
+) -> None:
+    """``spec=[]``: any session attribute (a query, the lock) would raise
+    ``AttributeError`` instead of the refusal asserted here."""
+
+    service = CreditRolloutService(Mock(spec=[]))
+    with pytest.raises(
+        CreditEnforcementRejected,
+        match="^expected_report_digest is not a lowercase SHA-256$",
+    ):
+        await service.arm_enforcement(
+            set_by="task", expected_report_digest=digest  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("digest", "reason"), [("A" * 64, "standalone"), ("a" * 64, "  ")]
+)
+async def test_a_malformed_acceptance_is_refused_before_the_author_is_read(
+    digest: str, reason: str
+) -> None:
+    service = CreditRolloutService(Mock(spec=[]))
+    with pytest.raises(ValueError):
+        await service.accept_cutoff(
+            tenant_id=uuid4(),
+            builder_id=None,
+            reason=reason,
+            report_digest=digest,
+            author_user_id=uuid4(),
+        )

@@ -456,7 +456,15 @@ async def test_the_periodic_pass_keeps_has_alert_until_the_orphan_closes(
 ) -> None:
     world = await subscribed_builder(clean)
     async with clean.sessions() as session:
-        await CreditRolloutService(session).arm_enforcement(set_by="owner-decision")
+        rollout = CreditRolloutService(session)
+        # This proof must arm: confirm the report as the task does, at the
+        # database clock.
+        reviewed = await rollout.cutoff_report(
+            now=await CreditRepository(session).database_now()
+        )
+        await rollout.arm_enforcement(
+            set_by="owner-decision", expected_report_digest=reviewed.digest
+        )
         await session.commit()
     monkeypatch.setattr(credit_rollout, "credit_switch_effective", lambda: True)
 
