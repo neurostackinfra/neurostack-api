@@ -81,11 +81,17 @@ function StateLine({
  * (`<tr>`) of the same `<table>` as the header, so in the table layout the
  * browser aligns each header with its cells by construction: there is no
  * second grid template that could drift. The layout follows the width the
- * table really has (a container query on `container`, at 44rem), not the
+ * table really has (a container query on `container`, at 48rem), not the
  * viewport: with the sidebar open, a `md` viewport leaves too little room for
- * six columns. 44rem (704px) clears the table's measured minimum width with
- * the real catalog amounts (652px PT, 691px EN, Inter) by at least 8px, so a
- * shown table never needs its internal scroll. Below 44rem the same elements
+ * six columns. 48rem (768px) clears the table's measured minimum width with
+ * the real catalog amounts by 12px. Measured in Chromium with Inter: 652px PT
+ * and 691px EN with every plan subscribable; when a pending subscription's
+ * row carries both the "Aguardando confirmação" badge and the disabled
+ * "Assinar" button (the badge's nowrap width sets the plan column), 728px PT
+ * and 751px EN for pending Pro, 732px PT and 755px EN for pending Plus, and
+ * 733px PT and 756px EN for pending Max (the widest row); smaller with the
+ * fallback font. So a shown
+ * table never needs its internal scroll. Below 48rem the same elements
  * are re-laid out as one card per plan (the header row is hidden and each
  * cell shows its own label). Explicit roles keep the table semantics when the
  * card layout overrides the table display. Tailwind needs literal class
@@ -94,21 +100,21 @@ function StateLine({
 export const PLAN_TABLE_CLASSES = {
   container: "@container",
   /** Horizontal scroll at most: an action is never clipped silently. */
-  wrapper: "@min-[44rem]:overflow-x-auto @min-[44rem]:rounded-lg @min-[44rem]:border @min-[44rem]:border-border/60",
-  table: "block w-full @min-[44rem]:table @min-[44rem]:border-collapse",
-  head: "hidden @min-[44rem]:table-header-group",
+  wrapper: "@min-[48rem]:overflow-x-auto @min-[48rem]:rounded-lg @min-[48rem]:border @min-[48rem]:border-border/60",
+  table: "block w-full @min-[48rem]:table @min-[48rem]:border-collapse",
+  head: "hidden @min-[48rem]:table-header-group",
   headCell:
     "bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-4 last:pr-4",
-  body: "block space-y-3 @min-[44rem]:table-row-group @min-[44rem]:space-y-0",
-  row: "grid grid-cols-2 gap-3 rounded-lg border p-4 @min-[44rem]:table-row @min-[44rem]:rounded-none @min-[44rem]:border-0 @min-[44rem]:p-0",
+  body: "block space-y-3 @min-[48rem]:table-row-group @min-[48rem]:space-y-0",
+  row: "grid grid-cols-2 gap-3 rounded-lg border p-4 @min-[48rem]:table-row @min-[48rem]:rounded-none @min-[48rem]:border-0 @min-[48rem]:p-0",
   bodyCell:
-    "@min-[44rem]:table-cell @min-[44rem]:border-t @min-[44rem]:border-border/60 @min-[44rem]:px-2 @min-[44rem]:py-4 @min-[44rem]:align-middle @min-[44rem]:first:pl-4 @min-[44rem]:last:pr-4",
+    "@min-[48rem]:table-cell @min-[48rem]:border-t @min-[48rem]:border-border/60 @min-[48rem]:px-2 @min-[48rem]:py-4 @min-[48rem]:align-middle @min-[48rem]:first:pl-4 @min-[48rem]:last:pr-4",
   /**
    * Per-cell label: the card's accessible name in the card layout; removed
    * (`display: none`, so not read twice) where the column header exists.
    */
-  cellLabel: "block text-[10px] uppercase tracking-wide text-muted-foreground @min-[44rem]:hidden",
-  button: "w-full gap-1.5 @min-[44rem]:w-auto",
+  cellLabel: "block text-[10px] uppercase tracking-wide text-muted-foreground @min-[48rem]:hidden",
+  button: "w-full gap-1.5 @min-[48rem]:w-auto",
 } as const;
 
 /**

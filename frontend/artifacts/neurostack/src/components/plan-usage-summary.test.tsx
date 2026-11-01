@@ -209,6 +209,43 @@ describe("<PlanUsageSummary /> states", () => {
     ]);
     expect(screen.getByText("builder_pro")).toBeInTheDocument();
   });
+
+  // The dashboard (default) keeps its pre-payments-page markup: truncating
+  // meter labels and no test attributes on the card; only the payments page
+  // wraps the labels and carries `data-testid`/`data-state`.
+  it("keeps truncating labels and no data attributes on the dashboard card; the billing card wraps and has both", () => {
+    const LABELS = ["Traces do mês", "Armazenamento RAG", "Armazenamento de mídias"];
+    const { container, unmount } = render(<PlanUsageSummary usage={usage} locale="pt" />);
+    const dashboardCard = container.firstElementChild as HTMLElement;
+    expect(dashboardCard).not.toHaveAttribute("data-testid");
+    expect(dashboardCard).not.toHaveAttribute("data-state");
+    expect(container.querySelector("[data-testid]")).toBeNull();
+    expect(screen.queryByTestId("plan-usage")).not.toBeInTheDocument();
+    for (const label of LABELS) {
+      const text = screen.getByText(label, { selector: "p" });
+      expect(text).toHaveClass("truncate");
+      expect(text).not.toHaveClass("break-words");
+    }
+    unmount();
+
+    render(<PlanUsageSummary usage={usage} locale="pt" variant="billing" />);
+    const billingCard = screen.getByTestId("plan-usage");
+    expect(billingCard).toHaveAttribute("data-state", "ready");
+    for (const label of LABELS) {
+      const text = screen.getByText(label, { selector: "p" });
+      expect(text).toHaveClass("break-words");
+      expect(text).not.toHaveClass("truncate");
+    }
+  });
+
+  it("puts no data attributes on a dashboard state card; the billing state card keeps them", () => {
+    const { container, unmount } = render(<PlanUsageSummary state={{ status: "error" }} locale="pt" />);
+    expect(container.firstElementChild).not.toHaveAttribute("data-testid");
+    expect(container.firstElementChild).not.toHaveAttribute("data-state");
+    unmount();
+    render(<PlanUsageSummary state={{ status: "error" }} locale="pt" variant="billing" />);
+    expect(screen.getByTestId("plan-usage")).toHaveAttribute("data-state", "error");
+  });
 });
 
 // ── Credits (neurostack-credit-system Group 6) ──────────────────────────────

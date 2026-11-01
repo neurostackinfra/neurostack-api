@@ -495,24 +495,40 @@ async function horizontalOverflow(page: Page): Promise<number> {
 // One warm-up visit per worker, before any assertion, absorbs it; the tests
 // themselves keep their strict waits.
 test.beforeAll(async ({ browser, baseURL }) => {
-  // Room for both 30 s attempts (the default hook timeout is 30 s).
+  // Per attempt: navigation at most 15 s, then the page at most 25 s, so 40 s;
+  // two full attempts take at most 80 s, 10 s under the 90 s hook timeout
+  // (the default is 30 s), which leaves room for opening and closing the pages
+  // and for the explicit error below instead of a generic hook timeout.
+  const GOTO_TIMEOUT = 15_000;
+  const READY_TIMEOUT = 25_000;
   test.setTimeout(90_000);
-  const page = await browser.newPage();
-  try {
-    await mockNetwork(page, STATES["01-active"], baseURL!);
-    await signIn(page, "pt");
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      await page.goto(`${baseURL}/billing`);
-      const ready = await page
-        .getByTestId("billing-area")
-        .first()
-        .waitFor({ timeout: 30_000 })
-        .then(() => true)
-        .catch(() => false);
-      if (ready) break;
+  let ready = false;
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2 && !ready; attempt += 1) {
+    // A fresh page per attempt: after a failed navigation Chromium loads its
+    // own error page, which would interrupt a second `goto` on the same page.
+    // A navigation error is retried like a page that never rendered.
+    const page = await browser.newPage();
+    try {
+      await mockNetwork(page, STATES["01-active"], baseURL!);
+      await signIn(page, "pt");
+      await page.goto(`${baseURL}/billing`, { timeout: GOTO_TIMEOUT });
+      await page.getByTestId("billing-area").first().waitFor({ timeout: READY_TIMEOUT });
+      ready = true;
+    } catch (error: unknown) {
+      lastError = error;
+    } finally {
+      await page.close();
     }
-  } finally {
-    await page.close();
+  }
+  // Both attempts failed: fail here, loudly, instead of letting the first
+  // real test fail on a cold dev server with a confusing message.
+  if (!ready) {
+    throw new Error(
+      `Warm-up failed: ${baseURL}/billing never rendered [data-testid="billing-area"] in 2 attempts ` +
+        `(navigation ${GOTO_TIMEOUT / 1000} s + page ${READY_TIMEOUT / 1000} s each). ` +
+        `Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    );
   }
 });
 
@@ -650,6 +666,42 @@ test.describe("Pagamento — layout invariants", () => {
       await page.setViewportSize({ width: 1024, height: 900 });
       await expect.poll(display).toBe("block");
       await assertActionsVisible();
+
+      // A pending subscription's row carries the "Aguardando confirmação"
+      // badge AND the disabled subscribe button: the widest table. At 1056 px
+      // (sidebar open) a shown table must fit without its internal scroll,
+      // with every action visible and each header over its cells; otherwise
+      // the cards are shown.
+      await page.setViewportSize({ width: 1056, height: 900 });
+      for (const locale of ["pt", "en"] as const) {
+        await page.unrouteAll({ behavior: "ignoreErrors" });
+        const pending = await openBilling(page, "02-pending", baseURL!, locale);
+        const plans = page.getByRole("table", { name: locale === "en" ? "Plan comparison" : "Comparação de planos" });
+        const wrapper = (await scroll.boundingBox())!;
+        const action = page.getByRole("button", { name: locale === "en" ? "Subscribe to Pro" : "Assinar Pro" });
+        await expect(action).toBeVisible();
+        await expect(action).toBeDisabled();
+        const box = (await action.boundingBox())!;
+        expect(box.x, locale).toBeGreaterThanOrEqual(wrapper.x - 0.5);
+        expect(box.x + box.width, locale).toBeLessThanOrEqual(Math.min(wrapper.x + wrapper.width, 1056) + 0.5);
+        if ((await plans.evaluate((el) => getComputedStyle(el).display)) === "table") {
+          expect(await scroll.evaluate((el) => el.scrollWidth - el.clientWidth), locale).toBeLessThanOrEqual(1);
+          const misalignment = await plans.evaluate((el) => {
+            const heads = [...el.querySelectorAll("thead th")];
+            const cells = [...el.querySelector("tbody tr")!.children];
+            return Math.max(
+              ...heads.map((head, index) => {
+                const a = head.getBoundingClientRect();
+                const b = cells[index].getBoundingClientRect();
+                return Math.max(Math.abs(a.left - b.left), Math.abs(a.right - b.right));
+              }),
+            );
+          });
+          expect(misalignment, locale).toBeLessThanOrEqual(1);
+        }
+        expect(await horizontalOverflow(page), locale).toBeLessThanOrEqual(0);
+        expect(pending.unmocked, locale).toEqual([]);
+      }
     } else {
       expect(await display()).toBe("block");
       await assertActionsVisible();

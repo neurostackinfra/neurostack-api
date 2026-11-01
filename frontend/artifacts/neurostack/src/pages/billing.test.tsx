@@ -1356,6 +1356,33 @@ describe("Billing credits", () => {
     expect(screen.getByTestId("credits-and-topups").textContent ?? "").not.toMatch(/\d\s*créditos/);
   });
 
+  it.each(["pending", "active", "grace", "suspended", "deletion_due"] as const)(
+    "shows a not-applicable ledger in %s with top-ups open but no top-up action or notice",
+    async (state) => {
+      routeFetch(fetchMock, {
+        // Flag on and the packages listed: only the ledger keeps the top-up away.
+        "GET /v1/billing/summary": () => response(topupSummary),
+        [`GET ${CREDIT_SUMMARY}`]: () =>
+          response(
+            creditSummary({
+              state: { state, pending_reasons: ["standalone"] },
+              balance: { monthly_available_mc: 0, topup_available_mc: 0, available_mc: 0, net_available_mc: 0 },
+            }),
+          ),
+      });
+      renderBilling();
+
+      const notice = await screen.findByTestId("credit-state");
+      expect(notice).toHaveAttribute("data-state", "not_applicable");
+      expect(notice).toHaveTextContent("Não se aplica: esta clínica não pertence a um builder com conta de créditos.");
+      await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_CATALOG).length).toBeGreaterThan(0));
+      const credits = screen.getByTestId("credits-and-topups");
+      await waitFor(() => expect(credits.textContent ?? "").not.toMatch(/Recarga indisponível/));
+      expect(screen.queryByTestId("topup-blocked")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Recarregar" })).not.toBeInTheDocument();
+    },
+  );
+
   it("shows no state notice for an active account", async () => {
     routeFetch(fetchMock, {
       "GET /v1/billing/summary": () => response(summary),

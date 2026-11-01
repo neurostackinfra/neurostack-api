@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { CreditLot, CreditSummary } from "@/pages/billing-contract";
+import type { BillingSummary, CreditCatalog, CreditLot, CreditSummary } from "@/pages/billing-contract";
+import { deriveTopupState } from "@/pages/billing-view";
 import {
   CreditsAndTopups,
   HISTORY_TABLE_CLASSES,
@@ -217,6 +218,45 @@ describe("<CreditsAndTopups /> state matrix", () => {
     expect(screen.queryByTestId("credit-history")).not.toBeInTheDocument();
     expect(screen.getByTestId("credits-and-topups").textContent ?? "").not.toMatch(/\d+\s*créditos/);
   });
+
+  // The panel fed by the real `deriveTopupState`: flag on, packages listed and
+  // read, yet a not-applicable ledger shows no top-up action and no hold
+  // notice next to "Não se aplica", in every lifecycle state.
+  it.each(["pending", "active", "grace", "suspended", "deletion_due"] as const)(
+    "shows a not-applicable ledger in %s without a top-up action or a top-up notice",
+    (lifecycleState) => {
+      const ledger = summary({ state: lifecycleState, pending_reasons: ["standalone"] }, { net_available_mc: 0 });
+      const offerId = "package_credits_500_v1";
+      const topup = deriveTopupState({
+        summary: {
+          status: "ok",
+          data: {
+            topup_commercial_enabled: true,
+            checkout: { available: true, available_offer_ids: [offerId], live_session: null },
+          } as unknown as BillingSummary,
+        },
+        credit: { status: "ok", data: ledger },
+        creditCatalog: {
+          status: "ok",
+          data: {
+            millicredits_per_credit: 1000,
+            packages: [
+              { offer_id: offerId, credits: 500, amount_cents: 1_234, currency: "BRL", payment_methods: ["pix"], validity_months: 6 },
+            ],
+          } as unknown as CreditCatalog,
+        },
+        checkoutLive: false,
+        txt: (pt) => pt,
+      });
+      renderPanel({ state: { status: "ready", summary: ledger }, topup });
+      expect(screen.getByTestId("credit-state")).toHaveTextContent(/^Não se aplica:/);
+      const panel = screen.getByTestId("credits-and-topups");
+      expect(panel.textContent ?? "").not.toMatch(/Recarga indisponível/);
+      expect(screen.queryByTestId("topup-blocked")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("topup-offer")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Recarregar" })).not.toBeInTheDocument();
+    },
+  );
 
   it("keeps the deadline notice of a standing account and its balance", () => {
     renderPanel({
