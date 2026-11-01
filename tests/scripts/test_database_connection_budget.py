@@ -1,13 +1,47 @@
 from __future__ import annotations
 
+import itertools
 import json
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
+from sqlalchemy import event, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool, Pool
 
 from scripts import check_database_connection_budget as budget
 from src.config.settings import Settings
+
+# Connections ONE process's billing fact worker and the credit consumer it
+# presents to (asaas-rollout-opening Group 2c, transport on) may hold at the
+# same time, out of that process's pool: the publisher commits its lease --
+# returning its connection -- before the presentation, and the consumer runs
+# in its own session.  The rest of the pool stays with the request path.
+WORKER_AND_CONSUMER_CONNECTION_BUDGET = 1
+
+
+class PoolCounter:
+    """Concurrent checkouts of one pool, from its own events."""
+
+    def __init__(self, pool: Pool) -> None:
+        self.current = 0
+        self.peak = 0
+        self.checkouts = 0
+        event.listen(pool, "checkout", self._checkout)
+        event.listen(pool, "checkin", self._checkin)
+
+    def _checkout(self, *_args: Any) -> None:
+        self.current += 1
+        self.checkouts += 1
+        self.peak = max(self.peak, self.current)
+
+    def _checkin(self, *_args: Any) -> None:
+        self.current -= 1
+
 
 requires_docker_compose = pytest.mark.skipif(
     not Path("/usr/bin/docker").is_file(),
@@ -366,3 +400,121 @@ def test_vps_structure_still_refuses_missing_group5_production_secret(
         budget.validate_vps_facts(
             profile, compose=compose, dockerfile=dockerfile, env_file=env_file
         )
+
+
+# ---------------------------------------------------------------------------
+# The worker plus the consumer, counted with the transport on
+# (asaas-rollout-opening Group 2c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("profile_name", ["vps-compose", "ecs-poc"])
+def test_the_worker_and_consumer_share_leaves_every_process_pool_room(
+    profile_name: str,
+) -> None:
+    profile = budget.load_profile(
+        Path("config/database-connection-budgets.json"), profile_name
+    )
+    per_process = profile["pool_size"] + profile["max_overflow"]
+    # Never the whole pool: requests keep at least one connection per process.
+    assert 0 < WORKER_AND_CONSUMER_CONNECTION_BUDGET < per_process
+    processes = profile["tasks"] * profile["workers"]
+    assert processes * WORKER_AND_CONSUMER_CONNECTION_BUDGET < profile["total"]
+
+
+@pytest.fixture
+def inbox_sequence() -> Iterator[None]:
+    """SQLite stand-in for the PostgreSQL ``inbox_seq`` identity."""
+
+    from src.models.credit_fact_inbox import CreditFactInbox
+
+    counter = itertools.count(1)
+
+    def assign(_mapper: Any, _connection: Any, target: Any) -> None:
+        if target.inbox_seq is None:
+            target.inbox_seq = next(counter)
+
+    event.listen(CreditFactInbox, "before_insert", assign)
+    try:
+        yield
+    finally:
+        event.remove(CreditFactInbox, "before_insert", assign)
+
+
+@pytest.mark.usefixtures("inbox_sequence")
+async def test_the_worker_and_the_consumer_stay_within_the_budget_transport_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One process pool, sized like the approved profile, shared by the real
+    worker and the real consumer exactly as ``src/api/main.py`` wires them."""
+
+    from src.api import main as main_module
+    from src.models.base import Base
+    from src.models.billing import BillingFactAck, BillingFactDelivery
+    from src.models.credit_fact_inbox import CreditFactInbox
+    from src.repositories.database import _patch_jsonb_for_sqlite
+    from src.services import credit_fact_consumer as consumer_module
+    from src.services.billing_fact_worker import (
+        BillingFactWorker,
+        BillingFactWorkerConfig,
+    )
+    from src.services.credit_switch import CreditSwitch
+    from tests.services.test_billing_fact_worker import _seed_fact
+
+    profile = budget.load_profile(
+        Path("config/database-connection-budgets.json"), "ecs-poc"
+    )
+    _patch_jsonb_for_sqlite()
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'budget.db'}",
+        poolclass=AsyncAdaptedQueuePool,
+        pool_size=profile["pool_size"],
+        max_overflow=profile["max_overflow"],
+        pool_timeout=profile["pool_timeout"],
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+        )
+        facts = [await _seed_fact(sessions) for _ in range(3)]
+        monkeypatch.setattr(CreditSwitch, "effective", lambda _self: True)
+        monkeypatch.setattr(
+            consumer_module, "default_session_factory", lambda: sessions
+        )
+        counter = PoolCounter(engine.sync_engine.pool)
+        clock = [datetime.now(timezone.utc)]
+        worker = BillingFactWorker(
+            sessions,
+            transport=main_module._credit_fact_transport(),
+            transport_ready=main_module._billing_fact_transport_ready,
+            config=BillingFactWorkerConfig.from_settings(Settings()),
+            now=lambda: clock[0],
+        )
+        presenting = await worker.run_tick()
+        clock[0] += timedelta(minutes=2)
+        await worker.run_tick()  # the maintenance pass reads the acks
+        async with sessions() as session:
+            inbox = await session.scalar(select(func.count(CreditFactInbox.inbox_seq)))
+            acks = await session.scalar(select(func.count(BillingFactAck.id)))
+            states = set(
+                (
+                    await session.scalars(
+                        select(BillingFactDelivery.state).where(
+                            BillingFactDelivery.outbox_event_id.in_(facts)
+                        )
+                    )
+                ).all()
+            )
+    finally:
+        await engine.dispose()
+    # Not vacuous: the real consumer applied every fact through the wiring.
+    assert (presenting.presented, presenting.failed, presenting.not_ready) == (
+        3,
+        0,
+        0,
+    )
+    assert (inbox, acks, states) == (3, 3, {"acknowledged"})
+    assert counter.checkouts > 0 and counter.current == 0
+    assert counter.peak <= WORKER_AND_CONSUMER_CONNECTION_BUDGET, counter.peak

@@ -1068,9 +1068,9 @@ print(json.dumps({
 
 # What ``src.api.main`` serves on its own.  NOT yet served by the app:
 # ``neurostack_credit_fact_inbox`` and ``neurostack_credit_fact_rejected``
-# live in ``src.services.credit_fact_consumer``, which main.py does not import
-# (its wiring into the billing fact transport belongs to another wish); they
-# appear in /metrics only once that module is imported.
+# live in ``src.services.credit_fact_consumer``, which main.py imports only
+# with ``BILLING_FACT_TRANSPORT_ENABLED`` on (and the worker on), at lifespan
+# start; they appear in /metrics only once that module is imported.
 _SERVED_BY_MAIN = [
     "neurostack_credit_balance_thresholds",
     "neurostack_credit_debt_recorded_millicredits",

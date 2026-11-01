@@ -78,18 +78,22 @@ O manifesto `config/database-connection-budgets.json` registra as topologias apr
 
 No VPS, o deploy confere separadamente o comando de workers do Dockerfile, a propagação das três variáveis pelo Compose, os valores do `.env` e `max_connections=100` antes de `docker pull` ou `docker compose up`. O perfil `ecs-poc` mantém um orçamento separado e versionado para o deploy ECS.
 
+Com `BILLING_FACT_TRANSPORT_ENABLED` ligada, o worker do outbox e o consumidor de créditos usam esse mesmo pool e, juntos, seguram no máximo **1** conexão por processo de cada vez: o publisher commita a tentativa (devolvendo a conexão) antes de apresentar, e o consumidor roda em sessão própria. O teste `tests/scripts/test_database_connection_budget.py` conta os checkouts do pool com o worker e o consumidor reais, e `tests/integration/test_billing_fact_worker_postgres.py` conta também os backends abertos no PostgreSQL; ambos falham acima desse orçamento, que deixa o resto do pool para as requisições.
+
 ## Worker do outbox `billing.fact.v1`
 
-O worker periódico que reconcilia, escalona e (quando houver consumidor)
+O worker periódico que reconcilia, escalona e (com o transporte ligado)
 apresenta os fatos `billing.fact.v1` é **desligado por padrão**.
 `BILLING_FACT_WORKER_ENABLED=false` não cria task, loop nem acesso ao banco, e
 nenhuma métrica do worker recebe valor capaz de disparar alerta. O merge, porém,
 não é neutro: ele altera `config/prometheus_rules.yml` e, portanto, o digest de
 regras vinculado ao release (ver "Release" abaixo).
 
-O worker **não tem transporte e não entrega nada hoje**: nenhum consumidor de
-créditos existe, a produção passa `transport=None` e a apresentação está
-bloqueada por uma guarda de código (ver "Apresentação bloqueada" abaixo).
+Sem `BILLING_FACT_TRANSPORT_ENABLED` (desligada por padrão) o worker **não tem
+transporte e não entrega nada**: `src/api/main.py` passa `transport=None` e
+nem carrega o módulo do consumidor de créditos. Com ela ligada (e o worker
+ligado), o consumidor de créditos é o transporte, atrás de um gancho de
+prontidão (ver "Transporte e prontidão do consumidor" abaixo).
 
 No serviço ECS de produção o valor vem do parâmetro revisado
 `BILLING_FACT_WORKER_ENABLED` em
@@ -129,19 +133,21 @@ worker flag").
 | `BILLING_FACT_WORKER_BATCH_SIZE` | `50` | 1–500 | Máximo de fatos apresentados por tick e tamanho de cada página de reconciliação/escalonamento. |
 | `BILLING_FACT_WORKER_MAX_ATTEMPTS` | `10` | 1–50 | Apresentações sem ack antes do estado terminal `blocked`. |
 | `BILLING_FACT_WORKER_STALE_AFTER_SECONDS` | `900` | 60–86400 | Idade a partir da qual um fato `pending`/`awaiting_ack` dispara o alerta de atraso (padrão 15 min). |
+| `BILLING_FACT_TRANSPORT_ENABLED` | `false` | booleano | Com o worker ligado, apresenta os fatos ao consumidor de créditos no mesmo processo (`handle_billing_fact`). Desligada, nenhum transporte é ligado e o consumidor nem é importado. |
 
 Garantias com vários processos, todas no PostgreSQL:
 
 - **Claim sem dupla apresentação:** cada fato é reivindicado numa transação
   curta própria com `FOR UPDATE OF billing_fact_deliveries SKIP LOCKED`, e a
-  linha fica travada até o commit da tentativa. Outro processo pula a linha em
-  vez de esperar, e o backoff persistido (`last_attempt_at`, exponencial de
-  60 s até 1 h) adia a próxima apresentação **de uma tentativa já
-  commitada**. Ele não cobre uma queda entre o envio e o commit (ver
-  "Apresentação bloqueada"). Um fato cujo ack foi commitado antes da releitura
-  feita logo após o lock não é reapresentado; um ack commitado depois dessa
-  releitura não interrompe a apresentação já em curso (ela acontece uma vez
-  mais e o reconciliador converge o fato em seguida).
+  tentativa (`attempt_count + 1`, `last_attempt_at`) é commitada **antes** de
+  o fato ser apresentado: esse commit é um lease de pelo menos o backoff base
+  (60 s), maior que o timeout de apresentação (10 s), então nenhum outro
+  processo apresenta o mesmo fato enquanto ele está em voo, e o backoff
+  persistido (exponencial de 60 s até 1 h) adia a próxima apresentação. Um
+  fato cujo ack foi commitado antes da releitura feita logo após o lock não é
+  reapresentado; um ack commitado depois dessa releitura não interrompe a
+  apresentação já em curso (ela acontece uma vez mais e o reconciliador
+  converge o fato em seguida).
 - **Manutenção serializada:** a reconciliação (página limitada dos fatos não
   `acknowledged`, com cursor que dá a volta) e o escalonamento rodam sob
   `pg_try_advisory_xact_lock`; quem não obtém o lock pula a fase sem esperar.
@@ -151,34 +157,58 @@ Garantias com vários processos, todas no PostgreSQL:
   `billing_fact_reconciliation_alerts`. O fato nunca é apagado nem marcado
   `acknowledged` sem ack válido; um ack válido que chegue depois ainda o
   converge para `acknowledged`.
-- **Apresentação bloqueada:** a tentativa só é contada depois que o transporte
-  retorna, na mesma transação. Se o processo cair, ou o commit se perder,
-  depois de um envio já visível ao consumidor, a entrega continua `pending`
-  com `attempt_count` inalterado e é reapresentada no tick seguinte: a cada
-  nova queda isso se repete **sem limite**, ignorando o backoff e
-  `BILLING_FACT_WORKER_MAX_ATTEMPTS`. Por isso
-  `PRESENTATION_PRECONDITIONS_OPEN = True` em `src/services/billing_outbox.py`
-  faz `BillingFactWorker(transport=...)`, `publish_next`, e os caminhos legados
-  `publish_pending`/`pending` levantarem `PresentationPreconditionsOpen`. A
-  constante só pode virar `False` quando as três pré-condições forem cumpridas:
-  (1) contar a tentativa num lease commitado **antes** de apresentar;
-  (2) existir um caminho de requeue para entregas `blocked`;
-  (3) o runbook cobrir o transporte real.
+- **Registro em duas fases e guarda de apresentação:** como a tentativa é
+  commitada antes do envio, uma queda do processo (ou um commit perdido)
+  depois de um envio já visível ao consumidor deixa exatamente essa tentativa
+  contada, e o backoff e `BILLING_FACT_WORKER_MAX_ATTEMPTS` continuam
+  limitando a reapresentação. A guarda `PRESENTATION_PRECONDITIONS_OPEN` em
+  `src/services/billing_outbox.py` está **fechada** (`False`): as três
+  pré-condições foram cumpridas (o registro em duas fases; o requeue auditado
+  `src/ops/billing_fact_requeue.py` para entregas `blocked` por esgotamento;
+  o runbook do transporte real). O caminho legado de uma fase
+  (`publish_pending`/`pending`) foi removido junto; `publish_next` é o único
+  caminho de apresentação. Fechar a guarda não liga nada sozinho: só
+  `BILLING_FACT_TRANSPORT_ENABLED` liga o transporte. Voltar a constante para
+  `True` faz `BillingFactWorker(transport=...)`, `publish_next` e o `handle`
+  do consumidor levantarem `PresentationPreconditionsOpen` de novo.
 - **Ack válido:** o backlog (`unacked`/`stale`) e o escalonamento `ack overdue`
   ignoram fatos que já têm um ack válido (mesmo schema, mesmo `event_id`,
   `accepted` e digests iguais aos do outbox/handoff), mesmo antes de a página de
   reconciliação marcá-los `acknowledged`. Um ack divergente continua contando
   até o reconciliador mover o fato para `blocked`.
-- **Sem consumidor:** hoje nenhum consumidor de créditos existe, então nenhum
-  transporte é ligado. Os fatos ficam `pending`, sem tentativas consumidas e
-  reapresentáveis quando o consumidor existir; após o limiar, cada fato recebe
-  um alerta `backlog` (detalhe `ack overdue`) e o gauge
+- **Sem transporte:** com `BILLING_FACT_TRANSPORT_ENABLED=false` (o padrão)
+  nenhum transporte é ligado. Os fatos ficam `pending`, sem tentativas
+  consumidas e reapresentáveis quando o transporte for ligado; após o limiar,
+  cada fato recebe um alerta `backlog` (detalhe `ack overdue`) e o gauge
   `neurostack_billing_fact_backlog{condition="stale"}` dispara
-  `BillingFactDeliveryStale`. O worker nunca chama ledger ou lógica de crédito.
+  `BillingFactDeliveryStale`. O worker nunca importa nem chama ledger ou
+  lógica de crédito: o transporte é injetado por `src/api/main.py`, o único
+  ponto de ligação.
+- **Transporte e prontidão do consumidor:** com o worker e
+  `BILLING_FACT_TRANSPORT_ENABLED` ligados, `src/api/main.py` entrega ao worker
+  `handle_billing_fact` (`src/services/credit_fact_consumer.py`, importado só
+  nesse caso) e um gancho de prontidão. O gancho é falso enquanto a chave de
+  crédito não está efetiva (`CREDIT_HOT_PATH_ENABLED` desligada, ou o schema
+  abaixo de `042`) ou a imagem falha na verificação de contrato do próprio
+  consumidor (`consumer_contract_digests`: manifesto do bundle #137 ou arquivo
+  do schema indisponível, ou digest do bundle, do schema ou do catálogo
+  diferente do pin do consumidor), que só lê arquivos, nunca o banco. Um fato
+  cujo handoff nomeia outro digest de bundle continua sendo uma falha contada.
+  Gancho falso antes da apresentação, ou depois de uma apresentação
+  que falhou (a prontidão virou durante ela), e `CreditSwitchOff` do
+  consumidor (que `main.py` traduz) viram `TransportNotReady`: **nenhuma
+  tentativa é gasta**, `last_attempt_at` fica com o instante da recusa e o
+  lote termina, então um consumidor que continua não pronto nunca leva uma
+  entrega a `blocked`. Cada recusa soma 1 em
+  `neurostack_billing_fact_consumer_not_ready_total` (sem labels, por
+  processo); `neurostack_billing_fact_publish_attempts_total` não a conta e o
+  tick continua `completed`. Depois de uma recusa o fato espera de novo o
+  backoff da contagem restaurada (decisão em aberto do owner, ver o runbook).
 - **Shutdown:** o lifespan para o loop antes de fechar o pool; o fato em voo
   termina (timeout de apresentação de 10 s, espera de até 15 s) e nenhum novo é
-  reivindicado. Se for preciso cancelar, a transação faz rollback e o fato
-  mantém o estado anterior. Um `CancelledError` que não foi dirigido à task do
+  reivindicado. Se for preciso cancelar, a tentativa já commitada no lease
+  continua contada, o fato mantém o estado anterior e é reapresentado depois
+  do backoff. Um `CancelledError` que não foi dirigido à task do
   loop (por exemplo, levantado pelo código do consumidor ou do driver) é
   registrado em ERROR e contado como tick/tentativa falha, e o loop continua;
   um cancelamento real (shutdown) nunca é engolido.

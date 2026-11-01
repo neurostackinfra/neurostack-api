@@ -468,11 +468,27 @@ def _no_session() -> AsyncSession:
     raise AssertionError("the consumer must not open a session")
 
 
-async def test_presentation_guard_raises_before_anything() -> None:
-    with pytest.raises(PresentationPreconditionsOpen):
+async def test_presentation_guard_raises_before_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Inverted pin (asaas-rollout-opening Group 2c): the guard is closed by
+    # default, so with the switch off the first refusal is CreditSwitchOff,
+    # still before any session.
+    assert outbox_module.PRESENTATION_PRECONDITIONS_OPEN is False
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: False)
+    with pytest.raises(CreditSwitchOff):
         await CreditFactConsumer(_no_session).handle(_fixture(TOPUP[0]))
-    with pytest.raises(PresentationPreconditionsOpen):
+    with pytest.raises(CreditSwitchOff):
         await handle_billing_fact(_fixture(TOPUP[0]))
+    # Reopened, the guard refuses first again, with the switch on and with
+    # it off: the guard is checked before the switch.
+    monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", True)
+    for effective in (True, False):
+        monkeypatch.setattr(CreditSwitch, "effective", lambda _self, e=effective: e)
+        with pytest.raises(PresentationPreconditionsOpen):
+            await CreditFactConsumer(_no_session).handle(_fixture(TOPUP[0]))
+        with pytest.raises(PresentationPreconditionsOpen):
+            await handle_billing_fact(_fixture(TOPUP[0]))
 
 
 async def test_the_switch_must_be_effective(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -502,11 +518,15 @@ def test_handle_billing_fact_is_a_fact_transport(
         interval_seconds=30, batch_size=1, max_attempts=1, stale_after_seconds=60
     )
     sessions = async_sessionmaker(class_=AsyncSession)
-    with pytest.raises(PresentationPreconditionsOpen):
-        BillingFactWorker(sessions, transport=handle_billing_fact, config=config)
-    monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", False)
+    # Inverted pin (asaas-rollout-opening Group 2c): with the guard closed by
+    # default the worker takes the consumer as its transport.
+    assert outbox_module.PRESENTATION_PRECONDITIONS_OPEN is False
     worker = BillingFactWorker(sessions, transport=handle_billing_fact, config=config)
     assert worker.consumer_ready
+    # Reopened, the worker refuses it again.
+    monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", True)
+    with pytest.raises(PresentationPreconditionsOpen):
+        BillingFactWorker(sessions, transport=handle_billing_fact, config=config)
     assert CreditFactConsumer()._timeout == TRANSPORT_TIMEOUT_SECONDS == 10.0
 
 

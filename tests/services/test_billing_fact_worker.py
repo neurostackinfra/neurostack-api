@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
+import json
+import os
 import re
+import subprocess
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +25,7 @@ import pytest
 import yaml
 from prometheus_client import REGISTRY
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config.settings import Settings, settings
@@ -116,11 +121,11 @@ async def factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[AsyncSessi
 
 @pytest.fixture
 def presentation_preconditions_waived(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Explicit, test-only waiver of the open presentation preconditions.
+    """Pin the presentation guard closed for one test.
 
-    Production can never present a fact while
-    ``PRESENTATION_PRECONDITIONS_OPEN`` is true; only tests that exercise the
-    fake transport state machine opt in, one by one.
+    The guard is closed by default since asaas-rollout-opening Group 2c; the
+    tests of the fake transport state machine still pin it, so they keep
+    proving the machine if the guard is ever reopened.
     """
 
     monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", False)
@@ -1227,15 +1232,30 @@ async def test_successive_ticks_advance_the_reconcile_cursor_over_every_fact(
         assert await _alerts(factory, outbox_id, ACK_MISSING_DETAIL) == 1
 
 
-async def test_no_transport_can_be_wired_while_presentation_preconditions_are_open(
+# ---------------------------------------------------------------------------
+# The closed presentation guard and the main.py wiring
+# (asaas-rollout-opening Group 2c)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_presentation_guard_is_closed_and_bites_again_when_reopened(
     factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.api import main as main_module
-
-    assert outbox_module.PRESENTATION_PRECONDITIONS_OPEN is True
-    guard = outbox_module.PresentationPreconditionsOpen
-    outbox_id = await _seed_fact(factory)
+    # Closed on purpose: the two-phase record (2a) and the requeue and its
+    # runbook (2b) are on main.  Inverts the pin that asserted it open.
+    assert outbox_module.PRESENTATION_PRECONDITIONS_OPEN is False
+    outbox_module.require_presentation_allowed()
+    first = await _seed_fact(factory)
     transport = _Transport()
+    worker = BillingFactWorker(factory, transport=transport, config=_config())
+    assert worker.consumer_ready
+    assert (await worker.run_tick()).presented == 1
+    assert transport.sent == [str(first)]
+
+    # Reopened, every presenting entry point raises again before any work.
+    monkeypatch.setattr(outbox_module, "PRESENTATION_PRECONDITIONS_OPEN", True)
+    guard = outbox_module.PresentationPreconditionsOpen
+    second = await _seed_fact(factory)
     with pytest.raises(guard, match="presentation preconditions are open"):
         BillingFactWorker(factory, transport=transport, config=_config())
     enabled = settings.model_copy(update={"billing_fact_worker_enabled": True})
@@ -1243,28 +1263,659 @@ async def test_no_transport_can_be_wired_while_presentation_preconditions_are_op
         start_billing_fact_worker(enabled, lambda: factory, transport=transport)
     assert all(task.get_name() != "billing-fact-worker" for task in asyncio.all_tasks())
     async with factory() as session:
-        publisher = BillingFactPublisher(session)
         with pytest.raises(guard, match="presentation preconditions are open"):
-            await publisher.publish_next(
+            await BillingFactPublisher(session).publish_next(
                 transport, policy=FactRetryPolicy(max_attempts=3), timeout=1.0
             )
-        with pytest.raises(guard, match="presentation preconditions are open"):
-            await publisher.publish_pending(transport)
-        with pytest.raises(guard, match="presentation preconditions are open"):
-            await publisher.pending()
-    assert transport.sent == []
+    assert transport.sent == [str(first)]
+    delivery = await _delivery(factory, second)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 0)
+
+
+def test_the_legacy_single_phase_sender_is_gone() -> None:
+    # Whoever closes the guard removes the path it never covered.
+    for name in ("publish_pending", "pending", "_record_attempt"):
+        assert not hasattr(BillingFactPublisher, name), name
+    assert not hasattr(outbox_module, "PublishedFact")
+    source = (ROOT / "src/services/billing_outbox.py").read_text(encoding="utf-8")
+    for name in ("publish_pending", "_record_attempt", "PublishedFact"):
+        assert name not in source, name
+
+
+def _captured_start(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    from src.api import main as main_module
+
+    captured: dict[str, object] = {}
+
+    def fake_start(source: Settings, provider: Any, **wiring: Any) -> None:
+        assert source is settings
+        captured.update(wiring)
+
+    monkeypatch.setattr(main_module, "start_billing_fact_worker", fake_start)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("worker_on", "transport_on"),
+    [
+        pytest.param(True, False, id="worker-on-transport-off"),
+        pytest.param(False, True, id="worker-off-transport-on"),
+        pytest.param(False, False, id="both-off"),
+    ],
+)
+def test_main_wires_todays_worker_unless_both_settings_are_on(
+    monkeypatch: pytest.MonkeyPatch, worker_on: bool, transport_on: bool
+) -> None:
+    from src.api import main as main_module
+
+    assert Settings.model_fields["billing_fact_transport_enabled"].default is False
+    monkeypatch.setattr(settings, "billing_fact_worker_enabled", worker_on)
+    monkeypatch.setattr(settings, "billing_fact_transport_enabled", transport_on)
+    captured = _captured_start(monkeypatch)
+    assert main_module._start_billing_fact_worker() is None
+    # Exactly today's call: no transport and no readiness hook.
+    assert captured == {"transport": None}
+
+
+def test_main_wires_the_credit_consumer_behind_its_readiness_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.api import main as main_module
+
+    monkeypatch.setattr(settings, "billing_fact_worker_enabled", True)
+    monkeypatch.setattr(settings, "billing_fact_transport_enabled", True)
+    captured = _captured_start(monkeypatch)
+    main_module._start_billing_fact_worker()
+    assert set(captured) == {"transport", "transport_ready"}
+    assert captured["transport_ready"] is main_module._billing_fact_transport_ready
+    assert inspect.iscoroutinefunction(captured["transport"])
+
+
+async def test_with_the_transport_setting_off_main_starts_todays_worker(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.api import main as main_module
+
+    outbox_id = await _seed_fact(factory)
+    monkeypatch.setattr(settings, "billing_fact_worker_enabled", True)
+    monkeypatch.setattr(settings, "billing_fact_transport_enabled", False)
+    monkeypatch.setattr(
+        "src.repositories.database.get_db_session_factory", lambda: factory
+    )
+    worker = main_module._start_billing_fact_worker()
+    assert worker is not None
+    await worker.stop()
+    assert worker.consumer_ready is False
+    report = await worker.run_tick()  # the loop is stopped: one more tick
+    assert (report.presented, report.failed, report.not_ready) == (0, 0, 0)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count, delivery.last_attempt_at) == (
+        "pending",
+        0,
+        None,
+    )
+
+
+# The consumer module registers its own metric families on import, so "not
+# imported" is what keeps the setting-off process identical to today.
+_CONSUMER_IMPORT_PROBE = """
+import json, sys
+from src.api import main
+calls = []
+main.start_billing_fact_worker = lambda source, provider, **wiring: calls.append(
+    sorted(wiring)
+)
+main._start_billing_fact_worker()
+print(json.dumps({
+    "calls": calls,
+    "imported": "src.services.credit_fact_consumer" in sys.modules,
+}))
+"""
+
+
+@pytest.mark.parametrize(
+    ("transport_setting", "imported", "wiring"),
+    [
+        pytest.param("false", False, ["transport"], id="off-never-imported"),
+        pytest.param("true", True, ["transport", "transport_ready"], id="on"),
+    ],
+)
+def test_with_the_transport_setting_off_the_consumer_is_never_imported(
+    transport_setting: str, imported: bool, wiring: list[str]
+) -> None:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", "PYTHONSTARTUP"}
+    }
+    environment.update(
+        PYTHONDONTWRITEBYTECODE="1",
+        BILLING_FACT_WORKER_ENABLED="true",
+        BILLING_FACT_TRANSPORT_ENABLED=transport_setting,
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", _CONSUMER_IMPORT_PROBE],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    probe = json.loads(result.stdout.strip().splitlines()[-1])
+    assert probe == {"calls": [wiring], "imported": imported}
+
+
+# ---------------------------------------------------------------------------
+# The readiness hook: no attempt is spent while the consumer is not ready
+# ---------------------------------------------------------------------------
+
+# The switch causes, then the image-level faults of the consumer's own
+# contract check (``consumer_contract_digests``): faults of the image, never
+# of one fact, so none of them may spend an attempt.
+_IMAGE_FAULTS = (
+    "bundle_digest_unavailable",
+    "bundle_digest_differs",
+    "schema_unavailable",
+    "schema_digest_differs",
+    "catalog_differs",
+)
+_UNREADY_CAUSES = ("config_off", "schema_below_042", *_IMAGE_FAULTS)
+
+
+@pytest.fixture
+async def credit_switch_reset() -> AsyncIterator[None]:
+    from src.services.credit_switch import stop_credit_switch
+
+    try:
+        yield
+    finally:
+        await stop_credit_switch(None)  # the process verdict back to off
+
+
+async def _drive_readiness(
+    factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    cause: str | None,
+) -> str:
+    """Make the REAL switch verdict and contract check show ``cause``."""
+
+    from src.services import credit_fact_consumer as consumer_module
+    from src.services.credit_switch import refresh_credit_switch
+
+    async with factory() as session:
+        await session.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version "
+                "(version_num VARCHAR(32) NOT NULL)"
+            )
+        )
+        await session.execute(text("DELETE FROM alembic_version"))
+        await session.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": "041" if cause == "schema_below_042" else "042"},
+        )
+        await session.commit()
+    reading = await refresh_credit_switch(
+        enabled=cause != "config_off", session_factory=factory
+    )
+    missing = ROOT / "no-such-dir"
+    if cause == "bundle_digest_unavailable":
+        real_bundle = outbox_module.billing_fact_bundle_digest
+        monkeypatch.setattr(
+            consumer_module,
+            "billing_fact_bundle_digest",
+            lambda: real_bundle(missing / "SHA256SUMS"),
+        )
+    elif cause == "bundle_digest_differs":
+        monkeypatch.setattr(consumer_module, "PINNED_BUNDLE_DIGEST", "0" * 64)
+    elif cause == "schema_unavailable":
+        real_schema = outbox_module.billing_fact_schema_digest
+        monkeypatch.setattr(
+            consumer_module,
+            "billing_fact_schema_digest",
+            lambda: real_schema(missing / "billing_fact_v1.schema.json"),
+        )
+    elif cause == "schema_digest_differs":
+        monkeypatch.setattr(consumer_module, "PINNED_SCHEMA_DIGEST", "0" * 64)
+    elif cause == "catalog_differs":
+        real_catalog = consumer_module.catalog_snapshot_bytes
+        monkeypatch.setattr(
+            consumer_module,
+            "catalog_snapshot_bytes",
+            lambda: real_catalog() + b"another catalog",
+        )
+    return reading.reason
+
+
+@pytest.mark.usefixtures("credit_switch_reset")
+@pytest.mark.parametrize(
+    ("cause", "reason"),
+    [
+        pytest.param(None, "schema_ready", id="ready"),
+        pytest.param("config_off", "config_disabled", id="config_off"),
+        pytest.param("schema_below_042", "schema_below_minimum", id="schema_041"),
+        pytest.param("bundle_digest_unavailable", "schema_ready", id="no_manifest"),
+        pytest.param("bundle_digest_differs", "schema_ready", id="bundle_pin"),
+        pytest.param("schema_unavailable", "schema_ready", id="no_schema"),
+        pytest.param("schema_digest_differs", "schema_ready", id="schema_pin"),
+        pytest.param("catalog_differs", "schema_ready", id="catalog_pin"),
+    ],
+)
+async def test_the_readiness_hook_is_false_for_each_of_its_causes(
+    factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    cause: str | None,
+    reason: str,
+) -> None:
+    from src.api import main as main_module
+
+    assert await _drive_readiness(factory, monkeypatch, cause) == reason
+    assert main_module._billing_fact_transport_ready() is (cause is None)
+
+
+def _not_ready_total() -> float:
+    return _sample("neurostack_billing_fact_consumer_not_ready_total")
+
+
+def _attempt_totals() -> dict[str, float]:
+    return {
+        outcome: _sample(
+            "neurostack_billing_fact_publish_attempts_total", outcome=outcome
+        )
+        for outcome in ("presented", "failed", "exhausted")
+    }
+
+
+@pytest.mark.usefixtures("credit_switch_reset")
+@pytest.mark.parametrize("cause", _UNREADY_CAUSES)
+async def test_an_unready_consumer_never_spends_or_blocks_through_main(
+    factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    cause: str,
+) -> None:
+    from src.api import main as main_module
+    from src.services import credit_fact_consumer as consumer_module
+
+    await _drive_readiness(factory, monkeypatch, cause)
+    handled: list[object] = []
+
+    async def consumer(payload: dict[str, object]) -> None:
+        handled.append(payload["event_id"])
+
+    monkeypatch.setattr(consumer_module, "handle_billing_fact", consumer)
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+    worker = BillingFactWorker(
+        factory,
+        transport=main_module._credit_fact_transport(),
+        transport_ready=main_module._billing_fact_transport_ready,
+        # One attempt allowed: a single spent attempt would block the fact.
+        config=_config(max_attempts=1),
+        now=clock,
+    )
+    not_ready, attempts = _not_ready_total(), _attempt_totals()
+    for _ in range(4):
+        report = await worker.run_tick()
+        assert (report.outcome, report.not_ready, report.presented) == (
+            "completed",
+            1,
+            0,
+        )
+        assert (report.failed, report.exhausted, report.backlog.blocked) == (0, 0, 0)
+        delivery = await _delivery(factory, outbox_id)
+        assert (delivery.state, delivery.attempt_count) == ("pending", 0)
+        clock.advance(hours=2)  # past every backoff: due again each tick
+    assert handled == []  # the hook turned it away before the consumer
+    assert _not_ready_total() == not_ready + 4
+    assert _attempt_totals() == attempts
+
+
+@pytest.mark.usefixtures("credit_switch_reset")
+async def test_the_switch_off_inside_the_real_consumer_is_not_an_attempt(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.api import main as main_module
+    from src.services.credit_fact_consumer import CreditSwitchOff
+
+    await _drive_readiness(factory, monkeypatch, "config_off")
+    outbox_id = await _seed_fact(factory)
+    async with factory() as session:
+        stored = await session.get(BillingOutboxEvent, outbox_id)
+        assert stored is not None
+        payload = dict(stored.payload)
+    transport = main_module._credit_fact_transport()
+    with pytest.raises(TransportNotReady) as turned_away:
+        await transport(payload)
+    assert isinstance(turned_away.value.__cause__, CreditSwitchOff)
+
+    # The hook is forced to say ready, so only main's translation of the
+    # real consumer's CreditSwitchOff keeps the attempt from being counted.
+    worker = BillingFactWorker(
+        factory,
+        transport=transport,
+        transport_ready=lambda: True,
+        config=_config(max_attempts=1),
+        now=_Clock(),
+    )
+    report = await worker.run_tick()
+    assert (report.not_ready, report.failed, report.exhausted) == (1, 0, 0)
     delivery = await _delivery(factory, outbox_id)
     assert (delivery.state, delivery.attempt_count) == ("pending", 0)
 
-    # The production wiring passes no transport at all.
-    captured: dict[str, object] = {}
 
-    def fake_start(source: Settings, provider: Any, *, transport: Any) -> None:
-        captured["transport"] = transport
+@pytest.mark.parametrize(
+    ("flips", "counted"),
+    [
+        pytest.param(True, False, id="readiness-flipped-off"),
+        pytest.param(False, True, id="still-ready-a-real-failure"),
+    ],
+)
+async def test_readiness_flipping_off_during_a_presentation_is_not_counted(
+    factory: async_sessionmaker[AsyncSession], flips: bool, counted: bool
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    ready = [True]
 
-    monkeypatch.setattr(main_module, "start_billing_fact_worker", fake_start)
-    assert main_module._start_billing_fact_worker() is None
-    assert captured == {"transport": None}
+    async def consumer(payload: dict[str, object]) -> None:
+        if flips:
+            ready[0] = False  # e.g. the switch refresher, mid-presentation
+        raise RuntimeError("consumer failed")
+
+    worker = BillingFactWorker(
+        factory,
+        transport=consumer,
+        transport_ready=lambda: ready[0],
+        config=_config(),
+        now=_Clock(),
+    )
+    report = await worker.run_tick()
+    assert (report.not_ready, report.failed) == ((0, 1) if counted else (1, 0))
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", int(counted))
+
+
+_REAL_FAILURES = ("handoff_digest_mismatch", "unresolvable_fact", "database_error")
+
+
+async def _make_the_real_consumer_fail(
+    factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    outbox_id: UUID,
+    failure: str,
+) -> type[BaseException]:
+    """Make the REAL consumer raise a non-switch error for this one fact."""
+
+    from sqlalchemy.exc import OperationalError
+
+    from src.repositories.credit_fact_ack import CreditFactAckRepository
+    from src.services import credit_fact_consumer as consumer_module
+
+    monkeypatch.setattr(consumer_module, "default_session_factory", lambda: factory)
+    if failure == "handoff_digest_mismatch":
+        # Per fact (credit_fact_consumer ``_consume``): the image passes its
+        # own contract check, the handoff names another bundle digest.
+        async with factory() as session:
+            await session.execute(
+                update(BillingFactHandoff)
+                .where(BillingFactHandoff.outbox_event_id == outbox_id)
+                .values(bundle_digest="f" * 64)
+            )
+            await session.commit()
+        return consumer_module.ConsumerContractDivergence
+    if failure == "unresolvable_fact":
+        async with factory() as session:
+            await session.execute(
+                BillingFactHandoff.__table__.delete().where(
+                    BillingFactHandoff.outbox_event_id == outbox_id
+                )
+            )
+            await session.commit()
+        return consumer_module.UnresolvableFact
+
+    async def unavailable(self: object, event_id: UUID) -> None:
+        raise OperationalError("SELECT handoff", {}, ConnectionError("db down"))
+
+    monkeypatch.setattr(CreditFactAckRepository, "resolve_handoff", unavailable)
+    return OperationalError
+
+
+@pytest.mark.usefixtures("credit_switch_reset")
+@pytest.mark.parametrize("hook", ["forced_true", "main_hook"])
+@pytest.mark.parametrize("failure", _REAL_FAILURES)
+async def test_only_the_switch_is_translated_a_real_consumer_failure_is_counted(
+    factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    hook: str,
+) -> None:
+    """Through main's transport and the REAL consumer, with the hook true: a
+    failure that is not ``CreditSwitchOff`` spends its attempt (a broadened
+    translation would make every failure free and the fact eternal)."""
+
+    from src.api import main as main_module
+
+    assert await _drive_readiness(factory, monkeypatch, None) == "schema_ready"
+    outbox_id = await _seed_fact(factory)
+    raised = await _make_the_real_consumer_fail(
+        factory, monkeypatch, outbox_id, failure
+    )
+    async with factory() as session:
+        stored = await session.get(BillingOutboxEvent, outbox_id)
+        assert stored is not None
+        payload = dict(stored.payload)
+    transport = main_module._credit_fact_transport()
+    with pytest.raises(raised):
+        await transport(payload)
+    # The per-fact faults never touch the image-level check.
+    assert main_module._billing_fact_transport_ready() is True
+
+    worker = BillingFactWorker(
+        factory,
+        transport=transport,
+        transport_ready=(
+            (lambda: True)
+            if hook == "forced_true"
+            else main_module._billing_fact_transport_ready
+        ),
+        config=_config(),
+        now=_Clock(),
+    )
+    not_ready, attempts = _not_ready_total(), _attempt_totals()
+    report = await worker.run_tick()
+    assert (report.failed, report.not_ready, report.presented) == (1, 0, 0)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 1)
+    assert _not_ready_total() == not_ready
+    assert _attempt_totals() == {**attempts, "failed": attempts["failed"] + 1}
+
+
+@pytest.mark.usefixtures("credit_switch_reset")
+async def test_the_readiness_hook_never_reaches_the_database(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The image check is file-level: no statement per call of the hook."""
+
+    from sqlalchemy import event
+
+    from src.api import main as main_module
+
+    await _drive_readiness(factory, monkeypatch, None)
+    engine = factory.kw["bind"].sync_engine
+    statements: list[str] = []
+
+    def record(*args: object) -> None:
+        statements.append(str(args[2]))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        started = time.perf_counter()
+        for _ in range(50):
+            assert main_module._billing_fact_transport_ready() is True
+        elapsed = time.perf_counter() - started
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert statements == []
+    # Measured: ~0.2 ms per call idle, ~0.5 ms with every core busy (at most
+    # 27 ms for 50 calls): 0.5 s keeps a wide margin and still fails a hook
+    # of 10 ms per call.
+    assert elapsed < 0.5
+
+
+@pytest.mark.usefixtures("credit_switch_reset")
+async def test_the_hook_reads_only_a_contract_divergence_as_not_ready(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any other error of the contract check is a bug: the hook lets it out,
+    so the worker logs ``readiness unreadable`` instead of turning silent."""
+
+    from src.api import main as main_module
+    from src.services import credit_fact_consumer as consumer_module
+
+    await _drive_readiness(factory, monkeypatch, None)
+
+    def broken() -> bytes:
+        raise TypeError("catalog snapshot is broken")
+
+    monkeypatch.setattr(consumer_module, "catalog_snapshot_bytes", broken)
+    with pytest.raises(TypeError, match="catalog snapshot is broken"):
+        main_module._billing_fact_transport_ready()
+
+    recorder = _LogRecorder()
+    monkeypatch.setattr(worker_module, "logger", recorder)
+    outbox_id = await _seed_fact(factory)
+    transport = _Transport()
+    worker = BillingFactWorker(
+        factory,
+        transport=transport,
+        transport_ready=main_module._billing_fact_transport_ready,
+        config=_config(),
+        now=_Clock(),
+    )
+    report = await worker.run_tick()
+    assert (report.not_ready, report.failed) == (1, 0)
+    assert transport.sent == []
+    assert (await _delivery(factory, outbox_id)).attempt_count == 0
+    assert (
+        "billing fact consumer readiness unreadable",
+        {"failure_class": "TypeError"},
+    ) in recorder.errors
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_timeout_behind_the_hook_stays_a_counted_attempt(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The timeout cancels the presentation: the readiness wrapper must let
+    the cancellation through even when the hook has turned false."""
+
+    outbox_id = await _seed_fact(factory)
+    ready = [True]
+
+    async def hanging(payload: dict[str, object]) -> None:
+        ready[0] = False
+        await asyncio.Event().wait()
+
+    worker = BillingFactWorker(
+        factory,
+        transport=hanging,
+        transport_ready=lambda: ready[0],
+        config=_config(transport_timeout_seconds=0.05),
+        now=_Clock(),
+    )
+    report = await worker.run_tick()
+    assert (report.failed, report.not_ready) == (1, 0)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 1)
+
+
+@pytest.mark.usefixtures("presentation_preconditions_waived")
+async def test_a_cancellation_behind_the_hook_is_never_swallowed(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    outbox_id = await _seed_fact(factory)
+    ready = [True]
+    entered = asyncio.Event()
+
+    async def hanging(payload: dict[str, object]) -> None:
+        ready[0] = False
+        entered.set()
+        await asyncio.Event().wait()
+
+    worker = BillingFactWorker(
+        factory,
+        transport=hanging,
+        transport_ready=lambda: ready[0],
+        config=_config(transport_timeout_seconds=30.0),
+    )
+    task = worker.start()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        task.cancel()  # a real cancellation aimed at the loop task
+        await asyncio.wait({task}, timeout=10)
+        assert task.done(), "a genuine cancellation was swallowed"
+        assert task.cancelled()
+    finally:
+        await worker.stop(grace=0.1)
+    delivery = await _delivery(factory, outbox_id)
+    assert (delivery.state, delivery.attempt_count) == ("pending", 1)
+
+
+async def test_a_readiness_hook_that_raises_or_is_not_true_is_not_ready(
+    factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _LogRecorder()
+    monkeypatch.setattr(worker_module, "logger", recorder)
+    outbox_id = await _seed_fact(factory)
+    clock = _Clock()
+
+    def broken() -> bool:
+        raise RuntimeError("readiness unreadable")
+
+    for hook in (broken, lambda: 1, lambda: None):
+        transport = _Transport()
+        worker = BillingFactWorker(
+            factory,
+            transport=transport,
+            transport_ready=hook,  # type: ignore[arg-type]
+            config=_config(),
+            now=clock,
+        )
+        assert (await worker.run_tick()).not_ready == 1
+        assert transport.sent == []
+        clock.advance(minutes=2)
+    assert (await _delivery(factory, outbox_id)).attempt_count == 0
+    assert (
+        "billing fact consumer readiness unreadable",
+        {"failure_class": "RuntimeError"},
+    ) in recorder.errors
+
+
+def test_a_readiness_hook_needs_a_transport(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    with pytest.raises(ValueError, match="^a readiness hook needs a transport$"):
+        BillingFactWorker(
+            factory, transport=None, transport_ready=lambda: True, config=_config()
+        )
+
+
+def test_not_ready_has_its_own_label_less_counter_outside_the_attempts() -> None:
+    from src.observability.metric_dimensions import metric_dimension_contract
+
+    contract = metric_dimension_contract("neurostack_billing_fact_consumer_not_ready")
+    assert contract.labels == ()
+    attempts = metric_dimension_contract("neurostack_billing_fact_publish_attempts")
+    assert attempts.labels == ("outcome",)
+    assert attempts.policies["outcome"].vocabulary == frozenset(
+        {"presented", "failed", "exhausted"}
+    )
+    # Exported at zero from import, before any not-ready happened.
+    assert (
+        REGISTRY.get_sample_value("neurostack_billing_fact_consumer_not_ready_total")
+        is not None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1508,6 +2159,10 @@ async def test_a_not_ready_presentation_is_logged_but_never_counted_as_an_attemp
         )
         for outcome in outcomes
     }
+    not_ready = _sample("neurostack_billing_fact_consumer_not_ready_total")
+    completed = _sample(
+        "neurostack_billing_fact_worker_ticks_total", outcome="completed"
+    )
     worker = BillingFactWorker(
         factory, transport=_NotReady(), config=_config(), now=_Clock()
     )
@@ -1518,6 +2173,13 @@ async def test_a_not_ready_presentation_is_logged_but_never_counted_as_an_attemp
         )
         for outcome in outcomes
     } == before
+    # Its own bounded signal (Group 2c), while the tick itself completed.
+    assert _sample("neurostack_billing_fact_consumer_not_ready_total") == (
+        not_ready + 1
+    )
+    assert _sample(
+        "neurostack_billing_fact_worker_ticks_total", outcome="completed"
+    ) == (completed + 1)
     assert ("billing fact consumer not ready", {"attempt_count": 0}) in (
         recorder.warnings
     )
