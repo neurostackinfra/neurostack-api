@@ -42,6 +42,8 @@ def _credit_modules() -> list[Path]:
         ROOT / "src/api/routes/admin_credits.py",
         ROOT / "src/api/schemas/credits.py",
         ROOT / "src/api/schemas/admin_credits.py",
+        # The credit one-off tasks (``python -m src.ops.credit_enforcement``).
+        *sorted((ROOT / "src/ops").glob("credit_*.py")),
     ]
     return [path for path in paths if path.exists()]
 
@@ -57,6 +59,7 @@ def test_the_swept_module_set_is_the_declared_one() -> None:
         "src/services/content_retention.py",
         "src/models/content_retention.py",
         "src/api/routes/admin_credits.py",
+        "src/ops/credit_enforcement.py",
     } <= swept
 
 

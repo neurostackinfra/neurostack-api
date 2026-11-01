@@ -143,7 +143,12 @@ async def credit_capability_status(
     actor: Actor = Depends(_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> CreditRolloutStatus:
-    """Read code readiness; neither records a receipt nor arms enforcement."""
+    """Read code readiness; neither records a receipt nor arms enforcement.
+
+    Orphans are the FULL-history scan (set-based, a constant number of
+    statements, human-triggered), so an orphan older than the periodic window
+    stays visible here until it closes.
+    """
 
     del actor
     rollout = CreditRolloutService(session)

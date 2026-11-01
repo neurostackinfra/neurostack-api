@@ -185,8 +185,23 @@ def test_only_credit_code_and_main_may_import_the_fact_handler() -> None:
     ), "handle_billing_fact is wired into main.py before Group 8"
 
 
+def _credit_writer_files() -> list[Path]:
+    """The credit modules plus the credit one-off tasks (``src/ops/credit_*``):
+    the tasks are swept for ASAAS writes only, never added to the set of
+    modules allowed to import the fact handler."""
+
+    return sorted({*_credit_files(), *_ROOT.glob("src/ops/credit_*.py")})
+
+
+def test_the_asaas_write_sweep_covers_the_credit_tasks() -> None:
+    swept = {path.relative_to(_ROOT).as_posix() for path in _credit_writer_files()}
+    assert "src/ops/credit_enforcement.py" in swept
+
+
 @pytest.mark.parametrize(
-    "path", _credit_files(), ids=lambda path: path.relative_to(_ROOT).as_posix()
+    "path",
+    _credit_writer_files(),
+    ids=lambda path: path.relative_to(_ROOT).as_posix(),
 )
 def test_credit_code_writes_no_asaas_table_but_the_ack(path: Path) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

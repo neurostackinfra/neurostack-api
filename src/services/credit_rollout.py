@@ -13,13 +13,32 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
-from typing import Awaitable, Callable, Final, Literal
+from datetime import date, datetime, time, timedelta, timezone
+from time import monotonic
+from typing import Any, Awaitable, Callable, Final, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, case, exists, func, or_, select
+from sqlalchemy import (
+    String,
+    and_,
+    any_,
+    bindparam,
+    case,
+    exists,
+    func,
+    literal,
+    literal_column,
+    null,
+    or_,
+    select,
+    true,
+)
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from src.config.logging import get_logger
 from src.config.settings import settings
@@ -78,6 +97,16 @@ ORPHAN_EFFECT_KINDS: Final = frozenset(
         "maintenance",
     }
 )
+# The periodic orphan pass (worker, admin GET routes) anchors only on rows
+# created in this window; the full-history scan is the arming transaction's.
+ORPHAN_PERIODIC_WINDOW: Final = timedelta(hours=24)
+# The worker's full-history sweep cadence (seconds of its monotonic clock).
+ORPHAN_FULL_SWEEP_SECONDS: Final = 900.0
+# Deletion closures written per worker pass (the rest on the next ones).
+ORPHAN_CLOSURE_BATCH: Final = 500
+# ``run_credit_orphan_reconciliation_once`` when another process holds the
+# pass lock (distinct from a clean pass, which returns 0).
+ORPHAN_PASS_SKIPPED: Final = -1
 UNKNOWN_INGRESS_SOURCES: Final = frozenset({"uazapi", "evolution"})
 # Non-terminal ASAAS subscription statuses (``ck_billing_subscriptions_status``
 # of ``src/models/billing.py``; terminal are ``inactive`` and ``cancelled``).
@@ -670,7 +699,8 @@ class CreditRolloutService:
         is also true while an ASAAS line is ``quarantined`` (quarantine), while
         a settled cycle's binding is missing or behind its revision (consumer
         binding lag -- requests are still served), for an open ``rejected``
-        ack or digest mismatch, and while an orphan effect is open.
+        ack or digest mismatch, and while an orphan effect is open (the
+        full-history orphan scan).
         """
 
         return await self._capability_readiness(now=now, orphans=self.orphan_report)
@@ -792,6 +822,7 @@ class CreditRolloutService:
         message_rows = (
             await self.session.execute(
                 select(Event.tenant_id, Tenant.builder_id)
+                .distinct()
                 .outerjoin(Tenant, Tenant.id == Event.tenant_id)
                 .where(
                     Event.event_type == "message.in",
@@ -912,22 +943,83 @@ class CreditRolloutService:
     ) -> str:
         return f"trace:{tenant_id}:{interaction_id}:decision:{decision_version}"
 
-    async def orphan_report(self) -> OrphanReport:
+    async def orphan_report(
+        self, *, since: datetime | None = None, publish: bool = True
+    ) -> OrphanReport:
         """Reconcile durable decision/effect/outbox boundaries by reading only.
 
         Zero-cost effects are complete effects, not partial debits.  The one
         mutation is intentionally elsewhere in :meth:`reconcile_orphans` and
         is limited to a deletion closure for an already-deleted tenant.
+
+        ``since=None`` is the FULL scan over all history: the arming
+        transaction, its ops ``status`` preview, the admin GET routes and the
+        worker's low-cadence full sweep run it.  The worker's every-tick pass
+        passes ``since`` (:meth:`periodic_orphan_since`): only claims,
+        effects, response-outbox rows and handoffs created at or after it are
+        anchors.  Either way the statement count does not grow with the
+        number of rows (no per-effect query).  The gauge is set only when
+        *publish* (the worker publishes its own combined value).
         """
 
-        return await self._orphan_report(assumed_closures=frozenset(), publish=True)
+        return await self._orphan_report(
+            assumed_closures=frozenset(), publish=publish, since=since
+        )
+
+    async def periodic_orphan_since(self) -> datetime:
+        """Start of the periodic orphan window, at the database clock."""
+
+        now = await CreditRepository(self.session).database_now()
+        return now - ORPHAN_PERIODIC_WINDOW
+
+    def _postgresql(self) -> bool:
+        return self.session.get_bind().dialect.name == "postgresql"
+
+    def _one_of(self, column: Any, values: list[Any], item_type: Any) -> Any:
+        """``column = ANY(:values)``: ONE bound array on PostgreSQL, however
+        many values (an expanded ``IN`` would bind one parameter each)."""
+
+        if self._postgresql():
+            return column == any_(bindparam(None, value=values, type_=ARRAY(item_type)))
+        return column.in_(values)
+
+    @staticmethod
+    def _trace_claim_key(effect_id: str) -> tuple[UUID, UUID] | None:
+        """``(tenant_id, interaction_id)`` named by a trace effect id."""
+
+        parts = effect_id.split(":")
+        if len(parts) != 5 or parts[0] != "trace" or parts[3] != "decision":
+            return None
+        try:
+            return UUID(parts[1]), UUID(parts[2])
+        except ValueError:
+            return None
 
     async def _orphan_report(
-        self, *, assumed_closures: frozenset[str], publish: bool
+        self,
+        *,
+        assumed_closures: frozenset[str],
+        publish: bool,
+        since: datetime | None = None,
     ) -> OrphanReport:
         """:meth:`orphan_report` as if *assumed_closures* (deletion-closure
-        effect ids) were already written; the gauge only when *publish*."""
+        effect ids) were already written; the gauge only when *publish*.
 
+        A constant number of statements (at most nine), whatever the number
+        of claims, effects, outbox rows or handoffs: every join is one
+        set-based query.  With *since* every anchor is window-bounded and the
+        lookups of the other side are keyed (tenant-scoped) by the anchors.
+        """
+
+        def recent(column: Any) -> Any:
+            return true() if since is None else column >= since
+
+        trace_kinds = ("trace", "trace_credit_pending", "trace_no_response")
+        inventory_kinds = ("rag", "media", "egress", "maintenance")
+        enforced_claim = and_(
+            CreditIngressClaim.mode == "enforced",
+            CreditIngressClaim.builder_id.is_not(None),
+        )
         claims = (
             await self.session.execute(
                 select(
@@ -935,13 +1027,13 @@ class CreditRolloutService:
                     CreditIngressClaim.builder_id,
                     CreditIngressClaim.interaction_id,
                     CreditIngressClaim.decision_version,
-                ).where(
-                    CreditIngressClaim.mode == "enforced",
-                    CreditIngressClaim.builder_id.is_not(None),
-                )
+                ).where(enforced_claim, recent(CreditIngressClaim.created_at))
             )
         ).all()
-        expected: set[tuple[UUID, str]] = {
+        # The decisions of the window (or of all history): each must have
+        # its effect.  An effect is written after its claim, so an anchored
+        # claim's effect is itself inside the window.
+        anchored: set[tuple[UUID, str]] = {
             (
                 builder_id,
                 self._trace_effect_id(tenant_id, interaction_id, int(version)),
@@ -949,31 +1041,10 @@ class CreditRolloutService:
             for tenant_id, builder_id, interaction_id, version in claims
             if isinstance(builder_id, UUID)
         }
-        closure_effect_ids = {
-            effect_id
-            for (effect_id,) in (
-                await self.session.execute(
-                    select(CreditEffect.effect_id).where(
-                        CreditEffect.effect_kind == "deletion_closure"
-                    )
-                )
-            ).all()
-        } | assumed_closures
-        live_tenants = {
-            tenant_id
-            for (tenant_id,) in (await self.session.execute(select(Tenant.id))).all()
-        }
-        allocation_effects = {
-            (builder_id, effect_id)
-            for builder_id, effect_id in (
-                await self.session.execute(
-                    select(
-                        CreditAllocation.builder_id, CreditAllocation.effect_id
-                    ).where(CreditAllocation.effect_id.is_not(None))
-                )
-            ).all()
-            if isinstance(effect_id, str)
-        }
+        window_effects = select(CreditEffect).where(
+            CreditEffect.effect_kind.in_(ORPHAN_EFFECT_KINDS),
+            recent(CreditEffect.created_at),
+        )
         effects = (
             await self.session.execute(
                 select(
@@ -981,99 +1052,216 @@ class CreditRolloutService:
                     CreditEffect.tenant_id,
                     CreditEffect.effect_id,
                     CreditEffect.effect_kind,
-                ).where(CreditEffect.effect_kind.in_(ORPHAN_EFFECT_KINDS))
+                ).where(
+                    CreditEffect.effect_kind.in_(ORPHAN_EFFECT_KINDS),
+                    recent(CreditEffect.created_at),
+                )
             )
         ).all()
         actual = {
             (builder_id, effect_id) for builder_id, _tenant, effect_id, _kind in effects
         }
-        decision_without_effect = len(expected - actual)
+        decision_without_effect = len(anchored - actual)
 
         # Only trace-shaped effects are decisions with an ingress boundary.
         # RAG/media/maintenance use their own durable allocation/source key
         # and are checked through their effect/outbox states below.
-        effect_without_decision = 0
-        for builder_id, tenant_id, effect_id, kind in effects:
-            closed_by_deletion = (
+        expected = set(anchored)
+        unmatched_traces = [
+            effect_id
+            for builder_id, _tenant, effect_id, kind in effects
+            if kind in trace_kinds and (builder_id, effect_id) not in expected
+        ]
+        if since is not None and unmatched_traces:
+            # A trace effect of the window whose claim was created before it
+            # (a takeover/replay of an older claim): look exactly those claims
+            # up, tenant-scoped, in one statement.
+            keys = [
+                key
+                for key in map(self._trace_claim_key, unmatched_traces)
+                if key is not None
+            ]
+            if keys:
+                older = (
+                    await self.session.execute(
+                        select(
+                            CreditIngressClaim.tenant_id,
+                            CreditIngressClaim.builder_id,
+                            CreditIngressClaim.interaction_id,
+                            CreditIngressClaim.decision_version,
+                        ).where(
+                            enforced_claim,
+                            self._one_of(
+                                CreditIngressClaim.tenant_id,
+                                sorted({tenant for tenant, _ in keys}, key=str),
+                                PG_UUID(as_uuid=True),
+                            ),
+                            self._one_of(
+                                CreditIngressClaim.interaction_id,
+                                sorted(
+                                    {interaction for _, interaction in keys}, key=str
+                                ),
+                                PG_UUID(as_uuid=True),
+                            ),
+                        )
+                    )
+                ).all()
+                expected |= {
+                    (
+                        builder_id,
+                        self._trace_effect_id(tenant_id, interaction_id, int(version)),
+                    )
+                    for tenant_id, builder_id, interaction_id, version in older
+                    if isinstance(builder_id, UUID)
+                }
+
+        window = window_effects.subquery()
+        live_tenants = {
+            tenant_id
+            for (tenant_id,) in (
+                await self.session.execute(
+                    select(Tenant.id).where(
+                        Tenant.id.in_(
+                            select(window.c.tenant_id).where(
+                                window.c.tenant_id.is_not(None)
+                            )
+                        )
+                    )
+                )
+            ).all()
+        }
+        allocation_effects = {
+            (builder_id, effect_id)
+            for builder_id, effect_id in (
+                await self.session.execute(
+                    select(
+                        CreditAllocation.builder_id, CreditAllocation.effect_id
+                    ).where(
+                        CreditAllocation.effect_id.in_(
+                            select(window.c.effect_id).where(
+                                window.c.effect_kind.in_(inventory_kinds)
+                            )
+                        )
+                    )
+                )
+            ).all()
+            if isinstance(effect_id, str)
+        }
+
+        def undecided(builder_id: UUID, effect_id: str, kind: str) -> bool:
+            if kind in trace_kinds:
+                return (builder_id, effect_id) not in expected
+            if kind in inventory_kinds:
+                return (builder_id, effect_id) not in allocation_effects
+            return False
+
+        candidates = [
+            (tenant_id, effect_id)
+            for builder_id, tenant_id, effect_id, kind in effects
+            if undecided(builder_id, effect_id, kind)
+        ]
+        dead = {
+            self._deletion_closure_id(effect_id)
+            for tenant_id, effect_id in candidates
+            if tenant_id is not None and tenant_id not in live_tenants
+        }
+        written_closures: set[str] = set()
+        if dead - assumed_closures:
+            written_closures = {
+                effect_id
+                for (effect_id,) in (
+                    await self.session.execute(
+                        select(CreditEffect.effect_id).where(
+                            CreditEffect.effect_kind == "deletion_closure",
+                            self._one_of(
+                                CreditEffect.effect_id,
+                                sorted(dead - assumed_closures),
+                                String(),
+                            ),
+                        )
+                    )
+                ).all()
+            }
+        closure_effect_ids = written_closures | assumed_closures
+        effect_without_decision = sum(
+            1
+            for tenant_id, effect_id in candidates
+            if not (
                 tenant_id is not None
                 and tenant_id not in live_tenants
                 and self._deletion_closure_id(effect_id) in closure_effect_ids
             )
-            if (
-                kind in {"trace", "trace_credit_pending", "trace_no_response"}
-                and (builder_id, effect_id) not in expected
-                and not closed_by_deletion
-            ):
-                effect_without_decision += 1
-            elif (
-                kind in {"rag", "media", "egress", "maintenance"}
-                and (builder_id, effect_id) not in allocation_effects
-                and not closed_by_deletion
-            ):
-                effect_without_decision += 1
+        )
 
-        partial = 0
-        for builder_id, _tenant_id, effect_id, kind in effects:
-            if kind != "trace":
-                continue
-            debit = int(
-                await self.session.scalar(
-                    select(
-                        func.coalesce(func.sum(CreditLedgerEntry.amount_mc), 0)
-                    ).where(
-                        CreditLedgerEntry.builder_id == builder_id,
-                        CreditLedgerEntry.effect_id == effect_id,
-                        CreditLedgerEntry.entry_type == "debit",
+        # Traces only: debit + debt must be exactly one trace.  ONE aggregate
+        # statement (correlated sums per effect), never a query per effect.
+        debit = (
+            select(func.coalesce(func.sum(CreditLedgerEntry.amount_mc), 0))
+            .where(
+                CreditLedgerEntry.builder_id == CreditEffect.builder_id,
+                CreditLedgerEntry.effect_id == CreditEffect.effect_id,
+                CreditLedgerEntry.entry_type == "debit",
+            )
+            .correlate(CreditEffect)
+            .scalar_subquery()
+        )
+        debt = (
+            select(func.coalesce(func.sum(CreditDebt.amount_mc), 0))
+            .where(
+                CreditDebt.builder_id == CreditEffect.builder_id,
+                CreditDebt.debt_source_effect_id == CreditEffect.effect_id,
+            )
+            .correlate(CreditEffect)
+            .scalar_subquery()
+        )
+        partial = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(CreditEffect)
+                .where(
+                    CreditEffect.effect_kind == "trace",
+                    recent(CreditEffect.created_at),
+                    debit + debt != TRACE_COST_MC,
+                )
+            )
+            or 0
+        )
+
+        orphan_outbox = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(CreditResponseOutbox)
+                .where(
+                    recent(CreditResponseOutbox.created_at),
+                    ~exists().where(
+                        CreditEffect.tenant_id == CreditResponseOutbox.tenant_id,
+                        CreditEffect.effect_id == CreditResponseOutbox.effect_id,
+                    ),
+                )
+            )
+            or 0
+        )
+
+        # Only handoffs carrying a credit effect id are anchors; the query
+        # returns just those whose effect is missing (normally none).
+        linked = HandoffRecord.context["credit_effect_id"].as_string()
+        handoff_without_effect = sum(
+            1
+            for (context,) in (
+                await self.session.execute(
+                    select(HandoffRecord.context).where(
+                        recent(HandoffRecord.created_at),
+                        linked.is_not(None),
+                        ~exists().where(
+                            CreditEffect.tenant_id == HandoffRecord.tenant_id,
+                            CreditEffect.effect_id == linked,
+                        ),
                     )
                 )
-                or 0
-            )
-            debt = int(
-                await self.session.scalar(
-                    select(func.coalesce(func.sum(CreditDebt.amount_mc), 0)).where(
-                        CreditDebt.builder_id == builder_id,
-                        CreditDebt.debt_source_effect_id == effect_id,
-                    )
-                )
-                or 0
-            )
-            if debit + debt != TRACE_COST_MC:
-                partial += 1
-
-        orphan_outbox = 0
-        for tenant_id, effect_id in (
-            await self.session.execute(
-                select(CreditResponseOutbox.tenant_id, CreditResponseOutbox.effect_id)
-            )
-        ).all():
-            effect = await self.session.scalar(
-                select(CreditEffect.id).where(
-                    CreditEffect.tenant_id == tenant_id,
-                    CreditEffect.effect_id == effect_id,
-                )
-            )
-            if effect is None:
-                orphan_outbox += 1
-
-        handoff_without_effect = 0
-        for tenant_id, context in (
-            await self.session.execute(
-                select(HandoffRecord.tenant_id, HandoffRecord.context)
-            )
-        ).all():
-            effect_id = (
-                context.get("credit_effect_id") if isinstance(context, dict) else None
-            )
-            if not isinstance(effect_id, str):
-                continue
-            effect = await self.session.scalar(
-                select(CreditEffect.id).where(
-                    CreditEffect.tenant_id == tenant_id,
-                    CreditEffect.effect_id == effect_id,
-                )
-            )
-            if effect is None:
-                handoff_without_effect += 1
+            ).all()
+            if isinstance(context, dict)
+            and isinstance(context.get("credit_effect_id"), str)
+        )
 
         report = OrphanReport(
             decision_without_effect=decision_without_effect,
@@ -1105,6 +1293,110 @@ class CreditRolloutService:
                 )
             ).scalars()
         )
+
+    @staticmethod
+    def _closure_id_sql(effect_id: Any) -> Any:
+        """:meth:`_deletion_closure_id` in PostgreSQL: ``'deletion_closure:'``
+        || hex(sha256(utf8(effect_id)))."""
+
+        return literal("deletion_closure:", String()) + func.encode(
+            func.sha256(func.convert_to(effect_id, literal_column("'UTF8'"))),
+            literal_column("'hex'"),
+            type_=String(),
+        )
+
+    async def _write_missing_closures(self, *, limit: int | None) -> None:
+        """Write the deletion closure of every deleted-tenant effect that has
+        none yet -- whatever the effect's age -- at most *limit* per call
+        (``None``: all; a later pass picks up the rest).
+
+        PostgreSQL: ONE ``INSERT ... SELECT`` whose anti-join recomputes the
+        closure id in SQL, so the statement count does not grow with the
+        number of effects.  SQLite (single-process development/tests, no
+        ``sha256``): the same selection in Python.
+        """
+
+        if self._postgresql():
+            closure = aliased(CreditEffect)
+            closure_id = self._closure_id_sql(CreditEffect.effect_id)
+            pending = (
+                select(
+                    CreditEffect.builder_id.label("builder_id"),
+                    closure_id.label("closure_id"),
+                    CreditEffect.decision_digest.label("decision_digest"),
+                )
+                .where(
+                    CreditEffect.tenant_id.is_not(None),
+                    CreditEffect.effect_kind.in_(ORPHAN_EFFECT_KINDS),
+                    ~exists().where(Tenant.id == CreditEffect.tenant_id),
+                    ~exists().where(
+                        closure.builder_id == CreditEffect.builder_id,
+                        closure.effect_kind == "deletion_closure",
+                        closure.effect_id == closure_id,
+                    ),
+                )
+                .limit(limit)
+                .subquery()
+            )
+            await self.session.execute(
+                pg_insert(CreditEffect)
+                .from_select(
+                    [
+                        "id",
+                        "builder_id",
+                        "tenant_id",
+                        "effect_id",
+                        "effect_kind",
+                        "decision_digest",
+                    ],
+                    select(
+                        func.gen_random_uuid(),
+                        pending.c.builder_id,
+                        null(),
+                        pending.c.closure_id,
+                        literal("deletion_closure", String()),
+                        pending.c.decision_digest,
+                    ),
+                )
+                .on_conflict_do_nothing(index_elements=["builder_id", "effect_id"])
+            )
+            return
+        deleted_effects = await self._deleted_tenant_effects()
+        written: set[tuple[UUID, str]] = set()
+        if deleted_effects:
+            written = {
+                (builder_id, effect_id)
+                for builder_id, effect_id in (
+                    await self.session.execute(
+                        select(CreditEffect.builder_id, CreditEffect.effect_id).where(
+                            CreditEffect.effect_kind == "deletion_closure",
+                            CreditEffect.effect_id.in_(
+                                sorted(
+                                    {
+                                        self._deletion_closure_id(effect.effect_id)
+                                        for effect in deleted_effects
+                                    }
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+            }
+        missing = [
+            effect
+            for effect in deleted_effects
+            if (effect.builder_id, self._deletion_closure_id(effect.effect_id))
+            not in written
+        ]
+        repository = CreditRepository(self.session)
+        for effect in missing if limit is None else missing[:limit]:
+            await repository.insert_effect(
+                builder_id=effect.builder_id,
+                tenant_id=None,
+                effect_id=self._deletion_closure_id(effect.effect_id),
+                effect_kind="deletion_closure",
+                decision_digest=effect.decision_digest,
+            )
 
     async def deletion_closure_preview(
         self, *, now: datetime | None = None
@@ -1145,27 +1437,28 @@ class CreditRolloutService:
             ),
         )
 
-    async def reconcile_orphans(self) -> OrphanReport:
+    async def reconcile_orphans(
+        self,
+        *,
+        since: datetime | None = None,
+        publish: bool = True,
+        closure_limit: int | None = None,
+    ) -> OrphanReport:
         """Write only idempotent deleted-tenant closure effects, then report.
 
         A closure preserves the original decision digest under the original
         builder account; it never changes a balance, a fact, or any ASAAS
         table.  Normal orphan classes remain blockers for a human repair.
+
+        The closures are age-independent: every deleted-tenant effect still
+        without one gets it (at most *closure_limit* per call, the rest on a
+        later pass), whatever *since* bounds the report to.  ``since=None``
+        (the arming transaction) reports over the full history.
         """
 
-        deleted_effects = await self._deleted_tenant_effects()
-        repository = CreditRepository(self.session)
-        for effect in deleted_effects:
-            closure_id = self._deletion_closure_id(effect.effect_id)
-            await repository.insert_effect(
-                builder_id=effect.builder_id,
-                tenant_id=None,
-                effect_id=closure_id,
-                effect_kind="deletion_closure",
-                decision_digest=effect.decision_digest,
-            )
+        await self._write_missing_closures(limit=closure_limit)
         await self.session.flush()
-        return await self.orphan_report()
+        return await self.orphan_report(since=since, publish=publish)
 
     async def accept_cutoff(
         self,
@@ -1333,42 +1626,128 @@ class CreditRolloutService:
         return state
 
 
+def credit_orphan_pass_advisory_key() -> int:
+    """Stable signed bigint key serializing the periodic orphan pass."""
+
+    digest = hashlib.sha256(b"neurostack:credit-orphan-reconciliation:global").digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+async def _try_orphan_pass_lock(session: AsyncSession) -> bool:
+    """Take the global orphan-pass lock for this transaction, never waiting."""
+
+    if session.get_bind().dialect.name != "postgresql":
+        return True  # single-process SQLite development/test databases
+    acquired = await session.scalar(
+        select(func.pg_try_advisory_xact_lock(credit_orphan_pass_advisory_key()))
+    )
+    return bool(acquired)
+
+
+@dataclass
+class OrphanSweepState:
+    """Per-worker memory of the low-cadence full sweep.
+
+    The every-tick pass is window-bounded; every
+    :data:`ORPHAN_FULL_SWEEP_SECONDS` (monotonic clock) the same locked pass
+    also runs the full-history scan, and the published gauge is
+    ``max(window count, last full-sweep count)``: an open orphan older than
+    the window keeps the alert firing until a later full sweep sees it closed.
+    A fresh state (a direct call) sweeps at once.
+    """
+
+    clock: Callable[[], float] = monotonic
+    last_full_at: float | None = None
+    last_full_count: int = 0
+
+    def full_due(self) -> bool:
+        return (
+            self.last_full_at is None
+            or self.clock() - self.last_full_at >= ORPHAN_FULL_SWEEP_SECONDS
+        )
+
+
 async def run_credit_orphan_reconciliation_once(
     session_factory: object | None = None,
+    *,
+    state: OrphanSweepState | None = None,
 ) -> int:
     """Run the post-enforcement orphan pass once.
 
     Before the effective switch and the immutable enforcement timestamp the
     worker performs no query beyond the timestamp read and emits no metric.
     Afterward it is read-only except for idempotent deleted-tenant closure
-    effects; every other orphan remains visible to the operator as a bounded
-    gauge and sanitized log count.
+    effects (age-independent, :data:`ORPHAN_CLOSURE_BATCH` per pass); every
+    other orphan remains visible to the operator as a bounded gauge and
+    sanitized log count.
+
+    Every pass is window-bounded (:data:`ORPHAN_PERIODIC_WINDOW`) and, when
+    *state* says it is due, also runs the full sweep; the pass is serialized
+    across processes by ``pg_try_advisory_xact_lock``.  Returns the published
+    open count, or :data:`ORPHAN_PASS_SKIPPED` when another process holds the
+    lock (nothing read, the gauge left as it was).
     """
 
     if not credit_switch_effective():
         return 0
+    sweep = state if state is not None else OrphanSweepState()
     if session_factory is None:
         from src.repositories.database import get_db_session_factory
 
         session_factory = get_db_session_factory()
     factory = session_factory
+    full_count: int | None = None
     async with factory() as session:  # type: ignore[operator]
         try:
             if await CreditRepository(session).enforcement_at() is None:
                 await session.rollback()
                 return 0
-            report = await CreditRolloutService(session).reconcile_orphans()
+            # One pass at a time across every process (2 ECS tasks x 4
+            # uvicorn workers): a process that does not get the lock skips
+            # this tick instead of waiting (the fact worker's pattern), and
+            # leaves its gauge as the last pass it ran set it.
+            if not await _try_orphan_pass_lock(session):
+                await session.rollback()
+                return ORPHAN_PASS_SKIPPED
+            rollout = CreditRolloutService(session)
+            window = await rollout.reconcile_orphans(
+                since=await rollout.periodic_orphan_since(),
+                publish=False,
+                closure_limit=ORPHAN_CLOSURE_BATCH,
+            )
+            # Publish the window first: a full sweep that keeps failing (a
+            # statement timeout) must never freeze the gauge.
+            CREDIT_ORPHAN_EFFECTS.set(max(window.open_count, sweep.last_full_count))
+            if sweep.full_due():
+                try:
+                    async with session.begin_nested():
+                        full_count = (
+                            await rollout.orphan_report(publish=False)
+                        ).open_count
+                except Exception as error:
+                    # The savepoint is rolled back; the window's closures
+                    # still commit and the last full count is kept.
+                    logger.warning(
+                        "credit orphan full sweep failed",
+                        alert="credit_orphan_worker",
+                        error_type=type(error).__name__,
+                    )
             await session.commit()
         except Exception:
             await session.rollback()
             raise
-    if report.open_count:
+    if full_count is not None:
+        sweep.last_full_at = sweep.clock()
+        sweep.last_full_count = full_count
+    published = max(window.open_count, sweep.last_full_count)
+    CREDIT_ORPHAN_EFFECTS.set(published)
+    if published:
         logger.warning(
             "credit orphan reconciliation is open",
             alert="credit_orphan_effects",
-            count=report.open_count,
+            count=published,
         )
-    return report.open_count
+    return published
 
 
 async def run_credit_orphan_reconciliation_worker(
@@ -1378,6 +1757,7 @@ async def run_credit_orphan_reconciliation_worker(
 ) -> None:
     """Cancellable low-frequency lifecycle task; never owns rollout authority."""
 
+    state = OrphanSweepState()
     while True:
         # Match the other non-critical background maintenance: do not let a
         # just-started process contend with request/bootstrap work.  A direct
@@ -1385,7 +1765,7 @@ async def run_credit_orphan_reconciliation_worker(
         # scheduler/tests for an immediate explicit sweep.
         await asyncio.sleep(interval)
         try:
-            await run_credit_orphan_reconciliation_once(session_factory)
+            await run_credit_orphan_reconciliation_once(session_factory, state=state)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -1475,9 +1855,15 @@ __all__ = [
     "OBSERVATIONAL_DROP_REASONS",
     "OPEN_SUBSCRIPTION_STATUSES",
     "ORPHAN_EFFECT_KINDS",
+    "ORPHAN_CLOSURE_BATCH",
+    "ORPHAN_FULL_SWEEP_SECONDS",
+    "ORPHAN_PASS_SKIPPED",
+    "ORPHAN_PERIODIC_WINDOW",
+    "OrphanSweepState",
     "OrphanReport",
     "PRODUCTION_SERVING",
     "ReadbackReport",
+    "credit_orphan_pass_advisory_key",
     "cutoff_digest",
     "derive_operational_role",
     "record_observational_write_drop",

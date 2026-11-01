@@ -199,3 +199,33 @@ async def test_a_malformed_acceptance_is_refused_before_the_author_is_read(
             report_digest=digest,
             author_user_id=uuid4(),
         )
+
+
+async def test_the_orphan_worker_keeps_one_sweep_state_across_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-sweep cadence lives in ONE state for the worker's lifetime: a
+    state recreated per tick would sweep the full history every tick."""
+
+    import asyncio
+
+    from src.services import credit_rollout
+
+    seen: list[object] = []
+    done = asyncio.Event()
+
+    async def once(_factory: object, *, state: object = None) -> int:
+        seen.append(state)
+        if len(seen) == 3:
+            done.set()
+        return 0
+
+    monkeypatch.setattr(credit_rollout, "run_credit_orphan_reconciliation_once", once)
+    task = asyncio.create_task(
+        credit_rollout.run_credit_orphan_reconciliation_worker(0)
+    )
+    await asyncio.wait_for(done.wait(), timeout=5)
+    await credit_rollout.stop_credit_orphan_reconciliation_worker(task)
+    assert len(seen) >= 3
+    assert isinstance(seen[0], credit_rollout.OrphanSweepState)
+    assert all(state is seen[0] for state in seen)

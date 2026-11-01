@@ -1935,3 +1935,40 @@ async def test_the_fence_starts_unset_after_migration(clean: _Harness) -> None:
             )
         ) == 0
         await session.rollback()
+
+
+async def test_the_cutoff_reads_one_message_row_per_tenant(clean: _Harness) -> None:
+    """The ``message.in`` evidence is DISTINCT per (tenant, builder): many
+    events of one tenant are one row shipped, not one per event."""
+
+    from sqlalchemy import event
+
+    standalone = await make_tenant(clean, None)
+    for minutes in range(1, 26):
+        await message_in(clean, standalone, NOW - timedelta(minutes=minutes))
+    captured: list[tuple[str, object]] = []
+
+    def record(*args: object) -> None:
+        statement, parameters = str(args[2]), args[3]
+        if "message.in" in statement or (
+            "FROM events" in statement and "event_type" in statement
+        ):
+            captured.append((statement, parameters))
+
+    engine = clean.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        async with clean.sessions() as session:
+            report = await CreditRolloutService(session).cutoff_report(
+                now=await CreditRepository(session).database_now()
+            )
+            await session.rollback()
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert [f.reason for f in report.findings].count("standalone") == 1
+    [(statement, parameters)] = captured
+    async with clean.engine.connect() as connection:
+        rows = (
+            await connection.exec_driver_sql(statement, parameters)  # type: ignore[arg-type]
+        ).all()
+    assert len(rows) == 1

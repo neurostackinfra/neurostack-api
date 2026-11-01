@@ -128,3 +128,61 @@ def test_rollout_routes_refuse_every_non_super_admin_caller(
     response = client.get(_path(route, world), headers=headers)
     assert response.status_code == 403, response.text
     assert client._submit(_written_rows()) == NOTHING_WRITTEN
+
+
+async def test_the_admin_rollout_reads_use_the_full_orphan_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/rollout/status`` and ``/rollout/readiness`` run the FULL-history
+    orphan scan (set-based, human-triggered): no ``since`` window is passed,
+    so an orphan older than the periodic window stays visible."""
+
+    from unittest.mock import AsyncMock
+
+    from src.api.routes import admin_credits
+    from src.services.credit_rollout import CapabilityReadiness, OrphanReport
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    readiness = CapabilityReadiness(
+        environment="test",
+        billing_fact_schema_digest="a" * 64,
+        inbox_high_watermark=0,
+        reconciliation_complete=True,
+        readback_complete=True,
+        has_open_gap=False,
+        has_backlog=False,
+        has_alert=False,
+    )
+
+    class Rollout:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def periodic_orphan_since(self) -> datetime:
+            raise AssertionError("an admin read must not window the orphans")
+
+        async def capability_ready(self, **kwargs: Any) -> CapabilityReadiness:
+            calls.append(("capability_ready", kwargs))
+            return readiness
+
+        async def orphan_report(self, **kwargs: Any) -> OrphanReport:
+            calls.append(("orphan_report", kwargs))
+            return OrphanReport()
+
+    class Repository:
+        def __init__(self, _session: object) -> None:
+            pass
+
+        async def enforcement_at(self) -> None:
+            return None
+
+    monkeypatch.setattr(admin_credits, "CreditRolloutService", Rollout)
+    monkeypatch.setattr(admin_credits, "CreditRepository", Repository)
+    session = AsyncMock()
+    await admin_credits.credit_capability_status(actor=object(), session=session)
+    await admin_credits.credit_capability_readiness(actor=object(), session=session)
+    assert calls == [
+        ("capability_ready", {}),
+        ("orphan_report", {}),
+        ("capability_ready", {}),
+    ]
