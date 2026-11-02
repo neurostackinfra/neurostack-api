@@ -126,10 +126,12 @@ target:
 # as _sha256(_request_from_response(<DescribeTaskDefinition
 # neurostack-staging-app:12 with include TAGS>)) in
 # scripts/asaas_production_wiring.py (not the plan's rendered_request_sha256).
-# The owner declared the observation closed at the time on the next line
-# (floor: 6 hours after revision 12's deployment completed, so
-# 2026-11-03T04:54Z).
-# closed_at: 2026-11-03T04:54Z
+# The owner WAIVED the 6 hour observation floor of this re-pin
+# (2026-11-03T04:54Z by the 9 to 10 precedent) on 2026-11-02: staging is
+# validated over several days after the rollout, and revision 12 adds rows
+# the serving image does not read. The owner declared the observation closed
+# at the time on the next line, after revision 12's deployment completed.
+# closed_at: 2026-11-02T23:53Z
 # Next, its own reviewed PR with the same evidence: 12 to 13 after window
 # 042's observation (L4, before L5). Above 13 any revision may be pinned with
 # effective_after revision_serving_verified_and_observation_closed (a hotfix

@@ -2774,14 +2774,15 @@ the manifest's second `closed_at` marker with its image digest and its
 name). The re-pin merged with Group 5b, before L2a.
 
 **History (11 to 12).** Revision 12 (live step L2a: revision 11 plus the two
-staged rows at `'false'`, deployment `COMPLETED` 2026-11-02 22:53:42Z, so the
-floor is 2026-11-03T04:54Z; the post-deploy webhook hook reported
-`registered` with no write) is recorded as the manifest's third `closed_at`
-marker with its image digest (the same as revision 11's) and its
-`request_sha256` (read only on 2026-11-02: `ACTIVE`, exactly one
-`BILLING_FACT_WORKER_ENABLED` `'true'`, the two staged rows at `'false'`, no
-`APPCONFIG_*` name). The re-pin (L2c) merges after that observation closes,
-before L2b. Besides the checklist above, it also updated
+staged rows at `'false'`, deployment `COMPLETED` 2026-11-02 22:53:42Z; the
+post-deploy webhook hook reported `registered` with no write) was declared
+observed by the owner at 2026-11-02T23:53Z: the owner waived the 6 h floor
+(2026-11-03T04:54Z), staging being validated over several days after the
+rollout. It is recorded as the manifest's third `closed_at` marker with its
+image digest (the same as revision 11's) and its `request_sha256` (read only
+on 2026-11-02: `ACTIVE`, exactly one `BILLING_FACT_WORKER_ENABLED` `'true'`,
+the two staged rows at `'false'`, no `APPCONFIG_*` name). The re-pin (L2c)
+merges before L2b. Besides the checklist above, it also updated
 `test_the_10_to_11_re_pin_records_its_request_sha256_and_image_digest` and
 `test_the_runbook_documents_the_image_bump` (revision 12 runs revision 11's
 image, so the manifest names that digest twice) and the context line of

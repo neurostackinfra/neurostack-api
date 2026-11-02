@@ -6399,10 +6399,12 @@ REPIN_9_TO_10_EARLIEST_CLOSE = datetime.datetime(2026, 10, 25, 7, 51)
 # observation closes no earlier than 21:07.
 REPIN_10_TO_11_EARLIEST_CLOSE = datetime.datetime(2026, 10, 25, 21, 7)
 # Revision 12's deployment (live step L2a) completed at 2026-11-02 22:53:42
-# UTC: 6 h after COMPLETED, rounded up to the minute, its observation closes
-# no earlier than 2026-11-03 04:54 (live step L2c's floor).
+# UTC. The 6 h floor (2026-11-03 04:54) was WAIVED by the owner on
+# 2026-11-02 (staging is validated over several days after the rollout), so
+# the floor of live step L2c's close is the deployment itself, rounded up to
+# the minute.
 REVISION_12_COMPLETED = datetime.datetime(2026, 11, 2, 22, 53, 42)
-REPIN_11_TO_12_EARLIEST_CLOSE = datetime.datetime(2026, 11, 3, 4, 54)
+REPIN_11_TO_12_EARLIEST_CLOSE = datetime.datetime(2026, 11, 2, 22, 54)
 # One `# closed_at:` marker per re-pin in the manifest comment, in file order,
 # each with its own floor (the re-pin 12 -> 13 of live step L4 appends its).
 REPIN_CLOSE_FLOORS = (
@@ -6504,7 +6506,7 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
     assert expected == len(REPIN_CLOSE_FLOORS) == 3
     for (name, floor), value in zip(REPIN_CLOSE_FLOORS, values, strict=True):
         assert _closed_at_is_valid(value, floor), (name, value)
-    assert values == ["2026-10-25T12:42Z", "2026-11-01T01:19Z", "2026-11-03T04:54Z"]
+    assert values == ["2026-10-25T12:42Z", "2026-11-01T01:19Z", "2026-11-02T23:53Z"]
     # In order: each marker follows its own re-pin's text and precedes the
     # field; each later close is after the earlier one.
     positions = [m.start() for m in marker.finditer(text)]
@@ -6574,7 +6576,7 @@ def test_the_10_to_11_re_pin_records_its_request_sha256_and_image_digest() -> No
 def test_the_11_to_12_re_pin_records_its_request_sha256_and_image_digest() -> None:
     comment = _manifest_comment()
     start = comment.index("Re-pinned from revision 11 to revision 12")
-    section = comment[start : comment.index("closed_at: 2026-11-03T04:54Z")]
+    section = comment[start : comment.index("closed_at: 2026-11-02T23:53Z")]
     assert re.findall(r"request_sha256 ([0-9a-f]+)\b", section) == [
         REVISION_12_REQUEST_SHA256
     ]
@@ -6589,8 +6591,8 @@ def test_the_11_to_12_re_pin_records_its_request_sha256_and_image_digest() -> No
         " neurostack-staging-app:12 with include TAGS>)) in"
         " scripts/asaas_production_wiring.py (not the plan's"
         " rendered_request_sha256)",
-        "floor: 6 hours after revision 12's deployment completed, so"
-        " 2026-11-03T04:54Z",
+        "The owner WAIVED the 6 hour observation floor of this re-pin"
+        " (2026-11-03T04:54Z by the 9 to 10 precedent) on 2026-11-02",
     ):
         assert phrase in section, phrase
 
