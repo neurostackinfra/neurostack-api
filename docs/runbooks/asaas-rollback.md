@@ -176,10 +176,11 @@ re-pins the target to the serving revision (any revision above 13), by a
 manifest PR alone.
 
 **Revision 8 is unsafe after migration 036**: it reads columns 036 drops,
-and 036 ran on 2026-10-24, so roll back to the field's revision (11 since
-the third re-pin), never to 8. Read "revision R" below as the field's
-current value, revision 11 (check with `plan`, `rollback_target`); it was
-revision 8 in phase 1, revision 9 in phase 2 and revision 10 in phase 3. A
+and 036 ran on 2026-10-24, so roll back to the field's revision (12 since
+the fourth re-pin, live step L2c), never to 8. Read "revision R" below as
+the field's current value, revision 12 (check with `plan`,
+`rollback_target`); it was revision 8 in phase 1, revision 9 in phase 2,
+revision 10 in phase 3 and revision 11 until L2c. A
 failed post-deploy webhook registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a
 reason to roll back.
 
@@ -213,10 +214,10 @@ reason to roll back.
     --services neurostack-staging-app
   ```
 
-  `R` is the rollback target, `11` since the third re-pin (it was `8` until
-  the first re-pin merged, `9` until the second and `10` until the third);
-  never `8`, because migration 036 has run. Along the live chain R becomes
-  `12` (L2c) and then `13` (L4). After L6 do not roll back by hand to R
+  `R` is the rollback target, `12` since the fourth re-pin (live step L2c;
+  it was `8` until the first re-pin merged, `9` until the second, `10` until
+  the third and `11` until the fourth); never `8`, because migration 036 has
+  run. Along the live chain R becomes `13` (L4). After L6 do not roll back by hand to R
   (13): the rendering is then R plus two flips, a dead end of more than one
   kind of change for `plan`
   (`service_on_rollback_target_plan_stuck:<revision 13 ARN>`); go back to the

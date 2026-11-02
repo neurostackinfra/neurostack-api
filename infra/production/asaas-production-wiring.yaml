@@ -35,7 +35,7 @@ context:
     - A revision that only moves the app image to another digest of the same repository (the image bump, from the apply-time parameter app_image_override) is its own owner approval; plan reports it as a register_task_definition change carrying app_image. An image and a worker flag change never share a revision.
     - CREDIT_HOT_PATH_ENABLED and BILLING_FACT_TRANSPORT_ENABLED render their reviewed parameters exactly ('false' or 'true') in every rendering. Their two rows enter together, both 'false', in a revision that changes nothing else, the serving image included (plan change flag_rows_added); afterwards each value flips alone in its own revision (credit_hot_path_flag, transport_flag). A row change, a flag flip and an image change never share a revision.
     - The AppConfig group (task_definition.app_environment_appconfig_group) is rendered all or none, only when its three parameters are set, in a revision that adds it alone (plan change appconfig_group_added); APPCONFIG_ENABLED is always 'true' and APPCONFIG_SOURCE always sdk, written by the planner, never parameters.
-    - The service rollback target is the field rollback_target; code paths read it from here and it moves one reviewed re-pin at a time, 8 to 9 and 9 to 10 being the safety re-pins (each with its mandatory repin note while pending), 10 to 11 and later owner re-pins with no note (11 recorded in this manifest; 12 and 13 are separate PRs of the live sequence), and above 13 any serving revision with effective_after revision_serving_verified_and_observation_closed.
+    - The service rollback target is the field rollback_target; code paths read it from here and it moves one reviewed re-pin at a time, 8 to 9 and 9 to 10 being the safety re-pins (each with its mandatory repin note while pending), 10 to 11 and later owner re-pins with no note (11 and 12 recorded in this manifest; 13 is a separate PR of the live sequence), and above 13 any serving revision with effective_after revision_serving_verified_and_observation_closed.
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
     - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names; the one exception is exactly the complete AppConfig group, in the app environment (APPCONFIG_ORIGIN, APPCONFIG_TOKEN and any other APPCONFIG_ name stay forbidden).
     - Keep financial_egress_enabled closed by absence until the AppConfig group is rendered; opening it is then the AppConfig configuration's value, set outside this manifest under its own owner approval.
@@ -111,14 +111,32 @@ target:
 # (floor: 6 hours after revision 11's deployment completed, by the 9 to 10
 # precedent, so 2026-10-25T21:07Z).
 # closed_at: 2026-11-01T01:19Z
-# Next, each its own reviewed PR with the same evidence: 11 to 12 after live
-# step L2a's observation (L2c, before L2b), 12 to 13 after window 042's
-# observation (L4, before L5). Above 13 any revision may be pinned with
+# Re-pinned from revision 11 to revision 12 (live step L2c): revision 12 is
+# L2a's revision, revision 11 plus the two staged rows CREDIT_HOT_PATH_ENABLED
+# and BILLING_FACT_TRANSPORT_ENABLED at 'false' and nothing else, deployed on
+# 2026-11-02 (deployment COMPLETED 22:53:42Z, post-deploy webhook hook
+# outcome registered with no write), once revision 12 had served, been
+# verified and its observation closed, and before live step L2b (whose
+# revision replaces 12). Evidence of revision 12 (read only, 2026-11-02):
+# ACTIVE, app
+# image sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159,
+# exactly one BILLING_FACT_WORKER_ENABLED 'true', the two staged rows at
+# 'false', no APPCONFIG_ name; request_sha256
+# 183ccf6605ee14e4379fb83b0c0fe0f54d922c84794211b51168969c7fa4e3cb, defined
+# as _sha256(_request_from_response(<DescribeTaskDefinition
+# neurostack-staging-app:12 with include TAGS>)) in
+# scripts/asaas_production_wiring.py (not the plan's rendered_request_sha256).
+# The owner declared the observation closed at the time on the next line
+# (floor: 6 hours after revision 12's deployment completed, so
+# 2026-11-03T04:54Z).
+# closed_at: 2026-11-03T04:54Z
+# Next, its own reviewed PR with the same evidence: 12 to 13 after window
+# 042's observation (L4, before L5). Above 13 any revision may be pinned with
 # effective_after revision_serving_verified_and_observation_closed (a hotfix
 # image during the canary is re-pinned to the serving revision first).
 rollback_target:
-  revision: 11
-  effective_after: e7b_revision_11_serving_verified_and_observation_closed
+  revision: 12
+  effective_after: staged_rows_revision_12_serving_verified_and_observation_closed
 
 secrets:
   kms_key_arn: arn:aws:kms:us-east-1:388460142431:key/90eff49a-c2bf-4836-834f-d5666294d956

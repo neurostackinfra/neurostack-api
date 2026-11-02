@@ -2751,12 +2751,12 @@ new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
 13) it is a starting point, to confirm by running the runbook readers, since
 it depends on how L2c rewrote these tests: in
 `tests/scripts/test_asaas_migration_window.py`,
-`test_the_reviewed_manifest_is_pinned_to_revision_11` and the `MANIFEST`
+`test_the_reviewed_manifest_is_pinned_to_revision_12` and the `MANIFEST`
 line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
 `042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
 in `tests/scripts/test_asaas_production_wiring.py`,
 `test_manifest_and_template_validate`,
-`test_rollback_target_is_re_pinned_to_revision_11_without_a_note`,
+`test_rollback_target_is_re_pinned_to_revision_12_without_a_note`,
 `test_manifest_validator_rejects_an_invalid_rollback_target`,
 `test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
 `test_the_repository_parameters_propose_the_l2a_rows_revision`,
@@ -2772,6 +2772,21 @@ the manifest's second `closed_at` marker with its image digest and its
 `request_sha256` (read only on 2026-11-01: `ACTIVE`, exactly one
 `BILLING_FACT_WORKER_ENABLED` `'true'`, no staged row, no `APPCONFIG_*`
 name). The re-pin merged with Group 5b, before L2a.
+
+**History (11 to 12).** Revision 12 (live step L2a: revision 11 plus the two
+staged rows at `'false'`, deployment `COMPLETED` 2026-11-02 22:53:42Z, so the
+floor is 2026-11-03T04:54Z; the post-deploy webhook hook reported
+`registered` with no write) is recorded as the manifest's third `closed_at`
+marker with its image digest (the same as revision 11's) and its
+`request_sha256` (read only on 2026-11-02: `ACTIVE`, exactly one
+`BILLING_FACT_WORKER_ENABLED` `'true'`, the two staged rows at `'false'`, no
+`APPCONFIG_*` name). The re-pin (L2c) merges after that observation closes,
+before L2b. Besides the checklist above, it also updated
+`test_the_10_to_11_re_pin_records_its_request_sha256_and_image_digest` and
+`test_the_runbook_documents_the_image_bump` (revision 12 runs revision 11's
+image, so the manifest names that digest twice) and the context line of
+`test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time`; L4
+moves to a new image and should not need those three.
 
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production
