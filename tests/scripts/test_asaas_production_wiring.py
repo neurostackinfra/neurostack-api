@@ -704,8 +704,21 @@ class FakeAws:
         return path
 
 
+# The scenario base of the staged flags: both 'false', the state the live
+# chain was built and tested on up to live step L4. Since L5 the repository
+# file carries CREDIT_HOT_PATH_ENABLED 'true'; the scenarios keep their own
+# base explicit here instead of inheriting it, and the tests that pin the
+# repository file itself read PARAMS directly
+# (test_the_repository_turns_the_credit_switch_on).
+SCENARIO_STAGED_FLAGS = {
+    "CREDIT_HOT_PATH_ENABLED": "false",
+    "BILLING_FACT_TRANSPORT_ENABLED": "false",
+}
+
+
 def _parameters(**changes: Any) -> dict[str, Any]:
     raw = yaml.safe_load(PARAMS.read_text(encoding="utf-8"))
+    raw["parameters"].update(SCENARIO_STAGED_FLAGS)
     raw["parameters"].update(changes)
     return raw
 
@@ -1727,9 +1740,10 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         # Present and valid here; its repository value is pinned once, by
         # test_the_repository_turns_the_outbox_worker_on.
         "BILLING_FACT_WORKER_ENABLED": values["BILLING_FACT_WORKER_ENABLED"],
-        # asaas-rollout-opening: both staged flags 'false' (live step L2a);
-        # each becomes 'true' only through its own reviewed PR (L5, L6).
-        "CREDIT_HOT_PATH_ENABLED": "false",
+        # asaas-rollout-opening: both staged flags entered 'false' (live step
+        # L2a); each becomes 'true' only through its own reviewed PR. The
+        # credit switch did at L5; the transport waits for L6.
+        "CREDIT_HOT_PATH_ENABLED": "true",
         "BILLING_FACT_TRANSPORT_ENABLED": "false",
         "app_image_override": None,
         # The AppConfig group is not rendered until live step L7.
@@ -1745,7 +1759,10 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         Settings.validate_asaas_webhook_url(values["ASAAS_WEBHOOK_URL"])
         == values["ASAAS_WEBHOOK_URL"]
     )
-    assert wiring.validate_parameters(_parameters()) == values
+    assert (
+        wiring.validate_parameters(yaml.safe_load(PARAMS.read_text(encoding="utf-8")))
+        == values
+    )
 
 
 def test_webhook_path_matches_the_application_receiver() -> None:
@@ -5038,9 +5055,19 @@ def test_the_docs_state_that_the_repository_turns_the_worker_on() -> None:
 def _repository_params_copy(directory: Path, flag: str | None) -> Path:
     """The operator's local copy of the repository file: app_image_override set
     to the bridge digest. ``flag=None`` keeps the repository's flag line as it
-    is; a value rewrites it (the control run only)."""
+    is; a value rewrites it (the control run only). The staged flags are put
+    back on the scenario base (SCENARIO_STAGED_FLAGS): this is the bridge
+    state, long before L5."""
 
     text = PARAMS.read_text(encoding="utf-8")
+    for name, value in SCENARIO_STAGED_FLAGS.items():
+        text = re.sub(
+            rf"^  {name}: '(?:true|false)'$",
+            f"  {name}: '{value}'",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
     image = re.compile(r"^  app_image_override: null$", re.MULTILINE)
     line = re.compile(rf"^  {WORKER_FLAG}: '(?:false|true)'$", re.MULTILINE)
     assert len(image.findall(text)) == 1 and len(line.findall(text)) == 1
@@ -6274,9 +6301,19 @@ def test_the_safety_re_pins_stay_8_to_9_and_9_to_10() -> None:
 
 def _repository_params_with_image(directory: Path, image: str) -> Path:
     """The operator's local copy of the repository file with only
-    app_image_override set (the flag line is the repository's own)."""
+    app_image_override set (the worker line is the repository's own). The
+    staged flags are put back on the scenario base (SCENARIO_STAGED_FLAGS):
+    these scenarios are points of the live chain before L5."""
 
     text = PARAMS.read_text(encoding="utf-8")
+    for name, value in SCENARIO_STAGED_FLAGS.items():
+        text = re.sub(
+            rf"^  {name}: '(?:true|false)'$",
+            f"  {name}: '{value}'",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
     line = re.compile(r"^  app_image_override: null$", re.MULTILINE)
     assert len(line.findall(text)) == 1
     path = directory / f"params-{image.rsplit(':', 1)[1][:12]}.yaml"
@@ -7099,16 +7136,28 @@ def test_the_mirrored_staged_sets_are_equal_everywhere() -> None:
     assert rollout.FINGERPRINTED_ENVIRONMENT_NAMES == rollout.ENVIRONMENT_NAME_SETS[-1]
 
 
-def test_the_repository_renders_both_staged_rows_false() -> None:
+def test_the_repository_turns_the_credit_switch_on() -> None:
+    """Live step L5: the repository file carries CREDIT_HOT_PATH_ENABLED
+    'true', set by its own reviewed PR, and the transport still 'false' (L6
+    is its own PR). The only test that pins the repository value of the
+    staged flags; the scenarios set their own base (SCENARIO_STAGED_FLAGS).
+    Turning the switch off again is the same kind of PR, back to 'false',
+    changing this test with it."""
+
     values = yaml.safe_load(PARAMS.read_text(encoding="utf-8"))["parameters"]
-    assert values[CREDIT_FLAG] == values[TRANSPORT_FLAG] == "false"
+    assert values[CREDIT_FLAG] == "true"
+    assert values[TRANSPORT_FLAG] == "false"
     assert all(values[name] is None for name in APPCONFIG)
-    _plan_result, rendered = _plan(FakeAws(applied=True))
+    # The repository values over the scenario base: the rendering of the file.
+    _plan_result, rendered = _plan(
+        FakeAws(applied=True), **{name: values[name] for name in STAGED_FLAGS}
+    )
     assert rendered is not None
     environment = evidence._container_map(rendered)["app"]["environment"]
+    expected = {CREDIT_FLAG: "true", TRANSPORT_FLAG: "false"}
     for name in STAGED_FLAGS:
         assert [row for row in environment if row["name"] == name] == [
-            {"name": name, "value": "false"}
+            {"name": name, "value": expected[name]}
         ]
     assert not any(row["name"].startswith("APPCONFIG_") for row in environment)
 
