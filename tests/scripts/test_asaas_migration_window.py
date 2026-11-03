@@ -1921,36 +1921,45 @@ def test_036_037_and_042_refuse_a_rollback_target_not_repinned(
     for manifest in (initial_manifest(tmp_path), bridge_manifest(tmp_path)):
         blocks = _blocks(world, tmp_path, manifest=manifest)
         assert "rollback_target_not_repinned" in blocks
-    # Any other pin than the window's own, the reviewed manifest's 11 too:
-    # 036 and 037 require 10, 042 requires 12 (never 10, 11 or a later one).
+    # Any other pin than the window's own: 036 and 037 require 10, 042
+    # requires 12 (never 10, 11 or a later one).
     own = mw.WINDOWS[window].rollback_target_revision
     for revision in (10, 11, 12, 13, 14):
         if revision == own:
             continue
         blocks = _blocks(world, tmp_path, manifest=pinned_manifest(tmp_path, revision))
         assert "rollback_target_not_repinned" in blocks, revision
-    assert "rollback_target_not_repinned" in _blocks(world, tmp_path, manifest=MANIFEST)
+    # The reviewed manifest, at 12 since live step L2c: 042's own target, so
+    # only 036 and 037 refuse it (042 is ready with it).
+    if own == 12:
+        assert plan(world, tmp_path, manifest=MANIFEST)["status"] == "ready"
+    else:
+        assert "rollback_target_not_repinned" in _blocks(
+            world, tmp_path, manifest=MANIFEST
+        )
 
 
-def test_the_reviewed_manifest_is_pinned_to_revision_11() -> None:
-    """Group 5b re-pinned the reviewed manifest from 10 to 11 (the E7b image
-    bump, the way back from live step L2a). No window goes back to 11: 036
-    and 037 (already applied in production, which is at 037) require 10 and
-    can run again only with a manifest at 10, after a snapshot restore; 042
-    requires 12, after live step L2c."""
+def test_the_reviewed_manifest_is_pinned_to_revision_12() -> None:
+    """Live step L2c re-pinned the reviewed manifest from 11 to 12 (L2a's
+    staged rows revision, the way back from live step L2b and window 042).
+    Of the windows only 042 goes back to 12; 036 and 037 (already applied in
+    production, which is at 037) require 10 and can run again only with a
+    manifest at 10, after a snapshot restore."""
 
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 11,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_E7B,
+        "revision": 12,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_STAGED_ROWS,
     }
     pins = wiring.manifest_pins(wiring.validate_manifest(raw))
-    assert pins.rollback_revision == 11
+    assert pins.rollback_revision == 12
     assert pins.rollback_repin_before is None
-    assert pins.rollback_task_definition_arn == SERVICE_TD_11
-    assert pins.rollback_revision not in {
-        window.rollback_target_revision for window in mw.WINDOWS.values()
-    }
+    assert pins.rollback_task_definition_arn == SERVICE_TD_12
+    assert {
+        name
+        for name, window in mw.WINDOWS.items()
+        if window.rollback_target_revision == pins.rollback_revision
+    } == {"042"}
 
 
 @pytest.mark.parametrize("window", ["036", "037", "042"])
@@ -1958,30 +1967,34 @@ def test_without_a_manifest_the_tool_reads_the_reviewed_one(
     window: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The live operator's path (the runbook passes no ``--manifest``): the
-    reviewed manifest, read through the planner's default, pinned to 11, so
-    no window's own target: each refuses ``rollback_target_not_repinned``
-    (never ``manifest_invalid``)."""
+    reviewed manifest, read through the planner's default, pinned to 12
+    (since live step L2c): 042's own target, so 042 is ready, and 036 and
+    037 refuse ``rollback_target_not_repinned`` (never ``manifest_invalid``)."""
 
     world = ready_world(tmp_path, window)
+    refused = mw.WINDOWS[window].rollback_target_revision != 12
     document, run = mw.evaluate_plan(
         world.readback(tmp_path, "plan.json"), world.context(), now=NOW_DT
     )
-    assert run is None and document["status"] == "blocked"
-    assert document["manifest"] == {"rollback_target_revision": 11}
-    assert "rollback_target_not_repinned" in document["blocks"]
+    assert document["manifest"]["rollback_target_revision"] == 12
+    assert ("rollback_target_not_repinned" in document["blocks"]) is refused
     assert "manifest_invalid" not in document["blocks"]
+    if refused:
+        assert run is None and document["status"] == "blocked"
+    else:
+        assert document["status"] == "ready", document["blocks"]
     document, run = mw.evaluate_plan(
         world.readback(tmp_path, "plan.json"),
         world.context(),
         now=NOW_DT,
         manifest=None,
     )
-    assert document["manifest"] == {"rollback_target_revision": 11}
+    assert document["manifest"]["rollback_target_revision"] == 12
     code, out, _err = run_cli(["plan", *world.args(tmp_path)], capsys)
-    assert code == 2
+    assert code == (2 if refused else 0)
     printed = json.loads(out)
-    assert printed["manifest"] == {"rollback_target_revision": 11}
-    assert "rollback_target_not_repinned" in printed["blocks"]
+    assert printed["manifest"]["rollback_target_revision"] == 12
+    assert ("rollback_target_not_repinned" in printed["blocks"]) is refused
     assert "manifest_invalid" not in printed["blocks"]
     # With the window's own target the same reads are ready.
     code, out, err = run_cli(
