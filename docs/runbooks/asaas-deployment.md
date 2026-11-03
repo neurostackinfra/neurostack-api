@@ -2751,12 +2751,12 @@ new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
 13) it is a starting point, to confirm by running the runbook readers, since
 it depends on how L2c rewrote these tests: in
 `tests/scripts/test_asaas_migration_window.py`,
-`test_the_reviewed_manifest_is_pinned_to_revision_12` and the `MANIFEST`
+`test_the_reviewed_manifest_is_pinned_to_revision_13` and the `MANIFEST`
 line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
 `042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
 in `tests/scripts/test_asaas_production_wiring.py`,
 `test_manifest_and_template_validate`,
-`test_rollback_target_is_re_pinned_to_revision_12_without_a_note`,
+`test_rollback_target_is_re_pinned_to_revision_13_without_a_note`,
 `test_manifest_validator_rejects_an_invalid_rollback_target`,
 `test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
 `test_the_repository_parameters_propose_the_l2a_rows_revision`,
@@ -2788,6 +2788,24 @@ merges before L2b. Besides the checklist above, it also updated
 image, so the manifest names that digest twice) and the context line of
 `test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time`; L4
 moves to a new image and should not need those three.
+
+**History (12 to 13).** Revision 13 (live step L2b: revision 12 with the app
+image alone moved to the image containing 042, deployment `COMPLETED`
+2026-11-03 00:39:19Z; the post-deploy webhook hook reported `registered` with
+no write) served window `042` (migrations revision 8, snapshot
+`pre-038-042-2026-11-03`, the five upgrades `037 -> 038` to `041 -> 042`,
+post-read verified `042` at 01:14:03Z). It was declared observed by the owner
+at 2026-11-03T01:16Z: the owner waived the floor (the post-read + 24 h,
+2026-11-04T01:15Z, and never before L2b's `COMPLETED` + 6 h,
+2026-11-03T06:40Z), staging being validated over several days after the
+rollout. It is recorded as the manifest's fourth `closed_at` marker with its
+image digest and its `request_sha256` (read only on 2026-11-03: `ACTIVE`,
+exactly one `BILLING_FACT_WORKER_ENABLED` `'true'`, the two staged rows at
+`'false'`, no `APPCONFIG_*` name). The re-pin (L4) merges before L5. Besides
+the checklist above it also updated the 10 to 11 evidence test (one
+`request_sha256` per re-pin) and the context line of
+`test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time`, and
+added `test_the_12_to_13_re_pin_records_its_request_sha256_and_image_digest`.
 
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production
