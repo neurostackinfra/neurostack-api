@@ -43,9 +43,9 @@ parameters:
   # profile (name or ID), renders the complete group with APPCONFIG_ENABLED
   # 'true' and APPCONFIG_SOURCE sdk, which the planner writes itself; a part
   # of the three fails the plan.
-  APPCONFIG_APPLICATION: null
-  APPCONFIG_ENVIRONMENT: null
-  APPCONFIG_PROFILE: null
+  APPCONFIG_APPLICATION: 27acp5a
+  APPCONFIG_ENVIRONMENT: 36vg56r
+  APPCONFIG_PROFILE: ejwxo7u
   # null keeps the live app image reference exactly. A value must be an
   # immutable <account ECR repository URI>@sha256:<digest> that exists in ECR;
   # building and attesting that image is a separate gate. It is an apply-time
