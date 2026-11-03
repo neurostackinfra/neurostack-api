@@ -36,7 +36,7 @@ parameters:
   # then becomes 'true' alone, through its own reviewed PR and revision: the
   # credit switch at L5, the transport at L6.
   CREDIT_HOT_PATH_ENABLED: 'true'
-  BILLING_FACT_TRANSPORT_ENABLED: 'false'
+  BILLING_FACT_TRANSPORT_ENABLED: 'true'
   # The AppConfig group (Decision 14, live step L7): null renders no
   # APPCONFIG_* name (financial egress closed by absence). All three set, to
   # the reviewed AppConfig application, environment and configuration

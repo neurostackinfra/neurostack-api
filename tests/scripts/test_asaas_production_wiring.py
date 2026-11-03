@@ -706,10 +706,11 @@ class FakeAws:
 
 # The scenario base of the staged flags: both 'false', the state the live
 # chain was built and tested on up to live step L4. Since L5 the repository
-# file carries CREDIT_HOT_PATH_ENABLED 'true'; the scenarios keep their own
-# base explicit here instead of inheriting it, and the tests that pin the
+# file carries CREDIT_HOT_PATH_ENABLED 'true', and since L6
+# BILLING_FACT_TRANSPORT_ENABLED 'true'; the scenarios keep their own base
+# explicit here instead of inheriting it, and the tests that pin the
 # repository file itself read PARAMS directly
-# (test_the_repository_turns_the_credit_switch_on).
+# (test_the_repository_turns_both_staged_flags_on).
 SCENARIO_STAGED_FLAGS = {
     "CREDIT_HOT_PATH_ENABLED": "false",
     "BILLING_FACT_TRANSPORT_ENABLED": "false",
@@ -1741,10 +1742,10 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         # test_the_repository_turns_the_outbox_worker_on.
         "BILLING_FACT_WORKER_ENABLED": values["BILLING_FACT_WORKER_ENABLED"],
         # asaas-rollout-opening: both staged flags entered 'false' (live step
-        # L2a); each becomes 'true' only through its own reviewed PR. The
-        # credit switch did at L5; the transport waits for L6.
+        # L2a); each became 'true' only through its own reviewed PR: the
+        # credit switch at L5, the transport at L6.
         "CREDIT_HOT_PATH_ENABLED": "true",
-        "BILLING_FACT_TRANSPORT_ENABLED": "false",
+        "BILLING_FACT_TRANSPORT_ENABLED": "true",
         "app_image_override": None,
         # The AppConfig group is not rendered until live step L7.
         "APPCONFIG_APPLICATION": None,
@@ -7136,17 +7137,17 @@ def test_the_mirrored_staged_sets_are_equal_everywhere() -> None:
     assert rollout.FINGERPRINTED_ENVIRONMENT_NAMES == rollout.ENVIRONMENT_NAME_SETS[-1]
 
 
-def test_the_repository_turns_the_credit_switch_on() -> None:
-    """Live step L5: the repository file carries CREDIT_HOT_PATH_ENABLED
-    'true', set by its own reviewed PR, and the transport still 'false' (L6
-    is its own PR). The only test that pins the repository value of the
-    staged flags; the scenarios set their own base (SCENARIO_STAGED_FLAGS).
-    Turning the switch off again is the same kind of PR, back to 'false',
-    changing this test with it."""
+def test_the_repository_turns_both_staged_flags_on() -> None:
+    """Live steps L5 and L6: the repository file carries
+    CREDIT_HOT_PATH_ENABLED 'true' (L5) and BILLING_FACT_TRANSPORT_ENABLED
+    'true' (L6), each set by its own reviewed PR. The only test that pins the
+    repository value of the staged flags; the scenarios set their own base
+    (SCENARIO_STAGED_FLAGS). Turning one off again is the same kind of PR,
+    back to 'false', changing this test with it."""
 
     values = yaml.safe_load(PARAMS.read_text(encoding="utf-8"))["parameters"]
     assert values[CREDIT_FLAG] == "true"
-    assert values[TRANSPORT_FLAG] == "false"
+    assert values[TRANSPORT_FLAG] == "true"
     assert all(values[name] is None for name in APPCONFIG)
     # The repository values over the scenario base: the rendering of the file.
     _plan_result, rendered = _plan(
@@ -7154,7 +7155,7 @@ def test_the_repository_turns_the_credit_switch_on() -> None:
     )
     assert rendered is not None
     environment = evidence._container_map(rendered)["app"]["environment"]
-    expected = {CREDIT_FLAG: "true", TRANSPORT_FLAG: "false"}
+    expected = {CREDIT_FLAG: "true", TRANSPORT_FLAG: "true"}
     for name in STAGED_FLAGS:
         assert [row for row in environment if row["name"] == name] == [
             {"name": name, "value": expected[name]}
