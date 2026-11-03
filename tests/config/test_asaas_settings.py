@@ -86,7 +86,7 @@ def _production_settings(**overrides: object) -> Settings:
 def test_asaas_endpoint_and_auth_header_are_not_deployment_overridable() -> None:
     configured = Settings(
         _env_file=None,
-        asaas_api_key="$aact_prod_fixture",
+        asaas_api_key="$aact_prod_" + "fixture",
         asaas_webhook_token="fixture-webhook-token",
     )
 
@@ -105,7 +105,57 @@ def test_non_production_namespace_key_is_rejected_without_disclosure(
         Settings(_env_file=None, asaas_api_key=api_key)
 
     assert api_key not in str(exc_info.value)
-    assert "production key namespace" in str(exc_info.value)
+    assert "production or the sandbox key namespace" in str(exc_info.value)
+
+
+def test_the_key_namespace_picks_the_asaas_environment() -> None:
+    """A production key talks to the production API, a sandbox key to the
+    sandbox, and the sandbox is refused under ENVIRONMENT=production."""
+
+    from src.config.settings import (
+        ASAAS_API_BASE_URLS,
+        ASAAS_SANDBOX_API_BASE_URL,
+        asaas_environment_for_key,
+    )
+
+    assert asaas_environment_for_key("$aact_prod_" + "x") == "production"
+    assert asaas_environment_for_key("$aact_hmlg_" + "x") == "sandbox"
+    assert asaas_environment_for_key("$aact_test_x") is None
+    assert asaas_environment_for_key("") is None
+    assert ASAAS_API_BASE_URLS == {
+        "production": "https://api.asaas.com/v3",
+        "sandbox": ASAAS_SANDBOX_API_BASE_URL,
+    }
+    assert ASAAS_SANDBOX_API_BASE_URL == "https://api-sandbox.asaas.com/v3"
+
+    sandbox = Settings(
+        _env_file=None,
+        environment="staging",
+        secret_key="s" * 48,
+        asaas_api_key="$aact_hmlg_" + "fixture",
+        asaas_webhook_token="token-fixture",
+    )
+    assert sandbox.asaas_api_environment == "sandbox"
+    assert sandbox.is_asaas_configuration_compatible is True
+
+    production_key = Settings(
+        _env_file=None,
+        environment="staging",
+        secret_key="s" * 48,
+        asaas_api_key="$aact_prod_" + "fixture",
+        asaas_webhook_token="token-fixture",
+    )
+    assert production_key.asaas_api_environment == "production"
+    assert production_key.is_asaas_configuration_compatible is True
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            environment="production",
+            asaas_api_key="$aact_hmlg_" + "fixture",
+        )
+    assert "$aact_hmlg_" + "fixture" not in str(exc_info.value)
+    assert "under ENVIRONMENT=production" in str(exc_info.value)
 
 
 def test_secrets_are_masked_from_settings_repr_and_dump() -> None:
@@ -131,7 +181,7 @@ def test_absent_or_incomplete_asaas_configuration_is_incompatible() -> None:
     assert (
         Settings(
             _env_file=None,
-            asaas_api_key="$aact_prod_fixture",
+            asaas_api_key="$aact_prod_" + "fixture",
         ).is_asaas_configuration_compatible
         is False
     )

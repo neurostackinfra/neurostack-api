@@ -142,7 +142,7 @@ CLI_ACTIONS = frozenset({"none", "created", "updated"})
 CLI_CHECK_NAMES = (
     "settings_loaded",
     "imports_ok",
-    "api_key_production_namespace",
+    "api_key_namespace_valid",
     "webhook_token_valid",
     "webhook_url_valid",
     "webhook_host_allowed",
@@ -150,6 +150,14 @@ CLI_CHECK_NAMES = (
     "notification_email_valid",
     "environment_deployable",
     "user_agent_valid",
+)
+# The check of the images built before the ASAAS environment was chosen by
+# the key's namespace (they report ``api_key_production_namespace``). Accepted
+# so the hook still verifies a deploy of such an image (a rollback included);
+# drop once no deployable revision runs one.
+CLI_CHECK_NAMES_BEFORE_SANDBOX = tuple(
+    "api_key_production_namespace" if name == "api_key_namespace_valid" else name
+    for name in CLI_CHECK_NAMES
 )
 CLI_COUNT_NAMES = (
     "webhooks_listed",
@@ -1514,7 +1522,7 @@ def validate_cli_document(document: Any) -> dict[str, Any]:
             for value in counts.values()
         )
         and isinstance(checks, dict)
-        and set(checks) == set(CLI_CHECK_NAMES)
+        and set(checks) in (set(CLI_CHECK_NAMES), set(CLI_CHECK_NAMES_BEFORE_SANDBOX))
         and all(type(value) is bool for value in checks.values())
         and type(document["force_rewrite_token"]) is bool
         and type(document["allow_enable"]) is bool

@@ -130,7 +130,12 @@ from pydantic import SecretStr, ValidationError
 # environment (for example a sandbox ASAAS key).  The failure is kept so the
 # command still prints its one JSON line instead of a traceback.
 try:
-    from src.config.settings import ASAAS_API_BASE_URL, Settings
+    from src.config.settings import (
+        ASAAS_API_BASE_URL,
+        ASAAS_API_BASE_URLS,
+        Settings,
+        asaas_environment_for_key,
+    )
     from src.services.asaas import (
         ASAAS_MAX_RESPONSE_BYTES,
         AsaasClient,
@@ -175,6 +180,7 @@ MIN_DEADLINE_SECONDS: Final = 10
 MAX_DEADLINE_SECONDS: Final = 600
 DEPLOYABLE_ENVIRONMENTS: Final = frozenset({"staging", "production"})
 PRODUCTION_KEY_PREFIX: Final = "$aact_prod_"
+SANDBOX_KEY_PREFIX: Final = "$aact_hmlg_"
 # Deliberate safety net, not configuration: the only webhook URL this
 # command registers, exactly the owner-decided D3 parameter
 # ``ASAAS_WEBHOOK_URL`` (2026-10-18; ``infra/production/
@@ -194,7 +200,7 @@ CREATION_ONLY_DRIFT: Final = frozenset({"api_version"})
 CHECK_NAMES: Final = (
     "settings_loaded",
     "imports_ok",
-    "api_key_production_namespace",
+    "api_key_namespace_valid",
     "webhook_token_valid",
     "webhook_url_valid",
     "webhook_host_allowed",
@@ -456,7 +462,15 @@ def validate_config(
     checks = {
         "settings_loaded": True,
         "imports_ok": True,
-        "api_key_production_namespace": key.startswith(PRODUCTION_KEY_PREFIX)
+        # A production key anywhere, or a sandbox key outside
+        # ENVIRONMENT=production (the key picks the ASAAS origin).
+        "api_key_namespace_valid": (
+            key.startswith(PRODUCTION_KEY_PREFIX)
+            or (
+                key.startswith(SANDBOX_KEY_PREFIX)
+                and config.environment != "production"
+            )
+        )
         and _printable_ascii(key),
         "webhook_token_valid": _accepts(
             lambda: desired().payload(auth_token=config.webhook_token, create=False)
@@ -473,7 +487,7 @@ def validate_config(
         ),
     }
     reasons: list[str] = []
-    if not checks["api_key_production_namespace"]:
+    if not checks["api_key_namespace_valid"]:
         reasons.append("api_key_invalid" if key else "api_key_missing")
     if not checks["webhook_token_valid"]:
         reasons.append("webhook_token_invalid" if token else "webhook_token_missing")
@@ -739,8 +753,10 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         *,
         allow_writes: bool,
         max_write_sends: int = 1 + RETRIES,
+        base_url: str | None = None,
     ) -> None:
-        origin = urlsplit(ASAAS_API_BASE_URL)
+        # The origin of the key's environment (the production one by default).
+        origin = urlsplit(base_url or ASAAS_API_BASE_URL)
         self._scheme = origin.scheme
         self._host = origin.hostname
         self._list_path = origin.path.rstrip("/") + "/webhooks"
@@ -1078,9 +1094,11 @@ async def run(
         url=config.webhook_url,
         email=config.notification_email,
     )
+    key_environment = asaas_environment_for_key(config.api_key.get_secret_value())
     guard = GuardedTransport(
         transport if transport is not None else default_transport(),
         allow_writes=command == "reconcile",
+        base_url=ASAAS_API_BASE_URLS[key_environment] if key_environment else None,
     )
     retrier = Retrier(
         sleep=sleep, rng=rng if rng is not None else random.SystemRandom()
