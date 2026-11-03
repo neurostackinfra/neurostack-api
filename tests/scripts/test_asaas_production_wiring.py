@@ -12,6 +12,7 @@ import datetime
 import json
 import os
 import re
+import tempfile
 import sys
 import types
 from collections.abc import Callable
@@ -714,7 +715,37 @@ class FakeAws:
 SCENARIO_STAGED_FLAGS = {
     "CREDIT_HOT_PATH_ENABLED": "false",
     "BILLING_FACT_TRANSPORT_ENABLED": "false",
+    # Since L7 the repository file also carries the AppConfig group; the
+    # scenarios start from the group absent (closed by absence).
+    "APPCONFIG_APPLICATION": None,
+    "APPCONFIG_ENVIRONMENT": None,
+    "APPCONFIG_PROFILE": None,
 }
+
+
+def _with_scenario_base(text: str) -> str:
+    """The repository file's text with the SCENARIO_STAGED_FLAGS lines put
+    back on the scenario base (a quoted flag value, or null for the group)."""
+
+    for name, value in SCENARIO_STAGED_FLAGS.items():
+        rendered = "null" if value is None else f"'{value}'"
+        text, count = re.subn(
+            rf"^  {name}: .*$", f"  {name}: {rendered}", text, flags=re.MULTILINE
+        )
+        assert count == 1, name
+    return text
+
+
+def _scenario_params_file() -> Path:
+    """The repository parameters file on the scenario base, for the CLI
+    scenarios that read a file (written once per session next to the
+    tests' temporary files)."""
+
+    path = Path(tempfile.gettempdir()) / "asaas-wiring-scenario-params.yaml"
+    path.write_text(
+        _with_scenario_base(PARAMS.read_text(encoding="utf-8")), encoding="utf-8"
+    )
+    return path
 
 
 def _parameters(**changes: Any) -> dict[str, Any]:
@@ -1747,10 +1778,13 @@ def test_reviewed_parameters_pass_the_application_settings_validators() -> None:
         "CREDIT_HOT_PATH_ENABLED": "true",
         "BILLING_FACT_TRANSPORT_ENABLED": "true",
         "app_image_override": None,
-        # The AppConfig group is not rendered until live step L7.
-        "APPCONFIG_APPLICATION": None,
-        "APPCONFIG_ENVIRONMENT": None,
-        "APPCONFIG_PROFILE": None,
+        # The AppConfig group, rendered since live step L7: the IDs of the
+        # application, environment and FeatureFlags profile created by the
+        # infrastructure repository (envs/staging/app, 2026-11-02), the IDs
+        # that match the task role policy's exact ARN.
+        "APPCONFIG_APPLICATION": "27acp5a",
+        "APPCONFIG_ENVIRONMENT": "36vg56r",
+        "APPCONFIG_PROFILE": "ejwxo7u",
     }
     assert (
         Settings.validate_asaas_checkout_return_url(values["ASAAS_CHECKOUT_RETURN_URL"])
@@ -1943,7 +1977,7 @@ def test_cli_plan_render_and_check_from_a_readback_file(
     snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
     args = [
         "--params",
-        str(PARAMS),
+        str(_scenario_params_file()),
         "--readback-file",
         str(snapshot),
         "--manifest",
@@ -1980,7 +2014,7 @@ def test_render_refuses_before_the_secret_access_stack_exists(
         [
             "render-taskdef",
             "--params",
-            str(PARAMS),
+            str(_scenario_params_file()),
             "--readback-file",
             str(snapshot),
             "--manifest",
@@ -2027,14 +2061,14 @@ def test_output_never_contains_secret_like_material(
 ) -> None:
     fake = FakeAws(applied=True)
     snapshot = fake.snapshot(tmp_path / "readback.json")
-    args = ["--params", str(PARAMS), "--readback-file", str(snapshot)]
+    args = ["--params", str(_scenario_params_file()), "--readback-file", str(snapshot)]
     outputs = []
     for command in ("plan", "render-taskdef", "check"):
         _code, out, err = _run([command, *args], capsys)
         outputs.append(out + err)
     preview_snapshot = FakeAws().snapshot(tmp_path / "preview.json")
     _code, out, err = _run(
-        ["plan", "--params", str(PARAMS), "--readback-file", str(preview_snapshot)],
+        ["plan", "--params", str(_scenario_params_file()), "--readback-file", str(preview_snapshot)],
         capsys,
     )
     outputs.append(out + err)
@@ -2217,7 +2251,7 @@ def test_render_and_check_refuse_whenever_the_plan_is_blocked(
     snapshot = fake.snapshot(tmp_path / "readback.json")
     args = [
         "--params",
-        str(PARAMS),
+        str(_scenario_params_file()),
         "--readback-file",
         str(snapshot),
         "--manifest",
@@ -2457,7 +2491,7 @@ def test_plan_prints_the_pinned_migrations_command(
         [
             "plan",
             "--params",
-            str(PARAMS),
+            str(_scenario_params_file()),
             "--readback-file",
             str(snapshot),
             "--manifest",
@@ -4161,7 +4195,7 @@ def test_plan_reports_every_window_step_from_the_table(
         [
             "plan",
             "--params",
-            str(PARAMS),
+            str(_scenario_params_file()),
             "--readback-file",
             str(snapshot),
             "--manifest",
@@ -5061,14 +5095,7 @@ def _repository_params_copy(directory: Path, flag: str | None) -> Path:
     state, long before L5."""
 
     text = PARAMS.read_text(encoding="utf-8")
-    for name, value in SCENARIO_STAGED_FLAGS.items():
-        text = re.sub(
-            rf"^  {name}: '(?:true|false)'$",
-            f"  {name}: '{value}'",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
+    text = _with_scenario_base(text)
     image = re.compile(r"^  app_image_override: null$", re.MULTILINE)
     line = re.compile(rf"^  {WORKER_FLAG}: '(?:false|true)'$", re.MULTILINE)
     assert len(image.findall(text)) == 1 and len(line.findall(text)) == 1
@@ -6307,14 +6334,7 @@ def _repository_params_with_image(directory: Path, image: str) -> Path:
     these scenarios are points of the live chain before L5."""
 
     text = PARAMS.read_text(encoding="utf-8")
-    for name, value in SCENARIO_STAGED_FLAGS.items():
-        text = re.sub(
-            rf"^  {name}: '(?:true|false)'$",
-            f"  {name}: '{value}'",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
+    text = _with_scenario_base(text)
     line = re.compile(r"^  app_image_override: null$", re.MULTILINE)
     assert len(line.findall(text)) == 1
     path = directory / f"params-{image.rsplit(':', 1)[1][:12]}.yaml"
@@ -7148,7 +7168,10 @@ def test_the_repository_turns_both_staged_flags_on() -> None:
     values = yaml.safe_load(PARAMS.read_text(encoding="utf-8"))["parameters"]
     assert values[CREDIT_FLAG] == "true"
     assert values[TRANSPORT_FLAG] == "true"
-    assert all(values[name] is None for name in APPCONFIG)
+    # Live step L7: the AppConfig group, the IDs created by the
+    # infrastructure repository (the rendering of the group is covered by the
+    # L7 tests; this one renders the flags over the scenario base).
+    assert [values[name] for name in APPCONFIG] == ["27acp5a", "36vg56r", "ejwxo7u"]
     # The repository values over the scenario base: the rendering of the file.
     _plan_result, rendered = _plan(
         FakeAws(applied=True), **{name: values[name] for name in STAGED_FLAGS}
