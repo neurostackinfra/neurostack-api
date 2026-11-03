@@ -1858,8 +1858,8 @@ def test_unknown_parameter_is_rejected() -> None:
 def test_manifest_and_template_validate() -> None:
     manifest, parameters, digests = wiring.load_inputs(MANIFEST, PARAMS)
     assert manifest["rollback_target"] == {
-        "revision": 12,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_STAGED_ROWS,
+        "revision": 13,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_CREDIT_IMAGE,
     }
     assert "rollback_task_definition_revision" not in manifest["target"]
     assert parameters is not None
@@ -2789,22 +2789,22 @@ LIVE_REVISION_9_IMAGE = (
 )
 
 
-def test_rollback_target_is_re_pinned_to_revision_12_without_a_note() -> None:
-    """The reviewed manifest after live step L2c's re-pin 11 -> 12: revision
-    12 (L2a's staged rows revision, the way back from live step L2b and window
-    042), no note."""
+def test_rollback_target_is_re_pinned_to_revision_13_without_a_note() -> None:
+    """The reviewed manifest after live step L4's re-pin 12 -> 13: revision
+    13 (L2b's revision, the image containing 042, the way back during the
+    flips L5 to L7), no note."""
 
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 12,
-        "effective_after": "staged_rows_revision_12_serving_verified_and_observation_closed",
+        "revision": 13,
+        "effective_after": "credit_image_revision_13_serving_verified_and_window_042_observed",
     }
     manifest = wiring.validate_manifest(raw)
     assert "repin" not in manifest["rollback_target"]
     pins = _pins()
-    assert pins.rollback_revision == 12
-    assert pins.rollback_task_definition_arn == REVISION_12_ARN
-    assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_STAGED_ROWS
+    assert pins.rollback_revision == 13
+    assert pins.rollback_task_definition_arn == STAGED_ARNS[13]
+    assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_CREDIT_IMAGE
     assert pins.rollback_repin_before is None
     # The D3 source stays revision 8: the re-pins move only the rollback target.
     assert manifest["task_definition"]["source_revision"] == 8
@@ -6405,12 +6405,19 @@ REPIN_10_TO_11_EARLIEST_CLOSE = datetime.datetime(2026, 10, 25, 21, 7)
 # the minute.
 REVISION_12_COMPLETED = datetime.datetime(2026, 11, 2, 22, 53, 42)
 REPIN_11_TO_12_EARLIEST_CLOSE = datetime.datetime(2026, 11, 2, 22, 54)
+# Window 042's post-read verified 042 at 2026-11-03 01:14:03 UTC. The floor
+# of live step L4 (that post-read + 24 h, and never before L2b's deployment
+# COMPLETED + 6 h) was WAIVED by the owner on 2026-11-03, so the floor of its
+# close is the post-read itself, rounded up to the minute.
+WINDOW_042_POST_READ = datetime.datetime(2026, 11, 3, 1, 14, 3)
+REPIN_12_TO_13_EARLIEST_CLOSE = datetime.datetime(2026, 11, 3, 1, 15)
 # One `# closed_at:` marker per re-pin in the manifest comment, in file order,
 # each with its own floor (the re-pin 12 -> 13 of live step L4 appends its).
 REPIN_CLOSE_FLOORS = (
     ("9 to 10", REPIN_9_TO_10_EARLIEST_CLOSE),
     ("10 to 11", REPIN_10_TO_11_EARLIEST_CLOSE),
     ("11 to 12", REPIN_11_TO_12_EARLIEST_CLOSE),
+    ("12 to 13", REPIN_12_TO_13_EARLIEST_CLOSE),
 )
 
 
@@ -6503,10 +6510,15 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
         4,
         4,
     ]
-    assert expected == len(REPIN_CLOSE_FLOORS) == 3
+    assert expected == len(REPIN_CLOSE_FLOORS) == 4
     for (name, floor), value in zip(REPIN_CLOSE_FLOORS, values, strict=True):
         assert _closed_at_is_valid(value, floor), (name, value)
-    assert values == ["2026-10-25T12:42Z", "2026-11-01T01:19Z", "2026-11-02T23:53Z"]
+    assert values == [
+        "2026-10-25T12:42Z",
+        "2026-11-01T01:19Z",
+        "2026-11-02T23:53Z",
+        "2026-11-03T01:16Z",
+    ]
     # In order: each marker follows its own re-pin's text and precedes the
     # field; each later close is after the earlier one.
     positions = [m.start() for m in marker.finditer(text)]
@@ -6517,6 +6529,8 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
         < positions[1]
         < text.index("Re-pinned from revision 11 to revision 12")
         < positions[2]
+        < text.index("Re-pinned from revision 12 to revision 13")
+        < positions[3]
         < text.index("\nrollback_target:\n")
     )
     closes = [datetime.datetime.strptime(v, "%Y-%m-%dT%H:%MZ") for v in values]
@@ -6525,6 +6539,8 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
     assert closes[1] > datetime.datetime(2026, 10, 25, 15, 6, 57)
     # The 11 -> 12 close is after revision 12's deployment completed.
     assert closes[2] > REVISION_12_COMPLETED
+    # The 12 -> 13 close is after window 042's post-read.
+    assert closes[3] > WINDOW_042_POST_READ
 
 
 # The read-only evidence of revision 11 the 10 -> 11 re-pin records (the
@@ -6538,6 +6554,13 @@ REVISION_11_REQUEST_SHA256 = (
 REVISION_12_REQUEST_SHA256 = (
     "183ccf6605ee14e4379fb83b0c0fe0f54d922c84794211b51168969c7fa4e3cb"
 )
+# The read-only evidence of revision 13 the 12 -> 13 re-pin (live step L4)
+# records (the orchestrator's read with the owner's go, 2026-11-03): L2b's
+# revision, on the image containing 042.
+REVISION_13_REQUEST_SHA256 = (
+    "981902828344b25fa5dc9f929e1e91c58f55e41be6db0c173b3c2bc757a4fc11"
+)
+L2B_DIGEST = "sha256:d7f2ff6f459d0e1adcfc300ee9031bc41556d9417d48fc7c721cdfa71aaaf1de"
 E7B_DIGEST = "sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159"
 
 
@@ -6553,7 +6576,11 @@ def _manifest_comment() -> str:
 def test_the_10_to_11_re_pin_records_its_request_sha256_and_image_digest() -> None:
     comment = _manifest_comment()
     hashes = re.findall(r"request_sha256 ([0-9a-f]+)\b", comment)
-    assert hashes == [REVISION_11_REQUEST_SHA256, REVISION_12_REQUEST_SHA256]
+    assert hashes == [
+        REVISION_11_REQUEST_SHA256,
+        REVISION_12_REQUEST_SHA256,
+        REVISION_13_REQUEST_SHA256,
+    ]
     assert re.fullmatch(r"[0-9a-f]{64}", hashes[0])
     # Revisions 11 and 12 (L2a) run the same image: one digest per re-pin.
     assert MANIFEST.read_text(encoding="utf-8").count(E7B_DIGEST) == 2
@@ -6597,15 +6624,39 @@ def test_the_11_to_12_re_pin_records_its_request_sha256_and_image_digest() -> No
         assert phrase in section, phrase
 
 
+def test_the_12_to_13_re_pin_records_its_request_sha256_and_image_digest() -> None:
+    comment = _manifest_comment()
+    start = comment.index("Re-pinned from revision 12 to revision 13")
+    section = comment[start : comment.index("closed_at: 2026-11-03T01:16Z")]
+    assert re.findall(r"request_sha256 ([0-9a-f]+)\b", section) == [
+        REVISION_13_REQUEST_SHA256
+    ]
+    assert f"app image {L2B_DIGEST}," in section
+    assert section.index(L2B_DIGEST) < section.index(REVISION_13_REQUEST_SHA256)
+    assert MANIFEST.read_text(encoding="utf-8").count(L2B_DIGEST) == 1
+    for phrase in (
+        "deployment COMPLETED 00:39:19Z",
+        "post-read verified 042 at 01:14:03Z",
+        "exactly one BILLING_FACT_WORKER_ENABLED 'true', the two staged rows at"
+        " 'false', no APPCONFIG_ name",
+        "defined as _sha256(_request_from_response(<DescribeTaskDefinition"
+        " neurostack-staging-app:13 with include TAGS>)) in"
+        " scripts/asaas_production_wiring.py (not the plan's"
+        " rendered_request_sha256)",
+        "The owner WAIVED the observation floor of this re-pin",
+    ):
+        assert phrase in section, phrase
+
+
 def test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time() -> None:
     must = wiring.load_yaml(MANIFEST)["context"]["must"]
     assert (
         "The service rollback target is the field rollback_target; code paths"
         " read it from here and it moves one reviewed re-pin at a time, 8 to 9"
         " and 9 to 10 being the safety re-pins (each with its mandatory repin"
-        " note while pending), 10 to 11 and later owner re-pins with no note (11"
-        " and 12 recorded in this manifest; 13 is a separate PR of the live"
-        " sequence), and above 13 any serving revision with effective_after"
+        " note while pending), 10 to 11 and later owner re-pins with no note (11,"
+        " 12 and 13 recorded in this manifest), and above 13 any serving revision"
+        " with effective_after"
         " revision_serving_verified_and_observation_closed." in must
     )
     assert not [line for line in must if "(8 to 9, then 9 to 10)." in line]
@@ -6657,8 +6708,8 @@ def test_a_rollback_revision_must_be_spelled_in_plain_decimal(
 
     text = MANIFEST.read_text(encoding="utf-8")
     field = (
-        "rollback_target:\n  revision: 12\n"
-        "  effective_after: staged_rows_revision_12_serving_verified_and_observation_closed\n"
+        "rollback_target:\n  revision: 13\n"
+        "  effective_after: credit_image_revision_13_serving_verified_and_window_042_observed\n"
     )
     assert field in text
     generic = f"  effective_after: {GENERIC_EFFECTIVE_AFTER}\n"
@@ -8783,11 +8834,11 @@ def test_the_planner_code_names_no_chain_revision_outside_the_pin_table() -> Non
 # its current pin (measured for 11 to 12: each fails then). The runbook's
 # checklist names exactly these (test_the_runbook_documents_the_rollback_target_chain).
 RE_PIN_CHECKLIST = (
-    "test_the_reviewed_manifest_is_pinned_to_revision_12",
+    "test_the_reviewed_manifest_is_pinned_to_revision_13",
     "test_036_037_and_042_refuse_a_rollback_target_not_repinned",
     "test_without_a_manifest_the_tool_reads_the_reviewed_one",
     "test_manifest_and_template_validate",
-    "test_rollback_target_is_re_pinned_to_revision_12_without_a_note",
+    "test_rollback_target_is_re_pinned_to_revision_13_without_a_note",
     "test_manifest_validator_rejects_an_invalid_rollback_target",
     "test_render_taskdef_refuses_the_image_stuck_state_with_its_reason",
     "test_the_repository_parameters_propose_the_l2a_rows_revision",
