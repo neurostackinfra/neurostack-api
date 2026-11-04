@@ -2751,12 +2751,12 @@ new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
 13) it is a starting point, to confirm by running the runbook readers, since
 it depends on how L2c rewrote these tests: in
 `tests/scripts/test_asaas_migration_window.py`,
-`test_the_reviewed_manifest_is_pinned_to_revision_13` and the `MANIFEST`
+`test_the_reviewed_manifest_is_pinned_to_revision_16` and the `MANIFEST`
 line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
 `042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
 in `tests/scripts/test_asaas_production_wiring.py`,
 `test_manifest_and_template_validate`,
-`test_rollback_target_is_re_pinned_to_revision_13_without_a_note`,
+`test_rollback_target_is_re_pinned_to_revision_16_without_a_note`,
 `test_manifest_validator_rejects_an_invalid_rollback_target`,
 `test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
 `test_the_repository_parameters_propose_the_l2a_rows_revision`,
@@ -2806,6 +2806,21 @@ the checklist above it also updated the 10 to 11 evidence test (one
 `request_sha256` per re-pin) and the context line of
 `test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time`, and
 added `test_the_12_to_13_re_pin_records_its_request_sha256_and_image_digest`.
+
+**History (13 to 16).** The first image change after L7 (the image of `main`
+after the ASAAS sandbox-by-key change, `build-20261104-fbda835a-41748073151`,
+built and smoked by `.github/workflows/deploy.yml`) was gated with the target
+on 13 (`rollback_target_not_repinned_before_image_bump`: revision 16 differs
+from 13 by the flips L5 to L7). Following the hotfix-image flow above 13, the
+manifest was first re-pinned to the serving revision 16 (L7's revision,
+deployment `COMPLETED` 2026-11-03 20:45:20Z) with `effective_after:
+revision_serving_verified_and_observation_closed`, its image digest and its
+`request_sha256` (read only on 2026-11-04: `ACTIVE`, exactly one
+`BILLING_FACT_WORKER_ENABLED` `'true'`, both staged rows `'true'`, the
+complete AppConfig group). The owner waived its 6 h floor (2026-11-04T02:46Z)
+and declared the observation closed at 2026-11-04T01:12Z, the manifest's fifth
+`closed_at` marker. With the target on 16 the image change plans with no gate
+block.
 
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production

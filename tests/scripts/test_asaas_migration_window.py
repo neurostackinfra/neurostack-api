@@ -1934,7 +1934,7 @@ def test_036_037_and_042_refuse_a_rollback_target_not_repinned(
     assert "rollback_target_not_repinned" in _blocks(world, tmp_path, manifest=MANIFEST)
 
 
-def test_the_reviewed_manifest_is_pinned_to_revision_13() -> None:
+def test_the_reviewed_manifest_is_pinned_to_revision_16() -> None:
     """Live step L4 re-pinned the reviewed manifest from 12 to 13 (L2b's
     revision, after window 042 ran on 2026-11-03). No window goes back to 13:
     036 and 037 require 10 and 042 requires 12, and production is at 042, so
@@ -1943,13 +1943,13 @@ def test_the_reviewed_manifest_is_pinned_to_revision_13() -> None:
 
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 13,
-        "effective_after": wiring.ROLLBACK_EFFECTIVE_CREDIT_IMAGE,
+        "revision": 16,
+        "effective_after": wiring.ROLLBACK_EFFECTIVE_SERVING,
     }
     pins = wiring.manifest_pins(wiring.validate_manifest(raw))
-    assert pins.rollback_revision == 13
+    assert pins.rollback_revision == 16
     assert pins.rollback_repin_before is None
-    assert pins.rollback_task_definition_arn == SERVICE_TD_13
+    assert pins.rollback_task_definition_arn == TD_PREFIX + "neurostack-staging-app:16"
     assert pins.rollback_revision not in {
         window.rollback_target_revision for window in mw.WINDOWS.values()
     }
@@ -1965,11 +1965,11 @@ def test_without_a_manifest_the_tool_reads_the_reviewed_one(
     ``rollback_target_not_repinned`` (never ``manifest_invalid``)."""
 
     world = ready_world(tmp_path, window)
-    refused = mw.WINDOWS[window].rollback_target_revision != 13
+    refused = mw.WINDOWS[window].rollback_target_revision != 16
     document, run = mw.evaluate_plan(
         world.readback(tmp_path, "plan.json"), world.context(), now=NOW_DT
     )
-    assert document["manifest"]["rollback_target_revision"] == 13
+    assert document["manifest"]["rollback_target_revision"] == 16
     assert ("rollback_target_not_repinned" in document["blocks"]) is refused
     assert "manifest_invalid" not in document["blocks"]
     if refused:
@@ -1982,11 +1982,11 @@ def test_without_a_manifest_the_tool_reads_the_reviewed_one(
         now=NOW_DT,
         manifest=None,
     )
-    assert document["manifest"]["rollback_target_revision"] == 13
+    assert document["manifest"]["rollback_target_revision"] == 16
     code, out, _err = run_cli(["plan", *world.args(tmp_path)], capsys)
     assert code == (2 if refused else 0)
     printed = json.loads(out)
-    assert printed["manifest"]["rollback_target_revision"] == 13
+    assert printed["manifest"]["rollback_target_revision"] == 16
     assert ("rollback_target_not_repinned" in printed["blocks"]) is refused
     assert "manifest_invalid" not in printed["blocks"]
     # With the window's own target the same reads are ready.
