@@ -199,6 +199,7 @@ alembic/versions/*.pyc
 .github/workflows/*
 !.github/workflows/asaas-build-attestation.yml
 !.github/workflows/billing-postgres-integration.yml
+!.github/workflows/deploy.yml
 # Genie CLI
 .genie/
 !.genie/
