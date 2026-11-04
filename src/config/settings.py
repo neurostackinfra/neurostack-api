@@ -22,8 +22,35 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.exceptions import ConfigurationError
 
-ASAAS_API_BASE_URL: Final = "https://api.asaas.com/v3"
+# ASAAS environment, chosen by the API key itself.  ASAAS issues production
+# keys as ``$aact_prod_...`` and sandbox keys as ``$aact_hmlg_...``, each
+# valid only against its own origin, so the key decides the origin and a key
+# can never be paired with the other environment's API.  A sandbox key is
+# refused under ``ENVIRONMENT=production`` (``validate_asaas_api_key``).
+AsaasEnvironment = Literal["production", "sandbox"]
+ASAAS_PRODUCTION_KEY_PREFIX: Final = "$aact_prod_"
+ASAAS_SANDBOX_KEY_PREFIX: Final = "$aact_hmlg_"
+ASAAS_PRODUCTION_API_BASE_URL: Final = "https://api.asaas.com/v3"
+ASAAS_SANDBOX_API_BASE_URL: Final = "https://api-sandbox.asaas.com/v3"
+ASAAS_API_BASE_URLS: Final[dict[str, str]] = {
+    "production": ASAAS_PRODUCTION_API_BASE_URL,
+    "sandbox": ASAAS_SANDBOX_API_BASE_URL,
+}
+# The production origin, kept under its historical name.
+ASAAS_API_BASE_URL: Final = ASAAS_PRODUCTION_API_BASE_URL
 ASAAS_AUTH_HEADER: Final = "access_token"
+
+
+def asaas_environment_for_key(key: str) -> AsaasEnvironment | None:
+    """Return the ASAAS environment a key belongs to, or ``None``."""
+
+    if key.startswith(ASAAS_PRODUCTION_KEY_PREFIX):
+        return "production"
+    if key.startswith(ASAAS_SANDBOX_KEY_PREFIX):
+        return "sandbox"
+    return None
+
+
 ASAAS_DEFAULT_USER_AGENT: Final = "NeuroStack/asaas-payment-gateway"
 
 
@@ -570,12 +597,35 @@ class Settings(BaseSettings):
 
     @field_validator("asaas_api_key")
     @classmethod
-    def validate_asaas_api_key(cls, value: SecretStr) -> SecretStr:
-        """Accept only an absent key or the ASAAS production-key namespace."""
+    def validate_asaas_api_key(
+        cls, value: SecretStr, info: ValidationInfo
+    ) -> SecretStr:
+        """Accept an absent key, a production key, or a sandbox key outside
+        ``ENVIRONMENT=production``.
+
+        The key's namespace picks the ASAAS origin (``asaas_environment_for_key``),
+        so the production service can never run against the sandbox and a
+        sandbox key can never reach the production API.
+        """
 
         raw_value = value.get_secret_value()
-        if raw_value and not raw_value.startswith("$aact_prod_"):
-            raise ValueError("ASAAS_API_KEY must use the production key namespace")
+        if not raw_value:
+            return value
+        key_environment = asaas_environment_for_key(raw_value)
+        if key_environment is None:
+            raise ValueError(
+                "ASAAS_API_KEY must use the production or the sandbox key namespace"
+            )
+        # ``environment`` is declared before ``asaas_api_key``, so it is in
+        # ``info.data`` once valid; when it is not, fail closed.
+        if key_environment == "sandbox" and info.data.get("environment") in (
+            "production",
+            None,
+        ):
+            raise ValueError(
+                "ASAAS_API_KEY must use the production key namespace under "
+                "ENVIRONMENT=production"
+            )
         return value
 
     @field_validator("asaas_webhook_token")
@@ -813,16 +863,24 @@ class Settings(BaseSettings):
         return self.environment == "development"
 
     @property
+    def asaas_api_environment(self) -> AsaasEnvironment | None:
+        """The ASAAS environment of the configured key (``None`` without one)."""
+
+        return asaas_environment_for_key(self.asaas_api_key.get_secret_value())
+
+    @property
     def is_asaas_configuration_compatible(self) -> bool:
         """Return whether required ASAAS settings are complete and compatible."""
 
-        api_key = self.asaas_api_key.get_secret_value()
         webhook_token = self.asaas_webhook_token.get_secret_value()
+        key_environment = self.asaas_api_environment
         return bool(
-            api_key.startswith("$aact_prod_")
+            key_environment is not None
+            and not (key_environment == "sandbox" and self.environment == "production")
             and webhook_token
             and self.asaas_user_agent.strip()
-            and ASAAS_API_BASE_URL == "https://api.asaas.com/v3"
+            and ASAAS_API_BASE_URLS[key_environment]
+            in (ASAAS_PRODUCTION_API_BASE_URL, ASAAS_SANDBOX_API_BASE_URL)
             and ASAAS_AUTH_HEADER == "access_token"
         )
 

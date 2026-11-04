@@ -697,7 +697,11 @@ BAD_CONFIGS = [
     ({"webhook_token": SecretStr("x" * 20 + " " + "x" * 20)}, "webhook_token_invalid"),
     ({"webhook_token": SecretStr("x" * 40 + "é")}, "webhook_token_invalid"),
     ({"api_key": SecretStr("")}, "api_key_missing"),
-    ({"api_key": SecretStr(SANDBOX_KEY)}, "api_key_invalid"),
+    # A sandbox key is valid outside ENVIRONMENT=production only.
+    (
+        {"api_key": SecretStr(SANDBOX_KEY), "environment": "production"},
+        "api_key_invalid",
+    ),
     ({"api_key": SecretStr("$aact_YTU5YTE0M2M2N2I4MTIxNzlkMjM")}, "api_key_invalid"),
     ({"api_key": SecretStr(KEY + " ")}, "api_key_invalid"),
     ({"webhook_url": ""}, "webhook_url_missing"),
@@ -782,7 +786,7 @@ async def test_check_config_prints_only_booleans_and_makes_no_request() -> None:
     assert result.checks == {
         "settings_loaded": True,
         "imports_ok": True,
-        "api_key_production_namespace": True,
+        "api_key_namespace_valid": True,
         "webhook_token_valid": True,
         "webhook_url_valid": True,
         "webhook_host_allowed": True,
@@ -863,28 +867,50 @@ def test_fake_keys_are_exactly_what_the_validators_accept_and_reject() -> None:
     assert make_settings().asaas_api_key.get_secret_value() == KEY
     AsaasClient(api_key=SecretStr(KEY), user_agent="NeuroStack/test")
     checks, reasons = cli.validate_config(make_config())
-    assert checks["api_key_production_namespace"] is True and reasons == ()
-    # Sandbox namespace: refused by the settings field validator, the client
-    # and this CLI, without echoing the value.
+    assert checks["api_key_namespace_valid"] is True and reasons == ()
+    assert AsaasClient(api_key=SecretStr(KEY), user_agent="NeuroStack/t").base_url == (
+        "https://api.asaas.com/v3"
+    )
+    # Sandbox namespace outside ENVIRONMENT=production: accepted by the
+    # settings, the client (which then only talks to the sandbox origin) and
+    # this CLI.
+    assert make_settings(
+        asaas_api_key=SecretStr(SANDBOX_KEY)
+    ).asaas_api_environment == ("sandbox")
+    sandbox = AsaasClient(api_key=SecretStr(SANDBOX_KEY), user_agent="NeuroStack/t")
+    assert sandbox.base_url == "https://api-sandbox.asaas.com/v3"
+    assert sandbox.environment == "sandbox"
+    checks, reasons = cli.validate_config(make_config(api_key=SecretStr(SANDBOX_KEY)))
+    assert checks["api_key_namespace_valid"] is True and reasons == ()
+    # Sandbox namespace under ENVIRONMENT=production: refused by the settings
+    # field validator and this CLI, without echoing the value.
     with pytest.raises(ValidationError) as caught:
-        make_settings(asaas_api_key=SecretStr(SANDBOX_KEY))
+        make_settings(environment="production", asaas_api_key=SecretStr(SANDBOX_KEY))
     errors = caught.value.errors(include_url=False)
-    assert [(e["loc"], e["type"]) for e in errors] == [
-        (("asaas_api_key",), "value_error")
+    assert (("asaas_api_key",), "value_error") in [
+        (e["loc"], e["type"]) for e in errors
     ]
     _assert_no_canary(str(caught.value), repr(caught.value))
-    with pytest.raises(cli.AsaasConfigurationError):
-        AsaasClient(api_key=SecretStr(SANDBOX_KEY), user_agent="NeuroStack/test")
-    checks, reasons = cli.validate_config(make_config(api_key=SecretStr(SANDBOX_KEY)))
-    assert checks["api_key_production_namespace"] is False
+    checks, reasons = cli.validate_config(
+        make_config(api_key=SecretStr(SANDBOX_KEY), environment="production")
+    )
+    assert checks["api_key_namespace_valid"] is False
     assert reasons == ("api_key_invalid",)
+    # Any other namespace: refused everywhere.
+    other = "$aact_test_" + "x" * 8
+    with pytest.raises(ValidationError):
+        make_settings(asaas_api_key=SecretStr(other))
+    with pytest.raises(cli.AsaasConfigurationError):
+        AsaasClient(api_key=SecretStr(other), user_agent="NeuroStack/test")
+    checks, _ = cli.validate_config(make_config(api_key=SecretStr(other)))
+    assert checks["api_key_namespace_valid"] is False
 
 
 def test_unloadable_settings_print_one_unconfigured_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(ValidationError) as caught:
-        make_settings(asaas_api_key=SecretStr(SANDBOX_KEY))
+        make_settings(asaas_api_key=SecretStr("$aact_test_" + "x" * 8))
     monkeypatch.setattr(cli, "_IMPORT_ERROR", caught.value)
     code, out, err = invoke(["reconcile"])
     document = json.loads(out)
@@ -1647,12 +1673,14 @@ def _subprocess(
     )
 
 
-def test_entry_point_fails_closed_on_a_sandbox_key(tmp_path: Path) -> None:
+def test_entry_point_fails_closed_on_a_key_outside_both_namespaces(
+    tmp_path: Path,
+) -> None:
     result = _subprocess(
         tmp_path,
         ["reconcile"],
         {
-            "ASAAS_API_KEY": SANDBOX_KEY,
+            "ASAAS_API_KEY": "$aact_test_" + "x" * 8,
             "ASAAS_WEBHOOK_TOKEN": TOKEN,
             "ASAAS_WEBHOOK_URL": URL,
             "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": EMAIL,
@@ -1673,6 +1701,30 @@ def test_entry_point_check_config_passes_without_network(tmp_path: Path) -> None
         ["check-config"],
         {
             "ASAAS_API_KEY": KEY,
+            "ASAAS_WEBHOOK_TOKEN": TOKEN,
+            "ASAAS_WEBHOOK_URL": URL,
+            "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": EMAIL,
+        },
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    (line,) = result.stdout.splitlines()
+    document = json.loads(line)
+    assert document["verdict"] == "ready"
+    assert set(document["checks"].values()) == {True}
+    _assert_no_canary(result.stdout, result.stderr)
+
+
+def test_entry_point_check_config_accepts_a_sandbox_key_in_staging(
+    tmp_path: Path,
+) -> None:
+    """ENVIRONMENT=staging with a sandbox key: the settings load and every
+    check passes (the key picks the sandbox origin; no request is sent)."""
+
+    result = _subprocess(
+        tmp_path,
+        ["check-config"],
+        {
+            "ASAAS_API_KEY": SANDBOX_KEY,
             "ASAAS_WEBHOOK_TOKEN": TOKEN,
             "ASAAS_WEBHOOK_URL": URL,
             "ASAAS_WEBHOOK_NOTIFICATION_EMAIL": EMAIL,

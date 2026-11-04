@@ -1144,7 +1144,10 @@ class BillingCheckoutService:
             # the hardened client boundary.
             from src.services.asaas import checkout_page_url
 
-            checkout_url = checkout_page_url(checkout.external_checkout_id)
+            checkout_url = checkout_page_url(
+                checkout.external_checkout_id,
+                settings.asaas_api_environment or "production",
+            )
         return CheckoutView(
             checkout_session_id=checkout.id,
             kind=kind,

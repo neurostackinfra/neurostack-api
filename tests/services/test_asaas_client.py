@@ -284,3 +284,45 @@ def test_committed_request_fixtures_are_the_exact_bytes_the_service_sends(
     assert fixture.read_bytes() == request.body() + b"\n"
     parsed = json.loads(fixture.read_bytes(), parse_float=Decimal)
     assert isinstance(parsed["items"][0]["value"], Decimal)  # never a float
+
+
+def test_a_sandbox_key_targets_only_the_sandbox_origin_and_payer_page() -> None:
+    """The key's namespace picks the environment: a sandbox key never builds
+    a request or a payer link for the production origin, and vice versa."""
+
+    from src.services.asaas import (
+        AsaasConfigurationError,
+        CheckoutCreated,
+        checkout_page_url,
+    )
+
+    sandbox = AsaasClient(
+        api_key=SecretStr("$aact_hmlg_" + "fixture"), user_agent="NeuroStack/t"
+    )
+    assert sandbox.environment == "sandbox"
+    assert sandbox.base_url == "https://api-sandbox.asaas.com/v3"
+    assert str(sandbox._http().base_url) == "https://api-sandbox.asaas.com/v3/"
+    assert "api-sandbox.asaas.com" in repr(sandbox)
+
+    production = AsaasClient(
+        api_key=SecretStr("$aact_prod_" + "fixture"), user_agent="NeuroStack/t"
+    )
+    assert production.environment == "production"
+    assert str(production._http().base_url) == "https://api.asaas.com/v3/"
+
+    checkout_id = "chk_000000000000001"
+    assert checkout_page_url(checkout_id) == (
+        "https://asaas.com/checkoutSession/show?id=chk_000000000000001"
+    )
+    assert checkout_page_url(checkout_id, "sandbox") == (
+        "https://sandbox.asaas.com/checkoutSession/show?id=chk_000000000000001"
+    )
+    assert CheckoutCreated(checkout_id=checkout_id, environment="sandbox").url == (
+        checkout_page_url(checkout_id, "sandbox")
+    )
+    assert CheckoutCreated(checkout_id=checkout_id).url == checkout_page_url(
+        checkout_id
+    )
+
+    with pytest.raises(AsaasConfigurationError):
+        AsaasClient(api_key=SecretStr("$aact_test_fixture"), user_agent="NeuroStack/t")

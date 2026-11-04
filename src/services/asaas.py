@@ -1,8 +1,10 @@
 """ASAAS v3 HTTP client for hosted Checkout creation and containment.
 
-Trust boundary. Every request goes to the code-constant production origin
-``https://api.asaas.com/v3`` with the ``access_token`` header read from a
-``SecretStr``; redirects are never followed, proxies/environment are ignored,
+Trust boundary. Every request goes to a code-constant origin chosen by the
+API key's namespace: ``https://api.asaas.com/v3`` for a production key
+(``$aact_prod_``) or ``https://api-sandbox.asaas.com/v3`` for a sandbox key
+(``$aact_hmlg_``; refused under ``ENVIRONMENT=production`` by the settings),
+with the ``access_token`` header read from a ``SecretStr``; redirects are never followed, proxies/environment are ignored,
 responses are size-bounded and parsed without floats, and every exception is
 a fixed code without payloads, URLs, headers or credentials.
 
@@ -20,7 +22,8 @@ Contract source: https://docs.asaas.com (retrieved 2026-10-11) —
 value``), ``POST /v3/checkouts/{id}/cancel``, ``DELETE /v3/subscriptions/{id}``,
 ``POST /v3/payments/{id}/refund``, ``GET /v3/subscriptions`` and
 ``GET /v3/payments`` (``externalReference``/``checkoutSession`` filters). The
-payer link is ``https://asaas.com/checkoutSession/show?id=<checkout.id>``.
+payer link is ``https://asaas.com/checkoutSession/show?id=<checkout.id>`` (the
+sandbox: ``https://sandbox.asaas.com/checkoutSession/show?id=<checkout.id>``).
 """
 
 from __future__ import annotations
@@ -37,11 +40,21 @@ from uuid import UUID
 import httpx
 from pydantic import SecretStr
 
-from src.config.settings import ASAAS_API_BASE_URL, ASAAS_AUTH_HEADER
+from src.config.settings import (
+    ASAAS_API_BASE_URLS,
+    ASAAS_AUTH_HEADER,
+    AsaasEnvironment,
+    asaas_environment_for_key,
+)
 
 CheckoutKind = Literal["subscription", "topup"]
 
-ASAAS_CHECKOUT_PAGE_URL: Final = "https://asaas.com/checkoutSession/show"
+ASAAS_CHECKOUT_PAGE_URLS: Final[dict[str, str]] = {
+    "production": "https://asaas.com/checkoutSession/show",
+    "sandbox": "https://sandbox.asaas.com/checkoutSession/show",
+}
+# The production payer page, kept under its historical name.
+ASAAS_CHECKOUT_PAGE_URL: Final = ASAAS_CHECKOUT_PAGE_URLS["production"]
 ASAAS_CHECKOUT_MINUTES_TO_EXPIRE: Final = 60
 ASAAS_MAX_RESPONSE_BYTES: Final = 65_536
 ASAAS_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
@@ -125,11 +138,15 @@ def validate_provider_id(value: object) -> str:
     return value
 
 
-def checkout_page_url(checkout_id: str) -> str:
-    """Build the payer URL from the fixed HTTPS origin and a validated ID."""
+def checkout_page_url(
+    checkout_id: str, environment: AsaasEnvironment = "production"
+) -> str:
+    """Build the payer URL from the environment's fixed HTTPS origin and a
+    validated ID."""
 
     validated = validate_provider_id(checkout_id)
-    return f"{ASAAS_CHECKOUT_PAGE_URL}?{urlencode({'id': validated})}"
+    origin = ASAAS_CHECKOUT_PAGE_URLS[environment]
+    return f"{origin}?{urlencode({'id': validated})}"
 
 
 def brl_amount(amount_cents: int) -> Decimal:
@@ -309,10 +326,11 @@ class CheckoutCreated:
     """Validated provider identity of a created hosted Checkout."""
 
     checkout_id: str
+    environment: AsaasEnvironment = "production"
 
     @property
     def url(self) -> str:
-        return checkout_page_url(self.checkout_id)
+        return checkout_page_url(self.checkout_id, self.environment)
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,7 +669,7 @@ def _reject(_constant: str) -> Any:
 class AsaasClient:
     """Async ASAAS client with fixed origin, headers and fail-closed parsing."""
 
-    __slots__ = ("_api_key", "_user_agent", "_transport")
+    __slots__ = ("_api_key", "_user_agent", "_transport", "_environment")
 
     def __init__(
         self,
@@ -660,10 +678,13 @@ class AsaasClient:
         user_agent: str,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if (
-            not isinstance(api_key, SecretStr)
-            or not api_key.get_secret_value().startswith("$aact_prod_")
-            or any(ord(c) < 33 or ord(c) > 126 for c in api_key.get_secret_value())
+        if not isinstance(api_key, SecretStr):
+            raise AsaasConfigurationError()
+        # The key's namespace picks the origin: a production key only ever
+        # reaches the production API, a sandbox key only the sandbox.
+        environment = asaas_environment_for_key(api_key.get_secret_value())
+        if environment is None or any(
+            ord(c) < 33 or ord(c) > 126 for c in api_key.get_secret_value()
         ):
             raise AsaasConfigurationError()
         if (
@@ -676,13 +697,24 @@ class AsaasClient:
         self._api_key = api_key
         self._user_agent = user_agent
         self._transport = transport
+        self._environment: AsaasEnvironment = environment
+
+    @property
+    def environment(self) -> AsaasEnvironment:
+        """The ASAAS environment this client talks to (from its key)."""
+
+        return self._environment
+
+    @property
+    def base_url(self) -> str:
+        return ASAAS_API_BASE_URLS[self._environment]
 
     def __repr__(self) -> str:
-        return f"AsaasClient(base_url={ASAAS_API_BASE_URL!r})"
+        return f"AsaasClient(base_url={self.base_url!r})"
 
     def _http(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=ASAAS_API_BASE_URL,
+            base_url=self.base_url,
             timeout=ASAAS_TIMEOUT,
             follow_redirects=False,
             trust_env=False,
@@ -788,7 +820,7 @@ class AsaasClient:
         status = payload.get("status")
         if status is not None and status not in _CHECKOUT_STATUSES:
             raise AsaasOutcomeUnknown("asaas_invalid_response")
-        return CheckoutCreated(checkout_id=checkout_id)
+        return CheckoutCreated(checkout_id=checkout_id, environment=self._environment)
 
     async def cancel_checkout(self, checkout_id: str) -> CheckoutStatus:
         """Cancel an open Checkout; containment never consults the creation gate."""
