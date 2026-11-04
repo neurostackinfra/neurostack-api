@@ -554,11 +554,12 @@ def test_rollback_runbook_states_every_rollback_target_phase() -> None:
         "**Revision 8 is unsafe after migration 036**: it reads columns 036"
         " drops, and 036 ran on 2026-10-24",
         "--task-definition neurostack-staging-app:R",
-        "`R` is the rollback target, `13` since the fifth re-pin (live step L4;"
-        " it was `8` until the first re-pin merged, `9` until the second, `10`"
-        " until the third, `11` until the fourth and `12` until the fifth);"
-        " never `8`, because migration 036 has run",
-        'Read "revision R" below as the field\'s current value, revision 13',
+        "`R` is the rollback target, `16` since the sixth re-pin (to the serving"
+        " revision before an image change; it was `8` until the first re-pin"
+        " merged, `9` until the second, `10` until the third, `11` until the"
+        " fourth, `12` until the fifth and `13` until the sixth); never `8`,"
+        " because migration 036 has run",
+        'Read "revision R" below as the field\'s current value, revision 16',
         "After L6 do not roll back by hand to R (13)",
         "`service_on_rollback_target_plan_stuck:<revision 13 ARN>`",
         # The breaker after L6: a safe state, not the documented way back.
