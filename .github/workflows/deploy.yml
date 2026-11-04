@@ -1,0 +1,155 @@
+# Build, smoke and publish the application image to the staging ECR.
+#
+# BUILD ONLY. This workflow never registers a task definition, never updates
+# the ECS service and never runs a migration: those stay with the operator,
+# through the production wiring planner and the runbook
+# (docs/runbooks/staging-image-build.md, docs/runbooks/asaas-deployment.md).
+# It only answers one question: "give me an image of this commit that passed
+# the smoke, and its digest", for the planner's app_image_override.
+#
+# Manual trigger only (workflow_dispatch), from main only. No push trigger: a
+# merge must never produce or move an image by itself.
+#
+# AWS access: the role neurostack-gha-app-deploy (infrastructure repository,
+# bootstrap/oidc.tf). Its trust accepts exactly this file on main of this
+# repository, with the repository's custom OIDC subject template
+# (repo, context, ref, workflow_ref). The job declares no `environment:` on
+# purpose: an environment changes the token's context and the role would
+# refuse it. The file name is part of that trust: renaming it breaks the
+# build until the trust is updated.
+#
+# The image pushed is the one the smoke checked, addressed by its image ID:
+# it is never rebuilt for the push (scripts/production_image_smoke.py).
+
+name: Staging image build
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_head:
+        description: "Alembic head of the migrations in this commit (e.g. 042)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: staging-image-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, smoke and push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      ROLE_ARN: arn:aws:iam::388460142431:role/neurostack-gha-app-deploy
+      ECR_REPOSITORY: neurostack-staging
+      ECR_REGISTRY: 388460142431.dkr.ecr.us-east-1.amazonaws.com
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+
+      - name: Check the expected Alembic head
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_HEAD" =~ ^[0-9]{3}$ ]] || {
+            echo "::error::expected_head must be three digits (e.g. 042)"
+            exit 1
+          }
+
+      - name: Build and smoke the production image (no push, no network in checks)
+        id: smoke
+        shell: bash
+        env:
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet "packaging==24.2"
+          set +e
+          python scripts/production_image_smoke.py \
+            --tag "neurostack-api-smoke:${GITHUB_SHA}" \
+            --revision "${GITHUB_SHA}" \
+            --expected-head "$EXPECTED_HEAD" \
+            --build-log "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/smoke.json"
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/smoke.json"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the image smoke failed (exit $status); nothing is pushed"
+            tail -n 80 "$RUNNER_TEMP/build.log" || true
+            exit 1
+          fi
+          image_id="$(jq -er '.image_id | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/smoke.json")"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+
+      - name: Assume the app deploy role (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: staging-image-build-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Push the smoked image by its ID and read the digest back
+        id: push
+        shell: bash
+        env:
+          IMAGE_ID: ${{ steps.smoke.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          # The repository's tags are immutable: one tag per commit and run.
+          tag="build-$(date -u +%Y%m%d)-${GITHUB_SHA::8}-${GITHUB_RUN_ID}"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
+          docker tag "$IMAGE_ID" "$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$tag"
+          digest="$(aws ecr describe-images --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" --image-ids "imageTag=$tag" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::ECR returned no digest for $tag"
+            exit 1
+          }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        env:
+          TAG: ${{ steps.push.outputs.tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IMAGE_ID: ${{ steps.smoke.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Staging image published"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Tag | \`${TAG}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Smoked image ID | \`${IMAGE_ID}\` |"
+            echo
+            echo "For the planner (local copy of the parameters file only):"
+            echo
+            echo '```'
+            echo "app_image_override: ${ECR_REGISTRY}/${ECR_REPOSITORY}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Nothing was deployed. Next: docs/runbooks/staging-image-build.md."
+          } >> "$GITHUB_STEP_SUMMARY"
