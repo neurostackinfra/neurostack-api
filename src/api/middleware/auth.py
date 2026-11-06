@@ -14,10 +14,8 @@ from uuid import UUID
 import jwt
 from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from passlib.context import CryptContext
 from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -26,7 +24,6 @@ from src.api.schemas.auth import StagingRehearsalTokenRequest
 from src.api.spa import is_public_spa_path
 from src.config.logging import get_logger
 from src.config.settings import settings
-from src.repositories import TenantRepository, get_db_session
 
 logger = get_logger(__name__)
 
@@ -90,10 +87,6 @@ end
 return count
 """
 
-# Password hashing context for API key validation
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
 # ============================================
 # API Key Authentication
 # ============================================
@@ -148,12 +141,14 @@ class APIKeyStore:
     """
     API Key store for validating and retrieving tenant information.
 
-    Validates API keys against the database using TenantRepository.
-    Falls back to development mode behavior if database validation fails.
+    No tenant API key is issued yet (tenant creation stores a hash of a
+    discarded random value), so only the development keys below authenticate,
+    and only in development and test. Any other environment rejects every key
+    without a database read or a bcrypt check, so an unauthenticated request
+    cannot spend server time on key verification.
     """
 
-    # Development API keys (fallback for development/testing)
-    # These are only used if database lookup fails in development mode
+    # Development API keys (development and test only)
     _dev_keys: dict[str, dict[str, Any]] = {
         "ns_dev_test_key_12345": {
             "tenant_id": UUID("a0000000-0000-0000-0000-000000000001"),
@@ -177,100 +172,24 @@ class APIKeyStore:
         """
         Validate API key and return tenant context.
 
-        First attempts to validate against database by checking all tenants
-        and comparing API key hash. Falls back to development keys if
-        database validation fails in development mode.
-
         Args:
             api_key: The API key to validate
 
         Returns:
-            TenantContext if valid, None otherwise
+            TenantContext for a development key in development or test,
+            None otherwise
         """
-        if not api_key:
+        if not api_key or not _dev_api_keys_allowed():
             return None
 
-        try:
-            # Try to validate against database
-            async with get_db_session() as session:
-                repo = TenantRepository(session)
-
-                # Get all active tenants
-                # NOTE: bcrypt uses salt, so we can't do direct hash lookup.
-                # TODO: Optimize with Redis cache for validated API keys in production
-                # Cache key: f"api_key:{api_key}" -> tenant_id with TTL
-                tenants = await repo.find_active(limit=1000)
-
-                # Check each tenant's API key hash
-                for tenant in tenants:
-                    try:
-                        # Verify API key against stored hash using bcrypt
-                        if pwd_context.verify(api_key, tenant.api_key_hash):
-                            # API key matches this tenant
-                            config = tenant.get_config()
-                            logger.debug(
-                                "API key validated successfully",
-                                tenant_id=str(tenant.id),
-                            )
-                            return TenantContext(
-                                tenant_id=tenant.id,
-                                api_key=api_key,
-                                rate_limit=config.rate_limit,
-                                is_active=tenant.is_active,
-                            )
-                    except ValueError as e:
-                        # Skip invalid hashes (shouldn't happen in production)
-                        logger.debug(
-                            "Failed to verify API key hash",
-                            tenant_id=str(tenant.id),
-                            error=str(e),
-                        )
-                        continue
-                # No commit needed - this is a read-only operation
-
-        except SQLAlchemyError as e:
-            # Database error - fall back to development mode if enabled
-            logger.warning(
-                "Database validation failed, falling back to dev keys",
-                error=str(e),
-                error_type=type(e).__name__,
-            )
-
-            # Allow fallback only in development and test
-            if _dev_api_keys_allowed():
-                return cls._fallback_to_dev_keys(api_key)
-
-            # In staging and production, fail securely
-            return None
-        except Exception as e:
-            # Unexpected error during API key validation
-            logger.error(
-                "Unexpected error during API key validation",
-                error=str(e),
-                error_type=type(e).__name__,
-                exc_info=True,
-            )
-
-            # Allow fallback only in development and test
-            if _dev_api_keys_allowed():
-                return cls._fallback_to_dev_keys(api_key)
-
-            # In staging and production, fail securely
-            return None
-
-        # If we get here, API key didn't match any tenant
-        # Try fallback only in development and test
-        if _dev_api_keys_allowed():
-            return cls._fallback_to_dev_keys(api_key)
-
-        return None
+        return cls._fallback_to_dev_keys(api_key)
 
     @classmethod
     def _fallback_to_dev_keys(cls, api_key: str) -> Optional[TenantContext]:
         """
-        Fallback to development keys if database validation fails.
+        Resolve a development key to its fixed development tenant.
 
-        Only used in development mode.
+        Only used in development and test.
         """
         # Check known development keys
         if api_key in cls._dev_keys:

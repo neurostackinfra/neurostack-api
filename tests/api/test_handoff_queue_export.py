@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.middleware.auth import pwd_context
+from src.api.middleware.auth import APIKeyStore, TenantContext
 from src.config.settings import settings
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
@@ -940,8 +940,18 @@ def test_export_requires_credentials_and_honors_api_key_tenant_boundary(
     _freeze_service_clock(monkeypatch, datetime(2026, 4, 5, 12, tzinfo=timezone.utc))
     api_key = "handoff-export-api-key"
     owner = _tenant()
-    owner.api_key_hash = pwd_context.hash(api_key)
     outsider = _tenant()
+
+    async def accept_owner_api_key(
+        _cls: type[APIKeyStore], value: str
+    ) -> TenantContext | None:
+        if value != api_key:
+            return None
+        return TenantContext(tenant_id=owner.id, api_key=value)
+
+    monkeypatch.setattr(
+        APIKeyStore, "validate_api_key", classmethod(accept_owner_api_key)
+    )
     session = _session(owner.id)
     record = _handoff(
         owner.id,
