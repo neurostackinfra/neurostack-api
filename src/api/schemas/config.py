@@ -301,6 +301,16 @@ class ConfigResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     clinic_id: Any = None
+    tenant_id: str | None = Field(
+        default=None,
+        description=(
+            "Tenant this configuration belongs to: the validated `?tenant_id=` "
+            "target for a Builder or Super Admin, otherwise the caller's own "
+            "tenant. It is the identifier of the clinic's public privacy page, "
+            "`/privacidade/{tenant_id}`. `clinic_id` is a different, usually "
+            "null column and must not be used for that URL."
+        ),
+    )
     version: int = 1
     effective_trigger_message: str = Field(
         default="Precisando de algo mais, estamos a disposição.",
