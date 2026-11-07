@@ -1116,17 +1116,25 @@ def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
     # 038 (the additive credit schema, neurostack-credit-system Group 1a;
     # owner sign-off 2026-10-26), 039 (inventory), 040 (additional copies),
     # 041 (lifecycle, legal hold, purge and roles, Group 5) and 042
-    # (enforcement cutoff acceptances, Group 7) are the last written
-    # revisions, and window 042 (asaas-rollout-opening Group 5, live step
-    # L3) applies exactly them. No later revision can exist unseen: a 043
-    # would need its own window.
+    # (enforcement cutoff acceptances, Group 7), and window 042
+    # (asaas-rollout-opening Group 5, live step L3) applies exactly them.
     assert declared["038"] == "037"
     assert declared["039"] == "038"
     assert declared["040"] == "039"
     assert declared["041"] == "040"
     assert declared["042"] == "041"
-    assert "043" not in declared
-    assert not [rev for rev, down in declared.items() if down == "042"]
+    # 043 (the media category/MIME invariant widened for audio/ogg) is written
+    # and deliberately has NO window: its rollback target is the revision
+    # serving before its own image, which does not exist until that image
+    # deploys, and the reviewed manifest is pinned to the serving revision 16
+    # (#183), so a window naming 16 today would arm itself with no re-pin.
+    # Production therefore stays at 042 until the window is authored.
+    assert declared["043"] == "042"
+    assert "043" not in {rev for row in mw.WINDOWS.values() for rev in row.chain}
+    # No later revision can exist unseen: a 044 would need its own window, or
+    # its own entry here saying why it has none.
+    assert "044" not in declared
+    assert not [rev for rev, down in declared.items() if down == "043"]
 
 
 @pytest.mark.parametrize(
