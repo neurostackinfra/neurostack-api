@@ -17,6 +17,7 @@ from starlette.types import Message, Scope
 
 from src.api.middleware.auth import TenantContext
 from src.api.middleware.media_limits import (
+    MEDIA_MULTIPART_MAX_BYTES,
     ImmediateLimiter,
     MediaConcurrencyLimiters,
     MediaUploadLimitsMiddleware,
@@ -24,7 +25,23 @@ from src.api.middleware.media_limits import (
 from src.api.routes import media_assets as route
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
-from src.services.media_assets import MediaAssetDomainError
+from src.services.media_assets import (
+    MEDIA_AUDIO_VIDEO_MAX_BYTES,
+    MEDIA_IMAGE_MAX_BYTES,
+    MediaAssetDomainError,
+)
+
+_OGG_OPUS = (
+    b"OggS"
+    + bytes([0, 0x02])
+    + bytes(20)  # granule, serial, sequence, CRC
+    + b"\x01\x13"  # one segment, 19 bytes long
+    + b"OpusHead"
+    + bytes([1, 2])
+    + (312).to_bytes(2, "little")
+    + (48_000).to_bytes(4, "little")
+    + bytes(3)  # output gain and channel mapping family
+)
 
 
 def _scope(*, content_length: int | None = None) -> Scope:
@@ -70,7 +87,9 @@ def _response_json(messages: list[Message]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_declared_request_above_51mb_is_rejected_without_consuming_body() -> None:
+async def test_declared_request_above_the_cap_is_rejected_without_consuming_body() -> (
+    None
+):
     consumed = False
 
     async def receive() -> Message:
@@ -87,7 +106,7 @@ async def test_declared_request_above_51mb_is_rejected_without_consuming_body() 
         upload_path="/v1/media-assets",
     )
     messages = await _response_messages(
-        middleware, _scope(content_length=51_000_001), receive
+        middleware, _scope(content_length=MEDIA_MULTIPART_MAX_BYTES + 1), receive
     )
 
     assert messages[0]["status"] == 413
@@ -96,13 +115,18 @@ async def test_declared_request_above_51mb_is_rejected_without_consuming_body() 
 
 
 @pytest.mark.asyncio
-async def test_chunked_request_above_51mb_is_stopped_before_parser_receives_excess() -> (
+async def test_chunked_request_above_the_cap_is_stopped_before_parser_receives_excess() -> (
     None
 ):
+    first = MEDIA_MULTIPART_MAX_BYTES // 2
     chunks = iter(
         [
-            {"type": "http.request", "body": b"a" * 25_500_000, "more_body": True},
-            {"type": "http.request", "body": b"b" * 25_500_001, "more_body": False},
+            {"type": "http.request", "body": b"a" * first, "more_body": True},
+            {
+                "type": "http.request",
+                "body": b"b" * (MEDIA_MULTIPART_MAX_BYTES - first + 1),
+                "more_body": False,
+            },
         ]
     )
     delivered = 0
@@ -307,6 +331,7 @@ def _raw_multipart_body(*, boundary: str, charset: str) -> bytes:
         (b"\xff\xd8\xff\xe0jpeg", "image/jpeg", "image"),
         (b"\xff\xfb\x90\x64mp3", "audio/mpeg", "audio"),
         (b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp42", "video/mp4", "video"),
+        (_OGG_OPUS, "audio/ogg", "audio"),
     ],
 )
 async def test_upload_order_and_all_formats_preserve_payload_and_metadata(
@@ -594,7 +619,7 @@ async def test_parser_rejects_duplicate_file_and_unknown_fields(
 
 
 @pytest.mark.asyncio
-async def test_file_above_50mb_rolls_back_without_insert(
+async def test_oversized_file_rolls_back_without_insert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def oversized(stream: Any) -> bytes:
@@ -636,6 +661,145 @@ async def test_file_above_50mb_rolls_back_without_insert(
         )
     assert caught.value.status_code == 413
     assert session.inserted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "mime", "expected_code"),
+    [
+        # 5 MB + 1: under the 20 MB read cap, over the image category's own limit.
+        (
+            b"\x89PNG\r\n\x1a\n" + bytes(MEDIA_IMAGE_MAX_BYTES - 7),
+            "image/png",
+            "media_size_exceeded",
+        ),
+        (
+            b"\xff\xfb\x90\x64" + bytes(MEDIA_AUDIO_VIDEO_MAX_BYTES - 3),
+            "audio/mpeg",
+            "media_size_exceeded",
+        ),
+    ],
+)
+async def test_file_over_its_category_limit_is_413_in_every_credit_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    mime: str,
+    expected_code: str,
+) -> None:
+    tenant_id = uuid4()
+    target = Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    async def authorized(*args: Any, **kwargs: Any) -> Tenant:
+        return target
+
+    async def forbidden_guard(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("oversized payload reached the capacity guard")
+
+    monkeypatch.setattr(route, "_authorized_target", authorized)
+    monkeypatch.setattr(route, "media_storage_capacity_guard", forbidden_guard)
+
+    class Session:
+        inserted = False
+
+        async def rollback(self) -> None:
+            return None
+
+        def add(self, asset: MediaAsset) -> None:
+            self.inserted = True
+
+    session = Session()
+    request = _FakeRequest(
+        FormData(
+            [
+                (
+                    "file",
+                    UploadFile(
+                        BytesIO(payload), headers=Headers({"content-type": mime})
+                    ),
+                ),
+                ("display_name", "x"),
+                ("original_filename", "x.bin"),
+            ]
+        )
+    )
+
+    with pytest.raises(Exception) as caught:
+        await route.upload_media_asset(
+            request=request,  # type: ignore[arg-type]
+            tenant_id=None,
+            tenant=TenantContext(tenant_id),
+            session=session,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.status_code == 413
+    assert caught.value.detail == {"code": expected_code}
+    assert session.inserted is False
+
+
+@pytest.mark.asyncio
+async def test_opus_codecs_parameter_is_stored_as_the_canonical_mime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    target = Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    async def authorized(*args: Any, **kwargs: Any) -> Tenant:
+        return target
+
+    class Guard(AbstractAsyncContextManager[Any]):
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def validate_projection(self, size: int) -> None:
+            return None
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(route, "_authorized_target", authorized)
+    monkeypatch.setattr(route, "media_storage_capacity_guard", lambda *a, **k: Guard())
+
+    class Session:
+        asset: MediaAsset
+
+        def add(self, asset: MediaAsset) -> None:
+            self.asset = asset
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    session = Session()
+    request = _FakeRequest(
+        FormData(
+            [
+                (
+                    "file",
+                    UploadFile(
+                        BytesIO(_OGG_OPUS),
+                        headers=Headers({"content-type": "audio/ogg; codecs=opus"}),
+                    ),
+                ),
+                ("display_name", "Áudio"),
+                ("original_filename", "recado.ogg"),
+            ]
+        )
+    )
+
+    asset = await route.upload_media_asset(
+        request=request,  # type: ignore[arg-type]
+        tenant_id=None,
+        tenant=TenantContext(tenant_id),
+        session=session,  # type: ignore[arg-type]
+    )
+
+    assert (asset.category, asset.mime_type) == ("audio", "audio/ogg")
+    assert asset.payload == _OGG_OPUS
 
 
 def test_real_app_registers_upload_and_documents_closed_multipart_shape() -> None:

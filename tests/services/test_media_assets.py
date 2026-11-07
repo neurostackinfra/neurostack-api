@@ -14,12 +14,17 @@ from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.services import media_assets
 from src.services.media_assets import (
+    MEDIA_AUDIO_VIDEO_MAX_BYTES,
+    MEDIA_CATEGORY_MAX_BYTES,
+    MEDIA_IMAGE_MAX_BYTES,
+    MEDIA_PDF_MAX_BYTES,
     MEDIA_STORAGE_CAP_BYTES,
     MediaAssetDomainError,
     MediaStorageCapacityExceeded,
     MediaStorageCapacityGuard,
     MediaStorageGuardError,
     MediaStorageProjection,
+    canonical_declared_mime,
     classify_media_payload,
     media_payload_sha256,
     media_storage_advisory_key,
@@ -42,6 +47,43 @@ class _ByteStream:
         chunk = self.payload[self.offset : end]
         self.offset += len(chunk)
         return chunk
+
+
+def _opus_head(version: int = 1, channels: int = 2) -> bytes:
+    """The 19-byte RFC 7845 identification header."""
+
+    return (
+        b"OpusHead"
+        + bytes([version, channels])
+        + (312).to_bytes(2, "little")  # pre-skip
+        + (48_000).to_bytes(4, "little")  # input sample rate
+        + (0).to_bytes(2, "little")  # output gain
+        + bytes([0])  # channel mapping family
+    )
+
+
+def _ogg_page(
+    *,
+    capture: bytes = b"OggS",
+    version: int = 0,
+    header_type: int = 0x02,
+    segments: bytes = b"\x13",
+    segment_count: int | None = None,
+    body: bytes | None = None,
+) -> bytes:
+    """One RFC 3533 page; the CRC is never read, so it stays zero."""
+
+    return (
+        capture
+        + bytes([version, header_type])
+        + bytes(8)  # granule position
+        + bytes(4)  # bitstream serial number
+        + bytes(4)  # page sequence number
+        + bytes(4)  # CRC
+        + bytes([len(segments) if segment_count is None else segment_count])
+        + segments
+        + (_opus_head() if body is None else body)
+    )
 
 
 @pytest.mark.parametrize(
@@ -139,6 +181,7 @@ def test_metadata_accepts_exact_length_boundaries() -> None:
         (b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb\x90\x64", "audio", "audio/mpeg"),
         (b"\xff\xfb\x90\x64mp3", "audio", "audio/mpeg"),
         (b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp42", "video", "video/mp4"),
+        (_ogg_page(), "audio", "audio/ogg"),
     ],
 )
 def test_classification_derives_each_canonical_pair(
@@ -188,6 +231,80 @@ def test_classification_rejects_truncated_or_non_mp4_container_signatures(
 ) -> None:
     with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
         classify_media_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ogg_page(capture=b"OggT"),
+        _ogg_page(version=1),
+        _ogg_page(header_type=0x00),  # not the start of a logical stream
+        _ogg_page()[:26],
+        _ogg_page(body=_opus_head()[:18]),  # identification one byte short
+        _ogg_page(body=_opus_head(version=0x10)),  # unknown major version
+        _ogg_page(body=_opus_head(channels=0)),
+        _ogg_page(body=b"\x01vorbis\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
+        _ogg_page(body=b"\x7fFLAC\x01\x00\x00\x00fLaC\x00\x00\x00\x22\x00\x00"),
+        # declares a segment table longer than the bytes it actually carries
+        _ogg_page(segment_count=255),
+    ],
+)
+def test_classification_rejects_ogg_containers_without_an_opus_head(
+    payload: bytes,
+) -> None:
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        classify_media_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "audio/ogg",
+        "audio/ogg; codecs=opus",
+        "AUDIO/OGG",
+        "  audio/ogg ;codecs=opus  ",
+    ],
+)
+def test_ogg_is_accepted_however_the_sender_spells_its_content_type(
+    declared: str,
+) -> None:
+    classification = validate_media_classification(_ogg_page(), declared)
+    assert (classification.category, classification.mime_type) == (
+        "audio",
+        "audio/ogg",
+    )
+    assert canonical_declared_mime(declared) == "audio/ogg"
+
+
+def test_each_category_is_capped_at_the_published_limit() -> None:
+    assert MEDIA_CATEGORY_MAX_BYTES == {
+        "image": 5_000_000,
+        "pdf": 20_000_000,
+        "audio": 16_000_000,
+        "video": 16_000_000,
+    }
+    # The PDF's 20 MB is the widest, so it is what the pre-parser cap derives from.
+    assert media_assets.MEDIA_FILE_MAX_BYTES == MEDIA_PDF_MAX_BYTES
+
+
+@pytest.mark.parametrize(
+    ("prefix", "mime_type", "limit"),
+    [
+        (b"\x89PNG\r\n\x1a\n", "image/png", MEDIA_IMAGE_MAX_BYTES),
+        (b"\xff\xd8\xff\xe0", "image/jpeg", MEDIA_IMAGE_MAX_BYTES),
+        (b"%PDF-1.7\n", "application/pdf", MEDIA_PDF_MAX_BYTES),
+        (b"\xff\xfb\x90\x64", "audio/mpeg", MEDIA_AUDIO_VIDEO_MAX_BYTES),
+    ],
+)
+def test_a_payload_one_byte_over_its_category_limit_is_rejected(
+    prefix: bytes,
+    mime_type: str,
+    limit: int,
+) -> None:
+    at_limit = prefix + b"\x00" * (limit - len(prefix))
+    assert validate_media_classification(at_limit, mime_type).mime_type == mime_type
+    with pytest.raises(MediaAssetDomainError, match="media_size_exceeded"):
+        validate_media_classification(at_limit + b"\x00", mime_type)
 
 
 @pytest.mark.asyncio

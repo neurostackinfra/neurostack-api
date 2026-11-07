@@ -371,8 +371,10 @@ MIGRATIONS_EXCLUDED: Mapping[str, str] = {
         "instruction after the image containing 042 serves"
     ),
     "042": (
-        "043 and later: none is written; a later revision needs its own "
-        "window in the table"
+        "043 (the media category/MIME invariant widened for audio/ogg) and "
+        "later: 043 is written and has no window yet, so production stays at "
+        "042; it needs its own window in the table, authored once the image "
+        "containing 043 serves and its rollback target revision exists"
     ),
 }
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from typing import AsyncContextManager, Protocol
+from typing import AsyncContextManager, Final, Protocol
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -17,7 +17,26 @@ from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.models.user import User
 
-MEDIA_FILE_MAX_BYTES = 50_000_000
+MEDIA_IMAGE_MAX_BYTES: Final = 5_000_000
+MEDIA_PDF_MAX_BYTES: Final = 20_000_000
+MEDIA_AUDIO_VIDEO_MAX_BYTES: Final = 16_000_000
+MEDIA_CATEGORY_MAX_BYTES: Final[dict[str, int]] = {
+    "image": MEDIA_IMAGE_MAX_BYTES,
+    "pdf": MEDIA_PDF_MAX_BYTES,
+    "audio": MEDIA_AUDIO_VIDEO_MAX_BYTES,
+    "video": MEDIA_AUDIO_VIDEO_MAX_BYTES,
+}
+MEDIA_FILE_MAX_BYTES = max(MEDIA_CATEGORY_MAX_BYTES.values())
+MEDIA_CANONICAL_MIME_TYPES: Final = frozenset(
+    {
+        "video/mp4",
+        "audio/mpeg",
+        "audio/ogg",
+        "application/pdf",
+        "image/jpeg",
+        "image/png",
+    }
+)
 MEDIA_STORAGE_CAP_BYTES = 500_000_000
 MEDIA_READ_CHUNK_BYTES = 1024 * 1024
 _ADVISORY_KEY_PREFIX = b"media-storage-owner:v1\0"
@@ -565,14 +584,31 @@ def _looks_like_mp4(payload: bytes) -> bool:
     return bool(brands) and all(brand in _MP4_BRANDS for brand in brands)
 
 
+def _looks_like_ogg_opus(payload: bytes) -> bool:
+    # RFC 3533 page header, then the RFC 7845 identification header which must
+    # open the first packet of the first page. Vorbis and FLAC in the same
+    # container are deliberately not recognized.
+    if len(payload) < 27 or not payload.startswith(b"OggS"):
+        return False
+    if payload[4] != 0 or not payload[5] & 0x02:
+        return False
+    identification_offset = 27 + payload[26]
+    identification = payload[identification_offset : identification_offset + 19]
+    if len(identification) < 19 or not identification.startswith(b"OpusHead"):
+        return False
+    return identification[8] & 0xF0 == 0 and identification[9] >= 1
+
+
 def classify_media_payload(payload: bytes) -> MediaClassification:
-    """Classify one of the five approved formats from content signatures."""
+    """Classify one of the six approved formats from content signatures."""
     if payload.startswith(b"%PDF-"):
         return MediaClassification("pdf", "application/pdf")
     if payload.startswith(b"\x89PNG\r\n\x1a\n"):
         return MediaClassification("image", "image/png")
     if payload.startswith(b"\xff\xd8\xff"):
         return MediaClassification("image", "image/jpeg")
+    if _looks_like_ogg_opus(payload):
+        return MediaClassification("audio", "audio/ogg")
     if _looks_like_mpeg_audio(payload):
         return MediaClassification("audio", "audio/mpeg")
     if _looks_like_mp4(payload):
@@ -580,23 +616,29 @@ def classify_media_payload(payload: bytes) -> MediaClassification:
     raise MediaAssetDomainError("media_signature_invalid")
 
 
+def canonical_declared_mime(declared_mime_type: str) -> str:
+    """Drop the Content-Type parameters and case that senders vary freely.
+
+    WhatsApp, ffmpeg and several browsers label Opus as
+    ``audio/ogg; codecs=opus``; the parameters carry nothing this allowlist
+    decides on.
+    """
+    return declared_mime_type.split(";", 1)[0].strip().lower()
+
+
 def validate_media_classification(
     payload: bytes,
     declared_mime_type: str,
 ) -> MediaClassification:
-    """Require a supported declared MIME that matches the derived signature."""
-    canonical_mimes = {
-        "video/mp4",
-        "audio/mpeg",
-        "application/pdf",
-        "image/jpeg",
-        "image/png",
-    }
-    if declared_mime_type not in canonical_mimes:
+    """Match the declared MIME to the signature and cap by its category."""
+    declared = canonical_declared_mime(declared_mime_type)
+    if declared not in MEDIA_CANONICAL_MIME_TYPES:
         raise MediaAssetDomainError("media_type_unsupported")
     classification = classify_media_payload(payload)
-    if classification.mime_type != declared_mime_type:
+    if classification.mime_type != declared:
         raise MediaAssetDomainError("media_type_mismatch")
+    if len(payload) > MEDIA_CATEGORY_MAX_BYTES[classification.category]:
+        raise MediaAssetDomainError("media_size_exceeded")
     return classification
 
 

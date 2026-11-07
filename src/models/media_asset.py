@@ -32,6 +32,9 @@ class MediaAsset(Base, TimestampMixin):
             "length(payload) = size_bytes",
             name="ck_media_assets_payload_size",
         ),
+        # Storage backstop, deliberately looser than the per-category product
+        # limits in src/services/media_assets.py: rows predating those limits
+        # stay valid.
         CheckConstraint(
             "size_bytes > 0 AND size_bytes <= 50000000",
             name="ck_media_assets_size_range",
@@ -42,7 +45,7 @@ class MediaAsset(Base, TimestampMixin):
         ),
         CheckConstraint(
             "(category = 'video' AND mime_type = 'video/mp4') OR "
-            "(category = 'audio' AND mime_type = 'audio/mpeg') OR "
+            "(category = 'audio' AND mime_type IN ('audio/mpeg', 'audio/ogg')) OR "
             "(category = 'pdf' AND mime_type = 'application/pdf') OR "
             "(category = 'image' AND mime_type IN ('image/jpeg', 'image/png'))",
             name="ck_media_assets_category_mime",

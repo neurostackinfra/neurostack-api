@@ -66,7 +66,9 @@ def test_upload_documents_closed_single_file_multipart_and_byte_limits() -> None
     request_body = operation["requestBody"]
     multipart = request_body["content"]["multipart/form-data"]["schema"]
 
-    assert request_body["x-maxBytes"] == 51_000_000
+    # The request cap is the largest category (PDF) plus the multipart overhead;
+    # the file cap is that largest category alone.
+    assert request_body["x-maxBytes"] == 21_000_000
     assert multipart["additionalProperties"] is False
     assert multipart["maxProperties"] == 5
     assert multipart["required"] == ["file", "display_name", "original_filename"]
@@ -78,7 +80,7 @@ def test_upload_documents_closed_single_file_multipart_and_byte_limits() -> None
         "auto_suggest",
     }
     assert multipart["properties"]["file"]["format"] == "binary"
-    assert multipart["properties"]["file"]["x-maxBytes"] == 50_000_000
+    assert multipart["properties"]["file"]["x-maxBytes"] == 20_000_000
     assert multipart["properties"]["display_name"]["maxLength"] == 200
     assert multipart["properties"]["original_filename"]["maxLength"] == 255
     assert multipart["properties"]["usage_trigger"]["maxLength"] == 500
@@ -98,7 +100,18 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
     assert response["display_name"]["minLength"] == 1
     assert response["display_name"]["maxLength"] == 200
     assert response["original_filename"]["maxLength"] == 255
+    # A stored type missing here is a 500 on the very upload that created it.
+    assert set(response["mime_type"]["enum"]) == {
+        "video/mp4",
+        "audio/mpeg",
+        "audio/ogg",
+        "application/pdf",
+        "image/jpeg",
+        "image/png",
+    }
     assert response["size_bytes"]["exclusiveMinimum"] == 0
+    # Wider than any upload cap on purpose: it describes what a stored row may
+    # report, including rows that predate the per-category limits.
     assert response["size_bytes"]["maximum"] == 50_000_000
     assert response["usage_trigger"]["anyOf"][0]["maxLength"] == 500
     assert patch["additionalProperties"] is False
@@ -123,6 +136,7 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
     assert set(content) == {
         "video/mp4",
         "audio/mpeg",
+        "audio/ogg",
         "application/pdf",
         "image/jpeg",
         "image/png",
@@ -131,6 +145,28 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
         value["schema"] == {"type": "string", "format": "binary"}
         for value in content.values()
     )
+
+
+def test_upload_publishes_the_per_category_limits_unconditionally() -> None:
+    operation = _operation(_schema(), "/v1/media-assets", "post")
+    request_body = operation["requestBody"]
+    file_property = request_body["content"]["multipart/form-data"]["schema"][
+        "properties"
+    ]["file"]
+    prose = " ".join(
+        [
+            operation["description"],
+            request_body["description"],
+            file_property["description"],
+            operation["responses"]["413"]["description"],
+        ]
+    )
+
+    for limit in ("5,000,000", "20,000,000", "16,000,000"):
+        assert limit in prose
+    assert "OGG-Opus" in file_property["description"]
+    # The limits are a property of the category, not of the credit rollout.
+    assert "credit_enforcement_at" not in prose
 
 
 def test_each_operation_documents_its_stable_error_surface() -> None:

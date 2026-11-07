@@ -1,16 +1,17 @@
 """Authorized tenant-scoped Media Assets catalog endpoints.
 
+The per-category size limits (image 5 MB, PDF 20 MB, audio/video 16 MB) hold in
+every credit mode, so the published contract never depends on the rollout
+state.  M4A stays ``media_type_unsupported``.
+
 Credits (neurostack-credit-system Group 4a, :mod:`src.services.credit_inventory`).
 With the credit switch off nothing changes.  With it on and before
-``credit_enforcement_at``, uploads and downloads keep ``main``'s limits,
-allowlist and answers and are measured observationally after their own
-transaction.  After the enforcement: the PDF's stricter per-type limits
-(image 5 MB, PDF 20 MB, audio/video 16 MB) apply before any reservation --
-M4A and OGG-Opus stay ``media_type_unsupported`` (deferred, owner decision
-A) --; an upload debits its media reservation in the same transaction, and
-a download debits its egress overage in a short transaction BEFORE it is
-answered; a standalone tenant or a quarantine hold is 402 ``credit_pending``
-before anything is stored or any byte is sent.
+``credit_enforcement_at``, uploads and downloads keep ``main``'s allowlist and
+answers and are measured observationally after their own transaction.  After
+the enforcement: an upload debits its media reservation in the same
+transaction, and a download debits its egress overage in a short transaction
+BEFORE it is answered; a standalone tenant or a quarantine hold is 402
+``credit_pending`` before anything is stored or any byte is sent.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from src.api.middleware.auth import (
     get_tenant_context,
     resolve_effective_tenant,
 )
-from src.api.middleware.media_limits import ImmediatePermit
+from src.api.middleware.media_limits import MEDIA_MULTIPART_MAX_BYTES, ImmediatePermit
 from src.api.schemas.media_assets import (
     MediaAssetAuthErrorResponse,
     MediaAssetErrorResponse,
@@ -60,10 +61,7 @@ from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
 from src.services import credit_inventory, credit_lifecycle
-from src.services.credit_allocations import (
-    ENFORCED_MEDIA_MAX_BYTES,
-    reservation_effect_id,
-)
+from src.services.credit_allocations import reservation_effect_id
 from src.services.credit_metering import (
     CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
     CreditEnforcementUnavailable,
@@ -71,6 +69,10 @@ from src.services.credit_metering import (
 )
 from src.services.credit_switch import request_credit_switch
 from src.services.media_assets import (
+    MEDIA_AUDIO_VIDEO_MAX_BYTES,
+    MEDIA_FILE_MAX_BYTES,
+    MEDIA_IMAGE_MAX_BYTES,
+    MEDIA_PDF_MAX_BYTES,
     MediaAssetDomainError,
     MediaStorageCapacityExceeded,
     MediaStorageGuardError,
@@ -93,10 +95,15 @@ _CURSOR_VERSION = 1
 _MIME_EXTENSIONS = {
     "video/mp4": ".mp4",
     "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
     "application/pdf": ".pdf",
     "image/jpeg": ".jpg",
     "image/png": ".png",
 }
+_MEDIA_LIMIT_SUMMARY = (
+    f"image {MEDIA_IMAGE_MAX_BYTES:,} bytes, PDF {MEDIA_PDF_MAX_BYTES:,} bytes, "
+    f"audio and video {MEDIA_AUDIO_VIDEO_MAX_BYTES:,} bytes"
+)
 _METADATA_COLUMNS = (
     MediaAsset.id,
     MediaAsset.tenant_id,
@@ -170,13 +177,6 @@ async def _credit_mode(
         return await credit_inventory.read_credit_mode(request, session)
     except CreditEnforcementUnavailable:
         raise _media_error(503, CREDIT_ENFORCEMENT_UNAVAILABLE_CODE) from None
-
-
-def _enforce_media_limit(category: str, size_bytes: int) -> None:
-    """The PDF's per-type limit, after the enforcement only."""
-
-    if size_bytes > ENFORCED_MEDIA_MAX_BYTES[category]:
-        raise MediaAssetDomainError("media_size_exceeded")
 
 
 async def _rollback(session: AsyncSession) -> None:
@@ -395,9 +395,10 @@ def _authorized_media_target_exists(
     status_code=status.HTTP_201_CREATED,
     summary="Upload media asset",
     description=(
-        "Persist exactly one file plus the approved metadata fields. The complete "
-        "multipart request is limited to 51,000,000 bytes and the file payload to "
-        "50,000,000 bytes."
+        "Persist exactly one file plus the approved metadata fields. The payload "
+        f"limit depends on the derived category ({_MEDIA_LIMIT_SUMMARY}) and the "
+        f"complete multipart request is limited to {MEDIA_MULTIPART_MAX_BYTES:,} "
+        "bytes."
     ),
     responses={
         400: {
@@ -416,7 +417,8 @@ def _authorized_media_target_exists(
         },
         413: {
             "description": (
-                "Multipart request or file payload exceeds its documented byte limit "
+                "Multipart request or file payload exceeds its documented byte limit, "
+                "including the per-category payload limit "
                 "(media_request_size_exceeded or media_size_exceeded)."
             ),
             "model": MediaAssetErrorResponse,
@@ -431,9 +433,9 @@ def _authorized_media_target_exists(
             "description": (
                 "Closed multipart body with exactly one file part and no fields "
                 "outside the four named metadata fields. Maximum request size: "
-                "51,000,000 bytes."
+                f"{MEDIA_MULTIPART_MAX_BYTES:,} bytes."
             ),
-            "x-maxBytes": 51_000_000,
+            "x-maxBytes": MEDIA_MULTIPART_MAX_BYTES,
             "content": {
                 "multipart/form-data": {
                     "schema": {
@@ -446,10 +448,11 @@ def _authorized_media_target_exists(
                                 "type": "string",
                                 "format": "binary",
                                 "description": (
-                                    "Exactly one MP4, MP3, PDF, JPEG or PNG file; "
-                                    "maximum payload size 50,000,000 bytes."
+                                    "Exactly one MP4, MP3, OGG-Opus, PDF, JPEG or "
+                                    "PNG file; the payload limit is the one of its "
+                                    f"derived category ({_MEDIA_LIMIT_SUMMARY})."
                                 ),
-                                "x-maxBytes": 50_000_000,
+                                "x-maxBytes": MEDIA_FILE_MAX_BYTES,
                             },
                             "display_name": {
                                 "type": "string",
@@ -503,8 +506,6 @@ async def upload_media_asset(
             payload,
             upload.content_type or "",
         )
-        if mode.enforced:
-            _enforce_media_limit(classification.category, len(payload))
 
         async with media_storage_capacity_guard(
             session,

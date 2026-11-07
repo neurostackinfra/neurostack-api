@@ -4,15 +4,16 @@ The real application (lifespan, middleware, SQLite ``:memory:``) with the
 credit switch forced per test.  What is pinned here:
 
 * mídia uses ``media_assets`` (no new table or route);
+* the PDF's per-type limits (image 5 MB, PDF 20 MB, audio/video 16 MB) and the
+  allowlist are properties of the category, so they answer the same in every
+  credit mode; M4A stays ``media_type_unsupported``;
 * with the switch off, or on before ``credit_enforcement_at``, uploads and
-  downloads answer exactly like ``main`` -- ``main``'s 50 MB limit and
-  allowlist; M4A/OGG-Opus stay ``media_type_unsupported`` (deferred, owner
-  decision A) -- and, switch on, are measured observationally; an injected
-  writer failure changes nothing but a log;
-* after the enforcement the PDF's per-type limits (image 5 MB, PDF 20 MB,
-  audio/video 16 MB) refuse before anything is reserved; an accepted upload
-  debits its media reservation in its transaction; a standalone tenant or a
-  quarantine hold is 402 ``credit_pending`` with nothing stored;
+  downloads are answered without reserving, and with the switch on they are
+  measured observationally; an injected writer failure changes nothing but a
+  log;
+* after the enforcement an accepted upload debits its media reservation in
+  its transaction; a standalone tenant or a quarantine hold is 402
+  ``credit_pending`` with nothing stored;
 * a download counts on every request (server delivery id, owner decision
   F) and its overage is charged BEFORE the answer (owner decision G): a hold
   or a standalone tenant is 402 before any byte.
@@ -84,6 +85,21 @@ def _mp3(size: int) -> bytes:
 def _mp4(size: int) -> bytes:
     header = b"\x00\x00\x00\x10ftypisom\x00\x00\x02\x00"
     return header + b"\x00" * (size - len(header))
+
+
+def _ogg(size: int) -> bytes:
+    page = (
+        b"OggS"
+        + bytes([0, 0x02])
+        + bytes(20)
+        + b"\x01\x13"
+        + b"OpusHead"
+        + bytes([1, 2])
+        + (312).to_bytes(2, "little")
+        + (48_000).to_bytes(4, "little")
+        + bytes(3)
+    )
+    return page + b"\x00" * (size - len(page))
 
 
 class World:
@@ -269,35 +285,40 @@ def _comparable(response: Any) -> tuple[int, Any]:
 
 
 @pytest.mark.parametrize(
-    ("payload", "mime"),
+    ("payload", "mime", "rejection"),
     [
-        (_png(6_000_000), "image/png"),  # above the PDF's 5 MB, within main's
-        (_pdf(21_000_000), "application/pdf"),
-        (_mp3(17_000_000), "audio/mpeg"),
-        (b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64, "audio/mp4"),
-        (b"OggS" + b"\x00" * 64, "audio/ogg"),
+        (_png(5_000_001), "image/png", (413, "media_size_exceeded")),
+        (_pdf(20_000_001), "application/pdf", (413, "media_size_exceeded")),
+        (_mp3(16_000_001), "audio/mpeg", (413, "media_size_exceeded")),
+        (_ogg(16_000_001), "audio/ogg", (413, "media_size_exceeded")),
+        (
+            b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64,
+            "audio/mp4",
+            (422, "media_type_unsupported"),
+        ),
+        # Big enough that the aggregate rounding leaves a non-zero reservation.
+        (_png(1_000_000), "image/png", None),
+        (_ogg(1_000_000), "audio/ogg", None),
     ],
-    ids=["png-6mb", "pdf-21mb", "mp3-17mb", "m4a", "ogg-opus"],
+    ids=["png-over", "pdf-over", "mp3-over", "ogg-over", "m4a", "png-ok", "ogg-ok"],
 )
-def test_before_the_enforcement_uploads_answer_like_main(
+def test_before_the_enforcement_the_answer_does_not_depend_on_the_switch(
     client: Any,
     world: World,
     switch: Callable[[bool], None],
     writer_outcomes: list[str],
     payload: bytes,
     mime: str,
+    rejection: tuple[int, str] | None,
 ) -> None:
     switch(False)
     off = _upload(client, world, payload, mime)
     switch(True)
     on = _upload(client, world, payload, mime)
     assert _comparable(on) == _comparable(off)
-    if mime in ("audio/mp4", "audio/ogg"):
-        # Deferred (owner decision A): main's answer, at any time.
-        assert (on.status_code, on.json()) == (
-            422,
-            {"detail": {"code": "media_type_unsupported"}},
-        )
+    if rejection is not None:
+        status_code, code = rejection
+        assert (on.status_code, on.json()) == (status_code, {"detail": {"code": code}})
         assert writer_outcomes == []
     else:
         assert on.status_code == 201
@@ -394,8 +415,9 @@ def test_an_injected_writer_failure_changes_neither_answer_nor_data(
         (_pdf(20_000_001), "application/pdf"),
         (_mp3(16_000_001), "audio/mpeg"),
         (_mp4(16_000_001), "video/mp4"),
+        (_ogg(16_000_001), "audio/ogg"),
     ],
-    ids=["png", "pdf", "mp3", "mp4"],
+    ids=["png", "pdf", "mp3", "mp4", "ogg"],
 )
 def test_after_the_enforcement_the_per_type_limits_refuse_before_reserving(
     client: Any, world: World, switch: Callable[[bool], None], payload: bytes, mime: str
@@ -411,15 +433,15 @@ def test_after_the_enforcement_the_per_type_limits_refuse_before_reserving(
         assert client._submit(_rows(model)) == []
 
 
-def test_after_the_enforcement_m4a_and_ogg_stay_unsupported(
+def test_m4a_stays_unsupported_in_every_credit_mode(
     client: Any, world: World, switch: Callable[[bool], None]
 ) -> None:
+    payload = b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64
+    switch(False)
+    off = _upload(client, world, payload, "audio/mp4")
     client._submit(_enforce())
-    for payload, mime in (
-        (b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64, "audio/mp4"),
-        (b"OggS" + b"\x00" * 64, "audio/ogg"),
-    ):
-        response = _upload(client, world, payload, mime)
+    enforced = _upload(client, world, payload, "audio/mp4")
+    for response in (off, enforced):
         assert (response.status_code, response.json()) == (
             422,
             {"detail": {"code": "media_type_unsupported"}},
