@@ -12,8 +12,8 @@ import datetime
 import json
 import os
 import re
-import tempfile
 import sys
+import tempfile
 import types
 from collections.abc import Callable
 from pathlib import Path
@@ -2068,7 +2068,13 @@ def test_output_never_contains_secret_like_material(
         outputs.append(out + err)
     preview_snapshot = FakeAws().snapshot(tmp_path / "preview.json")
     _code, out, err = _run(
-        ["plan", "--params", str(_scenario_params_file()), "--readback-file", str(preview_snapshot)],
+        [
+            "plan",
+            "--params",
+            str(_scenario_params_file()),
+            "--readback-file",
+            str(preview_snapshot),
+        ],
         capsys,
     )
     outputs.append(out + err)
@@ -6998,9 +7004,7 @@ def test_the_runbook_documents_the_image_bump() -> None:
         for number, line in enumerate(manifest_lines)
         if NEW_DIGEST[7:] in line
     ]
-    assert [line for _number, line in evidence_lines] == [
-        f"# image {NEW_DIGEST},"
-    ] * 2
+    assert [line for _number, line in evidence_lines] == [f"# image {NEW_DIGEST},"] * 2
     for number, _line in evidence_lines:
         assert number < manifest_lines.index("rollback_target:")
     assert NEW_DIGEST[7:] not in json.dumps(wiring.load_yaml(MANIFEST))

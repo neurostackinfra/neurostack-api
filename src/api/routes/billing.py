@@ -144,9 +144,7 @@ async def _ensure_webhook_ready() -> None:
         # reasons are a closed vocabulary (no URL, token or provider payload).
         logger.warning(
             "Checkout blocked: webhook not ready",
-            reasons=(
-                list(verdict.reasons) if verdict is not None else []
-            )
+            reasons=(list(verdict.reasons) if verdict is not None else [])
             or ["unverified_or_expired"],
         )
     ASAAS_WEBHOOK_READINESS.require_ready()
