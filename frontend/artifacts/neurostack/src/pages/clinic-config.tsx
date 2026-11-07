@@ -630,7 +630,7 @@ export const WA_PROVIDERS: {
   // WhatsApp Web / unofficial providers
   { id: "zapi", label: "Z-API",         sub: "by Z-API.io" },
   { id: "evolution", label: "Evolution API", sub: "Open Source" },
-  { id: "uazapi", label: "Uazapi",        sub: "WhatsApp Web" },
+  { id: "uazapi", label: "Uazapi",        sub: "by uazapi.dev" },
 ];
 
 const WA_PROVIDER_LABEL: Record<WhatsappProvider, string> = WA_PROVIDERS.reduce(
