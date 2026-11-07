@@ -621,6 +621,7 @@ describe("<Midias /> file name, type and format", () => {
     ["audio/mpeg", "voz.mp3", "Audio", "MP3"],
     ["audio/ogg", "voz.ogg", "Audio", "OGG/OPUS"],
     ["audio/ogg", "voz.opus", "Audio", "OGG/OPUS"],
+    ["audio/mp4", "voz.m4a", "Audio", "M4A"],
   ])(
     "lists %s stored as %s with its type and format",
     async (mime, original, type, format) => {
@@ -973,11 +974,11 @@ describe("<Midias /> per-category limits and upload errors", () => {
 
     renderPage();
     const input = await screen.findByLabelText("File");
-    for (const token of ["audio/ogg", ".ogg", ".opus"]) {
+    for (const token of ["audio/ogg", ".ogg", ".opus", "audio/mp4", ".m4a"]) {
       expect(input).toHaveAttribute("accept", expect.stringContaining(token));
     }
     expect(
-      screen.getByText(/JPG, JPEG, PNG, PDF, MP4, MP3, OGG\/OPUS/, {
+      screen.getByText(/JPG, JPEG, PNG, PDF, MP4, MP3, M4A, OGG\/OPUS/, {
         selector: "div",
       }),
     ).toBeInTheDocument();
@@ -1008,6 +1009,7 @@ describe("<Midias /> per-category limits and upload errors", () => {
     ["pdf", "guia.pdf", "application/pdf", 20_000_001, "The PDF exceeds the 20 MB limit."],
     ["audio", "voz.ogg", "audio/ogg", 16_000_001, "The audio exceeds the 16 MB limit."],
     ["video", "clipe.mp4", "video/mp4", 16_000_001, "The video exceeds the 16 MB limit."],
+    ["m4a audio", "voz.m4a", "audio/x-m4a", 16_000_001, "The audio exceeds the 16 MB limit."],
   ])(
     "blocks a %s one byte over its own limit before any upload request",
     async (_category, name, type, size, message) => {
@@ -1045,7 +1047,6 @@ describe("<Midias /> per-category limits and upload errors", () => {
   it.each([
     ["an untyped file without an extension", "gravação", ""],
     ["a type the server does not accept", "voz.wav", "audio/wav"],
-    ["M4A, still deferred on the server", "voz.m4a", "audio/x-m4a"],
   ])(
     "refuses %s in the browser with the format message",
     async (_label, name, type) => {
@@ -1061,6 +1062,51 @@ describe("<Midias /> per-category limits and upload errors", () => {
       expect(input).toHaveValue("");
       expect(screen.getByLabelText("File type")).toHaveValue("");
       expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ["audio/x-m4a", "audio/x-m4a"],
+    ["audio/m4a", "audio/m4a"],
+    ["audio/mp4", "audio/mp4"],
+    // Left untyped by the system: re-declared with the canonical MIME.
+    ["", "audio/mp4"],
+  ])(
+    "uploads an .m4a declared as %j as audio, keeping its extension",
+    async (declared, sent) => {
+      let uploadBody: FormData | undefined;
+      mocks.fetch.mockImplementation(
+        (_input: string | URL | Request, init?: RequestInit) => {
+          if (init?.method === "POST") {
+            uploadBody = init.body as FormData;
+            return jsonResponse(
+              asset({
+                id: "asset-m4a",
+                display_name: "recado",
+                original_filename: "recado.m4a",
+                category: "audio",
+                mime_type: "audio/mp4",
+              }),
+              201,
+            );
+          }
+          return jsonResponse(EMPTY_PAGE);
+        },
+      );
+
+      renderPage();
+      await screen.findByText("No media has been uploaded for this clinic.");
+      pickFile(sizedFile("recado.m4a", declared, 3_000_000));
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("File type")).toHaveValue("audio");
+      expect(screen.getByTestId("media-file-extension")).toHaveTextContent(".m4a");
+      submitUpload();
+
+      await waitFor(() => expect(uploadBody).toBeDefined());
+      expect((uploadBody?.get("file") as File).type).toBe(sent);
+      expect(uploadBody?.get("original_filename")).toBe("recado.m4a");
+      const row = await screen.findByTestId("media-item-asset-m4a");
+      expect(within(row).getAllByRole("cell")[2]).toHaveTextContent("M4A");
     },
   );
 
