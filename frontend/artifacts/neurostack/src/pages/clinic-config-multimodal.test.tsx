@@ -47,7 +47,7 @@ describe("multimodal provider boundary", () => {
     ).toBe("BUTTON"));
     expect(within(section).getByText("API LLM Fallback Multimodal")).toBeInTheDocument();
     expect(within(section).getByTestId("capability-requirement-multimodal"))
-      .toHaveTextContent("opcional");
+      .toHaveTextContent("obrigatório");
     expect(within(section).getAllByTestId(/provider-card-/)).toHaveLength(1);
     expect(within(section).getByText("DISPONÍVEL"))
       .toHaveClass("text-[10px]", "border-sky-500/30", "bg-sky-500/10", "text-sky-400");

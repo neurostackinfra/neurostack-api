@@ -557,7 +557,7 @@ export const API_CAPABILITIES: readonly {
       pt: "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
       en: "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
     },
-    required: false,
+    required: true,
   },
   {
     id: "stt",

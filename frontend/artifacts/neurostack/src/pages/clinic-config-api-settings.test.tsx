@@ -426,7 +426,7 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(API_CAPABILITIES.map(({ id, short, required }) => ({ id, short, required }))).toEqual([
       { id: "whatsapp", short: "API WhatsApp", required: true },
       { id: "llm", short: "API LLM", required: true },
-      { id: "multimodal", short: "API LLM Fallback Multimodal", required: false },
+      { id: "multimodal", short: "API LLM Fallback Multimodal", required: true },
       { id: "stt", short: "API STT", required: true },
       { id: "tts", short: "API TTS", required: false },
     ]);
@@ -491,10 +491,10 @@ describe("<ApiCredentialsForm /> card states", () => {
     expect(screen.getAllByTestId("voice-response-controls")).toHaveLength(1);
     expect(screen.getByRole("heading", { name: voiceTriggers })).toBeInTheDocument();
     expect(screen.getByText(moreTriggers)).toBeInTheDocument();
-    for (const id of ["whatsapp", "llm", "stt"]) {
+    for (const id of ["whatsapp", "llm", "multimodal", "stt"]) {
       expect(screen.getByTestId(`capability-requirement-${id}`)).toHaveTextContent(required);
     }
-    for (const id of ["multimodal", "tts"]) {
+    for (const id of ["tts"]) {
       expect(screen.getByTestId(`capability-requirement-${id}`)).toHaveTextContent(optional);
     }
   });
