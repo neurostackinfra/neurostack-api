@@ -649,10 +649,10 @@ export const STT_PROVIDERS: { id: SttProvider; label: string; sub: string }[] = 
   { id: "openrouter",        label: "Outros",     sub: "by OpenRouter"    },
 ];
 
-export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub: string }[] = [
-  { id: "elevenlabs", label: "ElevenLabs",      sub: "Voz natural e humana" },
-  { id: "google",     label: "Google Cloud TTS", sub: "Escala e bom custo"       },
-  { id: "openai",     label: "OpenAI TTS",       sub: "gpt-4o-audio / tts-1" },
+export const TTS_PROVIDERS: { id: TtsProvider; label: string; sub?: string }[] = [
+  { id: "elevenlabs", label: "ElevenLabs" },
+  { id: "google",     label: "Google Cloud TTS" },
+  { id: "openai",     label: "OpenAI TTS" },
 ];
 
 // The display catalog is intentionally availability-agnostic: the canonical
@@ -669,7 +669,7 @@ export const PROVIDERS: {
   { id: "outros",     label: "Outros",     sub: "OpenAI-compatible / OpenRouter" },
 ];
 
-type ProviderDisplay = { id: string; label: string; sub: string };
+type ProviderDisplay = { id: string; label: string; sub?: string };
 
 function providersForCapability(capability: ApiCapabilityId): readonly ProviderDisplay[] {
   switch (capability) {
