@@ -25,14 +25,14 @@ import hmac
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime
-from typing import Any, cast
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 from python_multipart.multipart import parse_options_header
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.datastructures import UploadFile
@@ -117,6 +117,21 @@ _METADATA_COLUMNS = (
     MediaAsset.created_at,
     MediaAsset.updated_at,
 )
+# Name search folds case and the accents of Portuguese (and the few Spanish and
+# French ones clinics use) on both sides, so "relatorio" finds "Relatório". The
+# strings are applied with SQL ``translate`` after ``lower``; uppercase accented
+# letters are listed too because ``lower`` leaves them untouched on a database
+# whose ctype is C. Combining marks (U+0300-U+036F) have no counterpart, so
+# ``translate`` deletes them: a name stored decomposed (NFD, as macOS hands file
+# names over) folds to the same letters as its composed form.
+_NAME_SEARCH_ACCENTED = "áàâãäåéèêëíìîïóòôõöúùûüçñÁÀÂÃÄÅÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇÑ"
+_NAME_SEARCH_PLAIN = "aaaaaaeeeeiiiiooooouuuucnaaaaaaeeeeiiiiooooouuuucn"
+_NAME_SEARCH_COMBINING = "".join(chr(code) for code in range(0x0300, 0x0370))
+_NAME_SEARCH_TABLE = str.maketrans(
+    _NAME_SEARCH_ACCENTED, _NAME_SEARCH_PLAIN, _NAME_SEARCH_COMBINING
+)
+_NAME_SEARCH_MAX_LENGTH = 200
+MediaCategoryFilter = Literal["video", "audio", "pdf", "image"]
 _MEDIA_SECURITY: list[dict[str, list[str]]] = [
     {"ApiKeyAuth": []},
     {"BearerAuth": []},
@@ -252,6 +267,21 @@ def _decode_cursor(cursor: str, tenant_id: UUID) -> tuple[datetime, UUID]:
         json.JSONDecodeError,
     ) as error:
         raise _media_error(400, "media_cursor_invalid") from error
+
+
+def _name_search_pattern(name: str) -> str:
+    """Fold *name* like the SQL side and make ``%``, ``_`` and ``\\`` literal."""
+    folded = name.lower().translate(_NAME_SEARCH_TABLE)
+    escaped = folded.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _folded_name(column: Any) -> Any:
+    return func.translate(
+        func.lower(column),
+        _NAME_SEARCH_ACCENTED + _NAME_SEARCH_COMBINING,
+        _NAME_SEARCH_PLAIN,
+    )
 
 
 def _metadata_values(row: Any) -> dict[str, Any]:
@@ -625,8 +655,9 @@ async def upload_media_asset(
     response_model=MediaAssetListResponse,
     summary="List media assets",
     description=(
-        "Return a descending keyset page of metadata only. Binary payloads are never "
-        "selected or returned by this operation."
+        "Return a descending keyset page of metadata only, optionally filtered by "
+        "category and by a name substring. Binary payloads are never selected or "
+        "returned by this operation."
     ),
     responses={
         400: {
@@ -658,6 +689,30 @@ async def list_media_assets(
     ),
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
+    category: Annotated[
+        MediaCategoryFilter | None,
+        Query(
+            description=(
+                "Only return assets of this server-derived category. Omit for "
+                "every category."
+            ),
+        ),
+    ] = None,
+    name: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=_NAME_SEARCH_MAX_LENGTH,
+            pattern=r"^[^\x00\r\n]*$",
+            description=(
+                "Only return assets whose original_filename (the name the "
+                "catalog shows, downloads and sends) contains this text, "
+                "ignoring case and accents. % and _ match themselves; NUL, CR "
+                "and LF are rejected. Keep the same filters when following "
+                "next_cursor."
+            ),
+        ),
+    ] = None,
 ) -> MediaAssetListResponse:
     """Return one descending keyset page without loading binary payloads."""
     try:
@@ -669,6 +724,14 @@ async def list_media_assets(
             MediaAsset.tenant_id == target.id,
             _authorized_media_target_exists(target.id, tenant),
         )
+        if category is not None:
+            statement = statement.where(MediaAsset.category == category)
+        if name is not None:
+            statement = statement.where(
+                _folded_name(MediaAsset.original_filename).like(
+                    _name_search_pattern(name), escape="\\"
+                )
+            )
         if cursor_position is not None:
             created_at, media_id = cursor_position
             statement = statement.where(

@@ -148,6 +148,160 @@ async def test_list_uses_descending_keyset_without_selecting_payload(
     assert len(statements) == 1
 
 
+def _rendered_list_statement(
+    monkeypatch: pytest.MonkeyPatch, **filters: Any
+) -> tuple[str, dict[str, Any]]:
+    tenant_id = uuid4()
+    captured: list[Any] = []
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    class Result:
+        def all(self) -> list[SimpleNamespace]:
+            return []
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            captured.append(statement)
+            return Result()
+
+        async def rollback(self) -> None:
+            raise AssertionError("successful list must not roll back")
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    asyncio.run(
+        route.list_media_assets(
+            request=_request(),
+            tenant_id=None,
+            cursor=None,
+            page_size=25,
+            tenant=TenantContext(tenant_id, api_key="key"),
+            session=Session(),  # type: ignore[arg-type]
+            **filters,
+        )
+    )
+    assert len(captured) == 1
+    compiled = captured[0].compile()
+    return str(compiled).lower(), dict(compiled.params)
+
+
+def test_list_without_filters_adds_no_category_or_name_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered, _ = _rendered_list_statement(monkeypatch)
+
+    assert "media_assets.category =" not in rendered
+    assert "translate" not in rendered
+    assert " like " not in rendered
+
+
+def test_list_category_filter_is_an_exact_bound_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered, params = _rendered_list_statement(monkeypatch, category="image")
+
+    assert "media_assets.category = :category_1" in rendered
+    assert params["category_1"] == "image"
+    assert "translate" not in rendered
+
+
+def test_list_name_filter_searches_the_shown_name_and_escapes_wildcards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered, params = _rendered_list_statement(monkeypatch, name="Relatório_50%")
+
+    # The catalog shows, downloads and sends original_filename, so that is the
+    # only name a search may match.
+    assert "translate(lower(media_assets.original_filename)" in rendered
+    assert "translate(lower(media_assets.display_name)" not in rendered
+    assert rendered.count("escape '\\'") == 1
+    patterns = {value for value in params.values() if str(value).startswith("%")}
+    assert patterns == {"%relatorio\\_50\\%%"}
+    folds = [value for value in params.values() if str(value).startswith("áà")]
+    assert folds == [route._NAME_SEARCH_ACCENTED + route._NAME_SEARCH_COMBINING]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    ["name=%00", "name=a%0Ab", "name=a%0Db", "name=", "category=document"],
+)
+async def test_list_rejects_unusable_filters_before_any_query(
+    monkeypatch: pytest.MonkeyPatch, query: str
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from src.api.main import create_app
+    from src.repositories import get_db_session_dependency
+
+    class Session:
+        async def execute(self, statement: Any) -> Any:
+            raise AssertionError("an invalid filter reached the database")
+
+        async def rollback(self) -> None:
+            return None
+
+    async def session_dependency() -> Any:
+        yield Session()
+
+    app = create_app()
+    app.dependency_overrides[get_db_session_dependency] = session_dependency
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get(
+            f"/v1/media-assets?{query}", headers={"X-API-Key": "test-api-key"}
+        )
+
+    assert response.status_code == 422, response.text
+
+
+def test_list_never_logs_the_searched_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    log_entries: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        route.logger,
+        "info",
+        lambda event, **values: log_entries.append((event, values)),
+    )
+
+    _rendered_list_statement(
+        monkeypatch, category="pdf", name="Paciente Joana Prontuário"
+    )
+
+    assert [event for event, _ in log_entries] == ["media_asset_list"]
+    logged = repr(log_entries).lower()
+    assert "joana" not in logged
+    assert "prontu" not in logged
+
+
+@pytest.mark.parametrize(
+    ("typed", "pattern"),
+    [
+        ("ANTES E DEPOIS", "%antes e depois%"),
+        ("Orientações", "%orientacoes%"),
+        ("ÇÃO", "%cao%"),
+        ("100%", "%100\\%%"),
+        ("a_b", "%a\\_b%"),
+        ("c:\\x", "%c:\\\\x%"),
+        # macOS hands file names over decomposed (NFD): the marks are dropped.
+        ("Relato\u0301rio", "%relatorio%"),
+        ("ORIENTAC\u0327O\u0303ES", "%orientacoes%"),
+    ],
+)
+def test_name_search_pattern_matches_sql_folding(typed: str, pattern: str) -> None:
+    assert route._name_search_pattern(typed) == pattern
+
+
+def test_name_search_fold_strings_pair_each_letter_with_its_base() -> None:
+    import unicodedata
+
+    assert len(route._NAME_SEARCH_ACCENTED) == len(route._NAME_SEARCH_PLAIN)
+    for accented, plain in zip(
+        route._NAME_SEARCH_ACCENTED, route._NAME_SEARCH_PLAIN, strict=True
+    ):
+        assert unicodedata.normalize("NFD", accented)[0].lower() == plain
+
+
 def test_cursor_codec_accepts_canonical_round_trip() -> None:
     tenant_id = UUID("00000000-0000-0000-0000-000000000001")
     media_id = UUID("00000000-0000-0000-0000-000000000002")
