@@ -365,7 +365,7 @@ export const en = {
   config_tab_operacao_header: "Operation & Logistics",
   config_tab_operacao_desc: "Defines how the agent guides people on opening hours, service locations and scheduling rules.",
   config_tab_negocio_header: "Business Rules & AI",
-  config_tab_negocio_desc: "Directives that control SRM Core behavior, the agent reasoning nucleus.",
+  config_tab_negocio_desc: "Defines which clinic rules the agent follows when handling patients.",
   config_tab_handoff_header: "Handoff Management",
   config_tab_handoff_desc: "Controls when and how the agent transfers the conversation to a human agent.",
   config_readonly_note: "Read-only mode, changes disabled",

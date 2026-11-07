@@ -367,7 +367,7 @@ export const pt: Record<TranslationKey, string> = {
   config_tab_operacao_header: "Operação & Logística",
   config_tab_operacao_desc: "Define como o agente orienta sobre horários, locais de atendimento e regras de agendamento.",
   config_tab_negocio_header: "Regras de Negócio & IA",
-  config_tab_negocio_desc: "Diretivas que controlam o comportamento do SRM Core, o núcleo de raciocínio do agente.",
+  config_tab_negocio_desc: "Define quais regras da clínica o agente segue no atendimento.",
   config_tab_handoff_header: "Gestão de Handoff",
   config_tab_handoff_desc: "Controla quando e como o agente transfere a conversa para um atendente humano.",
   config_readonly_note: "Modo somente leitura, alterações desabilitadas",
