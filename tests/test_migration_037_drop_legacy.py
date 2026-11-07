@@ -105,8 +105,9 @@ def test_037_revises_036_and_038_follows_it(migration: ModuleType) -> None:
     # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
     # (lifecycle, legal hold, purge and roles) follows 040; Group 7: 042
     # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg in the
-    # media category/MIME invariant) is the head.
-    assert current_head() == "043"
+    # media category/MIME invariant) follows 042; 044 (audio/mp4 in the same
+    # invariant) is the head.
+    assert current_head() == "044"
 
 
 def test_scope_is_the_four_legacy_tables_and_their_ten_functions(

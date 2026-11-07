@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import AsyncContextManager, Final, Protocol
 from uuid import UUID
@@ -32,6 +33,7 @@ MEDIA_CANONICAL_MIME_TYPES: Final = frozenset(
         "video/mp4",
         "audio/mpeg",
         "audio/ogg",
+        "audio/mp4",
         "application/pdf",
         "image/jpeg",
         "image/png",
@@ -54,6 +56,29 @@ _MP4_BRANDS = frozenset(
         b"mp42",
     }
 )
+# Apple's audio-only brand. M4B (audiobook), M4P (FairPlay DRM) and M4V (video)
+# are deliberately not recognized, as major or as compatible brands. Nor are
+# the 3GPP brands (3gp4, 3gp5...): those recorders write AMR, which would be
+# stored as audio/mp4 that WhatsApp may not play.
+_M4A_BRAND: Final = b"M4A "
+# Apple's encoder pads the compatible brands with an all-zero entry
+# (``M4A mp42isom\0\0\0\0``). Accepted for M4A only, never as the major brand
+# and never for video/mp4.
+_M4A_PADDING_BRAND: Final = bytes(4)
+_M4A_COMPATIBLE_BRANDS: Final = _MP4_BRANDS | {_M4A_BRAND, _M4A_PADDING_BRAND}
+# Chrome and Safari label ``.m4a`` as ``audio/x-m4a``, and some senders as
+# ``audio/m4a``; both name the registered ``audio/mp4`` (RFC 4337).
+_DECLARED_MIME_ALIASES: Final[dict[str, str]] = {
+    "audio/x-m4a": "audio/mp4",
+    "audio/m4a": "audio/mp4",
+}
+# moov -> trak -> mdia -> hdlr: the handler box of every track.
+_MP4_TRACK_HANDLER_PATH: Final = (b"moov", b"trak", b"mdia", b"hdlr")
+# Every box the walk splits counts, at every depth and at the top level too, so
+# a payload of 8-byte boxes cannot pin the event loop (the bound costs tens of
+# milliseconds at worst). A recorder's file has a few dozen boxes; fragmented
+# MP4 from MediaRecorder adds a moof and an mdat per fragment, thousands of them.
+_MP4_BOX_WALK_LIMIT: Final = 100_000
 
 
 class AsyncReadable(Protocol):
@@ -572,16 +597,120 @@ def _looks_like_mpeg_audio(payload: bytes) -> bool:
     )
 
 
-def _looks_like_mp4(payload: bytes) -> bool:
+def _ftyp_size(payload: bytes) -> int:
+    """The size of a well-formed leading ``ftyp`` box, or 0 when there is none."""
     if len(payload) < 16 or payload[4:8] != b"ftyp":
-        return False
+        return 0
     box_size = int.from_bytes(payload[:4], byteorder="big", signed=False)
     if box_size < 16 or box_size > len(payload) or box_size % 4:
-        return False
-    brands = (payload[8:12],) + tuple(
-        payload[offset : offset + 4] for offset in range(16, box_size, 4)
-    )
-    return bool(brands) and all(brand in _MP4_BRANDS for brand in brands)
+        return 0
+    return box_size
+
+
+def _ftyp_brands(payload: bytes, box_size: int) -> Iterator[bytes]:
+    """The major brand, then the compatible brands, one at a time.
+
+    Lazy on purpose: an ftyp may span the whole payload, and nothing caps its
+    brand count, so the brands are never materialized together.
+    """
+    yield payload[8:12]
+    for offset in range(16, box_size, 4):
+        yield payload[offset : offset + 4]
+
+
+def _ftyp_classification(payload: bytes) -> MediaClassification | None:
+    """Decide the M4A and the MP4 brand rules in one pass over the brands.
+
+    The major brand picks the rule, since ``M4A `` is not an MP4 brand: under
+    ``M4A `` every compatible brand must be an MP4 or M4A brand or Apple's zero
+    padding (audio/mp4); under an MP4 major brand every compatible brand must
+    be an MP4 brand (video/mp4). The first brand outside the rule ends the pass.
+    """
+    box_size = _ftyp_size(payload)
+    if not box_size:
+        return None
+    brands = _ftyp_brands(payload, box_size)
+    major = next(brands)
+    if major == _M4A_BRAND:
+        allowed = _M4A_COMPATIBLE_BRANDS
+        classification = MediaClassification("audio", "audio/mp4")
+    elif major in _MP4_BRANDS:
+        allowed = _MP4_BRANDS
+        classification = MediaClassification("video", "video/mp4")
+    else:
+        return None
+    return classification if all(brand in allowed for brand in brands) else None
+
+
+class _IsoBoxWalk:
+    """Bounded ISO-BMFF box splitter over a payload already in memory.
+
+    Malformed, truncated or oversized structure is ``media_signature_invalid``
+    and nothing else: the walk never indexes past the payload.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self._remaining = _MP4_BOX_WALK_LIMIT
+
+    def _children(self, start: int, end: int) -> list[tuple[bytes, int, int]]:
+        """Split ``[start, end)`` into ``(type, body_start, box_end)`` boxes.
+
+        The boxes must tile the range exactly. Size 1 announces a 64-bit
+        ``largesize``; size 0 extends the box to the end of the range, which at
+        the top level is the end of the file.
+        """
+        boxes: list[tuple[bytes, int, int]] = []
+        payload = self._payload
+        offset = start
+        while offset < end:
+            self._remaining -= 1
+            if self._remaining < 0 or end - offset < 8:
+                raise MediaAssetDomainError("media_signature_invalid")
+            size = int.from_bytes(payload[offset : offset + 4], byteorder="big")
+            header = 8
+            if size == 1:
+                if end - offset < 16:
+                    raise MediaAssetDomainError("media_signature_invalid")
+                size = int.from_bytes(payload[offset + 8 : offset + 16], "big")
+                header = 16
+            elif size == 0:
+                size = end - offset
+            if size < header or size > end - offset:
+                raise MediaAssetDomainError("media_signature_invalid")
+            boxes.append(
+                (payload[offset + 4 : offset + 8], offset + header, offset + size)
+            )
+            offset += size
+        return boxes
+
+    def bodies(
+        self, path: tuple[bytes, ...], start: int, end: int
+    ) -> Iterator[tuple[int, int]]:
+        """Yield the body range of every box reached by following ``path``."""
+        if not path:
+            yield start, end
+            return
+        for box_type, body_start, box_end in self._children(start, end):
+            if box_type == path[0]:
+                yield from self.bodies(path[1:], body_start, box_end)
+
+
+def _mp4_track_handlers(payload: bytes) -> frozenset[bytes]:
+    """The ``handler_type`` of every track, wherever ``moov`` sits."""
+    handlers: set[bytes] = set()
+    walk = _IsoBoxWalk(payload)
+    for start, end in walk.bodies(_MP4_TRACK_HANDLER_PATH, 0, len(payload)):
+        # FullBox version and flags (4), pre_defined (4), handler_type (4).
+        if end - start < 12:
+            raise MediaAssetDomainError("media_signature_invalid")
+        handlers.add(payload[start + 8 : start + 12])
+    return frozenset(handlers)
+
+
+def _mp4_is_audio_only(payload: bytes) -> bool:
+    handlers = _mp4_track_handlers(payload)
+    return b"soun" in handlers and b"vide" not in handlers
 
 
 def _looks_like_ogg_opus(payload: bytes) -> bool:
@@ -600,7 +729,12 @@ def _looks_like_ogg_opus(payload: bytes) -> bool:
 
 
 def classify_media_payload(payload: bytes) -> MediaClassification:
-    """Classify one of the six approved formats from content signatures."""
+    """Classify one of the seven approved formats from content signatures.
+
+    Only the ``M4A `` brand makes an MP4 container ``audio/mp4`` here. A
+    generic-brand container (``isom``, ``mp42``...) is ``video/mp4`` by content
+    alone, whatever its tracks; see :func:`validate_media_classification`.
+    """
     if payload.startswith(b"%PDF-"):
         return MediaClassification("pdf", "application/pdf")
     if payload.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -611,8 +745,9 @@ def classify_media_payload(payload: bytes) -> MediaClassification:
         return MediaClassification("audio", "audio/ogg")
     if _looks_like_mpeg_audio(payload):
         return MediaClassification("audio", "audio/mpeg")
-    if _looks_like_mp4(payload):
-        return MediaClassification("video", "video/mp4")
+    container = _ftyp_classification(payload)
+    if container is not None:
+        return container
     raise MediaAssetDomainError("media_signature_invalid")
 
 
@@ -621,20 +756,35 @@ def canonical_declared_mime(declared_mime_type: str) -> str:
 
     WhatsApp, ffmpeg and several browsers label Opus as
     ``audio/ogg; codecs=opus``; the parameters carry nothing this allowlist
-    decides on.
+    decides on. The ``.m4a`` labels ``audio/x-m4a`` and ``audio/m4a`` are
+    spelled ``audio/mp4``.
     """
-    return declared_mime_type.split(";", 1)[0].strip().lower()
+    essence = declared_mime_type.split(";", 1)[0].strip().lower()
+    return _DECLARED_MIME_ALIASES.get(essence, essence)
 
 
 def validate_media_classification(
     payload: bytes,
     declared_mime_type: str,
 ) -> MediaClassification:
-    """Match the declared MIME to the signature and cap by its category."""
+    """Match the declared MIME to the signature and cap by its category.
+
+    Android recorders write ``.m4a`` with the generic ``isom``/``mp42`` brands,
+    which the signature alone calls ``video/mp4``. Declared ``audio/mp4``, such
+    a container is ``audio/mp4`` only when its track handlers prove it: at
+    least one ``soun`` and no ``vide``. Declared ``video/mp4`` it stays
+    ``video/mp4`` without any walk, exactly as before.
+    """
     declared = canonical_declared_mime(declared_mime_type)
     if declared not in MEDIA_CANONICAL_MIME_TYPES:
         raise MediaAssetDomainError("media_type_unsupported")
     classification = classify_media_payload(payload)
+    if (
+        declared == "audio/mp4"
+        and classification.mime_type == "video/mp4"
+        and _mp4_is_audio_only(payload)
+    ):
+        classification = MediaClassification("audio", "audio/mp4")
     if classification.mime_type != declared:
         raise MediaAssetDomainError("media_type_mismatch")
     if len(payload) > MEDIA_CATEGORY_MAX_BYTES[classification.category]:

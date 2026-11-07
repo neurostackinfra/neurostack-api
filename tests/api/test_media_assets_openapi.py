@@ -105,6 +105,7 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
         "video/mp4",
         "audio/mpeg",
         "audio/ogg",
+        "audio/mp4",
         "application/pdf",
         "image/jpeg",
         "image/png",
@@ -151,6 +152,7 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
         "video/mp4",
         "audio/mpeg",
         "audio/ogg",
+        "audio/mp4",
         "application/pdf",
         "image/jpeg",
         "image/png",
@@ -179,6 +181,7 @@ def test_upload_publishes_the_per_category_limits_unconditionally() -> None:
     for limit in ("5,000,000", "20,000,000", "16,000,000"):
         assert limit in prose
     assert "OGG-Opus" in file_property["description"]
+    assert "M4A" in file_property["description"]
     # The limits are a property of the category, not of the credit rollout.
     assert "credit_enforcement_at" not in prose
 

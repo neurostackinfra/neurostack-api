@@ -21,6 +21,7 @@ class MediaAssetResponse(BaseModel):
         "video/mp4",
         "audio/mpeg",
         "audio/ogg",
+        "audio/mp4",
         "application/pdf",
         "image/jpeg",
         "image/png",

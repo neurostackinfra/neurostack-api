@@ -2414,6 +2414,7 @@ def test_migration_windows_pin_each_exact_upgrade() -> None:
         "instruction after the image containing 042 serves"
     )
     assert "043" in wiring.MIGRATIONS_EXCLUDED["042"]
+    assert "044" in wiring.MIGRATIONS_EXCLUDED["042"]
     assert all(
         scope == "separate_approval"
         for step, scope in wiring.STEPS

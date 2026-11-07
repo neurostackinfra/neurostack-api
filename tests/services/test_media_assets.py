@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import tracemalloc
+from collections.abc import Iterator
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
@@ -84,6 +86,59 @@ def _ogg_page(
         + segments
         + (_opus_head() if body is None else body)
     )
+
+
+def _box(box_type: bytes, body: bytes = b"") -> bytes:
+    """One ISO-BMFF box with a 32-bit size."""
+
+    return (8 + len(body)).to_bytes(4, "big") + box_type + body
+
+
+def _large_box(box_type: bytes, body: bytes = b"") -> bytes:
+    """Size 1: the real size follows the type as a 64-bit ``largesize``."""
+
+    return (
+        (1).to_bytes(4, "big") + box_type + (16 + len(body)).to_bytes(8, "big") + body
+    )
+
+
+def _to_end_box(box_type: bytes, body: bytes = b"") -> bytes:
+    """Size 0: the box runs to the end of what contains it."""
+
+    return bytes(4) + box_type + body
+
+
+def _ftyp(major: bytes, *compatible: bytes) -> bytes:
+    return _box(b"ftyp", major + bytes(4) + b"".join(compatible))
+
+
+def _hdlr(handler: bytes) -> bytes:
+    # FullBox version and flags, pre_defined, handler_type, reserved, name.
+    return _box(b"hdlr", bytes(4) + bytes(4) + handler + bytes(12) + b"\x00")
+
+
+def _trak(handler: bytes) -> bytes:
+    mdia = _box(b"mdhd", bytes(24)) + _hdlr(handler) + _box(b"minf")
+    return _box(b"trak", _box(b"tkhd", bytes(84)) + _box(b"mdia", mdia))
+
+
+def _moov(*handlers: bytes) -> bytes:
+    tracks = b"".join(_trak(handler) for handler in handlers)
+    return _box(b"moov", _box(b"mvhd", bytes(100)) + tracks)
+
+
+# Android MediaRecorder (MPEG_4): major mp42, compatible isom and mp42.
+_GENERIC_FTYP = _ftyp(b"mp42", b"isom", b"mp42")
+# iPhone Voice Memos.
+_VOICE_MEMO_FTYP = _ftyp(b"M4A ", b"M4A ", b"isom", b"mp42")
+_MDAT = _box(b"mdat", b"\x21" * 32)
+# moov after mdat, as a recorder that cannot seek back writes it.
+_ANDROID_M4A = _GENERIC_FTYP + _MDAT + _moov(b"soun")
+_ANDROID_M4A_MOOV_FIRST = _GENERIC_FTYP + _moov(b"soun") + _MDAT
+_VOICE_MEMO_M4A = _VOICE_MEMO_FTYP + _MDAT + _moov(b"soun")
+# iTunes and Apple's AAC encoder: the compatible brands end in an all-zero entry.
+_ITUNES_FTYP = _ftyp(b"M4A ", b"M4A ", b"mp42", b"isom", bytes(4))
+_ITUNES_M4A = _ITUNES_FTYP + _MDAT + _moov(b"soun")
 
 
 @pytest.mark.parametrize(
@@ -182,6 +237,8 @@ def test_metadata_accepts_exact_length_boundaries() -> None:
         (b"\xff\xfb\x90\x64mp3", "audio", "audio/mpeg"),
         (b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp42", "video", "video/mp4"),
         (_ogg_page(), "audio", "audio/ogg"),
+        (b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A isom", "audio", "audio/mp4"),
+        (_VOICE_MEMO_M4A, "audio", "audio/mp4"),
     ],
 )
 def test_classification_derives_each_canonical_pair(
@@ -221,7 +278,6 @@ def test_classification_rejects_unknown_signature_unsupported_and_mismatch() -> 
         b"\x00\x00\x00\x0cftypisom",
         b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heicmif1",
         b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1",
-        b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A isom",
         b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  ",
         b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomheic",
     ],
@@ -276,6 +332,530 @@ def test_ogg_is_accepted_however_the_sender_spells_its_content_type(
     assert canonical_declared_mime(declared) == "audio/ogg"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ftyp(b"M4B ", b"M4B ", b"isom", b"mp42"),  # audiobook
+        _ftyp(b"M4P ", b"M4P ", b"isom", b"mp42"),  # FairPlay DRM
+        _ftyp(b"M4V ", b"M4V ", b"isom", b"mp42"),  # video
+        # As the major brand alone, with nothing but MP4 brands after it.
+        _ftyp(b"M4B ", b"isom", b"mp42"),
+        _ftyp(b"M4P ", b"isom", b"mp42"),
+        _ftyp(b"M4V ", b"isom", b"mp42"),
+        _ftyp(b"M4A ", b"M4A ", b"M4B "),
+        _ftyp(b"M4A ", b"M4A ", b"M4P "),
+        _ftyp(b"M4A ", b"M4A ", b"M4V "),
+        _ftyp(b"M4A ", b"M4A ", b"qt  "),
+        _ftyp(b"isom", b"isom", b"M4A "),  # M4A only counts as the major brand
+        _ftyp(b"M4V ", b"M4A ") + _MDAT + _moov(b"soun"),
+        _ftyp(b"M4A ")[:15],  # an ftyp box too short to carry a minor version
+    ],
+)
+def test_m4b_m4p_and_m4v_are_not_recognized(payload: bytes) -> None:
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        classify_media_payload(payload)
+    for declared in ("audio/mp4", "audio/x-m4a", "video/mp4"):
+        with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+            validate_media_classification(payload, declared)
+
+
+@pytest.mark.parametrize(
+    ("declared", "canonical"),
+    [
+        ("audio/mp4", "audio/mp4"),
+        ("audio/x-m4a", "audio/mp4"),
+        ("audio/m4a", "audio/mp4"),
+        ("Audio/X-M4A", "audio/mp4"),
+        ("  audio/x-m4a ; codecs=mp4a.40.2 ", "audio/mp4"),
+        ("audio/mp4; codecs=mp4a.40.2", "audio/mp4"),
+        # Only the .m4a spellings are aliases.
+        ("audio/x-m4b", "audio/x-m4b"),
+        ("audio/x-m4p", "audio/x-m4p"),
+        ("video/x-m4v", "video/x-m4v"),
+        ("audio/aac", "audio/aac"),
+    ],
+)
+def test_the_m4a_labels_are_spelled_audio_mp4(declared: str, canonical: str) -> None:
+    assert canonical_declared_mime(declared) == canonical
+
+
+@pytest.mark.parametrize("declared", ["audio/x-m4b", "video/x-m4v", "audio/aac"])
+def test_labels_that_are_not_m4a_stay_unsupported(declared: str) -> None:
+    with pytest.raises(MediaAssetDomainError, match="media_type_unsupported"):
+        validate_media_classification(_VOICE_MEMO_M4A, declared)
+
+
+@pytest.mark.parametrize("declared", ["audio/mp4", "audio/x-m4a", "audio/m4a"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _VOICE_MEMO_FTYP,  # the brand alone decides: no box walk
+        _VOICE_MEMO_M4A,
+        _ftyp(b"M4A ", b"M4A ", b"mp42", b"isom"),
+        _ftyp(b"M4A ", b"M4A ", b"isom", b"iso2"),  # Voice Memos once copied
+        _ftyp(b"M4A ") + _MDAT + _moov(b"soun"),  # no compatible brand at all
+        _ITUNES_FTYP,
+        _ITUNES_M4A,
+        _ftyp(b"M4A ", bytes(4), b"M4A ", bytes(4)),  # padding anywhere, repeated
+    ],
+    ids=[
+        "brand-only",
+        "voice-memo",
+        "mp42isom",
+        "isomiso2",
+        "major-only",
+        "itunes-brand-only",
+        "itunes",
+        "padding-anywhere",
+    ],
+)
+def test_rule_a_the_m4a_major_brand_is_audio_mp4(payload: bytes, declared: str) -> None:
+    classification = validate_media_classification(payload, declared)
+    assert (classification.category, classification.mime_type) == (
+        "audio",
+        "audio/mp4",
+    )
+    assert classify_media_payload(payload) == classification
+
+
+def test_the_itunes_ftyp_is_the_one_apple_writes() -> None:
+    # 0x20 bytes: M4A, minor 0, then M4A mp42 isom and the zero padding.
+    assert _ITUNES_FTYP == (
+        b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00M4A mp42isom\x00\x00\x00\x00"
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # All zero, the major brand included.
+        _ftyp(bytes(4), bytes(4)),
+        _ftyp(bytes(4)),
+        b"\x00\x00\x00\x20ftyp" + bytes(24),
+        # The padding never stands in for the major brand.
+        _ftyp(bytes(4), b"M4A ", b"mp42", b"isom") + _MDAT + _moov(b"soun"),
+        # ...and never widens video/mp4.
+        _ftyp(b"mp42", b"isom", b"mp42", bytes(4)) + _MDAT + _moov(b"soun"),
+        _ftyp(b"isom", b"isom", bytes(4)) + _MDAT + _moov(b"vide", b"soun"),
+    ],
+    ids=[
+        "all-zero",
+        "zero-major-only",
+        "zero-ftyp",
+        "zero-major-m4a-compatible",
+        "generic-padded-audio",
+        "generic-padded-video",
+    ],
+)
+def test_the_zero_padding_brand_is_accepted_for_m4a_only(payload: bytes) -> None:
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        classify_media_payload(payload)
+    for declared in ("audio/mp4", "audio/x-m4a", "video/mp4"):
+        with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+            validate_media_classification(payload, declared)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # Android's MPEG4Writer for 3GPP output, and for MPEG_4 on older releases.
+        _ftyp(b"3gp4", b"isom", b"3gp4") + _MDAT + _moov(b"soun"),
+        _ftyp(b"isom", b"isom", b"3gp4") + _MDAT + _moov(b"soun"),
+        _ftyp(b"3gp5", b"3gp5", b"isom") + _MDAT + _moov(b"soun"),
+        _ftyp(b"mp42", b"isom", b"3gp5") + _MDAT + _moov(b"soun"),
+        _ftyp(b"M4A ", b"M4A ", b"3gp4") + _MDAT + _moov(b"soun"),
+    ],
+    ids=["3gp4-major", "3gp4-compatible", "3gp5-major", "3gp5-compatible", "m4a-3gp4"],
+)
+def test_3gpp_brands_stay_refused_even_audio_only(payload: bytes) -> None:
+    """Known limitation, deliberately: those recorders write AMR, and rule (b)
+    checks the handler type, not the codec, so accepting them would store AMR
+    as audio/mp4."""
+    for declared in ("audio/mp4", "audio/x-m4a", "audio/m4a", "video/mp4"):
+        with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+            validate_media_classification(payload, declared)
+
+
+def test_rule_a_an_m4a_brand_declared_video_is_a_mismatch() -> None:
+    with pytest.raises(MediaAssetDomainError, match="media_type_mismatch"):
+        validate_media_classification(_VOICE_MEMO_M4A, "video/mp4")
+
+
+@pytest.mark.parametrize("declared", ["audio/mp4", "audio/x-m4a", "audio/m4a"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ANDROID_M4A,
+        _ANDROID_M4A_MOOV_FIRST,
+        # ffmpeg's mp4 muxer.
+        _ftyp(b"isom", b"isom", b"iso2", b"mp41") + _MDAT + _moov(b"soun"),
+        # Other non-video handlers ride along.
+        _GENERIC_FTYP + _MDAT + _moov(b"soun", b"meta", b"text"),
+        _GENERIC_FTYP + _MDAT + _moov(b"soun", b"soun"),
+        _GENERIC_FTYP + _box(b"free", bytes(16)) + _MDAT + _moov(b"soun"),
+    ],
+    ids=["moov-last", "moov-first", "ffmpeg", "meta-text", "two-soun", "free"],
+)
+def test_rule_b_a_generic_brand_declared_audio_is_audio_mp4_when_its_tracks_prove_it(
+    payload: bytes, declared: str
+) -> None:
+    # The signature alone still says video: the declared MIME decides the walk.
+    assert classify_media_payload(payload).mime_type == "video/mp4"
+    classification = validate_media_classification(payload, declared)
+    assert (classification.category, classification.mime_type) == (
+        "audio",
+        "audio/mp4",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _GENERIC_FTYP + _MDAT + _moov(b"vide", b"soun"),
+        _GENERIC_FTYP + _MDAT + _moov(b"soun", b"vide"),
+        _GENERIC_FTYP + _moov(b"vide") + _MDAT,
+        _GENERIC_FTYP + _MDAT + _moov(b"soun") + _moov(b"vide"),
+        # No soun track at all.
+        _GENERIC_FTYP + _MDAT,
+        _GENERIC_FTYP + _MDAT + _moov(),
+        _GENERIC_FTYP + _MDAT + _moov(b"meta"),
+        _GENERIC_FTYP + _MDAT + _box(b"moov", _box(b"trak", _box(b"tkhd"))),
+        # A handler outside moov -> trak -> mdia is not a track's.
+        _GENERIC_FTYP + _MDAT + _box(b"moov", _box(b"udta", _hdlr(b"soun"))),
+        _GENERIC_FTYP + _MDAT + _box(b"moov", _box(b"trak", _hdlr(b"soun"))),
+        _GENERIC_FTYP + _MDAT + _box(b"free", _moov(b"soun")),
+        # Well formed to the end of the file, and still no moov.
+        _GENERIC_FTYP + _to_end_box(b"mdat", _moov(b"soun")),
+    ],
+    ids=[
+        "vide-first",
+        "vide-last",
+        "vide-only",
+        "second-moov-vide",
+        "no-moov",
+        "no-trak",
+        "meta-only",
+        "no-mdia",
+        "udta-hdlr",
+        "trak-hdlr",
+        "moov-inside-free",
+        "to-end-mdat-swallows-moov",
+    ],
+)
+def test_rule_b_a_generic_brand_without_audio_only_tracks_is_a_mismatch(
+    payload: bytes,
+) -> None:
+    for declared in ("audio/mp4", "audio/x-m4a"):
+        with pytest.raises(MediaAssetDomainError, match="media_type_mismatch"):
+            validate_media_classification(payload, declared)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ANDROID_M4A,
+        _GENERIC_FTYP + _MDAT + _moov(b"vide", b"soun"),
+        # Structure the walk would refuse: video never walks, so it never sees it.
+        _GENERIC_FTYP + b"\x00\x00\x00",
+        _GENERIC_FTYP + _box(b"mdat", bytes(8))[:-1],
+        b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp42",
+    ],
+    ids=["audio-only", "audio-video", "trailing-bytes", "truncated-mdat", "bare"],
+)
+def test_rule_c_a_generic_brand_declared_video_is_video_exactly_as_before(
+    payload: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_walk(_payload: bytes) -> frozenset[bytes]:
+        raise AssertionError("a video/mp4 declaration walked the boxes")
+
+    monkeypatch.setattr(media_assets, "_mp4_track_handlers", no_walk)
+    classification = validate_media_classification(payload, "video/mp4")
+    assert (classification.category, classification.mime_type) == (
+        "video",
+        "video/mp4",
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "declared"),
+    [
+        (_VOICE_MEMO_M4A, "audio/mp4"),
+        (_ogg_page(), "audio/ogg"),
+        (b"\xff\xfb\x90\x64mp3", "audio/mpeg"),
+        (b"%PDF-1.7\nbody", "application/pdf"),
+    ],
+)
+def test_only_a_generic_brand_declared_audio_mp4_walks_the_boxes(
+    payload: bytes, declared: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_walk(_payload: bytes) -> frozenset[bytes]:
+        raise AssertionError("walked the boxes of a payload its signature decides")
+
+    monkeypatch.setattr(media_assets, "_mp4_track_handlers", no_walk)
+    assert validate_media_classification(payload, declared).mime_type == declared
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # 64-bit largesize (size 1) on the mdat, on the moov and on a nested box.
+        _GENERIC_FTYP + _large_box(b"mdat", b"\x21" * 32) + _moov(b"soun"),
+        _GENERIC_FTYP + _MDAT + _large_box(b"moov", _trak(b"soun")),
+        _GENERIC_FTYP
+        + _MDAT
+        + _box(b"moov", _large_box(b"trak", _box(b"mdia", _hdlr(b"soun")))),
+        # Size 0: the last top-level box runs to the end of the file.
+        _GENERIC_FTYP + _moov(b"soun") + _to_end_box(b"mdat", b"\x21" * 32),
+        _GENERIC_FTYP + _MDAT + _to_end_box(b"moov", _trak(b"soun")),
+        # ...and a nested one to the end of its parent, which here is not the
+        # end of the file: a free box follows the moov.
+        _GENERIC_FTYP
+        + _MDAT
+        + _box(b"moov", _box(b"trak", _to_end_box(b"mdia", _hdlr(b"soun"))))
+        + _box(b"free", bytes(8)),
+    ],
+    ids=[
+        "largesize-mdat",
+        "largesize-moov",
+        "largesize-trak",
+        "to-end-mdat",
+        "to-end-moov",
+        "to-end-nested",
+    ],
+)
+def test_the_box_walk_reads_largesize_and_size_zero(payload: bytes) -> None:
+    assert validate_media_classification(payload, "audio/mp4").mime_type == (
+        "audio/mp4"
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ANDROID_M4A + b"\x00",  # a trailing byte too short for a box header
+        _ANDROID_M4A + bytes(7),
+        _ANDROID_M4A[:-1],  # moov one byte short
+        _GENERIC_FTYP + _box(b"mdat", bytes(4))[:-1] + _moov(b"soun"),
+        # A size below its own header.
+        _GENERIC_FTYP + (4).to_bytes(4, "big") + b"free" + _moov(b"soun"),
+        _GENERIC_FTYP + (7).to_bytes(4, "big") + b"free" + _moov(b"soun"),
+        # largesize below 16, past the end, absurd, or cut short.
+        _GENERIC_FTYP
+        + (1).to_bytes(4, "big")
+        + b"mdat"
+        + (15).to_bytes(8, "big")
+        + _moov(b"soun"),
+        # largesize 12: were the 16-byte header not enforced, the walk would go
+        # on cleanly from offset 12 (the largesize's low word reads as a 12-byte
+        # free box) to a moov with a soun track, and accept the file.
+        _GENERIC_FTYP
+        + (1).to_bytes(4, "big")
+        + b"mdat"
+        + (12).to_bytes(8, "big")
+        + b"free"
+        + bytes(4)
+        + _moov(b"soun"),
+        _GENERIC_FTYP
+        + (1).to_bytes(4, "big")
+        + b"mdat"
+        + (10**6).to_bytes(8, "big")
+        + _moov(b"soun"),
+        _GENERIC_FTYP + (1).to_bytes(4, "big") + b"mdat" + b"\xff" * 8,
+        _GENERIC_FTYP + _moov(b"soun") + (1).to_bytes(4, "big") + b"mdat\x00\x00",
+        # A box larger than its parent.
+        _GENERIC_FTYP
+        + _MDAT
+        + _box(b"moov", (10**4).to_bytes(4, "big") + b"trak" + _hdlr(b"soun")),
+        # An hdlr too short to carry a handler_type.
+        _GENERIC_FTYP
+        + _MDAT
+        + _box(b"moov", _box(b"trak", _box(b"mdia", _box(b"hdlr", bytes(11))))),
+    ],
+    ids=[
+        "trailing-byte",
+        "trailing-seven",
+        "moov-short",
+        "mdat-short",
+        "size-4",
+        "size-7",
+        "largesize-15",
+        "largesize-12-realigns",
+        "largesize-past-end",
+        "largesize-max",
+        "largesize-cut",
+        "child-past-parent",
+        "hdlr-short",
+    ],
+)
+def test_a_malformed_box_structure_is_an_invalid_signature(payload: bytes) -> None:
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        validate_media_classification(payload, "audio/mp4")
+
+
+def test_the_box_walk_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ftyp, mdat, moov; mvhd, trak; tkhd, mdia; mdhd, hdlr, minf.
+    boxes = 10
+    monkeypatch.setattr(media_assets, "_MP4_BOX_WALK_LIMIT", boxes)
+    assert validate_media_classification(_ANDROID_M4A, "audio/mp4").mime_type == (
+        "audio/mp4"
+    )
+    monkeypatch.setattr(media_assets, "_MP4_BOX_WALK_LIMIT", boxes - 1)
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        validate_media_classification(_ANDROID_M4A, "audio/mp4")
+
+
+def test_a_payload_of_tiny_boxes_stops_at_the_walk_limit() -> None:
+    limit = media_assets._MP4_BOX_WALK_LIMIT
+    flood = _GENERIC_FTYP + _box(b"free") * limit + _moov(b"soun")
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        validate_media_classification(flood, "audio/mp4")
+    # One box fewer than the limit, everything counted, still walks to the end.
+    within = _GENERIC_FTYP + _box(b"free") * (limit - 10) + _moov(b"soun")
+    assert validate_media_classification(within, "audio/mp4").mime_type == ("audio/mp4")
+
+
+@pytest.mark.parametrize(
+    ("handlers", "outcome"),
+    [((b"soun",), "audio/mp4"), ((b"vide", b"soun"), "media_type_mismatch")],
+    ids=["audio", "audio-video"],
+)
+def test_a_fragmented_recording_with_thousands_of_fragments_is_walked(
+    handlers: tuple[bytes, ...], outcome: str
+) -> None:
+    # MediaRecorder writes one moof and one mdat per timeslice.
+    fragment = _box(b"moof", _box(b"mfhd", bytes(8))) + _box(b"mdat", b"\x21" * 16)
+    fragments = 6_000
+    payload = (
+        _ftyp(b"iso5", b"iso5", b"iso6", b"mp41")
+        + _moov(*handlers)
+        + fragment * fragments
+    )
+    # More top-level boxes than the 10,000 the walk first allowed in total.
+    assert 2 + 2 * fragments > 10_000
+    assert _outcome(payload, "audio/mp4") == outcome
+
+
+def test_the_ftyp_brands_are_read_once_and_never_materialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    passes: list[int] = []
+    original = media_assets._ftyp_brands
+
+    def counted(payload: bytes, box_size: int) -> Iterator[bytes]:
+        passes.append(0)
+        for brand in original(payload, box_size):
+            passes[-1] += 1
+            yield brand
+
+    monkeypatch.setattr(media_assets, "_ftyp_brands", counted)
+    compatible = 250_000
+    for major, brand, mime_type in (
+        (b"isom", b"isom", "video/mp4"),
+        (b"M4A ", b"mp42", "audio/mp4"),
+    ):
+        payload = _ftyp(major, *([brand] * compatible))
+        passes.clear()
+        tracemalloc.start()
+        try:
+            classification = classify_media_payload(payload)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert classification.mime_type == mime_type
+        # One pass for both brand rules, each brand read once...
+        assert passes == [compatible + 1]
+        # ...and never held together: the brands alone would be megabytes.
+        assert peak < 256 * 1024
+    # The first brand outside the rule ends the pass.
+    passes.clear()
+    flooded = _ftyp(b"isom", b"isom", b"qt  ", *([b"isom"] * compatible))
+    with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
+        classify_media_payload(flooded)
+    assert passes == [3]
+
+
+_WALK_FIXTURES = {
+    "moov-last": _ANDROID_M4A,
+    "moov-first": _ANDROID_M4A_MOOV_FIRST,
+    "largesize": _GENERIC_FTYP + _large_box(b"mdat", b"\x21" * 8) + _moov(b"soun"),
+    "to-end": _GENERIC_FTYP + _moov(b"soun") + _to_end_box(b"mdat", b"\x21" * 8),
+    "voice-memo": _VOICE_MEMO_M4A,
+    "itunes": _ITUNES_M4A,
+    "audio-video": _GENERIC_FTYP + _MDAT + _moov(b"vide", b"soun"),
+}
+
+
+def _outcome(payload: bytes, declared: str) -> str:
+    try:
+        return validate_media_classification(payload, declared).mime_type
+    except MediaAssetDomainError as error:
+        return error.code
+
+
+@pytest.mark.parametrize("name", sorted(_WALK_FIXTURES))
+def test_truncation_at_every_byte_offset_fails_only_with_the_domain_error(
+    name: str,
+) -> None:
+    fixture = _WALK_FIXTURES[name]
+    accepted_prefixes = []
+    for cut in range(len(fixture) + 1):
+        prefix = fixture[:cut]
+        for declared in ("audio/mp4", "audio/x-m4a", "video/mp4"):
+            outcome = _outcome(prefix, declared)  # anything else propagates
+            assert outcome in {
+                "audio/mp4",
+                "video/mp4",
+                "media_signature_invalid",
+                "media_type_mismatch",
+            }, (cut, declared, outcome)
+            if declared == "audio/mp4" and outcome == "audio/mp4":
+                accepted_prefixes.append(cut)
+        try:
+            classify_media_payload(prefix)
+        except MediaAssetDomainError:
+            pass
+        try:
+            media_assets._mp4_track_handlers(prefix)
+        except MediaAssetDomainError:
+            pass
+    brand_decided = {"voice-memo": _VOICE_MEMO_FTYP, "itunes": _ITUNES_FTYP}
+    if name in brand_decided:
+        # The brand decides: every prefix holding the whole ftyp is accepted.
+        ftyp_end = len(brand_decided[name])
+        assert accepted_prefixes == list(range(ftyp_end, len(fixture) + 1))
+    elif name == "audio-video":
+        assert accepted_prefixes == []
+    elif name == "moov-first":
+        # Cut exactly after moov it is a well-formed file without its mdat.
+        moov_end = len(_GENERIC_FTYP) + len(_moov(b"soun"))
+        assert accepted_prefixes == [moov_end, len(fixture)]
+    elif name == "to-end":
+        # A size-0 box ends wherever the file does, so no cut after its header
+        # is detectable; the cut exactly after moov is a file without mdat.
+        moov_end = len(_GENERIC_FTYP) + len(_moov(b"soun"))
+        assert accepted_prefixes == [moov_end, *range(moov_end + 8, len(fixture) + 1)]
+    else:
+        # A generic brand is audio only when the whole file tiles into boxes.
+        assert accepted_prefixes == [len(fixture)]
+
+
+@pytest.mark.parametrize("name", sorted(_WALK_FIXTURES))
+@pytest.mark.parametrize("value", [0x00, 0x01, 0x7F, 0xFF])
+def test_overwriting_any_byte_fails_only_with_the_domain_error(
+    name: str, value: int
+) -> None:
+    fixture = _WALK_FIXTURES[name]
+    for offset in range(len(fixture)):
+        corrupted = fixture[:offset] + bytes([value]) + fixture[offset + 1 :]
+        for declared in ("audio/mp4", "video/mp4"):
+            assert _outcome(corrupted, declared) in {
+                "audio/mp4",
+                "video/mp4",
+                "media_signature_invalid",
+                "media_type_mismatch",
+            }
+
+
 def test_each_category_is_capped_at_the_published_limit() -> None:
     assert MEDIA_CATEGORY_MAX_BYTES == {
         "image": 5_000_000,
@@ -294,6 +874,7 @@ def test_each_category_is_capped_at_the_published_limit() -> None:
         (b"\xff\xd8\xff\xe0", "image/jpeg", MEDIA_IMAGE_MAX_BYTES),
         (b"%PDF-1.7\n", "application/pdf", MEDIA_PDF_MAX_BYTES),
         (b"\xff\xfb\x90\x64", "audio/mpeg", MEDIA_AUDIO_VIDEO_MAX_BYTES),
+        (_VOICE_MEMO_FTYP, "audio/mp4", MEDIA_AUDIO_VIDEO_MAX_BYTES),
     ],
 )
 def test_a_payload_one_byte_over_its_category_limit_is_rejected(
@@ -305,6 +886,21 @@ def test_a_payload_one_byte_over_its_category_limit_is_rejected(
     assert validate_media_classification(at_limit, mime_type).mime_type == mime_type
     with pytest.raises(MediaAssetDomainError, match="media_size_exceeded"):
         validate_media_classification(at_limit + b"\x00", mime_type)
+
+
+def test_a_generic_brand_audio_mp4_is_capped_at_the_audio_limit() -> None:
+    def android(size: int) -> bytes:
+        moov = _moov(b"soun")
+        mdat_body = size - len(_GENERIC_FTYP) - len(moov) - 8
+        return _GENERIC_FTYP + _box(b"mdat", bytes(mdat_body)) + moov
+
+    at_limit = android(MEDIA_AUDIO_VIDEO_MAX_BYTES)
+    assert len(at_limit) == MEDIA_AUDIO_VIDEO_MAX_BYTES
+    assert validate_media_classification(at_limit, "audio/x-m4a").category == "audio"
+    with pytest.raises(MediaAssetDomainError, match="media_size_exceeded"):
+        validate_media_classification(
+            android(MEDIA_AUDIO_VIDEO_MAX_BYTES + 1), "audio/x-m4a"
+        )
 
 
 @pytest.mark.asyncio

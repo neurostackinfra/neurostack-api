@@ -2,7 +2,7 @@
 
 The per-category size limits (image 5 MB, PDF 20 MB, audio/video 16 MB) hold in
 every credit mode, so the published contract never depends on the rollout
-state.  M4A stays ``media_type_unsupported``.
+state.  M4A is stored as ``audio/mp4`` under the audio limit.
 
 Credits (neurostack-credit-system Group 4a, :mod:`src.services.credit_inventory`).
 With the credit switch off nothing changes.  With it on and before
@@ -96,6 +96,7 @@ _MIME_EXTENSIONS = {
     "video/mp4": ".mp4",
     "audio/mpeg": ".mp3",
     "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
     "application/pdf": ".pdf",
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -478,8 +479,8 @@ def _authorized_media_target_exists(
                                 "type": "string",
                                 "format": "binary",
                                 "description": (
-                                    "Exactly one MP4, MP3, OGG-Opus, PDF, JPEG or "
-                                    "PNG file; the payload limit is the one of its "
+                                    "Exactly one MP4, MP3, OGG-Opus, M4A, PDF, JPEG "
+                                    "or PNG file; the payload limit is the one of its "
                                     f"derived category ({_MEDIA_LIMIT_SUMMARY})."
                                 ),
                                 "x-maxBytes": MEDIA_FILE_MAX_BYTES,
