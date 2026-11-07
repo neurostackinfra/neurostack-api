@@ -20,7 +20,6 @@ from hypothesis import strategies as st
 from src.services.credit_allocations import (
     EGRESS_INCLUDED_BYTES_PER_CREDIT,
     EGRESS_OVERAGE_BYTES_PER_CREDIT,
-    ENFORCED_MEDIA_MAX_BYTES,
     KNOWLEDGE_BATCH_MAX_FILES,
     KNOWLEDGE_DOCUMENT_MAX_CHARACTERS,
     KNOWLEDGE_FILE_MAX_BYTES,
@@ -59,13 +58,6 @@ def test_the_units_and_limits_are_the_pdfs() -> None:
     assert KNOWLEDGE_DOCUMENT_MAX_CHARACTERS == 500_000
     assert KNOWLEDGE_FILE_MAX_BYTES == 20_000_000
     assert KNOWLEDGE_BATCH_MAX_FILES == 10
-    # Only the five types media_assets stores (M4A/OGG-Opus deferred).
-    assert ENFORCED_MEDIA_MAX_BYTES == {
-        "image": 5_000_000,
-        "pdf": 20_000_000,
-        "audio": 16_000_000,
-        "video": 16_000_000,
-    }
 
 
 @pytest.mark.parametrize(

@@ -62,22 +62,12 @@ EGRESS_OVERAGE_BYTES_PER_CREDIT: Final = 100_000_000
 # 100 % of the active characters may be reprocessed in a window for free.
 RAG_REPROCESSING_INCLUDED_PERCENT: Final = 100
 
-# The PDF's limits; they apply only after ``credit_enforcement_at``.
+# The PDF's knowledge limits; they apply only after ``credit_enforcement_at``.
+# The PDF's media limits are not here: they are unconditional and live with the
+# category that decides them, in src/services/media_assets.py.
 KNOWLEDGE_DOCUMENT_MAX_CHARACTERS: Final = 500_000
 KNOWLEDGE_FILE_MAX_BYTES: Final = 20_000_000
 KNOWLEDGE_BATCH_MAX_FILES: Final = 10
-MEDIA_IMAGE_MAX_BYTES: Final = 5_000_000
-MEDIA_PDF_MAX_BYTES: Final = 20_000_000
-MEDIA_AUDIO_VIDEO_MAX_BYTES: Final = 16_000_000
-# Per media category of ``media_assets`` (the five existing types: M4A and
-# OGG-Opus are deferred, owner decision A, and keep ``main``'s
-# ``media_type_unsupported``).
-ENFORCED_MEDIA_MAX_BYTES: Final[dict[str, int]] = {
-    "image": MEDIA_IMAGE_MAX_BYTES,
-    "pdf": MEDIA_PDF_MAX_BYTES,
-    "audio": MEDIA_AUDIO_VIDEO_MAX_BYTES,
-    "video": MEDIA_AUDIO_VIDEO_MAX_BYTES,
-}
 
 _UNIT_PER_CREDIT: Final[dict[str, int]] = {
     "rag": RAG_CHARACTERS_PER_CREDIT,
@@ -250,14 +240,10 @@ def observational_maintenance_effect_id(
 __all__ = [
     "EGRESS_INCLUDED_BYTES_PER_CREDIT",
     "EGRESS_OVERAGE_BYTES_PER_CREDIT",
-    "ENFORCED_MEDIA_MAX_BYTES",
     "KNOWLEDGE_BATCH_MAX_FILES",
     "KNOWLEDGE_DOCUMENT_MAX_CHARACTERS",
     "KNOWLEDGE_FILE_MAX_BYTES",
-    "MEDIA_AUDIO_VIDEO_MAX_BYTES",
     "MEDIA_BYTES_PER_CREDIT",
-    "MEDIA_IMAGE_MAX_BYTES",
-    "MEDIA_PDF_MAX_BYTES",
     "RAG_CHARACTERS_PER_CREDIT",
     "RAG_REPROCESSING_INCLUDED_PERCENT",
     "AccountingWindow",

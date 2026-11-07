@@ -86,8 +86,9 @@ def test_036_revises_035_and_037_follows_it(migration: ModuleType) -> None:
     assert [rev for rev, parent in revisions.values() if parent == "036"] == ["037"]
     # neurostack-credit-system Group 1a: 038 (credit schema) follows 037;
     # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
-    # (lifecycle, legal hold, purge and roles) follows 040.
-    assert current_head() == "042"
+    # (lifecycle, legal hold, purge and roles) follows 040; 043 (audio/ogg in
+    # the media category/MIME invariant) is the head.
+    assert current_head() == "043"
 
 
 def test_frozen_file_is_pinned_rendered_and_outside_versions(

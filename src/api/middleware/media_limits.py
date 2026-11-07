@@ -9,8 +9,12 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.api.routing_paths import decision_path
+from src.services.media_assets import MEDIA_FILE_MAX_BYTES
 
-MEDIA_MULTIPART_MAX_BYTES: Final = 51_000_000
+# Headroom for the boundary, the part headers and the four text fields; the
+# cap exists to stop a body no category could accept before it is parsed.
+MEDIA_MULTIPART_OVERHEAD_BYTES: Final = 1_000_000
+MEDIA_MULTIPART_MAX_BYTES: Final = MEDIA_FILE_MAX_BYTES + MEDIA_MULTIPART_OVERHEAD_BYTES
 
 
 class MediaRequestTooLarge(Exception):

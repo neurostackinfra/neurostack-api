@@ -42,6 +42,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { CreditAllocationNotice } from "@/components/plan-usage-summary";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
+import type { TranslationKey } from "@/locales/en";
 
 type MediaCategory = "video" | "audio" | "pdf" | "image";
 
@@ -101,7 +102,66 @@ const EMPTY_CATALOG: Omit<CatalogState, "scope"> = {
   error: false,
 };
 
-const MAX_FILE_BYTES = 50_000_000;
+// Mirrors MEDIA_CATEGORY_MAX_BYTES in src/services/media_assets.py. The server
+// is authoritative; this only spares the user a long upload that ends in 413.
+const MAX_BYTES_BY_CATEGORY: Record<MediaCategory, number> = {
+  image: 5_000_000,
+  pdf: 20_000_000,
+  audio: 16_000_000,
+  video: 16_000_000,
+};
+
+const CATEGORY_BY_MIME: Record<string, MediaCategory> = {
+  "video/mp4": "video",
+  "audio/mpeg": "audio",
+  "audio/ogg": "audio",
+  "application/pdf": "pdf",
+  "image/jpeg": "image",
+  "image/png": "image",
+};
+
+const CATEGORY_BY_EXTENSION: Record<string, MediaCategory> = {
+  mp4: "video",
+  mp3: "audio",
+  ogg: "audio",
+  opus: "audio",
+  pdf: "pdf",
+  jpg: "image",
+  jpeg: "image",
+  png: "image",
+};
+
+const UPLOAD_ERROR_KEY: Record<string, TranslationKey> = {
+  media_size_exceeded: "media_upload_error_size",
+  media_request_size_exceeded: "media_upload_error_size",
+  media_type_unsupported: "media_upload_error_format",
+  media_type_mismatch: "media_upload_error_format",
+  media_signature_invalid: "media_upload_error_format",
+  media_storage_cap_exceeded: "media_upload_error_storage_full",
+  credit_pending: "media_upload_error_credits",
+  credit_category_exhausted: "media_upload_error_credits",
+  credit_suspended: "media_upload_error_credits",
+  media_concurrency_exceeded: "media_upload_error_busy",
+  media_storage_unavailable: "media_upload_error_busy",
+};
+
+function categoryOf(file: File): MediaCategory | undefined {
+  const mime = CATEGORY_BY_MIME[file.type.split(";")[0].trim().toLowerCase()];
+  if (mime) return mime;
+  const extension = /\.([^.]+)$/.exec(file.name.toLowerCase())?.[1];
+  return extension ? CATEGORY_BY_EXTENSION[extension] : undefined;
+}
+
+async function uploadErrorKey(response: Response): Promise<TranslationKey> {
+  try {
+    const body = (await response.json()) as { detail?: { code?: string } };
+    const code = body.detail?.code;
+    if (code && code in UPLOAD_ERROR_KEY) return UPLOAD_ERROR_KEY[code];
+  } catch {
+    // a body that is not the documented envelope falls back to the generic text
+  }
+  return "media_upload_error";
+}
 
 function authToken() {
   try {
@@ -179,6 +239,7 @@ export default function Midias() {
     scope: string;
     kind: FeedbackKind;
     success: boolean;
+    messageKey?: TranslationKey;
   } | null>(null);
   const [fileError, setFileError] = useState(false);
 
@@ -365,7 +426,14 @@ export default function Midias() {
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const selected = event.target.files?.[0] ?? null;
     setFeedback(null);
-    if (selected && selected.size > MAX_FILE_BYTES) {
+    // A file this page cannot classify is still offered to the server, which
+    // decides the category from the content signature rather than the name.
+    const category = selected ? categoryOf(selected) : undefined;
+    if (
+      selected &&
+      category &&
+      selected.size > MAX_BYTES_BY_CATEGORY[category]
+    ) {
       event.target.value = "";
       setFile(null);
       setFileError(true);
@@ -403,7 +471,18 @@ export default function Midias() {
         body: form,
         signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`media-upload-${response.status}`);
+      if (!response.ok) {
+        const messageKey = await uploadErrorKey(response);
+        if (scopeRef.current !== requestScope || controller.signal.aborted)
+          return;
+        setFeedback({
+          scope: requestScope,
+          kind: "upload",
+          success: false,
+          messageKey,
+        });
+        return;
+      }
       const created = (await response.json()) as MediaAsset;
       if (scopeRef.current !== requestScope || controller.signal.aborted)
         return;
@@ -701,7 +780,7 @@ export default function Midias() {
                 ref={fileInputRef}
                 id="media-file"
                 type="file"
-                accept="video/mp4,audio/mpeg,application/pdf,image/jpeg,image/png,.mp4,.mp3,.pdf,.jpg,.jpeg,.png"
+                accept="video/mp4,audio/mpeg,audio/ogg,application/pdf,image/jpeg,image/png,.mp4,.mp3,.ogg,.opus,.pdf,.jpg,.jpeg,.png"
                 onChange={handleFileChange}
                 required
                 disabled={isUploading}
@@ -807,7 +886,8 @@ export default function Midias() {
           {t(
             currentFeedback.success
               ? `media_${currentFeedback.kind}_success`
-              : `media_${currentFeedback.kind}_error`,
+              : (currentFeedback.messageKey ??
+                  `media_${currentFeedback.kind}_error`),
           )}
         </div>
       )}

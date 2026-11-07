@@ -88,6 +88,13 @@ function deferredResponse() {
   };
 }
 
+function sizedFile(name: string, type: string, size: number) {
+  const file = new File(["media"], name, { type });
+  // jsdom keeps the real byte length; the page only ever reads ``size``.
+  Object.defineProperty(file, "size", { value: size });
+  return file;
+}
+
 function setRole(
   role: "clinic_admin" | "builder" | "super_admin" | "investor",
   viewingClinicId = "clinic-selected",
@@ -581,6 +588,190 @@ describe("<Midias /> catalog operations", () => {
       await screen.findByText("No media has been uploaded for this clinic."),
     ).toBeInTheDocument();
     expect(attempts).toBe(2);
+  });
+});
+
+// The server is authoritative on both the size and the format; these cover the
+// client-side mirror of src/services/media_assets.py MEDIA_CATEGORY_MAX_BYTES
+// and the mapping from its documented error codes to actionable prose.
+describe("<Midias /> per-category limits and upload errors", () => {
+  beforeEach(() => {
+    mocks.fetch.mockImplementation(() =>
+      jsonResponse({ items: [], next_cursor: null, has_more: false }),
+    );
+  });
+
+  it("accepts and advertises OGG-Opus alongside the four original formats", async () => {
+    const created = asset({
+      id: "asset-ogg",
+      display_name: "Áudio de boas-vindas",
+      original_filename: "voz.ogg",
+      category: "audio",
+      mime_type: "audio/ogg",
+    });
+    let uploadBody: FormData | undefined;
+    mocks.fetch.mockImplementation(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          uploadBody = init.body as FormData;
+          return jsonResponse(created, 201);
+        }
+        return jsonResponse({ items: [], next_cursor: null, has_more: false });
+      },
+    );
+
+    renderPage();
+    const input = await screen.findByLabelText("File");
+    for (const token of ["audio/ogg", ".ogg", ".opus"]) {
+      expect(input).toHaveAttribute("accept", expect.stringContaining(token));
+    }
+    expect(screen.getByText(/MP4, MP3, OGG, PDF, JPG, PNG/)).toBeInTheDocument();
+
+    // WhatsApp and ffmpeg label Opus with a codecs parameter.
+    fireEvent.change(input, {
+      target: {
+        files: [sizedFile("voz.ogg", "audio/ogg; codecs=opus", 2_000_000)],
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Áudio de boas-vindas" },
+    });
+    fireEvent.submit(
+      screen.getByRole("button", { name: "Upload media" }).closest("form")!,
+    );
+
+    await waitFor(() => expect(uploadBody).toBeDefined());
+    expect(
+      await screen.findByText("Media uploaded successfully."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Áudio de boas-vindas")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["image", "foto.png", "image/png", 5_000_001],
+    ["pdf", "guia.pdf", "application/pdf", 20_000_001],
+    ["audio", "voz.ogg", "audio/ogg", 16_000_001],
+    ["video", "clipe.mp4", "video/mp4", 16_000_001],
+  ])(
+    "blocks a %s one byte over its own limit before any upload request",
+    async (_category, name, type, size) => {
+      renderPage();
+      const input = await screen.findByLabelText("File");
+      fireEvent.change(input, { target: { files: [sizedFile(name, type, size)] } });
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "5 MB for an image, 20 MB for a PDF, 16 MB for audio or video",
+      );
+      expect(input).toHaveValue("");
+      expect(
+        screen.getByRole("button", { name: "Upload media" }),
+      ).toBeDisabled();
+      expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    ["pdf", "guia.pdf", "application/pdf", 19_999_999],
+    ["audio", "voz.mp3", "audio/mpeg", 15_999_999],
+  ])(
+    "keeps a %s that a flat image-sized limit would have rejected",
+    async (_category, name, type, size) => {
+      renderPage();
+      const input = await screen.findByLabelText("File");
+      fireEvent.change(input, { target: { files: [sizedFile(name, type, size)] } });
+
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Original filename")).toHaveValue(name);
+    },
+  );
+
+  it("offers a file it cannot classify to the server rather than blocking it", async () => {
+    renderPage();
+    const input = await screen.findByLabelText("File");
+    fireEvent.change(input, {
+      target: { files: [sizedFile("gravação", "", 40_000_000)] },
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Original filename")).toHaveValue("gravação");
+  });
+
+  it.each([
+    [413, "media_size_exceeded", "exceeds the limit for its type"],
+    [413, "media_request_size_exceeded", "exceeds the limit for its type"],
+    [422, "media_type_unsupported", "This format is not accepted"],
+    [422, "media_type_mismatch", "This format is not accepted"],
+    [409, "media_storage_cap_exceeded", "media storage is full"],
+    [402, "credit_pending", "media credits do not cover this upload"],
+    [402, "credit_category_exhausted", "media credits do not cover this upload"],
+    [503, "media_concurrency_exceeded", "busy right now"],
+  ])(
+    "explains a %s %s instead of one generic failure",
+    async (status, code, expected) => {
+      mocks.fetch.mockImplementation(
+        (_input: string | URL | Request, init?: RequestInit) =>
+          init?.method === "POST"
+            ? jsonResponse({ detail: { code } }, status)
+            : jsonResponse({ items: [], next_cursor: null, has_more: false }),
+      );
+
+      renderPage();
+      fireEvent.change(await screen.findByLabelText("File"), {
+        target: { files: [sizedFile("arquivo.pdf", "application/pdf", 1_000)] },
+      });
+      fireEvent.submit(
+        screen.getByRole("button", { name: "Upload media" }).closest("form")!,
+      );
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(expected);
+      expect(
+        screen.queryByText(/Check the file and try again/),
+      ).not.toBeInTheDocument();
+      // A rejected upload keeps the form filled so the user can retry.
+      expect(screen.getByLabelText("Original filename")).toHaveValue(
+        "arquivo.pdf",
+      );
+    },
+  );
+
+  it.each([
+    ["an undocumented code", { detail: { code: "media_storage_conflict" } }],
+    ["a body that is not the envelope", { message: "gateway" }],
+  ])("falls back to the generic message for %s", async (_label, body) => {
+    mocks.fetch.mockImplementation(
+      (_input: string | URL | Request, init?: RequestInit) =>
+        init?.method === "POST"
+          ? jsonResponse(body, 409)
+          : jsonResponse({ items: [], next_cursor: null, has_more: false }),
+    );
+
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("File"), {
+      target: { files: [sizedFile("arquivo.pdf", "application/pdf", 1_000)] },
+    });
+    fireEvent.submit(
+      screen.getByRole("button", { name: "Upload media" }).closest("form")!,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The media could not be uploaded. Check the file and try again.",
+    );
+  });
+
+  it("states every limit in Portuguese too", async () => {
+    localStorage.setItem("ns_locale", "pt");
+    renderPage();
+    const input = await screen.findByLabelText("Arquivo");
+    expect(
+      screen.getByText(/5 MB para imagem, 20 MB para PDF, 16 MB para áudio/),
+    ).toBeInTheDocument();
+
+    fireEvent.change(input, {
+      target: { files: [sizedFile("foto.png", "image/png", 5_000_001)] },
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "ultrapassa o limite do seu tipo",
+    );
   });
 });
 

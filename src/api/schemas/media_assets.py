@@ -20,6 +20,7 @@ class MediaAssetResponse(BaseModel):
     mime_type: Literal[
         "video/mp4",
         "audio/mpeg",
+        "audio/ogg",
         "application/pdf",
         "image/jpeg",
         "image/png",
