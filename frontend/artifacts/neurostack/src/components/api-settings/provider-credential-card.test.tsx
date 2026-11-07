@@ -108,4 +108,16 @@ describe("<ProviderCredentialCard />", () => {
     expect(screen.getByTestId("provider-card-llm-openai"))
       .toHaveAttribute("aria-expanded", "true");
   });
+
+  it.each(["available", "incomplete", "configured", "coming_soon"] as const)(
+    "renders optional help text under sub only when given (%s)",
+    (state) => {
+      const { rerender } = render(
+        <ProviderCredentialCard id="mm-or" label="OpenRouter" sub="sub" state={state} badgeLabel="B" help="Help text" />,
+      );
+      expect(screen.getByTestId("provider-help-mm-or")).toHaveTextContent("Help text");
+      rerender(<ProviderCredentialCard id="mm-or" label="OpenRouter" sub="sub" state={state} badgeLabel="B" />);
+      expect(screen.queryByTestId("provider-help-mm-or")).toBeNull();
+    },
+  );
 });

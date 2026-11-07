@@ -2,12 +2,12 @@
 
 Trust boundary. This module is the single choke point for every outbound
 network call the application makes to a configured provider or a remote
-audio URL. It implements the wish's SSRF policy:
+audio or image URL. It implements the wish's SSRF policy:
 
 - HTTPS absolute only, no userinfo, no fragment, port 443, no ``localhost``.
 - Host allowlists per provider (exact hosts for the known operational
   edges; custom-public HTTPS validation for ``outros`` / Evolution /
-  Uazapi / audio URLs).
+  Uazapi / audio URLs / image URLs).
 - DNS resolution once at the transport boundary; every A/AAAA record must
   be a public unicast address (no loopback, no RFC1918/ULA, no link-local,
   no multicast, no reserved, no metadata service). The connection is
@@ -15,8 +15,9 @@ audio URL. It implements the wish's SSRF policy:
   keeps using the original hostname (TOCTOU-safe, no second resolution).
 - Redirects are always rejected; each new URL would require a fresh
   validation pass, so any 3xx short-circuits the caller.
-- Streaming downloads enforce a configurable byte cap and MIME allowlist;
-  ``Content-Length`` above the cap is rejected before reading the body.
+- Streaming downloads (audio and image) enforce a byte cap and a MIME
+  allowlist; ``Content-Length`` above the cap is rejected before reading the
+  body, and the cap is enforced again while streaming.
 - Errors never carry the caller's secret material: the caller passes API
   keys/tokens through ``headers``/``bearer_token`` after validation
   succeeds, and this module never logs or re-raises those values.
@@ -79,7 +80,7 @@ TTS_OPENAI_HOSTS: frozenset[str] = frozenset({"api.openai.com"})
 # Providers that fall back to the "custom public" policy: any public
 # HTTPS destination is accepted, but the DNS/IP filter still runs.
 CUSTOM_PUBLIC_PROVIDERS: frozenset[str] = frozenset(
-    {"outros", "evolution", "uazapi", "audio_url"}
+    {"outros", "evolution", "uazapi", "audio_url", "image_url"}
 )
 
 # MIME types acceptable for remote audio downloads.
@@ -87,6 +88,19 @@ AUDIO_MIME_ALLOWLIST: frozenset[str] = frozenset(
     {"application/ogg", "application/octet-stream"}
 )
 AUDIO_MIME_PREFIX_ALLOWLIST: tuple[str, ...] = ("audio/",)
+
+# MIME types acceptable for remote image downloads (whatsapp-image-understanding,
+# Decision 12). Exact types only, never an ``image/`` prefix: the effective
+# MIME ends up in the ``data:`` URL handed to the multimodal provider, so a
+# type outside this set (GIF, HEIC, SVG...) is refused at the boundary. The
+# multimodal adapter imports this same set, so the two can never drift.
+IMAGE_MIME_ALLOWLIST: frozenset[str] = frozenset(
+    {"image/jpeg", "image/png", "image/webp"}
+)
+# Generic binary type some CDNs answer for media. For images it is accepted
+# only when the channel declared an allowlisted MIME for the same media (the
+# declared MIME then becomes the effective one).
+OCTET_STREAM_MIME: str = "application/octet-stream"
 
 DEFAULT_CONNECT_TIMEOUT: float = 5.0
 DEFAULT_READ_TIMEOUT: float = 30.0
@@ -99,7 +113,8 @@ class UnsafeEgressError(ValueError):
 
     ``code`` is a stable machine token (``unsafe_api_url``,
     ``unsafe_audio_url``, ``audio_too_large``, ``unsupported_audio_mime``,
-    ``audio_download_failed``, ``redirect_forbidden``). Callers translate
+    ``audio_download_failed``, ``image_too_large``, ``unsupported_image_mime``,
+    ``image_download_failed``, ``redirect_forbidden``). Callers translate
     it to their transport (HTTP 422 for config URLs, HTTP 200 skip envelope
     for audio) without ever echoing headers/keys.
     """
@@ -309,21 +324,56 @@ def validate_audio_mime(content_type: str | None) -> None:
     raise UnsafeEgressError("unsupported_audio_mime")
 
 
+def _bare_mime(value: str | None) -> str:
+    """Lowercase a MIME type and drop its parameters (``; charset=...``)."""
+
+    return (value or "").split(";", 1)[0].strip().lower()
+
+
+def validate_image_mime(
+    content_type: str | None,
+    *,
+    declared_mime: str | None = None,
+) -> str:
+    """Return the effective MIME of a remote image, or raise.
+
+    The response ``Content-Type`` (parameters stripped, lowercased) must be in
+    :data:`IMAGE_MIME_ALLOWLIST`, and it wins over any declared type.
+    ``application/octet-stream`` is accepted only when the channel declared an
+    allowlisted MIME for the media (``declared_mime``), which then becomes the
+    effective MIME. A missing ``Content-Type`` is refused.
+    """
+
+    mime = _bare_mime(content_type)
+    if mime in IMAGE_MIME_ALLOWLIST:
+        return mime
+    if mime == OCTET_STREAM_MIME:
+        declared = _bare_mime(declared_mime)
+        if declared in IMAGE_MIME_ALLOWLIST:
+            return declared
+    raise UnsafeEgressError("unsupported_image_mime")
+
+
 def enforce_content_length(
     content_length: str | int | None,
     *,
     max_bytes: int,
+    too_large_code: str = "audio_too_large",
 ) -> None:
-    """Reject responses whose declared body exceeds the byte cap."""
+    """Reject responses whose declared body exceeds the byte cap.
+
+    ``too_large_code`` is the error code raised (``audio_too_large`` for the
+    audio downloader, ``image_too_large`` for the image one).
+    """
 
     if content_length is None or content_length == "":
         return
     try:
         length = int(content_length)
     except (TypeError, ValueError) as exc:
-        raise UnsafeEgressError("audio_too_large") from exc
+        raise UnsafeEgressError(too_large_code) from exc
     if length < 0 or length > max_bytes:
-        raise UnsafeEgressError("audio_too_large")
+        raise UnsafeEgressError(too_large_code)
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +427,7 @@ PROVIDER_POLICIES: Mapping[str, ProviderPolicy] = {
     "evolution": ProviderPolicy(kind="evolution", allowed_hosts=None),
     "uazapi": ProviderPolicy(kind="uazapi", allowed_hosts=None),
     "audio_url": ProviderPolicy(kind="audio_url", allowed_hosts=None),
+    "image_url": ProviderPolicy(kind="image_url", allowed_hosts=None),
 }
 
 
@@ -608,13 +659,16 @@ async def safe_async_client(
 
 
 # ---------------------------------------------------------------------------
-# Safe audio downloader (used by webhook handlers via Group 5)
+# Safe audio and image downloaders (used by the webhook handlers)
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class SafeDownload:
-    """Streaming download result for remote audio."""
+    """Streaming download result for remote audio or images.
+
+    ``mime_type`` is the effective MIME (parameters stripped, lowercased).
+    """
 
     content: bytes
     mime_type: str
@@ -666,11 +720,76 @@ async def safe_download_audio(
             raise UnsafeEgressError("audio_download_failed") from exc
 
 
+async def safe_download_image(
+    url: str,
+    *,
+    max_bytes: int,
+    headers: Mapping[str, str] | None = None,
+    declared_mime: str | None = None,
+    resolver: Any = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> SafeDownload:
+    """Stream a remote image URL through the safe transport.
+
+    Same host, redirect and streaming semantics as :func:`safe_download_audio`
+    under the custom-public ``image_url`` policy (whatsapp-image-understanding,
+    Decision 12):
+
+    - the URL must pass the public-HTTPS and DNS checks (``unsafe_api_url``)
+      and any 3xx is refused (``redirect_forbidden``);
+    - a status >= 400, a transport error or an empty body is
+      ``image_download_failed``;
+    - the MIME must be in :data:`IMAGE_MIME_ALLOWLIST`, with
+      ``application/octet-stream`` accepted only when ``declared_mime`` is
+      allowlisted (:func:`validate_image_mime`), else
+      ``unsupported_image_mime``;
+    - ``max_bytes`` is enforced on ``Content-Length`` before the body is read
+      **and** again while streaming (``image_too_large``).
+
+    ``headers`` (e.g. Meta's ``Authorization``) are sent as-is and never
+    appear in an error. ``resolver``/``transport`` are test seams, exactly as
+    on :func:`safe_download_audio`.
+    """
+
+    validated = validate_url(url, kind="image_url", resolver=resolver)
+    request_headers = dict(headers) if headers else {}
+    request_headers.setdefault("Host", validated.sni_host)
+    async with build_safe_async_client(validated, transport=transport) as client:
+        try:
+            async with client.stream(
+                "GET", validated.url, headers=request_headers
+            ) as response:
+                if response.status_code >= 400:
+                    raise UnsafeEgressError("image_download_failed")
+                mime = validate_image_mime(
+                    response.headers.get("Content-Type"),
+                    declared_mime=declared_mime,
+                )
+                enforce_content_length(
+                    response.headers.get("Content-Length"),
+                    max_bytes=max_bytes,
+                    too_large_code="image_too_large",
+                )
+                buffer = bytearray()
+                async for chunk in response.aiter_bytes():
+                    buffer.extend(chunk)
+                    if len(buffer) > max_bytes:
+                        raise UnsafeEgressError("image_too_large")
+                if not buffer:
+                    raise UnsafeEgressError("image_download_failed")
+                return SafeDownload(content=bytes(buffer), mime_type=mime)
+        except UnsafeEgressError:
+            raise
+        except httpx.HTTPError as exc:
+            raise UnsafeEgressError("image_download_failed") from exc
+
+
 __all__ = [
     "AUDIO_MIME_ALLOWLIST",
     "CUSTOM_PUBLIC_PROVIDERS",
     "DEFAULT_MAX_AUDIO_BYTES",
     "GEMINI_API_BASE_URL",
+    "IMAGE_MIME_ALLOWLIST",
     "LLM_DROPOUT_HOSTS",
     "LLM_GEMINI_HOSTS",
     "LLM_OPENAI_HOSTS",
@@ -678,6 +797,7 @@ __all__ = [
     "MULTIMODAL_GROQ_HOSTS",
     "MULTIMODAL_OPENAI_HOSTS",
     "MULTIMODAL_OPENROUTER_HOSTS",
+    "OCTET_STREAM_MIME",
     "PROVIDER_POLICIES",
     "STT_ELEVENLABS_HOSTS",
     "STT_GROQ_HOSTS",
@@ -701,6 +821,8 @@ __all__ = [
     "resolve_public_ips",
     "safe_async_client",
     "safe_download_audio",
+    "safe_download_image",
     "validate_audio_mime",
+    "validate_image_mime",
     "validate_url",
 ]

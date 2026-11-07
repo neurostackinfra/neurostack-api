@@ -1,8 +1,14 @@
-"""NeuroStack - Multimodal audio transcription service.
+"""NeuroStack - Multimodal audio transcription and image description service.
 
 Second step of the audio fallback chain: when the dedicated STT provider
 fails, the raw audio bytes are handed to a multimodal chat model through the
 OpenAI ``chat/completions`` shape, using ``input_audio`` content blocks.
+
+The same tenant bundle also describes images a patient sends on WhatsApp
+(:func:`describe_image_multimodal`, whatsapp-image-understanding): one
+``image_url`` content block carrying a base64 ``data:`` URL, a neutral,
+non-diagnostic prompt in the agent's language, and egress pinned to
+OpenRouter only. The description is text for the main LLM, never a reply.
 
 Deliberately *not* part of :mod:`src.services.groq_service`: that module is
 named per-provider around ``/audio/transcriptions``, while this one has to
@@ -35,6 +41,7 @@ from typing import Any
 import httpx
 
 from src.services.safe_egress import (
+    IMAGE_MIME_ALLOWLIST,
     MULTIMODAL_GROQ_HOSTS,
     MULTIMODAL_OPENAI_HOSTS,
     MULTIMODAL_OPENROUTER_HOSTS,
@@ -301,4 +308,215 @@ async def transcribe_audio_multimodal(
     text = _extract_text(payload)
     if not text:
         raise MultimodalTranscriptionError("empty_multimodal_response")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Image description (whatsapp-image-understanding, Decisions 1, 11 and 12)
+# ---------------------------------------------------------------------------
+
+#: Marker the image prompt asks for when nothing describable is visible.
+#: Like :data:`NO_SPEECH_MARKER` it is language-neutral; a response carrying
+#: it is a failure (``no_image_content``), never a description.
+IMAGE_NO_CONTENT_MARKER = "[[NO_IMAGE_CONTENT]]"
+
+#: Description instructions, one per agent language (Decision 11): an
+#: objective description plus a literal transcription of any visible text,
+#: and never a diagnosis or clinical opinion. Kept here (not at the call
+#: site) so the describe-only contract is enforced in one place.
+IMAGE_DESCRIPTION_PROMPT_PT = (
+    "Descreva esta imagem de forma objetiva, em português do Brasil, e "
+    "transcreva literalmente, sem traduzir, todo texto visível nela. Não faça "
+    "diagnóstico, não dê opinião clínica e não interprete o significado "
+    "médico do que aparece: apenas descreva o que se vê. Responda somente com "
+    "a descrição, sem comentários, prefixos ou aspas. Se não houver nada que "
+    f"possa ser descrito, responda exatamente: {IMAGE_NO_CONTENT_MARKER}"
+)
+IMAGE_DESCRIPTION_PROMPT_EN = (
+    "Describe this image objectively, in English, and transcribe verbatim, "
+    "without translating, any text visible in it. Do not make a diagnosis, do "
+    "not give a clinical opinion and do not interpret the medical meaning of "
+    "what appears: only describe what is seen. Reply with only the "
+    "description, without commentary, prefixes or quotes. If there is nothing "
+    f"that can be described, reply exactly: {IMAGE_NO_CONTENT_MARKER}"
+)
+
+#: The only egress kind allowed to receive patient images: the tenant's
+#: OpenRouter bundle (Decisions 1 and 15). OpenAI and Groq are pinned for
+#: audio but never receive an image.
+IMAGE_DESCRIPTION_KIND = "multimodal_openrouter"
+
+#: Stable codes of :class:`MultimodalImageError` (Decision 11).
+IMAGE_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "provider_not_multimodal_capable",
+        "unsupported_image_mime",
+        "provider_http_error",
+        "provider_transport_error",
+        "invalid_provider_response",
+        "no_image_content",
+    }
+)
+
+
+class MultimodalImageError(RuntimeError):
+    """Secret-free multimodal image-description failure.
+
+    Sibling of :class:`MultimodalTranscriptionError`. ``code`` is one of
+    :data:`IMAGE_ERROR_CODES`; ``context`` never carries credentials, headers,
+    image bytes or the model's text.
+    """
+
+    def __init__(self, code: str, **context: Any) -> None:
+        self.code = code
+        self.context: dict[str, Any] = context
+        super().__init__(code)
+
+
+def image_description_prompt(agent_language: str) -> str:
+    """The description prompt in the agent's language (``en`` or pt-BR)."""
+
+    if agent_language == "en":
+        return IMAGE_DESCRIPTION_PROMPT_EN
+    return IMAGE_DESCRIPTION_PROMPT_PT
+
+
+def image_mimetype(mimetype: str | None) -> str:
+    """Normalize an image MIME type, refusing anything off the allowlist."""
+
+    normalized = normalize_mimetype(mimetype)
+    if normalized not in IMAGE_MIME_ALLOWLIST:
+        raise MultimodalImageError("unsupported_image_mime")
+    return normalized
+
+
+def _extract_image_text(payload: Any) -> str | None:
+    """Assistant text of a chat-completions body, or ``None`` when malformed.
+
+    Unlike :func:`_extract_text` this separates a body that is not a
+    chat-completions answer at all (``None`` -> ``invalid_provider_response``)
+    from a well-formed answer with no text, such as an empty string or a
+    refusal (``""`` -> ``no_image_content``).
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        return "".join(parts).strip()
+    return None
+
+
+async def describe_image_multimodal(
+    api_key: str,
+    image_bytes: bytes,
+    mimetype: str,
+    model: str = DEFAULT_MULTIMODAL_MODEL,
+    base_url: str | None = None,
+    agent_language: str = "pt-BR",
+) -> str:
+    """Describe an image with the tenant's OpenRouter model. Returns the text.
+
+    The request is an OpenAI-compatible ``chat/completions`` call whose single
+    user message carries the :func:`image_description_prompt` text block and
+    exactly one ``image_url`` block with a ``data:<mime>;base64,...`` URL of
+    the normalized MIME. Egress, client, headers and timeout mirror
+    :func:`transcribe_audio_multimodal`.
+
+    Args:
+        api_key: Bearer token for OpenRouter.
+        image_bytes: Raw image content (JPEG, PNG or WebP).
+        mimetype: MIME type of the image; parameters and case are normalized.
+        model: OpenRouter model identifier.
+        base_url: Provider base URL. Defaults to OpenRouter; any URL that does
+            not resolve to ``multimodal_openrouter`` is refused before I/O.
+        agent_language: ``"en"`` for the English prompt, else pt-BR.
+
+    Raises:
+        UnsafeEgressError: base URL outside the pinned multimodal hosts (no
+            DNS lookup, no request), or another egress-policy violation such
+            as a redirect.
+        MultimodalImageError: ``provider_not_multimodal_capable`` (pinned
+            provider other than OpenRouter), ``unsupported_image_mime`` and
+            ``no_image_content`` for empty bytes (all before any I/O);
+            ``provider_http_error`` (non-2xx), ``provider_transport_error``,
+            ``invalid_provider_response`` (not a chat-completions body) and
+            ``no_image_content`` (empty text or
+            :data:`IMAGE_NO_CONTENT_MARKER`) after the call.
+    """
+
+    api_base = (base_url or "").rstrip("/") or OPENROUTER_API_BASE
+    kind = multimodal_kind_for_url(api_base)
+    if kind != IMAGE_DESCRIPTION_KIND:
+        raise MultimodalImageError("provider_not_multimodal_capable", kind=kind)
+    normalized = image_mimetype(mimetype)
+    if not image_bytes:
+        raise MultimodalImageError("no_image_content")
+
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    target_url = f"{api_base}/chat/completions"
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": image_description_prompt(agent_language)},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{normalized};base64,{encoded}"},
+                    },
+                ],
+            }
+        ],
+    }
+    try:
+        async with safe_async_client(
+            target_url,
+            kind=kind,
+            timeout=httpx.Timeout(60.0, connect=10.0),
+        ) as (client, validated):
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Host": validated.sni_host,
+            }
+            resp = await client.post(validated.url, headers=headers, json=body)
+            resp.raise_for_status()
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                raise MultimodalImageError("invalid_provider_response") from exc
+    except httpx.HTTPStatusError as exc:
+        raise MultimodalImageError(
+            "provider_http_error", status_code=exc.response.status_code
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise MultimodalImageError("provider_transport_error") from exc
+
+    text = _extract_image_text(payload)
+    if text is None:
+        raise MultimodalImageError("invalid_provider_response")
+    # A marker anywhere (not only an exact match) is a refusal to describe:
+    # forwarding it would put the marker itself into the patient's message.
+    if not text or IMAGE_NO_CONTENT_MARKER in text:
+        raise MultimodalImageError("no_image_content")
     return text

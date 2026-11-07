@@ -17,30 +17,49 @@ Group 4 additions (media handling):
   the shared Whisper client, and processed as normal text
 - Audio exceeding ``audio_max_seconds`` (approximated by byte size) triggers
   a handoff message + real HandoffService call — never a 500
-- File/attachment (image, PDF, Word…) is never downloaded; the bot replies
-  with the fixed acknowledgement (personalised with ``lead_name`` when
-  known) and marks the session as awaiting the patient's choice
+- File/attachment (PDF, Word, video, sticker…) is never downloaded; the bot
+  replies with the owner's fixed acknowledgement (never personalised) and
+  marks the session as awaiting the patient's choice
+
+whatsapp-image-understanding Group 4 (bottom of the module):
+- An image is resolved, downloaded and described when the tenant's
+  OpenRouter bundle is operational, and the caption plus the description
+  reaches the pipeline; any other outcome takes the file branch above
+- The file branch never resends its acknowledgement while a pending review
+  is active (2h window); an expired or legacy review counts as absent
 - Choosing "forward it to your team" initiates a real handoff and sends a
   confirmation
 - Media-specific log parity: ``logger.warning`` on media_id resolve
   failures, ``logger.exception`` on transcription failures
 """
 
+import base64
 import hashlib
 import hmac
 import json
-from collections.abc import Callable
+import logging
+import socket
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
+import httpx
 import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from src.api.routes import webhook as webhook_module
 from src.config.settings import settings
+from src.services.multimodal_service import (
+    IMAGE_NO_CONTENT_MARKER,
+    MultimodalImageError,
+)
+from src.services.safe_egress import SafeDownload, UnsafeEgressError
 
 API_CRED_PATH = "/v1/config/api-credentials"
 WEBHOOK_PATH = "/v1/webhook/meta"
@@ -1221,34 +1240,53 @@ class TestMetaWebhookFileFlow:
         # But the fixed ack message was sent
         assert mock_send.await_count == 1
         sent_body = mock_send.await_args.args[3]
-        # Portuguese default when no lead_name is known
+        # Portuguese default copy
         assert "arquivo" in sent_body.lower()
         assert "encaminh" in sent_body.lower() or "equipe" in sent_body.lower()
 
-    def test_file_ack_personalises_with_lead_name_when_known(
+    def test_file_ack_is_never_personalised_even_when_lead_name_is_known(
         self,
         client: TestClient,
         tenant_id: UUID,
     ):
-        """When ``cognitive_state.slots.lead_name`` is set, the ack greets the
-        patient by first name."""
+        """Inverted by design (whatsapp-image-understanding, Decision 6): even
+        with ``cognitive_state.slots.lead_name`` set, the ack is the owner's
+        fixed copy, never greeting the patient by name."""
+        from sqlalchemy import update
+
+        from src.api.routes.webhook import _FILE_ACK_MSG_PT, _get_or_create_session
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
         phone_id = f"pn_{uuid4().hex[:8]}"
         _seed_meta_credentials(client, tenant_id, phone_id)
+        from_phone = "5511900006666"
+
+        async def _seed_named_session() -> None:
+            db = get_db_session()
+            try:
+                session_id, _ = await _get_or_create_session(tenant_id, from_phone, db)
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == session_id)
+                    .values(cognitive_state={"slots": {"lead_name": "Ana Maria Silva"}})
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        client._submit(_seed_named_session())  # type: ignore[attr-defined]
 
         media_id = f"media_{uuid4().hex[:12]}"
         payload = _meta_media_payload(
             phone_number_id=phone_id,
-            from_phone="5511900006666",
+            from_phone=from_phone,
             media_id=media_id,
             message_id=f"wamid.file_named_{uuid4().hex[:8]}",
             msg_type="image",
         )
 
         with (
-            patch(
-                "src.api.routes.webhook._meta_load_lead_name",
-                new=AsyncMock(return_value="Ana Maria Silva"),
-            ),
             patch(
                 "src.api.routes.webhook.send_meta_cloud_text",
                 new=AsyncMock(return_value=_fake_meta_send_result()),
@@ -1269,8 +1307,9 @@ class TestMetaWebhookFileFlow:
         assert resp.json()["action"] == "file_ack"
         assert mock_send.await_count == 1
         sent_body = mock_send.await_args.args[3]
-        # Only the first name is used (never the full name)
-        assert ", Ana" in sent_body
+        # The owner's copy verbatim: no first name, no full name.
+        assert sent_body == _FILE_ACK_MSG_PT
+        assert "Ana" not in sent_body
         assert "Silva" not in sent_body
 
     def test_file_ack_never_calls_pipeline_or_download(
@@ -1353,7 +1392,7 @@ class TestMetaWebhookFileForwardChoice:
 
         with (
             patch(
-                "src.api.routes.webhook._meta_get_pending_file_review",
+                "src.api.routes.webhook._pending_file_review_active",
                 new=AsyncMock(return_value=True),
             ),
             patch(
@@ -1428,7 +1467,7 @@ class TestMetaWebhookFileForwardChoice:
 
         with (
             patch(
-                "src.api.routes.webhook._meta_get_pending_file_review",
+                "src.api.routes.webhook._pending_file_review_active",
                 new=AsyncMock(return_value=True),
             ),
             patch(
@@ -1605,7 +1644,7 @@ class TestMetaWebhookPrivacyNotice:
         sends = [call.args for call in mock_send.await_args_list]
         assert [args[3] for args in sends] == [
             _LGPD_EXPECTED_NOTICE,
-            _build_meta_file_ack_message("", "pt-BR"),
+            _build_meta_file_ack_message("pt-BR"),
         ]
         assert all(args[0] == phone_id for args in sends)
         assert all(args[2] == from_phone for args in sends)
@@ -1650,7 +1689,7 @@ class TestMetaWebhookPrivacyNotice:
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
         assert [call.args[3] for call in mock_send.await_args_list] == [
-            _build_meta_file_ack_message("", "pt-BR"),
+            _build_meta_file_ack_message("pt-BR"),
         ]
 
     def test_file_first_then_text_sends_notice_exactly_once(
@@ -1702,7 +1741,7 @@ class TestMetaWebhookPrivacyNotice:
 
         assert [call.args[3] for call in mock_send.await_args_list] == [
             _LGPD_EXPECTED_NOTICE,
-            _build_meta_file_ack_message("", "pt-BR"),
+            _build_meta_file_ack_message("pt-BR"),
             "A consulta custa R$ 200",
         ]
         assert service.run_pipeline.await_count == 1
@@ -1774,7 +1813,7 @@ class TestMetaWebhookPrivacyNotice:
 
         assert [call.args[3] for call in mock_send.await_args_list] == [
             _LGPD_EXPECTED_NOTICE,
-            _build_meta_file_ack_message("", "pt-BR"),
+            _build_meta_file_ack_message("pt-BR"),
             _FILE_FORWARDED_MSG_PT,
         ]
         assert handoff_mock.await_count == 1
@@ -3354,7 +3393,7 @@ class TestMetaInteractionOrigin:
             ),
             patch("src.api.routes.webhook.get_event_service", return_value=service),
             patch(
-                "src.api.routes.webhook._meta_get_pending_file_review",
+                "src.api.routes.webhook._pending_file_review_active",
                 new=AsyncMock(return_value=True),
             ),
             patch(
@@ -3601,7 +3640,7 @@ class TestMetaInteractionOrigin:
             ),
             patch("src.api.routes.webhook.get_event_service", return_value=service),
             patch(
-                "src.api.routes.webhook._meta_get_pending_file_review",
+                "src.api.routes.webhook._pending_file_review_active",
                 new=AsyncMock(return_value=True),
             ),
             patch(
@@ -3633,3 +3672,1186 @@ class TestMetaInteractionOrigin:
         assert request.session_id == context.session_id
         assert request.key_info["file_review_note"] == note
         service.run_pipeline.assert_not_awaited()
+
+
+# ============================================
+# whatsapp-image-understanding Group 4: patient images, the file branch and
+# the pending-review window on Meta
+# ============================================
+
+_G4_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF-meta-g4-fake-jpeg"
+_G4_DESCRIPTION = "Foto de um pedido de exame com o texto Hemograma completo."
+_G4_LOGGER = "src.api.routes.webhook"
+_G4_CDN_URL = "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=g4"
+_G4_REPLY = "Resposta da IA"
+_G4_ACK_PT = webhook_module._FILE_ACK_MSG_PT
+_G4_ACK_EN = webhook_module._FILE_ACK_MSG_EN
+_G4_EN_CONFIG = {"business_rules": {"agent_language": "en"}}
+_G4_FILE_ACK = {"ok": True, "replied": True, "action": "file_ack"}
+
+
+def _g4_marker(description: str = _G4_DESCRIPTION) -> str:
+    return f"[Imagem enviada pelo paciente: {description}]"
+
+
+def _g4_message(payload: dict) -> dict:
+    return payload["entry"][0]["changes"][0]["value"]["messages"][0]
+
+
+def _g4_image_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    fields = ("channel", "outcome", "mime", "size_bytes", "latency_ms")
+    return [
+        {name: getattr(record, name) for name in fields}
+        for record in caplog.records
+        if getattr(record, "event", None) == "image_description_attempt"
+    ]
+
+
+def _g4_log_dump(caplog: pytest.LogCaptureFixture) -> str:
+    """Every captured record: formatted text and traceback, args and extra."""
+    return "\n".join([caplog.text, *(repr(vars(r)) for r in caplog.records)])
+
+
+def _g4_review(age: timedelta | None) -> dict[str, Any]:
+    """A pending review set ``age`` ago; ``None`` is a legacy flag."""
+    if age is None:
+        return {"pending_file_review": True}
+    set_at = datetime.now(timezone.utc) - age
+    return {"pending_file_review": True, "pending_file_review_at": set_at.isoformat()}
+
+
+def _g4_assert_fresh_review(metadata: dict[str, Any]) -> None:
+    """The review was (re)written by this request: flag plus a fresh stamp."""
+    assert metadata["pending_file_review"] is True
+    set_at = datetime.fromisoformat(metadata["pending_file_review_at"])
+    assert timedelta(0) <= datetime.now(timezone.utc) - set_at < timedelta(minutes=1)
+
+
+def _g4_seed_session(
+    client: TestClient,
+    tenant_id: UUID,
+    phone: str,
+    metadata: dict[str, Any] | None,
+) -> UUID:
+    from sqlalchemy import update
+
+    from src.api.routes.webhook import _get_or_create_session
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID:
+        db = get_db_session()
+        try:
+            session_id, _ = await _get_or_create_session(tenant_id, phone, db)
+            if metadata is not None:
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == session_id)
+                    .values(session_metadata=metadata)
+                )
+            await db.commit()
+            return session_id
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _g4_session_metadata(
+    client: TestClient, tenant_id: UUID, phone: str
+) -> dict[str, Any]:
+    from sqlalchemy import select
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> list[Any]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(SessionRow.session_metadata).where(
+                    SessionRow.tenant_id == tenant_id,
+                    SessionRow.user_id == phone,
+                )
+            )
+            return list(result.scalars().all())
+        finally:
+            await db.close()
+
+    [metadata] = client._submit(_run())  # type: ignore[attr-defined]
+    return dict(metadata or {})
+
+
+@dataclass
+class _MetaImageWorld:
+    """One Meta tenant plus the patched provider boundaries.
+
+    ``calls`` records ``(kind, detail)`` in order across the Meta sends, the
+    media resolve and download, the image description and the pipeline, so a
+    test can assert sequencing (the LGPD notice before the description).
+    """
+
+    client: TestClient
+    tenant_id: UUID
+    phone_id: str
+    phone: str
+    token: str
+    resolve: AsyncMock
+    download: AsyncMock
+    describe: AsyncMock
+    send: AsyncMock
+    handoff: AsyncMock
+    service: MagicMock
+    calls: list[tuple[str, str]]
+    http_requests: list[httpx.Request] = field(default_factory=list)
+
+    def post(self, payload: dict) -> Any:
+        return _post_meta(self.client, payload)
+
+    def image(
+        self,
+        *,
+        caption: str | None = None,
+        mime_type: str = "image/jpeg",
+        message_id: str | None = None,
+    ) -> dict:
+        payload = _meta_media_payload(
+            phone_number_id=self.phone_id,
+            from_phone=self.phone,
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=message_id or f"wamid.img_{uuid4().hex[:10]}",
+            msg_type="image",
+            mime_type=mime_type,
+        )
+        if caption is not None:
+            _g4_message(payload)["image"]["caption"] = caption
+        return payload
+
+    def file(self, msg_type: str) -> dict:
+        return _meta_media_payload(
+            phone_number_id=self.phone_id,
+            from_phone=self.phone,
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.{msg_type}_{uuid4().hex[:10]}",
+            msg_type=msg_type,
+            filename="laudo.pdf" if msg_type == "document" else None,
+        )
+
+    def text(self, body: str) -> dict:
+        return _meta_text_payload(
+            phone_number_id=self.phone_id,
+            from_phone=self.phone,
+            text_body=body,
+            message_id=f"wamid.txt_{uuid4().hex[:10]}",
+        )
+
+    def resolve_returns(self, **overrides: Any) -> None:
+        """The resolve answers the default media info with ``overrides``; a
+        ``None`` drops the key."""
+        info: dict[str, Any] = {
+            "url": _G4_CDN_URL,
+            "mime_type": "image/jpeg",
+            "file_size": len(_G4_JPEG),
+            "sha256": "sha_placeholder",
+        }
+        info.update(overrides)
+        self.resolve.side_effect = None
+        self.resolve.return_value = {k: v for k, v in info.items() if v is not None}
+
+    def sent(self) -> list[str]:
+        return [call.args[3] for call in self.send.await_args_list]
+
+    def pipeline_contents(self) -> list[str]:
+        return [
+            call.args[0].payload.content
+            for call in self.service.run_pipeline.await_args_list
+        ]
+
+    def seed_session(self, metadata: dict[str, Any] | None = None) -> UUID:
+        return _g4_seed_session(self.client, self.tenant_id, self.phone, metadata)
+
+    def metadata(self) -> dict[str, Any]:
+        return _g4_session_metadata(self.client, self.tenant_id, self.phone)
+
+
+@pytest.fixture
+def meta_image_world(
+    client: TestClient,
+    tenant_id: UUID,
+    caplog: pytest.LogCaptureFixture,
+) -> Iterator[Callable[..., _MetaImageWorld]]:
+    """Factory for :class:`_MetaImageWorld` (one call per test).
+
+    Patches the Meta send, the media resolve and download, the multimodal
+    adapter (or, with ``real_boundaries``, only DNS and the transport under
+    the real resolve, download and adapter), the file handoff's creation and
+    the event service.
+    """
+    caplog.set_level(logging.INFO, logger=_G4_LOGGER)
+    with ExitStack() as stack:
+
+        def make(
+            *,
+            multimodal: bool = True,
+            token: str | None = None,
+            clinic_config: dict[str, Any] | None = None,
+            real_boundaries: bool = False,
+            phone: str = "5511977004400",
+        ) -> _MetaImageWorld:
+            phone_id = f"pn_{uuid4().hex[:8]}"
+            token = f"EAAG_g4_secret_{uuid4().hex}" if token is None else token
+            credentials: dict[str, Any] = {
+                "whatsapp_provider": "meta_cloud",
+                "meta_phone_number_id": phone_id,
+                "meta_waba_id": f"waba_{phone_id}",
+                "meta_permanent_token": token,
+                "meta_verify_token": f"verify_{uuid4().hex}",
+                "meta_app_secret": META_APP_SECRET,
+            }
+            if multimodal:
+                credentials.update(
+                    {
+                        "multimodal_provider": "openrouter",
+                        "multimodal_api_url": "https://openrouter.ai/api/v1",
+                        "multimodal_api_key": f"sk-fake-mm-{uuid4().hex}",
+                        "multimodal_model_name": "google/gemini-2.5-flash",
+                    }
+                )
+            _seed_legacy_meta_credentials(client, tenant_id, credentials)
+            calls: list[tuple[str, str]] = []
+
+            async def _resolve(media_id: str, _access_token: str) -> dict[str, Any]:
+                calls.append(("resolve", media_id))
+                return {
+                    "url": _G4_CDN_URL,
+                    "mime_type": "image/jpeg",
+                    "file_size": len(_G4_JPEG),
+                    "sha256": "sha_placeholder",
+                }
+
+            async def _download(url: str, **_kwargs: Any) -> SafeDownload:
+                calls.append(("download", url))
+                return SafeDownload(content=_G4_JPEG, mime_type="image/jpeg")
+
+            async def _describe(**kwargs: Any) -> str:
+                calls.append(("describe", kwargs["mimetype"]))
+                return _G4_DESCRIPTION
+
+            async def _send(_pnid: str, _token: str, _phone: str, text: str) -> dict:
+                calls.append(("send", text))
+                return _fake_meta_send_result()
+
+            async def _run_pipeline(event_request: Any, *_a: Any, **_k: Any) -> Any:
+                calls.append(("pipeline", event_request.payload.content))
+                return MagicMock(), {}, []
+
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value=clinic_config or {})
+            service.run_pipeline = AsyncMock(side_effect=_run_pipeline)
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response(_G4_REPLY)
+            )
+            world = _MetaImageWorld(
+                client=client,
+                tenant_id=tenant_id,
+                phone_id=phone_id,
+                phone=phone,
+                token=token,
+                resolve=AsyncMock(side_effect=_resolve),
+                download=AsyncMock(side_effect=_download),
+                describe=AsyncMock(side_effect=_describe),
+                send=AsyncMock(side_effect=_send),
+                handoff=AsyncMock(return_value=SimpleNamespace(id=uuid4())),
+                service=service,
+                calls=calls,
+            )
+            stack.enter_context(
+                patch("src.api.routes.webhook.send_meta_cloud_text", world.send)
+            )
+            stack.enter_context(
+                patch(
+                    "src.api.routes.webhook._meta_initiate_file_handoff",
+                    world.handoff,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "src.api.routes.webhook.get_event_service",
+                    return_value=service,
+                )
+            )
+            if real_boundaries:
+                _g4_patch_http(stack, world)
+            else:
+                stack.enter_context(
+                    patch("src.api.routes.webhook.resolve_meta_media", world.resolve)
+                )
+                stack.enter_context(
+                    patch("src.api.routes.webhook.safe_download_image", world.download)
+                )
+                stack.enter_context(
+                    patch(
+                        "src.services.multimodal_service.describe_image_multimodal",
+                        world.describe,
+                    )
+                )
+            return world
+
+        yield make
+
+
+def _g4_patch_http(stack: ExitStack, world: _MetaImageWorld) -> None:
+    """Run the real resolve, download and image adapter on a mock transport.
+
+    Only DNS and the transport under the safe-egress policy are replaced:
+    Graph answers the resolve, the CDN serves the JPEG and OpenRouter the
+    description. Every request is kept in ``world.http_requests``.
+    """
+    from src.services import safe_egress
+
+    def _resolver(_host: str, port: int) -> list[tuple[Any, ...]]:
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("104.18.2.1", port),
+            )
+        ]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        world.http_requests.append(request)
+        host = request.url.host
+        if host == "graph.facebook.com":
+            world.calls.append(("resolve", request.url.path))
+            return httpx.Response(
+                200,
+                json={
+                    "url": _G4_CDN_URL,
+                    "mime_type": "image/jpeg",
+                    "file_size": len(_G4_JPEG),
+                    "sha256": "sha_placeholder",
+                },
+            )
+        if host == "lookaside.fbsbx.com":
+            world.calls.append(("download", str(request.url)))
+            return httpx.Response(
+                200, content=_G4_JPEG, headers={"Content-Type": "image/jpeg"}
+            )
+        if host == "openrouter.ai":
+            world.calls.append(("describe", str(request.url)))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"role": "assistant", "content": _G4_DESCRIPTION}}
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    mock_transport = httpx.MockTransport(_handler)
+    original_build = safe_egress.build_safe_async_client
+
+    def _build(validated: Any, *, timeout: Any = None, transport: Any = None) -> Any:
+        return original_build(validated, timeout=timeout, transport=mock_transport)
+
+    stack.enter_context(patch.object(safe_egress, "_default_getaddrinfo", _resolver))
+    stack.enter_context(patch.object(safe_egress, "build_safe_async_client", _build))
+
+
+class TestMetaImageDescribed:
+    """Decisions 1, 5, 9, 10, 12, 14: an image is described once and answered."""
+
+    def test_captioned_image_reaches_openrouter_once_through_the_real_boundaries(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = meta_image_world(real_boundaries=True)
+        payload = world.image(caption="Olha o meu pedido de exame")
+        media_id = _g4_message(payload)["image"]["id"]
+
+        resp = world.post(payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        resolve, download, describe = world.http_requests
+        assert (resolve.method, resolve.url.host, resolve.url.path) == (
+            "GET",
+            "graph.facebook.com",
+            f"/v18.0/{media_id}",
+        )
+        assert (download.method, str(download.url)) == ("GET", _G4_CDN_URL)
+        for request in (resolve, download):
+            assert request.headers["Authorization"] == f"Bearer {world.token}"
+        assert describe.method == "POST"
+        assert str(describe.url) == "https://openrouter.ai/api/v1/chat/completions"
+        assert world.token not in describe.headers.get("Authorization", "")
+        [message] = json.loads(describe.content)["messages"]
+        [block] = [b for b in message["content"] if b["type"] == "image_url"]
+        encoded = base64.b64encode(_G4_JPEG).decode("ascii")
+        assert block["image_url"]["url"] == f"data:image/jpeg;base64,{encoded}"
+        assert world.pipeline_contents() == [
+            f"Olha o meu pedido de exame\n\n{_g4_marker()}"
+        ]
+        assert world.sent() == [_G4_REPLY]
+        world.handoff.assert_not_awaited()
+        assert "pending_file_review" not in world.metadata()
+        [event] = _g4_image_events(caplog)
+        assert (event["channel"], event["outcome"], event["mime"]) == (
+            "meta",
+            "described",
+            "image/jpeg",
+        )
+        assert event["size_bytes"] == len(_G4_JPEG)
+        assert isinstance(event["latency_ms"], int)
+        logs = _g4_log_dump(caplog)
+        assert world.token not in logs
+        assert _G4_DESCRIPTION not in logs
+        assert encoded not in logs
+
+    def test_download_carries_the_token_the_cap_and_the_declared_mime(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = meta_image_world()
+        world.download.side_effect = None
+        world.download.return_value = SafeDownload(
+            content=_G4_JPEG, mime_type="image/png"
+        )
+        payload = world.image()
+        media_id = _g4_message(payload)["image"]["id"]
+
+        resp = world.post(payload)
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.resolve.assert_awaited_once_with(media_id, world.token)
+        world.download.assert_awaited_once_with(
+            _G4_CDN_URL,
+            max_bytes=webhook_module.IMAGE_MAX_BYTES,
+            headers={"Authorization": f"Bearer {world.token}"},
+            declared_mime="image/jpeg",
+        )
+        kwargs = world.describe.await_args.kwargs
+        assert kwargs["image_bytes"] == _G4_JPEG
+        assert kwargs["mimetype"] == "image/png"  # the effective MIME
+        assert kwargs["api_key"].startswith("sk-fake-mm-")
+        assert kwargs["model"] == "google/gemini-2.5-flash"
+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert kwargs["agent_language"] == "pt-BR"
+        assert world.pipeline_contents() == [_g4_marker()]
+        [event] = _g4_image_events(caplog)
+        assert (event["outcome"], event["mime"]) == ("described", "image/png")
+
+    @pytest.mark.parametrize(
+        ("overrides", "payload_mime", "declared_mime"),
+        [
+            pytest.param(
+                {"file_size": 5_000_000}, "image/jpeg", "image/jpeg", id="at_the_cap"
+            ),
+            pytest.param(
+                {"file_size": None}, "image/jpeg", "image/jpeg", id="no_declared_size"
+            ),
+            pytest.param(
+                {"mime_type": None},
+                "image/webp",
+                "image/webp",
+                id="no_resolve_mime_uses_the_payload_one",
+            ),
+            pytest.param(
+                {"mime_type": None},
+                "",
+                None,
+                id="no_mime_declared_anywhere",
+            ),
+        ],
+    )
+    def test_within_the_declared_limits_the_image_is_downloaded(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        overrides: dict[str, Any],
+        payload_mime: str,
+        declared_mime: str | None,
+    ) -> None:
+        world = meta_image_world()
+        world.resolve_returns(**overrides)
+
+        resp = world.post(world.image(mime_type=payload_mime))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.download.assert_awaited_once()
+        assert world.download.await_args.kwargs["declared_mime"] == declared_mime
+        world.describe.assert_awaited_once()
+        assert world.pipeline_contents() == [_g4_marker()]
+
+    def test_english_agent_gets_the_english_marker(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world(clinic_config=_G4_EN_CONFIG)
+
+        world.post(world.image(caption="My exam request"))
+
+        assert world.pipeline_contents() == [
+            f"My exam request\n\n[Image sent by the patient: {_G4_DESCRIPTION}]"
+        ]
+        assert world.describe.await_args.kwargs["agent_language"] == "en"
+
+    def test_a_described_image_leaves_an_active_review_untouched(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        """Decision 14: neither cleared nor resolved, and the caption (a
+        forward keyword here) is never read as a forward request."""
+        world = meta_image_world()
+        review = _g4_review(timedelta(minutes=10))
+        world.seed_session(review)
+
+        resp = world.post(world.image(caption="Pode encaminhar pra equipe"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.handoff.assert_not_awaited()
+        assert world.pipeline_contents() == [
+            f"Pode encaminhar pra equipe\n\n{_g4_marker()}"
+        ]
+        assert world.sent() == [_G4_REPLY]
+        metadata = world.metadata()
+        assert metadata["pending_file_review"] is True
+        assert metadata["pending_file_review_at"] == review["pending_file_review_at"]
+
+    def test_a_redelivered_image_is_never_described_twice(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Decision 9: Meta's claim at the top covers the image; no new claim."""
+        world = meta_image_world()
+        payload = world.image(message_id=f"wamid.redelivered_{uuid4().hex[:8]}")
+
+        assert world.post(payload).json() == {"ok": True, "replied": True}
+        assert world.post(payload).json() == {
+            "ok": True,
+            "skipped": "duplicate_message",
+        }
+
+        world.download.assert_awaited_once()
+        world.describe.assert_awaited_once()
+        assert world.sent() == [_G4_REPLY]
+        assert [e["outcome"] for e in _g4_image_events(caplog)] == ["described"]
+
+
+class TestMetaImageNotDescribed:
+    """Decision 5: any other outcome takes today's file branch, exactly once
+    reported by ``image_description_attempt``."""
+
+    @pytest.mark.parametrize(
+        ("multimodal", "media", "outcome", "mime", "size_bytes", "resolved"),
+        [
+            pytest.param(
+                False, None, "no_capability", "image/jpeg", None, 0, id="no_capability"
+            ),
+            pytest.param(
+                True,
+                {"file_size": 5_000_001},
+                "too_large",
+                "image/jpeg",
+                5_000_001,
+                1,
+                id="declared_too_large",
+            ),
+            pytest.param(
+                True,
+                {"file_size": "6000000"},
+                "too_large",
+                "image/jpeg",
+                6_000_000,
+                1,
+                id="declared_too_large_as_string",
+            ),
+            pytest.param(
+                True,
+                {"mime_type": "image/gif"},
+                "unsupported_mime",
+                "image/gif",
+                len(_G4_JPEG),
+                1,
+                id="declared_gif",
+            ),
+            pytest.param(
+                True,
+                RuntimeError("graph unavailable"),
+                "download_failed",
+                "image/jpeg",
+                None,
+                1,
+                id="resolve_failed",
+            ),
+            pytest.param(
+                True,
+                {"url": None},
+                "download_failed",
+                "image/jpeg",
+                len(_G4_JPEG),
+                1,
+                id="resolve_without_url",
+            ),
+        ],
+    )
+    def test_refused_before_any_download(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        multimodal: bool,
+        media: dict[str, Any] | Exception | None,
+        outcome: str,
+        mime: str,
+        size_bytes: int | None,
+        resolved: int,
+    ) -> None:
+        world = meta_image_world(multimodal=multimodal)
+        if isinstance(media, Exception):
+            world.resolve.side_effect = media
+        elif media is not None:
+            world.resolve_returns(**media)
+
+        resp = world.post(world.image(caption="Minha foto"))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == _G4_FILE_ACK
+        assert world.resolve.await_count == resolved
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        [event] = _g4_image_events(caplog)
+        assert event == {
+            "channel": "meta",
+            "outcome": outcome,
+            "mime": mime,
+            "size_bytes": size_bytes,
+            "latency_ms": None,
+        }
+        assert world.sent() == [_G4_ACK_PT]
+        assert world.pipeline_contents() == []
+        world.handoff.assert_not_awaited()
+        _g4_assert_fresh_review(world.metadata())
+
+    @pytest.mark.parametrize(
+        ("download_error", "description", "outcome"),
+        [
+            pytest.param(
+                UnsafeEgressError("image_download_failed"),
+                None,
+                "download_failed",
+                id="download_failed",
+            ),
+            pytest.param(
+                UnsafeEgressError("redirect_forbidden"),
+                None,
+                "download_failed",
+                id="redirect_forbidden",
+            ),
+            pytest.param(
+                UnsafeEgressError("unsafe_api_url"),
+                None,
+                "download_failed",
+                id="unsafe_url",
+            ),
+            pytest.param(
+                UnsafeEgressError("image_too_large"),
+                None,
+                "too_large",
+                id="streamed_past_the_cap",
+            ),
+            pytest.param(
+                UnsafeEgressError("unsupported_image_mime"),
+                None,
+                "unsupported_mime",
+                id="served_bad_mime",
+            ),
+            pytest.param(
+                RuntimeError("socket closed"),
+                None,
+                "download_failed",
+                id="download_crash",
+            ),
+            pytest.param(
+                None,
+                MultimodalImageError("provider_http_error"),
+                "provider_failed",
+                id="provider_http_error",
+            ),
+            pytest.param(
+                None,
+                RuntimeError("socket closed"),
+                "provider_failed",
+                id="provider_crash",
+            ),
+            pytest.param(
+                None, IMAGE_NO_CONTENT_MARKER, "no_content", id="no_content_marker"
+            ),
+            pytest.param(None, "   ", "no_content", id="empty_description"),
+        ],
+    )
+    def test_refused_at_or_after_the_download(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        download_error: Exception | None,
+        description: str | Exception | None,
+        outcome: str,
+    ) -> None:
+        world = meta_image_world()
+        if download_error is not None:
+            world.download.side_effect = download_error
+        if isinstance(description, Exception):
+            world.describe.side_effect = description
+        elif description is not None:
+            world.describe.side_effect = None
+            world.describe.return_value = description
+
+        resp = world.post(world.image(caption="Minha foto"))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == _G4_FILE_ACK
+        world.download.assert_awaited_once()
+        described = download_error is None
+        assert world.describe.await_count == (1 if described else 0)
+        [event] = _g4_image_events(caplog)
+        assert (event["channel"], event["outcome"]) == ("meta", outcome)
+        assert event["size_bytes"] == len(_G4_JPEG)
+        if described:
+            assert isinstance(event["latency_ms"], int)
+        else:
+            assert event["latency_ms"] is None
+        assert world.sent() == [_G4_ACK_PT]
+        assert world.pipeline_contents() == []
+        world.handoff.assert_not_awaited()
+        _g4_assert_fresh_review(world.metadata())
+
+    def test_without_the_permanent_token_the_image_is_never_resolved(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = meta_image_world(token="")
+
+        resp = world.post(world.image())
+
+        assert resp.json() == {"ok": True, "replied": False, "reason": "no_credentials"}
+        world.resolve.assert_not_awaited()
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        assert [e["outcome"] for e in _g4_image_events(caplog)] == ["download_failed"]
+        assert world.sent() == []
+
+
+class TestMetaImageGates:
+    """Decision 8: the AI-off and pause gates run before the type dispatch,
+    so an image there is never resolved, downloaded, described or acked."""
+
+    @pytest.mark.parametrize(
+        ("gate", "skipped"),
+        [
+            pytest.param("bot_off", "bot_paused", id="bot_off"),
+            pytest.param("paused", "session_paused", id="paused"),
+        ],
+    )
+    def test_an_image_on_a_gated_session_does_nothing(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        gate: str,
+        skipped: str,
+    ) -> None:
+        world = meta_image_world(multimodal=True)
+        with ExitStack() as stack:
+            if gate == "bot_off":
+                world.seed_session()  # a row to prove nothing flags it
+                stack.enter_context(
+                    patch(
+                        "src.api.routes.webhook._check_bot_active",
+                        new=AsyncMock(
+                            return_value={"ok": True, "skipped": "bot_paused"}
+                        ),
+                    )
+                )
+            else:
+                _create_paused_session(world.client, world.tenant_id, world.phone)
+
+            resp = world.post(world.image(caption="Olha a minha receita"))
+
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": skipped}
+        world.resolve.assert_not_awaited()
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        assert world.sent() == []
+        assert world.pipeline_contents() == []
+        assert _g4_image_events(caplog) == []
+        sessions = _tenant_rows(world.client, world.tenant_id, "session")
+        assert len(sessions) == 1
+        assert "pending_file_review" not in (sessions[0].session_metadata or {})
+
+
+class TestMetaFileReviewWindow:
+    """Decision 4 on Meta: no resend while a review is active (a change from
+    acknowledging every file); an expired or legacy review counts as absent."""
+
+    @pytest.mark.parametrize(
+        ("kind", "multimodal", "outcomes"),
+        [
+            pytest.param("document", True, [], id="document"),
+            pytest.param("video", True, [], id="video"),
+            pytest.param("sticker", True, [], id="sticker"),
+            pytest.param("image", False, ["no_capability"], id="image_no_capability"),
+        ],
+    )
+    def test_an_active_review_suppresses_the_ack_of_a_new_file(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        kind: str,
+        multimodal: bool,
+        outcomes: list[str],
+    ) -> None:
+        world = meta_image_world(multimodal=multimodal)
+        review = _g4_review(timedelta(minutes=30))
+        world.seed_session(review)
+
+        resp = world.post(world.file(kind))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "ok": True,
+            "replied": False,
+            "action": "file_ack_suppressed",
+        }
+        assert world.sent() == []
+        assert world.pipeline_contents() == []
+        world.handoff.assert_not_awaited()
+        assert world.metadata()["pending_file_review_at"] == (
+            review["pending_file_review_at"]
+        )
+        assert [e["outcome"] for e in _g4_image_events(caplog)] == outcomes
+
+    def test_a_failed_description_also_respects_an_active_review(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = meta_image_world()
+        world.describe.side_effect = MultimodalImageError("provider_http_error")
+        world.seed_session(_g4_review(timedelta(minutes=5)))
+
+        resp = world.post(world.image())
+
+        assert resp.json()["action"] == "file_ack_suppressed"
+        assert world.sent() == []
+        assert [e["outcome"] for e in _g4_image_events(caplog)] == ["provider_failed"]
+
+    @pytest.mark.parametrize(
+        "age",
+        [
+            pytest.param(timedelta(hours=3), id="expired"),
+            pytest.param(timedelta(hours=2), id="at_the_window"),
+            pytest.param(None, id="no_timestamp"),
+        ],
+    )
+    def test_an_expired_or_legacy_review_resends_the_ack(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        age: timedelta | None,
+    ) -> None:
+        world = meta_image_world()
+        world.seed_session(_g4_review(age))
+
+        resp = world.post(world.file("document"))
+
+        assert resp.json() == _G4_FILE_ACK
+        assert world.sent() == [_G4_ACK_PT]
+        _g4_assert_fresh_review(world.metadata())
+
+    @pytest.mark.parametrize(
+        "age",
+        [
+            pytest.param(timedelta(hours=3), id="expired"),
+            pytest.param(None, id="no_timestamp"),
+        ],
+    )
+    def test_an_expired_or_legacy_review_lets_a_text_continue_the_pipeline(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        age: timedelta | None,
+    ) -> None:
+        world = meta_image_world()
+        world.seed_session(_g4_review(age))
+
+        resp = world.post(world.text("me manda o endereço"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.handoff.assert_not_awaited()
+        assert world.pipeline_contents() == ["me manda o endereço"]
+        assert world.sent() == [_G4_REPLY]
+
+    def test_an_active_review_turns_the_same_text_into_a_forward(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world()
+        world.seed_session(_g4_review(timedelta(minutes=30)))
+
+        resp = world.post(world.text("me manda o endereço"))
+
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_handoff"}
+        world.handoff.assert_awaited_once()
+        assert world.handoff.await_args.args[2:] == (
+            world.phone,
+            "file_pending_review",
+        )
+        assert world.sent() == [webhook_module._FILE_FORWARDED_MSG_PT]
+        assert world.pipeline_contents() == []
+        metadata = world.metadata()
+        assert "pending_file_review" not in metadata
+        assert "pending_file_review_at" not in metadata
+
+    def test_an_active_review_with_another_text_is_cleared_and_answered(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world()
+        world.seed_session(_g4_review(timedelta(minutes=30)))
+
+        resp = world.post(world.text("É um pedido de exame de sangue"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.handoff.assert_not_awaited()
+        assert world.pipeline_contents() == ["É um pedido de exame de sangue"]
+        metadata = world.metadata()
+        assert "pending_file_review" not in metadata
+        assert "pending_file_review_at" not in metadata
+
+
+class TestMetaFileAckOrder:
+    """Decision 17: send, track, store the id, then the review, then commit;
+    a failed send leaves nothing pending."""
+
+    def test_the_ack_is_sent_tracked_and_stored_before_the_review_is_written(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world(multimodal=False)
+        ack_id = f"wamid.ack_{uuid4().hex[:10]}"
+        order: list[str] = []
+        real_track = webhook_module._track_meta_sent_message
+        real_store = webhook_module._store_ai_msg_id_to_db
+        real_flag = webhook_module._meta_set_pending_file_review
+
+        async def _send(*_args: Any) -> dict:
+            order.append("send")
+            return _fake_meta_send_result(ack_id)
+
+        def _track(result: dict[str, Any]) -> None:
+            order.append("track")
+            real_track(result)
+
+        async def _store(session_id: UUID, message_id: str, db: Any) -> None:
+            order.append(f"store:{message_id}")
+            await real_store(session_id, message_id, db)
+
+        async def _flag(session_id: UUID, db: Any, **kwargs: Any) -> None:
+            order.append("flag")
+            await real_flag(session_id, db, **kwargs)
+
+        world.send.side_effect = _send
+        with (
+            patch.object(webhook_module, "_track_meta_sent_message", _track),
+            patch.object(webhook_module, "_store_ai_msg_id_to_db", _store),
+            patch.object(webhook_module, "_meta_set_pending_file_review", _flag),
+        ):
+            resp = world.post(world.image())
+
+        assert resp.json() == _G4_FILE_ACK
+        assert order == ["send", "track", f"store:{ack_id}", "flag"]
+        assert ack_id in webhook_module._INMEM_SENT
+        metadata = world.metadata()
+        assert [entry[0] for entry in metadata["ai_msg_ids"]] == [ack_id]
+        _g4_assert_fresh_review(metadata)
+
+    @pytest.mark.parametrize("kind", ["document", "image"])
+    def test_a_failed_ack_send_leaves_nothing_pending(
+        self, meta_image_world: Callable[..., _MetaImageWorld], kind: str
+    ) -> None:
+        world = meta_image_world(multimodal=False)
+        world.send.side_effect = RuntimeError("graph send failed")
+
+        resp = world.post(world.file(kind))
+
+        assert resp.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "send_failed",
+            "error": "graph send failed",
+        }
+        assert "pending_file_review" not in world.metadata()
+        # Nothing suppresses the next file's acknowledgement.
+        world.send.side_effect = None
+        world.send.return_value = _fake_meta_send_result()
+        assert world.post(world.file("document")).json() == _G4_FILE_ACK
+
+
+class TestMetaImagePrivacyNotice:
+    """Decision 8: a new session's LGPD notice precedes the description and
+    goes out once per request, whichever branch the image ends in."""
+
+    def test_a_new_session_gets_the_notice_before_the_description_once(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world(clinic_config=_meta_lgpd_clinic_config())
+
+        resp = world.post(world.image(caption="Olha"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        assert [kind for kind, _detail in world.calls] == [
+            "send",
+            "resolve",
+            "download",
+            "describe",
+            "pipeline",
+            "send",
+        ]
+        assert world.sent() == [_LGPD_EXPECTED_NOTICE, _G4_REPLY]
+
+    @pytest.mark.parametrize(
+        "reason", ["no_capability", "download_failed", "provider_failed"]
+    )
+    def test_a_new_session_gets_the_notice_once_when_the_image_falls_back(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        reason: str,
+    ) -> None:
+        world = meta_image_world(
+            multimodal=reason != "no_capability",
+            clinic_config=_meta_lgpd_clinic_config(),
+        )
+        if reason == "download_failed":
+            world.download.side_effect = UnsafeEgressError("image_download_failed")
+        elif reason == "provider_failed":
+            world.describe.side_effect = MultimodalImageError("provider_http_error")
+
+        resp = world.post(world.image())
+
+        assert resp.json() == _G4_FILE_ACK
+        assert world.calls[0] == ("send", _LGPD_EXPECTED_NOTICE)
+        assert world.sent() == [_LGPD_EXPECTED_NOTICE, _G4_ACK_PT]
+        assert [e["outcome"] for e in _g4_image_events(caplog)] == [reason]
+
+    def test_an_existing_session_gets_no_notice(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world(clinic_config=_meta_lgpd_clinic_config())
+        world.seed_session()
+
+        world.post(world.image())
+
+        assert world.sent() == [_G4_REPLY]
+
+
+class TestMetaFileTypesUnchanged:
+    """Documents, videos and stickers keep the file branch with the owner's
+    copy, capability or not; ``unsupported`` keeps the silent skip."""
+
+    @pytest.mark.parametrize("kind", ["document", "video", "sticker"])
+    def test_non_image_files_are_acknowledged_even_with_capability(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        kind: str,
+    ) -> None:
+        world = meta_image_world()
+
+        resp = world.post(world.file(kind))
+
+        assert resp.json() == _G4_FILE_ACK
+        assert world.sent() == [_G4_ACK_PT]
+        world.resolve.assert_not_awaited()
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        assert world.pipeline_contents() == []
+        assert _g4_image_events(caplog) == []
+        assert f"Meta file ack sent to {world.phone} (type={kind})" in [
+            record.getMessage() for record in caplog.records
+        ]
+        _g4_assert_fresh_review(world.metadata())
+
+    def test_english_agent_gets_the_english_ack(
+        self, meta_image_world: Callable[..., _MetaImageWorld]
+    ) -> None:
+        world = meta_image_world(clinic_config=_G4_EN_CONFIG)
+
+        world.post(world.file("document"))
+
+        assert world.sent() == [_G4_ACK_EN]
+
+    def test_unsupported_keeps_the_silent_non_text_skip(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Decision 13: Meta's view-once arrives as ``unsupported``."""
+        world = meta_image_world()
+        payload = world.text("ignored")
+        message = _g4_message(payload)
+        message.pop("text")
+        message["type"] = "unsupported"
+        message["errors"] = [{"code": 131051, "title": "Message type unknown"}]
+
+        resp = world.post(payload)
+
+        assert resp.json() == {"ok": True, "skipped": "non-text"}
+        assert world.sent() == []
+        world.resolve.assert_not_awaited()
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        assert world.pipeline_contents() == []
+        assert _g4_image_events(caplog) == []
+        assert "pending_file_review" not in world.metadata()
+
+
+class TestMetaImageLogs:
+    """Decision 12: the tenant's Bearer token never reaches a log record."""
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            "resolve_raises",
+            "download_raises",
+            "download_refused",
+            "declared_too_large",
+            "provider_failed",
+        ],
+    )
+    def test_the_bearer_token_never_reaches_a_log(
+        self,
+        meta_image_world: Callable[..., _MetaImageWorld],
+        caplog: pytest.LogCaptureFixture,
+        failure: str,
+    ) -> None:
+        world = meta_image_world()
+        leak = f"401 for Authorization: Bearer {world.token}"
+        if failure == "resolve_raises":
+            world.resolve.side_effect = RuntimeError(leak)
+        elif failure == "download_raises":
+            world.download.side_effect = RuntimeError(leak)
+        elif failure == "download_refused":
+            world.download.side_effect = UnsafeEgressError(
+                "image_download_failed", detail=leak
+            )
+        elif failure == "declared_too_large":
+            world.resolve_returns(file_size=9_000_000)
+        else:
+            world.describe.side_effect = MultimodalImageError("provider_http_error")
+
+        resp = world.post(world.image())
+
+        assert resp.json() == _G4_FILE_ACK
+        assert len(_g4_image_events(caplog)) == 1
+        assert caplog.records  # the failure was logged ...
+        assert world.token not in _g4_log_dump(caplog)  # ... without the token

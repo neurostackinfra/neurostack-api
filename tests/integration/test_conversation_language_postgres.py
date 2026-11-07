@@ -578,7 +578,7 @@ async def test_webhook_commit_releases_lock_before_finish_response(
                 )
                 monkeypatch.setattr(
                     webhook_module,
-                    "_meta_get_pending_file_review",
+                    "_pending_file_review_active",
                     AsyncMock(return_value=False),
                 )
                 response = await webhook_module.meta_webhook(

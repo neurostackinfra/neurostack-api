@@ -5,7 +5,11 @@ Covers Groups 2 + 4 of the uazapi-integration wish:
 - POST /v1/webhook/uazapi text flow (tenant resolution by uazapi_instance_name,
   pipeline dispatch, reply via ``send_uazapi_text``)
 - Unknown instance short-circuits with a WARNING log
-- Non-text events (image, chat_status, etc.) are skipped with ``non-text``
+- Non-text events (sticker, staff media, chat_status, etc.) are skipped with
+  ``non-text``; a patient image is described by the tenant's OpenRouter
+  bundle, and a document, video or non-described image gets the file
+  acknowledgement and the forward-on-request flow
+  (whatsapp-image-understanding Group 2)
 - ``_check_bot_active`` returning a skip dict yields 202 without touching the
   pipeline or the send helper
 - A tenant with resolved instance but no ``uazapi_api_url``/``uazapi_token``
@@ -15,17 +19,23 @@ Covers Groups 2 + 4 of the uazapi-integration wish:
   from the shape of the locally captured payload.
 """
 
+import base64
 import copy
 import json
+import logging
 import pathlib
 import re
-from collections.abc import Callable
+import socket
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
+import httpx
 import jwt
 import pytest
 from fastapi.testclient import TestClient
@@ -33,6 +43,13 @@ from fastapi.testclient import TestClient
 from src.api.routes import webhook as webhook_module
 from src.config.settings import settings
 from src.handoff.pause_policy import resolve_handoff_pause
+from src.interaction_context import InteractionOrigin, ResolvedInteractionContext
+from src.services.egress_policy import EgressDisabledError
+from src.services.multimodal_service import (
+    IMAGE_NO_CONTENT_MARKER,
+    MultimodalImageError,
+)
+from src.services.uazapi_service import UazapiMediaDownloadError
 from tests.handoff.test_pause_policy import RUNTIME_POLICY_BUCKETS
 
 # Synthetic Uazapi webhook payloads (audio + image), derived from capture
@@ -893,11 +910,16 @@ class TestUazapiWebhookUnknownInstance:
 
 
 class TestUazapiWebhookNonText:
-    def test_media_image_with_caption_is_skipped_as_non_text(
+    def test_media_image_with_caption_without_capability_gets_the_file_ack(
         self,
         client: TestClient,
         tenant_id: UUID,
     ):
+        """Inverted by design (whatsapp-image-understanding G2): a patient
+        image no longer exits as ``non-text``. Without a multimodal bundle it
+        is never downloaded and gets the owner's file acknowledgement; its
+        caption never reaches the pipeline."""
+        webhook_module._INMEM_INCOMING.clear()
         instance = f"clinica_{uuid4().hex[:8]}"
         _seed_uazapi_credentials(client, tenant_id, instance)
 
@@ -909,8 +931,12 @@ class TestUazapiWebhookNonText:
             msg_type="media",
             media_type="image",
         )
+        download = AsyncMock()
 
         with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.require_uazapi_egress", new=AsyncMock()),
+            patch("src.api.routes.webhook.download_uazapi_media", download),
             patch(
                 "src.api.routes.webhook.get_event_service",
             ) as mock_get_service,
@@ -927,11 +953,14 @@ class TestUazapiWebhookNonText:
 
             resp = client.post(WEBHOOK_PATH, json=payload)
 
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True, "skipped": "non-text"}
-        # Never touched the pipeline or the send helper
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
         assert service.run_pipeline.await_count == 0
-        assert mock_send.await_count == 0
+        download.assert_not_awaited()
+        assert [call.args[3] for call in mock_send.await_args_list] == [
+            webhook_module._FILE_ACK_MSG_PT
+        ]
+        webhook_module._INMEM_INCOMING.clear()
 
     def test_media_audio_predicate_wins_even_with_text_present(
         self,
@@ -3183,8 +3212,9 @@ class TestUazapiGroup4MediaEvidenceShape:
 
 
 class TestUazapiGroup4NonAudioMedia:
-    """Non-audio media exits as ``non-text`` (Z-API reference, not Meta's
-    file-ack). Uses the sanitized captured-shape *image* fixture."""
+    """A patient image from the sanitized captured-shape *image* fixture is
+    described and answered (whatsapp-image-understanding G2; it used to exit
+    as ``non-text``)."""
 
     def _clear_state(self) -> None:
         from src.api.routes import webhook as webhook_module
@@ -3193,37 +3223,62 @@ class TestUazapiGroup4NonAudioMedia:
         webhook_module._INMEM_SENT.clear()
         webhook_module._INMEM_STT_NOTICE.clear()
 
-    def test_patient_image_exits_as_non_text_without_download(
+    def test_patient_image_is_downloaded_described_and_answered(
         self,
         client: TestClient,
         tenant_id: UUID,
     ):
+        """Inverted by design: the captured image is downloaded once,
+        described once by the tenant's OpenRouter bundle, and the pipeline
+        receives the fixture's ``content.caption`` plus the description."""
         self._clear_state()
         instance = f"clinica_{uuid4().hex[:8]}"
         _seed_uazapi_audio_tenant(
             client, tenant_id, instance, stt=True, multimodal=True
         )
 
+        msg_id = f"3EB0_img_{uuid4().hex[:10]}"
         payload = _build_uazapi_media_body(
-            "image",
-            instance=instance,
-            message_id=f"3EB0_img_{uuid4().hex[:10]}",
+            "image", instance=instance, message_id=msg_id
         )
 
-        download_mock = AsyncMock()
+        download_mock = AsyncMock(return_value=(_G2_JPEG, "image/jpeg"))
+        describe_mock = AsyncMock(return_value=_G2_DESCRIPTION)
         send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
         with (
+            patch("src.api.routes.webhook._get_redis", return_value=None),
+            patch("src.api.routes.webhook.require_uazapi_egress", new=AsyncMock()),
             patch("src.api.routes.webhook.download_uazapi_media", download_mock),
+            patch(
+                "src.services.multimodal_service.describe_image_multimodal",
+                describe_mock,
+            ),
             patch("src.api.routes.webhook.send_uazapi_text", send_mock),
             patch("src.api.routes.webhook.get_event_service") as mock_get_service,
         ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Vi a sua receita.")
+            )
+            mock_get_service.return_value = service
             resp = client.post(WEBHOOK_PATH, json=payload)
 
         assert resp.status_code == 200, resp.text
-        assert resp.json() == {"ok": True, "skipped": "non-text"}
-        download_mock.assert_not_called()
-        send_mock.assert_not_called()
-        assert mock_get_service.call_count == 0
+        assert resp.json() == {"ok": True, "replied": True}
+        download_mock.assert_awaited_once()
+        assert download_mock.await_args.args[2] == msg_id
+        describe_mock.assert_awaited_once()
+        assert describe_mock.await_args.kwargs["image_bytes"] == _G2_JPEG
+        assert describe_mock.await_args.kwargs["mimetype"] == "image/jpeg"
+        assert service.run_pipeline.await_args.args[0].payload.content == (
+            f"TEST_CAPTION\n\n[Imagem enviada pelo paciente: {_G2_DESCRIPTION}]"
+        )
+        assert [call.args[3] for call in send_mock.await_args_list] == [
+            "Vi a sua receita."
+        ]
+        self._clear_state()
 
 
 class TestUazapiGroup4UnknownInstanceStopsBeforeDownload:
@@ -4342,3 +4397,1392 @@ class TestCheckPauseStateOrigin:
             )
 
         repository.assert_not_called()
+
+
+# ============================================
+# whatsapp-image-understanding Group 2: patient images and files
+# ============================================
+
+_G2_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF-uazapi-g2-fake-jpeg"
+_G2_DESCRIPTION = "Foto de uma receita com o texto Dipirona 500 mg."
+_G2_CLINIC = "5511940589006"
+_G2_LOGGER = "src.api.routes.webhook"
+_G2_ACK_PT = webhook_module._FILE_ACK_MSG_PT
+_G2_ACK_EN = webhook_module._FILE_ACK_MSG_EN
+_G2_FORWARDED_PT = webhook_module._FILE_FORWARDED_MSG_PT
+_G2_FORWARDED_EN = webhook_module._FILE_FORWARDED_MSG_EN
+_G2_EN_CONFIG = {"business_rules": {"agent_language": "en"}}
+
+
+def _g2_mid(label: str) -> str:
+    return f"3EB0_{label}_{uuid4().hex[:10]}"
+
+
+def _g2_marker(description: str = _G2_DESCRIPTION) -> str:
+    return f"[Imagem enviada pelo paciente: {description}]"
+
+
+def _uazapi_file_body(
+    *,
+    instance: str,
+    phone: str,
+    message_id: str,
+    media_type: str = "image",
+    message_type: str = "ImageMessage",
+    mimetype: str | None = "image/jpeg",
+    caption: str | None = None,
+    file_length: Any = 3,
+    view_once: bool | None = None,
+    from_me: bool = False,
+) -> dict:
+    """A variant derived from the captured *image* fixture.
+
+    Starts from ``media-payload.json`` (``image``) and changes only what the
+    variant is about: the patient's number, the kind (``mediaType`` /
+    ``messageType``), the declared ``mimetype`` / ``fileLength``, the caption
+    (mirrored into ``message.text``, as Uazapi does) and ``viewOnce``. A
+    ``None`` removes the field. Documents, videos and view-once images are
+    not proven by a captured payload, so these variants are the evidence.
+    """
+    body = _build_uazapi_media_body(
+        "image", instance=instance, message_id=message_id, from_me=from_me
+    )
+    message = body["message"]
+    jid = f"{phone}@s.whatsapp.net"
+    message["sender_pn"] = jid
+    message["chatid"] = jid
+    body["chat"]["wa_chatid"] = jid
+    message["mediaType"] = media_type
+    message["messageType"] = message_type
+    content = message["content"]
+    for key, value in (
+        ("mimetype", mimetype),
+        ("fileLength", file_length),
+        ("caption", caption),
+    ):
+        if value is None:
+            content.pop(key, None)
+        else:
+            content[key] = value
+    message["text"] = caption or ""
+    if view_once is not None:
+        content["viewOnce"] = view_once
+    return body
+
+
+def _image_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    fields = ("channel", "outcome", "mime", "size_bytes", "latency_ms")
+    return [
+        {name: getattr(record, name) for name in fields}
+        for record in caplog.records
+        if getattr(record, "event", None) == "image_description_attempt"
+    ]
+
+
+def _g2_session_id(client: TestClient, tenant_id: UUID, phone: str) -> UUID | None:
+    from sqlalchemy import select
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID | None:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(SessionRow.id).where(
+                    SessionRow.tenant_id == tenant_id,
+                    SessionRow.user_id == phone,
+                )
+            )
+            return result.scalars().first()
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _g2_write_metadata(
+    client: TestClient, session_id: UUID, metadata: dict[str, Any]
+) -> None:
+    from sqlalchemy import update
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            await db.execute(
+                update(SessionRow)
+                .where(SessionRow.id == session_id)
+                .values(session_metadata=metadata)
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _g2_review(age: timedelta | None) -> dict[str, Any]:
+    """A pending review set ``age`` ago; ``None`` is a legacy flag."""
+    if age is None:
+        return {"pending_file_review": True}
+    set_at = datetime.now(timezone.utc) - age
+    return {"pending_file_review": True, "pending_file_review_at": set_at.isoformat()}
+
+
+@dataclass
+class _FileWorld:
+    """One Uazapi tenant plus the patched provider boundaries.
+
+    ``calls`` records ``(kind, detail)`` in order across the Uazapi sends,
+    the image description and the pipeline, so tests can assert sequencing
+    (the LGPD notice before the description, for instance).
+    """
+
+    client: TestClient
+    tenant_id: UUID
+    instance: str
+    phone: str
+    send: AsyncMock
+    download: AsyncMock
+    describe: AsyncMock
+    handoff: AsyncMock
+    egress: AsyncMock
+    service: MagicMock
+    calls: list[tuple[str, str]]
+    send_results: list[dict[str, Any]]
+    openrouter_requests: list[httpx.Request] = field(default_factory=list)
+
+    def post(self, payload: dict) -> Any:
+        return self.client.post(WEBHOOK_PATH, json=payload)
+
+    def image(self, **kwargs: Any) -> dict:
+        kwargs.setdefault("message_id", _g2_mid("img"))
+        return _uazapi_file_body(instance=self.instance, phone=self.phone, **kwargs)
+
+    def document(self, **kwargs: Any) -> dict:
+        kwargs.setdefault("media_type", "document")
+        kwargs.setdefault("message_type", "DocumentMessage")
+        kwargs.setdefault("mimetype", "application/pdf")
+        kwargs.setdefault("file_length", 48213)
+        return self.image(**kwargs)
+
+    def text(self, body: str, *, message_id: str | None = None) -> dict:
+        return _uazapi_text_payload(
+            instance=self.instance,
+            from_phone=self.phone,
+            body=body,
+            message_id=message_id or _g2_mid("txt"),
+        )
+
+    def audio(self) -> dict:
+        body = _build_uazapi_media_body(
+            "audio", instance=self.instance, message_id=_g2_mid("audio")
+        )
+        jid = f"{self.phone}@s.whatsapp.net"
+        body["message"]["sender_pn"] = jid
+        body["message"]["chatid"] = jid
+        body["chat"]["wa_chatid"] = jid
+        return body
+
+    def sent(self) -> list[str]:
+        return [call.args[3] for call in self.send.await_args_list]
+
+    def pipeline_contents(self) -> list[str]:
+        return [
+            call.args[0].payload.content
+            for call in self.service.run_pipeline.await_args_list
+        ]
+
+    def session_id(self) -> UUID:
+        session_id = _g2_session_id(self.client, self.tenant_id, self.phone)
+        assert session_id is not None
+        return session_id
+
+    def metadata(self) -> dict[str, Any]:
+        return _session_metadata(self.client, self.session_id())
+
+    def seed_session(self, metadata: dict[str, Any] | None = None) -> UUID:
+        session_id = _create_session(self.client, self.tenant_id, self.phone)
+        if metadata is not None:
+            _g2_write_metadata(self.client, session_id, metadata)
+        return session_id
+
+
+@pytest.fixture
+def file_world(
+    client: TestClient,
+    tenant_id: UUID,
+    caplog: pytest.LogCaptureFixture,
+) -> Iterator[Callable[..., _FileWorld]]:
+    """Factory for :class:`_FileWorld` (one call per test).
+
+    Patches the Uazapi send and download, the multimodal adapter (or, with
+    ``openrouter_http``, only DNS and the transport under the real adapter),
+    the file handoff's creation, the event service and the egress gate
+    (open, unless ``egress_flag`` drives the real AppConfig policy).
+    """
+
+    def _clear() -> None:
+        webhook_module._INMEM_INCOMING.clear()
+        webhook_module._INMEM_SENT.clear()
+        webhook_module._INMEM_STT_NOTICE.clear()
+
+    _clear()
+    caplog.set_level(logging.INFO, logger=_G2_LOGGER)
+    with ExitStack() as stack:
+
+        def make(
+            *,
+            multimodal: bool = True,
+            stt: bool = False,
+            clinic_config: dict[str, Any] | None = None,
+            suggested: str | None = "Resposta da IA",
+            egress_flag: AsyncMock | None = None,
+            openrouter_http: str | None = None,
+            api_url: str = "https://uazapi.example.com",
+            phone: str = "5511977001100",
+        ) -> _FileWorld:
+            instance = f"clinica_{uuid4().hex[:8]}"
+            _seed_uazapi_audio_tenant(
+                client,
+                tenant_id,
+                instance,
+                stt=stt,
+                multimodal=multimodal,
+                api_url=api_url,
+            )
+            calls: list[tuple[str, str]] = []
+            send_results: list[dict[str, Any]] = []
+
+            async def _send(_url: str, _token: str, _phone: str, text: str) -> dict:
+                calls.append(("send", text))
+                result = _fake_uazapi_send_result()
+                send_results.append(result)
+                return result
+
+            async def _describe(**kwargs: Any) -> str:
+                calls.append(("describe", kwargs["mimetype"]))
+                return _G2_DESCRIPTION
+
+            async def _run_pipeline(event_request: Any, *_a: Any, **_k: Any) -> Any:
+                calls.append(("pipeline", event_request.payload.content))
+                return MagicMock(), {}, []
+
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value=clinic_config or {})
+            service.run_pipeline = AsyncMock(side_effect=_run_pipeline)
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response(suggested)
+            )
+            world = _FileWorld(
+                client=client,
+                tenant_id=tenant_id,
+                instance=instance,
+                phone=phone,
+                send=AsyncMock(side_effect=_send),
+                download=AsyncMock(return_value=(_G2_JPEG, "image/jpeg")),
+                describe=AsyncMock(side_effect=_describe),
+                handoff=AsyncMock(return_value=SimpleNamespace(id=uuid4())),
+                egress=AsyncMock(return_value=None),
+                service=service,
+                calls=calls,
+                send_results=send_results,
+            )
+            stack.enter_context(
+                patch("src.api.routes.webhook._get_redis", return_value=None)
+            )
+            if egress_flag is None:
+                stack.enter_context(
+                    patch("src.api.routes.webhook.require_uazapi_egress", world.egress)
+                )
+            else:
+                stack.enter_context(
+                    patch(
+                        "src.services.egress_policy.AppConfigClient.is_enabled",
+                        egress_flag,
+                    )
+                )
+            stack.enter_context(
+                patch("src.api.routes.webhook.send_uazapi_text", world.send)
+            )
+            stack.enter_context(
+                patch("src.api.routes.webhook.download_uazapi_media", world.download)
+            )
+            stack.enter_context(
+                patch(
+                    "src.api.routes.webhook._meta_initiate_file_handoff",
+                    world.handoff,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "src.api.routes.webhook.get_event_service",
+                    return_value=service,
+                )
+            )
+            if openrouter_http is None:
+                stack.enter_context(
+                    patch(
+                        "src.services.multimodal_service.describe_image_multimodal",
+                        world.describe,
+                    )
+                )
+            else:
+                _patch_openrouter_http(stack, openrouter_http, world)
+            return world
+
+        yield make
+    _clear()
+
+
+def _patch_openrouter_http(
+    stack: ExitStack, description: str, world: _FileWorld
+) -> None:
+    """Run the real image adapter against a recording mock transport."""
+    from src.services import safe_egress
+
+    def _resolver(_host: str, port: int) -> list[tuple[Any, ...]]:
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("104.18.2.1", port),
+            )
+        ]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        world.openrouter_requests.append(request)
+        world.calls.append(("describe", str(request.url)))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": description}}]
+            },
+        )
+
+    mock_transport = httpx.MockTransport(_handler)
+    original_build = safe_egress.build_safe_async_client
+
+    def _build(validated: Any, *, timeout: Any = None, transport: Any = None) -> Any:
+        return original_build(validated, timeout=timeout, transport=mock_transport)
+
+    stack.enter_context(patch.object(safe_egress, "_default_getaddrinfo", _resolver))
+    stack.enter_context(patch.object(safe_egress, "build_safe_async_client", _build))
+
+
+def _image_blocks(request: httpx.Request) -> list[dict[str, Any]]:
+    [message] = json.loads(request.content)["messages"]
+    return [block for block in message["content"] if block["type"] == "image_url"]
+
+
+class TestUazapiImageDescribed:
+    """Decisions 1, 10, 12: a patient image is described once and answered."""
+
+    def test_captioned_image_reaches_openrouter_once_with_an_image_url_block(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = file_world(openrouter_http=_G2_DESCRIPTION)
+
+        resp = world.post(world.image(caption="Olha a minha receita"))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        [request] = world.openrouter_requests
+        assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
+        assert request.headers["Host"] == "openrouter.ai"
+        assert json.loads(request.content)["model"] == "google/gemini-2.5-flash"
+        [block] = _image_blocks(request)
+        encoded = base64.b64encode(_G2_JPEG).decode("ascii")
+        assert block["image_url"]["url"] == f"data:image/jpeg;base64,{encoded}"
+        assert world.pipeline_contents() == [f"Olha a minha receita\n\n{_g2_marker()}"]
+        assert world.sent() == ["Resposta da IA"]
+        [event] = _image_events(caplog)
+        assert event["channel"] == "uazapi"
+        assert event["outcome"] == "described"
+        assert event["mime"] == "image/jpeg"
+        assert event["size_bytes"] == len(_G2_JPEG)
+        assert isinstance(event["latency_ms"], int)
+        for record in caplog.records:
+            assert _G2_DESCRIPTION not in record.getMessage()
+            assert encoded not in record.getMessage()
+
+    def test_image_without_caption_sends_only_the_marker(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+
+        resp = world.post(world.image(caption=None))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        assert world.pipeline_contents() == [_g2_marker()]
+        world.download.assert_awaited_once()
+        world.describe.assert_awaited_once()
+        kwargs = world.describe.await_args.kwargs
+        assert kwargs["image_bytes"] == _G2_JPEG
+        assert kwargs["mimetype"] == "image/jpeg"
+        assert kwargs["api_key"].startswith("sk-fake-mm-")
+        assert kwargs["model"] == "google/gemini-2.5-flash"
+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
+        assert kwargs["agent_language"] == "pt-BR"
+
+    def test_caption_falls_back_to_message_text(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        payload = world.image(caption=None)
+        payload["message"]["text"] = "Legenda só no texto"
+
+        world.post(payload)
+
+        assert world.pipeline_contents() == [f"Legenda só no texto\n\n{_g2_marker()}"]
+
+    def test_english_agent_gets_the_english_marker(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world(clinic_config=_G2_EN_CONFIG)
+
+        world.post(world.image(caption="My prescription"))
+
+        assert world.pipeline_contents() == [
+            f"My prescription\n\n[Image sent by the patient: {_G2_DESCRIPTION}]"
+        ]
+        assert world.describe.await_args.kwargs["agent_language"] == "en"
+
+    @pytest.mark.parametrize(
+        ("declared", "downloaded", "effective"),
+        [
+            ("image/jpeg", "image/png", "image/png"),
+            ("image/webp", "", "image/webp"),
+            ("image/jpeg", "IMAGE/JPEG; charset=binary", "image/jpeg"),
+        ],
+    )
+    def test_effective_mime_is_the_downloaded_one_else_the_declared_one(
+        self,
+        file_world: Callable[..., _FileWorld],
+        declared: str,
+        downloaded: str,
+        effective: str,
+    ) -> None:
+        world = file_world()
+        world.download.return_value = (_G2_JPEG, downloaded)
+
+        resp = world.post(world.image(mimetype=declared))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        assert world.describe.await_args.kwargs["mimetype"] == effective
+
+    def test_image_exactly_at_the_cap_is_downloaded_and_described(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = file_world()
+        at_cap = b"\xff" * webhook_module.IMAGE_MAX_BYTES
+        world.download.return_value = (at_cap, "image/jpeg")
+
+        resp = world.post(world.image(file_length=webhook_module.IMAGE_MAX_BYTES))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.describe.assert_awaited_once()
+        assert len(world.describe.await_args.kwargs["image_bytes"]) == 5_000_000
+        assert [e["outcome"] for e in _image_events(caplog)] == ["described"]
+
+
+class TestUazapiImageNotDescribed:
+    """Decisions 3, 12, 13: every non-described image gets the file ack."""
+
+    @pytest.mark.parametrize(
+        ("overrides", "multimodal", "outcome", "size_bytes"),
+        [
+            pytest.param({}, False, "no_capability", None, id="no_capability"),
+            pytest.param({"view_once": True}, True, "view_once", 3, id="view_once"),
+            pytest.param(
+                {"message_type": "ViewOnceMessageV2"},
+                True,
+                "view_once",
+                3,
+                id="view_once_message_type",
+            ),
+            pytest.param(
+                {"media_type": "", "message_type": "viewOnceMessage"},
+                True,
+                "view_once",
+                3,
+                id="view_once_of_no_known_kind",
+            ),
+            pytest.param(
+                {"file_length": 5_000_001},
+                True,
+                "too_large",
+                5_000_001,
+                id="declared_too_large",
+            ),
+            pytest.param(
+                {"file_length": "6000000"},
+                True,
+                "too_large",
+                6_000_000,
+                id="declared_too_large_as_string",
+            ),
+            pytest.param(
+                {"mimetype": "image/gif"},
+                True,
+                "unsupported_mime",
+                3,
+                id="declared_gif",
+            ),
+        ],
+    )
+    def test_refused_before_any_download(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+        overrides: dict[str, Any],
+        multimodal: bool,
+        outcome: str,
+        size_bytes: int | None,
+    ) -> None:
+        world = file_world(multimodal=multimodal)
+
+        resp = world.post(world.image(caption="Minha foto", **overrides))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        [event] = _image_events(caplog)
+        assert event["channel"] == "uazapi"
+        assert event["outcome"] == outcome
+        assert event["size_bytes"] == size_bytes
+        assert event["latency_ms"] is None
+        assert world.sent() == [_G2_ACK_PT]
+        assert world.pipeline_contents() == []
+        assert world.metadata()["pending_file_review"] is True
+
+    @pytest.mark.parametrize(
+        ("overrides", "download", "describe", "outcome", "described"),
+        [
+            pytest.param(
+                {},
+                UazapiMediaDownloadError("http_error: 502"),
+                None,
+                "download_failed",
+                False,
+                id="download_failed",
+            ),
+            pytest.param(
+                {}, (b"", "image/jpeg"), None, "download_failed", False, id="no_bytes"
+            ),
+            pytest.param(
+                {"file_length": None},
+                (b"\xff" * 5_000_001, "image/jpeg"),
+                None,
+                "too_large",
+                False,
+                id="downloaded_too_large",
+            ),
+            pytest.param(
+                {},
+                (_G2_JPEG, "image/gif"),
+                None,
+                "unsupported_mime",
+                False,
+                id="downloaded_gif",
+            ),
+            pytest.param(
+                {"mimetype": None},
+                (_G2_JPEG, ""),
+                None,
+                "unsupported_mime",
+                False,
+                id="no_mime_anywhere",
+            ),
+            pytest.param(
+                {},
+                (_G2_JPEG, "image/jpeg"),
+                MultimodalImageError("provider_http_error"),
+                "provider_failed",
+                True,
+                id="provider_http_error",
+            ),
+            pytest.param(
+                {},
+                (_G2_JPEG, "image/jpeg"),
+                RuntimeError("socket closed"),
+                "provider_failed",
+                True,
+                id="provider_crash",
+            ),
+            pytest.param(
+                {},
+                (_G2_JPEG, "image/jpeg"),
+                IMAGE_NO_CONTENT_MARKER,
+                "no_content",
+                True,
+                id="no_content_marker",
+            ),
+        ],
+    )
+    def test_refused_after_the_download(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+        overrides: dict[str, Any],
+        download: Any,
+        describe: Any,
+        outcome: str,
+        described: bool,
+    ) -> None:
+        world = file_world()
+        if isinstance(download, Exception):
+            world.download.side_effect = download
+        else:
+            world.download.return_value = download
+        if isinstance(describe, Exception):
+            world.describe.side_effect = describe
+        elif describe is not None:
+            world.describe.side_effect = None
+            world.describe.return_value = describe
+
+        resp = world.post(world.image(caption="Minha foto", **overrides))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        world.download.assert_awaited_once()
+        assert world.describe.await_count == (1 if described else 0)
+        assert [e["outcome"] for e in _image_events(caplog)] == [outcome]
+        assert world.sent() == [_G2_ACK_PT]
+        assert world.pipeline_contents() == []
+        assert world.metadata()["pending_file_review"] is True
+
+
+class TestUazapiImageGatesAndDedupe:
+    """Decisions 8, 9: AI-off and pause gates, LGPD order, claim, egress."""
+
+    @pytest.mark.parametrize("kind", ["image", "document"])
+    def test_ai_off_does_nothing(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+        kind: str,
+    ) -> None:
+        world = file_world()
+        payload = world.image(caption="Foto") if kind == "image" else world.document()
+
+        with patch(
+            "src.api.routes.webhook._check_bot_active",
+            new=AsyncMock(return_value={"ok": True, "skipped": "bot_paused"}),
+        ):
+            resp = world.post(payload)
+
+        assert resp.status_code == 202
+        assert resp.json() == {"ok": True, "skipped": "bot_paused"}
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        world.send.assert_not_awaited()
+        assert world.pipeline_contents() == []
+        assert _image_events(caplog) == []
+
+    @pytest.mark.parametrize("kind", ["image", "document"])
+    def test_paused_session_does_nothing(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+        kind: str,
+    ) -> None:
+        world = file_world()
+        session_id = world.seed_session()
+        _pause_session(world.client, session_id)
+        payload = world.image(caption="Foto") if kind == "image" else world.document()
+
+        resp = world.post(payload)
+
+        assert resp.status_code == 202
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        world.send.assert_not_awaited()
+        assert world.pipeline_contents() == []
+        assert _image_events(caplog) == []
+        assert "pending_file_review" not in _session_metadata(world.client, session_id)
+
+    def test_new_session_sends_the_lgpd_notice_before_the_description(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world(clinic_config=_lgpd_config(enabled=True))
+
+        resp = world.post(world.image(caption="Primeira foto"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        assert [kind for kind, _ in world.calls] == [
+            "send",
+            "describe",
+            "pipeline",
+            "send",
+        ]
+        notice = world.calls[0][1]
+        assert "LGPD" in notice or "Política de Privacidade" in notice
+        assert world.calls[-1] == ("send", "Resposta da IA")
+
+    def test_redelivery_never_describes_twice(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = file_world()
+        payload = world.image(caption="Foto")
+
+        first = world.post(payload)
+        second = world.post(payload)
+
+        assert first.json() == {"ok": True, "replied": True}
+        assert second.status_code == 200, second.text
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        world.describe.assert_awaited_once()
+        # The image claims after its download (Decision 9), like audio.
+        assert world.download.await_count == 2
+        assert len(world.pipeline_contents()) == 1
+        assert world.sent() == ["Resposta da IA"]
+        assert [e["outcome"] for e in _image_events(caplog)] == ["described"]
+
+    def test_redelivered_non_described_image_is_not_acknowledged_twice(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world(multimodal=False)
+        payload = world.image(caption="Foto")
+
+        first = world.post(payload)
+        second = world.post(payload)
+
+        assert first.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        assert world.sent() == [_G2_ACK_PT]
+
+    @pytest.mark.parametrize(
+        ("overrides", "outcome"),
+        [
+            pytest.param({"view_once": True}, "view_once", id="view_once"),
+            pytest.param(
+                {"file_length": 5_000_001}, "too_large", id="declared_too_large"
+            ),
+        ],
+    )
+    def test_redelivered_refusal_before_download_is_claimed_once(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+        overrides: dict[str, Any],
+        outcome: str,
+    ) -> None:
+        world = file_world()
+        payload = world.image(caption="Foto", **overrides)
+
+        first = world.post(payload)
+        second = world.post(payload)
+
+        assert first.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert second.status_code == 200, second.text
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        assert [e["outcome"] for e in _image_events(caplog)] == [outcome]
+        assert world.sent() == [_G2_ACK_PT]
+        world.download.assert_not_awaited()
+
+    @pytest.mark.parametrize("gate", ["bot_paused", "session_paused"])
+    def test_ai_off_and_pause_gates_run_before_the_egress_check(
+        self,
+        file_world: Callable[..., _FileWorld],
+        gate: str,
+    ) -> None:
+        flag = AsyncMock(return_value=False)
+        world = file_world(egress_flag=flag)
+        payload = world.image(caption="Foto")
+
+        with ExitStack() as stack:
+            if gate == "bot_paused":
+                stack.enter_context(
+                    patch(
+                        "src.api.routes.webhook._check_bot_active",
+                        new=AsyncMock(
+                            return_value={"ok": True, "skipped": "bot_paused"}
+                        ),
+                    )
+                )
+            else:
+                _pause_session(world.client, world.seed_session())
+            resp = world.post(payload)
+
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"ok": True, "skipped": gate}
+        flag.assert_not_awaited()
+        world.download.assert_not_awaited()
+        world.send.assert_not_awaited()
+
+    def test_closed_egress_answers_503_before_the_session_and_keeps_the_notice(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        flag = AsyncMock(return_value=False)
+        world = file_world(egress_flag=flag, clinic_config=_lgpd_config(enabled=True))
+        payload = world.image(caption="Primeira foto")
+
+        blocked = world.post(payload)
+
+        assert blocked.status_code == 503, blocked.text
+        assert blocked.json() == {
+            "ok": False,
+            "error": "uazapi_egress_disabled",
+            "retryable": True,
+        }
+        flag.assert_awaited_once_with("uazapi_egress_enabled")
+        assert _g2_session_id(world.client, world.tenant_id, world.phone) is None
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        world.send.assert_not_awaited()
+
+        flag.return_value = True
+        retried = world.post(payload)
+
+        assert retried.status_code == 200, retried.text
+        assert retried.json() == {"ok": True, "replied": True}
+        assert [kind for kind, _ in world.calls] == [
+            "send",
+            "describe",
+            "pipeline",
+            "send",
+        ]
+        notice = world.calls[0][1]
+        assert "LGPD" in notice or "Política de Privacidade" in notice
+
+    def test_egress_closing_during_the_download_is_retryable_and_unclaimed(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = file_world()
+        payload = world.image(caption="Foto")
+        world.download.side_effect = EgressDisabledError("uazapi_egress_disabled")
+
+        blocked = world.post(payload)
+
+        assert blocked.status_code == 503, blocked.text
+        assert blocked.json() == {
+            "ok": False,
+            "error": "uazapi_egress_disabled",
+            "retryable": True,
+        }
+        world.describe.assert_not_awaited()
+        world.send.assert_not_awaited()
+        assert _image_events(caplog) == []
+
+        world.download.side_effect = None
+        retried = world.post(payload)
+
+        assert retried.json() == {"ok": True, "replied": True}
+        world.describe.assert_awaited_once()
+        assert world.pipeline_contents() == [f"Foto\n\n{_g2_marker()}"]
+
+    def test_document_stays_on_the_top_level_claim(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        payload = world.document()
+
+        first = world.post(payload)
+        second = world.post(payload)
+
+        assert first.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert second.json() == {"ok": True, "skipped": "duplicate_message"}
+        assert world.sent() == [_G2_ACK_PT]
+        world.egress.assert_not_awaited()
+
+
+class TestUazapiFileAck:
+    """Decisions 3, 4, 6, 17, 18: the owner's acknowledgement for files."""
+
+    @pytest.mark.parametrize(
+        ("media_type", "message_type", "mimetype", "kind"),
+        [
+            ("document", "DocumentMessage", "application/pdf", "document"),
+            ("", "DocumentMessage", "application/pdf", "document"),
+            ("", "DocumentWithCaptionMessage", "application/pdf", "document"),
+            ("Document", "", "application/pdf", "document"),
+            ("video", "VideoMessage", "video/mp4", "video"),
+            ("", "VideoMessage", "video/mp4", "video"),
+            ("", "videomessage", "video/mp4", "video"),
+            ("VIDEO", "", "video/mp4", "video"),
+        ],
+    )
+    def test_document_and_video_names_get_the_ack(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+        media_type: str,
+        message_type: str,
+        mimetype: str,
+        kind: str,
+    ) -> None:
+        world = file_world()
+
+        resp = world.post(
+            world.image(
+                media_type=media_type,
+                message_type=message_type,
+                mimetype=mimetype,
+                file_length=48213,
+            )
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert world.sent() == [_G2_ACK_PT]
+        world.download.assert_not_awaited()
+        world.describe.assert_not_awaited()
+        assert world.pipeline_contents() == []
+        assert _image_events(caplog) == []
+        assert f"Uazapi file ack sent to {world.phone} (type={kind})" in [
+            record.getMessage() for record in caplog.records
+        ]
+        metadata = world.metadata()
+        assert metadata["pending_file_review"] is True
+        set_at = datetime.fromisoformat(metadata["pending_file_review_at"])
+        assert datetime.now(timezone.utc) - set_at < timedelta(minutes=1)
+
+    def test_caption_less_document_has_no_text_and_still_gets_the_ack(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        payload = world.document(caption=None)
+        assert webhook_module._extract_uazapi_message_text(payload["message"]) is None
+
+        resp = world.post(payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+
+    def test_captioned_document_gets_the_ack_and_never_the_pipeline(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+
+        resp = world.post(
+            world.document(
+                message_type="DocumentWithCaptionMessage",
+                caption="Segue o meu laudo",
+            )
+        )
+
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert world.sent() == [_G2_ACK_PT]
+        assert world.pipeline_contents() == []
+
+    def test_english_agent_gets_the_english_ack(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world(clinic_config=_G2_EN_CONFIG)
+
+        world.post(world.document())
+
+        assert world.sent() == [_G2_ACK_EN]
+
+    def test_a_burst_of_files_gets_one_ack(
+        self,
+        file_world: Callable[..., _FileWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = file_world()
+
+        first = world.post(world.document())
+        stamped = world.metadata()["pending_file_review_at"]
+        video = world.post(
+            world.image(
+                media_type="video", message_type="VideoMessage", mimetype="video/mp4"
+            )
+        )
+        gif = world.post(world.image(mimetype="image/gif"))
+
+        assert first.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        suppressed = {"ok": True, "replied": False, "action": "file_ack_suppressed"}
+        assert video.json() == suppressed
+        assert gif.json() == suppressed
+        assert world.sent() == [_G2_ACK_PT]
+        # The non-described image still reports its own outcome.
+        assert [e["outcome"] for e in _image_events(caplog)] == ["unsupported_mime"]
+        assert world.metadata()["pending_file_review_at"] == stamped
+
+    @pytest.mark.parametrize(
+        "review",
+        [
+            pytest.param(_g2_review(timedelta(hours=3)), id="expired"),
+            pytest.param(_g2_review(None), id="no_timestamp"),
+        ],
+    )
+    def test_expired_or_legacy_review_resends_the_ack(
+        self,
+        file_world: Callable[..., _FileWorld],
+        review: dict[str, Any],
+    ) -> None:
+        world = file_world()
+        world.seed_session(review)
+
+        resp = world.post(world.document())
+
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert world.sent() == [_G2_ACK_PT]
+        set_at = datetime.fromisoformat(world.metadata()["pending_file_review_at"])
+        assert datetime.now(timezone.utc) - set_at < timedelta(minutes=1)
+
+    def test_seeded_active_review_suppresses_the_ack(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        review = _g2_review(timedelta(minutes=10))
+        world.seed_session(review)
+
+        resp = world.post(world.document())
+
+        assert resp.json() == {
+            "ok": True,
+            "replied": False,
+            "action": "file_ack_suppressed",
+        }
+        world.send.assert_not_awaited()
+        assert world.metadata()["pending_file_review_at"] == (
+            review["pending_file_review_at"]
+        )
+
+    def test_failed_send_leaves_nothing_pending(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        world.send.side_effect = [
+            RuntimeError("uazapi 500"),
+            _fake_uazapi_send_result(),
+        ]
+
+        failed = world.post(world.document())
+
+        assert failed.json() == {"ok": True, "replied": False, "reason": "send_failed"}
+        assert "pending_file_review" not in world.metadata()
+
+        retried = world.post(world.document())
+
+        assert retried.json() == {"ok": True, "replied": True, "action": "file_ack"}
+        assert world.metadata()["pending_file_review"] is True
+
+    def test_closed_egress_on_the_ack_send_sets_no_flag(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        world.send.side_effect = EgressDisabledError("uazapi_egress_disabled")
+
+        resp = world.post(world.document())
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "uazapi_egress_disabled",
+        }
+        assert "pending_file_review" not in world.metadata()
+
+    def test_missing_send_credentials_set_no_flag(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world(api_url="")
+
+        resp = world.post(world.document())
+
+        assert resp.json() == {"ok": True, "replied": False, "reason": "no_credentials"}
+        world.send.assert_not_awaited()
+        assert "pending_file_review" not in world.metadata()
+
+    @pytest.mark.parametrize(
+        ("cross_worker", "skipped"),
+        [(False, "ai_echo"), (True, "ai_echo_db")],
+    )
+    def test_ack_echo_is_an_ai_echo_and_never_pauses(
+        self,
+        file_world: Callable[..., _FileWorld],
+        cross_worker: bool,
+        skipped: str,
+    ) -> None:
+        world = file_world()
+        ack_mid = _g2_mid("ack")
+        # Uazapi answers the composite ``owner:MSGID``; the echo carries MSGID.
+        world.send.side_effect = [{"id": f"{_G2_CLINIC}:{ack_mid}"}]
+        assert world.post(world.document()).json()["action"] == "file_ack"
+        if cross_worker:
+            webhook_module._INMEM_SENT.clear()
+
+        echo = _uazapi_text_payload(
+            instance=world.instance,
+            from_phone=_G2_CLINIC,
+            body=_G2_ACK_PT,
+            message_id=ack_mid,
+            from_me=True,
+            sender_pn=f"{_G2_CLINIC}@s.whatsapp.net",
+            chat_jid=f"{world.phone}@s.whatsapp.net",
+        )
+        resp = world.post(echo)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": skipped}
+        assert _session_row(world.client, world.session_id())["is_paused"] is False
+
+
+class TestUazapiPendingFileReview:
+    """Decisions 3, 4, 7, 14, 19: what resolves a pending review, and how."""
+
+    def test_forward_request_opens_the_handoff_and_confirms(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        assert world.post(world.document()).json()["action"] == "file_ack"
+        ingress_marker = object()
+        ingress = MagicMock(return_value=ingress_marker)
+        record = AsyncMock(return_value=None)
+        text = world.text("Pode encaminhar para a equipe, por favor")
+
+        with (
+            patch("src.api.routes.webhook.uazapi_ingress", ingress),
+            patch("src.api.routes.webhook.record_meta_file_handoff", record),
+        ):
+            resp = world.post(text)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_handoff"}
+        session_id = world.session_id()
+        world.handoff.assert_awaited_once()
+        assert world.handoff.await_args.args == (
+            world.tenant_id,
+            session_id,
+            world.phone,
+            "file_pending_review",
+        )
+        # The observational branch (Decision 7): the handoff commits on its
+        # own, then the Uazapi ingress records it.
+        handoff_kwargs = world.handoff.await_args.kwargs
+        assert set(handoff_kwargs) == {"context"}
+        context = handoff_kwargs["context"]
+        assert type(context) is ResolvedInteractionContext
+        assert context.origin is InteractionOrigin.UNKNOWN
+        assert context.effective_tenant_id == world.tenant_id
+        assert context.session_id == session_id
+        ingress.assert_called_once()
+        assert ingress.call_args.kwargs["message"] == text["message"]
+        assert ingress.call_args.kwargs["context"] is context
+        record.assert_awaited_once()
+        assert record.await_args.args[0] is ingress_marker
+        assert record.await_args.args[2] is world.handoff.return_value
+        assert record.await_args.kwargs == {"note": "file_pending_review"}
+
+        assert world.sent() == [_G2_ACK_PT, _G2_FORWARDED_PT]
+        assert world.pipeline_contents() == []
+        metadata = world.metadata()
+        assert "pending_file_review" not in metadata
+        assert "pending_file_review_at" not in metadata
+        forward_mid = world.send_results[-1]["MessageID"]
+        assert forward_mid in [entry[0] for entry in metadata["ai_msg_ids"]]
+        assert forward_mid in webhook_module._INMEM_SENT
+        # Decision 19: the forward opens the handoff but never pauses the AI.
+        assert _session_row(world.client, session_id)["is_paused"] is False
+
+    def test_english_forward_confirmation(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world(clinic_config=_G2_EN_CONFIG)
+        world.post(world.document())
+
+        resp = world.post(world.text("Please forward it to the team"))
+
+        assert resp.json() == {"ok": True, "replied": True, "action": "file_handoff"}
+        assert world.sent() == [_G2_ACK_EN, _G2_FORWARDED_EN]
+
+    def test_describing_the_need_clears_the_review_and_runs_the_pipeline(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        world.post(world.document())
+
+        resp = world.post(world.text("Queria saber se vocês aceitam convênio"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.handoff.assert_not_awaited()
+        assert world.pipeline_contents() == ["Queria saber se vocês aceitam convênio"]
+        assert world.sent() == [_G2_ACK_PT, "Resposta da IA"]
+        metadata = world.metadata()
+        assert "pending_file_review" not in metadata
+        assert "pending_file_review_at" not in metadata
+
+    @pytest.mark.parametrize(
+        ("transcript", "handed_off"),
+        [("pode encaminhar para a equipe", True), ("quero marcar consulta", False)],
+    )
+    def test_transcribed_audio_resolves_the_review(
+        self,
+        file_world: Callable[..., _FileWorld],
+        transcript: str,
+        handed_off: bool,
+    ) -> None:
+        world = file_world(stt=True)
+        world.post(world.document())
+        world.download.return_value = (b"OggS_g2_audio", "audio/ogg")
+
+        with patch(
+            "src.services.groq_service.transcribe_audio",
+            new=AsyncMock(return_value=transcript),
+        ):
+            resp = world.post(world.audio())
+
+        assert resp.status_code == 200, resp.text
+        assert "pending_file_review" not in world.metadata()
+        if handed_off:
+            assert resp.json() == {
+                "ok": True,
+                "replied": True,
+                "action": "file_handoff",
+            }
+            world.handoff.assert_awaited_once()
+            assert world.sent() == [_G2_ACK_PT, _G2_FORWARDED_PT]
+            assert world.pipeline_contents() == []
+        else:
+            assert resp.json() == {"ok": True, "replied": True}
+            world.handoff.assert_not_awaited()
+            assert world.pipeline_contents() == [transcript]
+
+    @pytest.mark.parametrize(
+        ("age", "handed_off"),
+        [
+            pytest.param(timedelta(minutes=10), True, id="active"),
+            pytest.param(timedelta(hours=3), False, id="expired"),
+            pytest.param(None, False, id="no_timestamp"),
+        ],
+    )
+    def test_forward_words_count_only_inside_the_window(
+        self,
+        file_world: Callable[..., _FileWorld],
+        age: timedelta | None,
+        handed_off: bool,
+    ) -> None:
+        world = file_world()
+        world.seed_session(_g2_review(age))
+
+        resp = world.post(world.text("me manda o endereço"))
+
+        if handed_off:
+            assert resp.json() == {
+                "ok": True,
+                "replied": True,
+                "action": "file_handoff",
+            }
+            world.handoff.assert_awaited_once()
+            assert world.pipeline_contents() == []
+        else:
+            assert resp.json() == {"ok": True, "replied": True}
+            world.handoff.assert_not_awaited()
+            assert world.pipeline_contents() == ["me manda o endereço"]
+            # The predicate is read-only: an expired or legacy flag stays.
+            assert world.metadata()["pending_file_review"] is True
+
+    def test_captioned_image_never_resolves_and_keeps_the_review(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        world.post(world.document())
+        before = world.metadata()
+
+        resp = world.post(world.image(caption="pode encaminhar para a equipe"))
+
+        assert resp.json() == {"ok": True, "replied": True}
+        world.handoff.assert_not_awaited()
+        assert world.pipeline_contents() == [
+            f"pode encaminhar para a equipe\n\n{_g2_marker()}"
+        ]
+        after = world.metadata()
+        assert after["pending_file_review"] is True
+        assert after["pending_file_review_at"] == before["pending_file_review_at"]
+
+    def test_captioned_document_never_resolves_and_is_suppressed(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+        world.post(world.document())
+        before = world.metadata()
+
+        resp = world.post(
+            world.document(
+                message_type="DocumentWithCaptionMessage",
+                caption="pode encaminhar para a equipe",
+            )
+        )
+
+        assert resp.json() == {
+            "ok": True,
+            "replied": False,
+            "action": "file_ack_suppressed",
+        }
+        world.handoff.assert_not_awaited()
+        assert world.sent() == [_G2_ACK_PT]
+        after = world.metadata()
+        assert after["pending_file_review"] is True
+        assert after["pending_file_review_at"] == before["pending_file_review_at"]
+
+
+class TestUazapiFileMediaUnchanged:
+    """Stickers and staff (``fromMe``) media keep the ``non-text`` exit."""
+
+    def test_patient_sticker_stays_non_text(
+        self, file_world: Callable[..., _FileWorld]
+    ) -> None:
+        world = file_world()
+
+        resp = world.post(
+            world.image(
+                media_type="sticker",
+                message_type="StickerMessage",
+                mimetype="image/webp",
+            )
+        )
+
+        assert resp.json() == {"ok": True, "skipped": "non-text"}
+        world.download.assert_not_awaited()
+        world.send.assert_not_awaited()
+        world.egress.assert_not_awaited()
+        assert world.pipeline_contents() == []
+
+    @pytest.mark.parametrize(
+        ("media_type", "message_type"),
+        [
+            ("image", "ImageMessage"),
+            ("document", "DocumentMessage"),
+            ("video", "VideoMessage"),
+        ],
+    )
+    def test_staff_media_stays_non_text(
+        self,
+        file_world: Callable[..., _FileWorld],
+        media_type: str,
+        message_type: str,
+    ) -> None:
+        world = file_world()
+
+        resp = world.post(
+            world.image(
+                media_type=media_type,
+                message_type=message_type,
+                caption="Enviado pela equipe",
+                from_me=True,
+            )
+        )
+
+        assert resp.json() == {"ok": True, "skipped": "non-text"}
+        world.download.assert_not_awaited()
+        world.send.assert_not_awaited()
+        assert world.pipeline_contents() == []
