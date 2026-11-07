@@ -2094,3 +2094,229 @@ def test_every_adapter_call_site_passes_the_origin_keywords() -> None:
             callee,
             explicit_none,
         )
+
+
+# ============================================
+# Group and channel chats are skipped
+# ============================================
+#
+# Z-API "on-message-received": a group payload carries ``"isGroup": true``
+# and a ``"<id>-group"`` phone; a channel carries ``"isNewsletter": true``.
+# Mirrors the Uazapi ``group_chat`` skip: nothing past the replay claim runs.
+
+_GROUP_PHONE = "120363019502650977-group"
+_NEWSLETTER_PHONE = "120363166555745933@newsletter"
+
+# Shapes without a ``phone`` keep the 1:1 phone of the base body, so the flag
+# alone has to trigger the skip; shapes without flags pin each phone suffix.
+_GROUP_OR_CHANNEL_SHAPES = {
+    "is_group_flag": {"isGroup": True, "phone": _GROUP_PHONE},
+    "is_newsletter_flag": {"isNewsletter": True, "phone": _NEWSLETTER_PHONE},
+    "group_phone_without_flags": {"phone": _GROUP_PHONE},
+    "is_group_flag_with_direct_phone": {"isGroup": True},
+    "is_newsletter_flag_with_direct_phone": {"isNewsletter": True},
+    "g_us_jid_without_flags": {"phone": "120363019502650977@g.us"},
+    "newsletter_jid_without_flags": {"phone": _NEWSLETTER_PHONE},
+}
+
+
+def _group_message_body(*, instance_id: str, kind: str, shape: str) -> dict:
+    """A Z-API payload of ``kind`` reshaped into a group or channel chat."""
+    message_id = f"mid_group_{uuid4().hex[:10]}"
+    if kind == "patient_audio":
+        body = _zapi_audio_body(instance_id=instance_id, message_id=message_id)
+    elif kind == "patient_image":
+        body = _zapi_body(instance_id=instance_id, message_id=message_id)
+        del body["text"]
+        body["image"] = {
+            "imageUrl": "https://cdn.example.com/photo.jpg",
+            "mimeType": "image/jpeg",
+            "caption": "",
+        }
+    else:
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=message_id,
+            from_me=kind == "from_me_text",
+        )
+    body["participantPhone"] = "5511900000901"
+    body.update(_GROUP_OR_CHANNEL_SHAPES[shape])
+    return body
+
+
+def _create_active_session(client: TestClient, tenant_id: UUID, phone: str) -> UUID:
+    """Create the phone's active, unpaused session through the webhook helper."""
+    from src.api.routes.webhook import _get_or_create_session
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID:
+        db = get_db_session()
+        try:
+            session_id, _ = await _get_or_create_session(tenant_id, phone, db)
+            await db.commit()
+            return session_id
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _tenant_sessions(client: TestClient, tenant_id: UUID) -> list[Any]:
+    """Every session row of the tenant, read in a new DB session."""
+    from sqlalchemy import select
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> list[Any]:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(SessionRow).where(SessionRow.tenant_id == tenant_id)
+            )
+            return list(result.scalars().all())
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+class TestZapiGroupAndChannelSkip:
+    @pytest.mark.parametrize("shape", sorted(_GROUP_OR_CHANNEL_SHAPES))
+    @pytest.mark.parametrize(
+        "kind", ["patient_text", "patient_audio", "patient_image", "from_me_text"]
+    )
+    def test_group_or_channel_message_is_skipped_before_any_side_effect(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        kind: str,
+        shape: str,
+    ) -> None:
+        from src.api.routes import webhook as webhook_module
+        from src.services.safe_egress import SafeDownload
+
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        # Real STT + multimodal credentials, read through the real loader, and
+        # a non-empty clinic config: a patient audio that got past the skip
+        # would reach the download.
+        _seed_zapi_audio_tenant(
+            client, tenant_id, instance_id, raw_token, stt=True, multimodal=True
+        )
+        body = _group_message_body(instance_id=instance_id, kind=kind, shape=shape)
+        # A session the bot already holds for this chat (how the bug looked
+        # in production): a clinic post in the group must not pause it.
+        group_session_id = _create_active_session(
+            client, tenant_id, webhook_module._normalise_phone(body["phone"])
+        )
+
+        service = _mock_pipeline_service()
+        service._load_clinic_config = AsyncMock(return_value={"business_rules": {}})
+        mock_send = AsyncMock(return_value=_fake_send_result())
+        mock_download = AsyncMock(
+            return_value=SafeDownload(content=b"OggS_fake", mime_type="audio/ogg")
+        )
+        mock_transcribe = AsyncMock(return_value=("Olá", None))
+        mock_read = AsyncMock()
+        # Call-through spies: the real takeover, credential read, credit
+        # pre-check and session lookup run if the skip is ever bypassed.
+        spy_clinic_message = AsyncMock(
+            side_effect=webhook_module._handle_clinic_message
+        )
+        spy_creds = AsyncMock(side_effect=webhook_module._load_tenant_credentials)
+        spy_precheck = AsyncMock(
+            side_effect=webhook_module.credit_metering.precheck_zapi
+        )
+        spy_session = AsyncMock(side_effect=webhook_module._get_or_create_session)
+        with (
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook.send_text_message", new=mock_send),
+            patch("src.api.routes.webhook.send_zapi_audio", new=AsyncMock()),
+            patch("src.api.routes.webhook.safe_download_audio", new=mock_download),
+            patch(
+                "src.api.routes.webhook._transcribe_audio_chain", new=mock_transcribe
+            ),
+            patch("src.api.routes.webhook.mark_message_read", new=mock_read),
+            patch("src.api.routes.webhook.mark_conversation_unread", new=AsyncMock()),
+            patch(
+                "src.api.routes.webhook._handle_clinic_message",
+                new=spy_clinic_message,
+            ),
+            patch("src.api.routes.webhook._load_tenant_credentials", new=spy_creds),
+            patch(
+                "src.api.routes.webhook.credit_metering.precheck_zapi",
+                new=spy_precheck,
+            ),
+            patch("src.api.routes.webhook._get_or_create_session", new=spy_session),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        # Persisted state first, then the side-effect seams, then the envelope:
+        # a bypassed skip fails on the effect it actually caused.
+        sessions = _tenant_sessions(client, tenant_id)
+        assert [row.id for row in sessions] == [group_session_id]
+        assert sessions[0].is_paused is False
+        assert mock_download.await_count == 0
+        assert mock_transcribe.await_count == 0
+        assert mock_read.await_count == 0
+        assert mock_send.await_count == 0
+        assert spy_clinic_message.await_count == 0
+        assert spy_creds.await_count == 0
+        assert spy_precheck.await_count == 0
+        assert spy_session.await_count == 0
+        assert service._load_clinic_config.await_count == 0
+        assert service.run_pipeline.await_count == 0
+        assert service.finish_response.await_count == 0
+        assert _message_in_rows(client, tenant_id) == []
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "group_chat"}
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"isGroup": "true", "phone": "5511900000903"},
+            {"isGroup": "false", "phone": "5511900000903"},
+            {"phone": "5511900000903@lid"},
+            {"phone": "5511900000903"},
+        ],
+        ids=["is_group_string_true", "is_group_string_false", "lid_phone", "digits"],
+    )
+    def test_non_group_payloads_are_not_classified_as_group(self, body: dict) -> None:
+        from src.api.routes.webhook import _is_zapi_group_or_channel
+
+        assert _is_zapi_group_or_channel(body) is False
+
+    def test_one_to_one_message_still_reaches_the_pipeline(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance_id = f"3E{uuid4().hex[:10]}"
+        raw_token = _new_canonical_token()
+        _seed_zapi_tenant(client, tenant_id, instance_id, raw_token)
+        body = _zapi_body(
+            instance_id=instance_id,
+            message_id=f"mid_direct_{uuid4().hex[:10]}",
+            phone="5511900000902",
+        )
+        body.update({"isGroup": False, "isNewsletter": False})
+
+        service = _mock_pipeline_service()
+        service.finish_response = AsyncMock(return_value=_fake_event_response("Oi!"))
+        mock_send = AsyncMock(return_value=_fake_send_result())
+        with (
+            patch("src.api.routes.webhook.get_event_service", return_value=service),
+            patch("src.api.routes.webhook.send_text_message", new=mock_send),
+            patch("src.api.routes.webhook.mark_conversation_unread", new=AsyncMock()),
+            patch("src.api.routes.webhook.mark_message_read", new=AsyncMock()),
+        ):
+            resp = client.post(f"/v1/webhook/zapi/{raw_token}", json=body)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "replied": True}
+        assert service.run_pipeline.await_count == 1
+        assert mock_send.await_count == 1
+        assert [row.user_id for row in _tenant_sessions(client, tenant_id)] == [
+            "5511900000902"
+        ]
