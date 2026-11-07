@@ -2408,6 +2408,26 @@ async def zapi_webhook(
     )
 
 
+_ZAPI_GROUP_OR_CHANNEL_PHONE_SUFFIXES = ("-group", "@g.us", "@newsletter")
+
+
+def _is_zapi_group_or_channel(body: dict[str, Any]) -> bool:
+    """Group and channel (newsletter) chats are out of scope for Z-API.
+
+    Mirrors ``_is_uazapi_group_chat``. Z-API flags a group with
+    ``"isGroup": true`` and a ``"<id>-group"`` phone, and a channel with
+    ``"isNewsletter": true``. The phone suffix alone is enough, and the
+    ``@g.us`` / ``@newsletter`` JID forms are accepted defensively, so an
+    unflagged payload still never reaches the pipeline or a reply.
+    """
+    if body.get("isGroup") is True or body.get("isNewsletter") is True:
+        return True
+    raw_phone = body.get("phone")
+    return isinstance(raw_phone, str) and raw_phone.strip().endswith(
+        _ZAPI_GROUP_OR_CHANNEL_PHONE_SUFFIXES
+    )
+
+
 async def _process_zapi_authenticated_body(
     *,
     body: dict[str, Any],
@@ -2424,6 +2444,13 @@ async def _process_zapi_authenticated_body(
     ``request`` only carries the credit switch captured at entry (observational
     metering, neurostack-credit-system Group 3a); without it nothing is metered.
     """
+    # Groups and channels exit before any side effect: no credential read,
+    # no fromMe takeover (a clinic post in a group pauses nothing), no media
+    # download or STT, no credit pre-check, no session and no reply.
+    if _is_zapi_group_or_channel(body):
+        logger.info("Z-API webhook: skipping group chat %s", body.get("phone"))
+        return {"ok": True, "skipped": "group_chat"}
+
     text_obj = body.get("text")
     audio_obj = body.get("audio")
 
