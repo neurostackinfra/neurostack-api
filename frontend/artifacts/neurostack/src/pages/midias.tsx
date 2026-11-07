@@ -168,6 +168,7 @@ const MEDIA_FORMATS: readonly MediaFormat[] = [
   { mime: "video/mp4", category: "video", extensions: ["mp4"] },
   { mime: "audio/mpeg", category: "audio", extensions: ["mp3"] },
   { mime: "audio/ogg", category: "audio", extensions: ["ogg", "opus"] },
+  { mime: "audio/mp4", category: "audio", extensions: ["m4a"] },
   { mime: "application/pdf", category: "pdf", extensions: ["pdf"] },
 ];
 
@@ -188,8 +189,16 @@ const UPLOAD_ERROR_KEY: Record<string, TranslationKey> = {
   media_storage_unavailable: "media_upload_error_busy",
 };
 
+// Chrome and Safari label .m4a as audio/x-m4a; the server folds the same
+// aliases into audio/mp4 (canonical_declared_mime).
+const MIME_ALIASES: Record<string, string> = {
+  "audio/x-m4a": "audio/mp4",
+  "audio/m4a": "audio/mp4",
+};
+
 function canonicalMime(type: string) {
-  return type.split(";")[0].trim().toLowerCase();
+  const mime = type.split(";")[0].trim().toLowerCase();
+  return MIME_ALIASES[mime] ?? mime;
 }
 
 function extensionOf(name: string) {
