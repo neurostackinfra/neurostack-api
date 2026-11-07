@@ -537,7 +537,7 @@ describe("<ApiCredentialsForm /> card states", () => {
 
     const card = screen.getByTestId("provider-card-tts-openai");
     expect(within(card).getByText("OpenAI TTS")).toBeInTheDocument();
-    expect(within(card).getByText("gpt-4o-audio / tts-1")).toBeInTheDocument();
+    expect(within(card).queryByText("gpt-4o-audio / tts-1")).not.toBeInTheDocument();
     fireEvent.click(card);
 
     const editor = screen.getByTestId("provider-editor-tts-openai");

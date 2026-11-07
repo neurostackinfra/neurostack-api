@@ -7,7 +7,7 @@ export type ProviderCardState =
 export interface ProviderCredentialCardProps {
   id: string;
   label: string;
-  sub: string;
+  sub?: string;
   state: ProviderCardState;
   badgeLabel: string;
   isExpanded?: boolean;
@@ -44,7 +44,7 @@ export function ProviderCredentialCard({
     <div className="flex w-full items-start justify-between gap-2">
       <div className="min-w-0 flex-1">
         <span className="text-xs font-bold truncate">{label}</span>
-        <span className="block text-[10px] opacity-70 mt-0.5">{sub}</span>
+        {sub && <span className="block text-[10px] opacity-70 mt-0.5">{sub}</span>}
       </div>
       <span
         data-testid={`provider-badge-${state}-${id}`}
