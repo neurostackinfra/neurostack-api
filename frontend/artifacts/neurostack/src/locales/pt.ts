@@ -365,7 +365,7 @@ export const pt: Record<TranslationKey, string> = {
   config_tab_identidade_header: "Identidade & Persona",
   config_tab_identidade_desc: "Define como o agente se apresenta e como responde perguntas sobre sua natureza.",
   config_tab_operacao_header: "Operação & Logística",
-  config_tab_operacao_desc: "Dados injetados como string literal no contexto, sem reinterpretação.",
+  config_tab_operacao_desc: "Define como o agente orienta sobre horários, locais de atendimento e regras de agendamento.",
   config_tab_negocio_header: "Regras de Negócio & IA",
   config_tab_negocio_desc: "Diretivas que controlam o comportamento do SRM Core, o núcleo de raciocínio do agente.",
   config_tab_handoff_header: "Gestão de Handoff",

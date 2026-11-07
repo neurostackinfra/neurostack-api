@@ -363,7 +363,7 @@ export const en = {
   config_tab_identidade_header: "Identity & Persona",
   config_tab_identidade_desc: "Defines how the agent presents itself and answers questions about its nature.",
   config_tab_operacao_header: "Operation & Logistics",
-  config_tab_operacao_desc: "Data injected as literal string into context, no reinterpretation.",
+  config_tab_operacao_desc: "Defines how the agent guides people on opening hours, service locations and scheduling rules.",
   config_tab_negocio_header: "Business Rules & AI",
   config_tab_negocio_desc: "Directives that control SRM Core behavior, the agent reasoning nucleus.",
   config_tab_handoff_header: "Handoff Management",
