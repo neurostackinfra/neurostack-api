@@ -225,6 +225,9 @@ alembic/versions/*.pyc
 !.genie/wishes/audit-export-window/
 .genie/wishes/audit-export-window/*
 !.genie/wishes/audit-export-window/WISH.md
+!.genie/wishes/neurostack-credit-system/
+.genie/wishes/neurostack-credit-system/*
+!.genie/wishes/neurostack-credit-system/WISH.md
 # Replit artifacts
 .replit-artifact/
 .genie/genie.db
