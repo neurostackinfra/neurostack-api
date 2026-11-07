@@ -467,7 +467,7 @@ type MultimodalProvider = "openrouter";
 export const MULTIMODAL_PROVIDERS: {
   id: MultimodalProvider; label: string; sub: string;
 }[] = [
-  { id: "openrouter", label: "OpenRouter", sub: "Gemini / GPT-4o audio" },
+  { id: "openrouter", label: "OpenRouter", sub: "Multimodal" },
 ];
 
 // Single source of truth for the 5 API capability blocks in the clinic-config
