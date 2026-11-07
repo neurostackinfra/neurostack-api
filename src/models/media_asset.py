@@ -45,7 +45,8 @@ class MediaAsset(Base, TimestampMixin):
         ),
         CheckConstraint(
             "(category = 'video' AND mime_type = 'video/mp4') OR "
-            "(category = 'audio' AND mime_type IN ('audio/mpeg', 'audio/ogg')) OR "
+            "(category = 'audio' AND "
+            "mime_type IN ('audio/mpeg', 'audio/ogg', 'audio/mp4')) OR "
             "(category = 'pdf' AND mime_type = 'application/pdf') OR "
             "(category = 'image' AND mime_type IN ('image/jpeg', 'image/png'))",
             name="ck_media_assets_category_mime",
