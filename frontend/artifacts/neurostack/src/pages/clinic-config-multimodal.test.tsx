@@ -138,4 +138,39 @@ describe("multimodal provider boundary", () => {
       });
     },
   );
+
+  const helpByLocale = {
+    pt: "Também usado para entender imagens recebidas no WhatsApp (uazapi, Z-API e Meta). As imagens são enviadas ao OpenRouter com a sua chave.",
+    en: "Also used to understand images received on WhatsApp (uazapi, Z-API and Meta). Images are sent to OpenRouter with your key.",
+  } as const;
+  const descByLocale = {
+    pt: "Fallback multimodal para três usos: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal), quando o STT falhar (o modelo ouve o áudio direto) e para entender imagens recebidas no WhatsApp.",
+    en: "Multimodal fallback for three uses: when the primary LLM fails (prompt and history are sent to the multimodal provider), when STT fails (the model listens to the audio directly) and to understand images received on WhatsApp.",
+  } as const;
+  const helpStates = [
+    ["available", {}],
+    ["incomplete", { multimodal_provider: "openrouter", multimodal_readiness: "incomplete" }],
+    ["configured", { multimodal_provider: "openrouter", multimodal_readiness: "active" }],
+  ] as const;
+
+  it.each((["pt", "en"] as const).flatMap((locale) =>
+    helpStates.map(([state, status]) => [locale, state, status] as const),
+  ))("shows the image-understanding help on the %s OpenRouter card when %s", async (locale, state, status) => {
+    localStorage.setItem("ns_locale", locale);
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => status,
+    }) as unknown as typeof fetch;
+
+    render(<Wrapper><ApiCredentialsForm clinicId="42" isReadOnly={false} isSuperAdmin={false} /></Wrapper>);
+
+    const section = screen.getByTestId("api-capability-multimodal");
+    const card = within(section).getByTestId("provider-card-multimodal-openrouter");
+    await waitFor(() => expect(card).toHaveAttribute("data-card-state", state));
+    const help = helpByLocale[locale];
+    expect(within(card).getByTestId("provider-help-multimodal-openrouter")).toHaveTextContent(help);
+    expect(screen.getAllByText(help)).toHaveLength(1);
+    expect(within(section).getByText(descByLocale[locale])).toBeInTheDocument();
+  });
 });

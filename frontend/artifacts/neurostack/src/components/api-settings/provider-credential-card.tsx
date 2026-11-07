@@ -8,6 +8,8 @@ export interface ProviderCredentialCardProps {
   id: string;
   label: string;
   sub?: string;
+  /** Optional help text rendered under `sub`; omitted when absent. */
+  help?: string;
   state: ProviderCardState;
   badgeLabel: string;
   isExpanded?: boolean;
@@ -35,6 +37,7 @@ export function ProviderCredentialCard({
   id,
   label,
   sub,
+  help,
   state,
   badgeLabel,
   isExpanded = false,
@@ -45,6 +48,14 @@ export function ProviderCredentialCard({
       <div className="min-w-0 flex-1">
         <span className="text-xs font-bold truncate">{label}</span>
         {sub && <span className="block text-[10px] opacity-70 mt-0.5">{sub}</span>}
+        {help && (
+          <span
+            data-testid={`provider-help-${id}`}
+            className="block text-[10px] text-muted-foreground mt-1"
+          >
+            {help}
+          </span>
+        )}
       </div>
       <span
         data-testid={`provider-badge-${state}-${id}`}

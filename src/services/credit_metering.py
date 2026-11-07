@@ -43,7 +43,8 @@ Cost (allowlist of the common rules): a decision ``would_debit_mc`` one trace
 is authenticated and -- for a webhook -- it has a deliverable response (LLM,
 deterministic or handoff; without one it costs zero, OWNER-e).  A
 ``POST /v1/events`` decision costs one trace even without an LLM (D5).  The
-Meta file handoff (both call sites, O2) is a production decision of its own.
+file handoff -- Meta's two call sites (O2) and the Z-API forward-on-request
+(whatsapp-image-understanding) -- is a production decision of its own.
 
 The writer (deliverable 4).  It starts only after the request's session and
 the main path's sessions ended their transactions (the caller ends the
@@ -133,8 +134,8 @@ age (OD-2); only the provider call is under the send timeout, and the
 bookkeeping after it is shielded and bounded (OD-5).
 :class:`CreditResponsePublisher` only recovers the crash windows, at most
 once per row; :func:`run_retention_sweeper` erases expired payloads config
-on or off (OD-3).  The Meta file handoff is one enforced transaction
-(:func:`run_meta_file_handoff`).  Uazapi and Evolution (``unknown``) never
+on or off (OD-3).  The Meta and Z-API file handoff is one enforced
+transaction (:func:`run_meta_file_handoff`).  Uazapi and Evolution (``unknown``) never
 reach any of this.
 """
 
@@ -966,7 +967,8 @@ async def record_meta_file_handoff(
     *,
     note: str,
 ) -> ObservationalOutcome | None:
-    """The Meta file handoff (forward-on-request and ``audio_too_long``, O2):
+    """The file handoff (Meta's forward-on-request and ``audio_too_long``, O2;
+    the Z-API and Uazapi forward-on-request, whatsapp-image-understanding):
     the handoff is the decision, anchored on its handoff id."""
 
     if ingress is None:
@@ -1932,7 +1934,7 @@ async def _no_response_effect(
 
 
 # ---------------------------------------------------------------------------
-# Enforced Z-API and Meta webhooks, the Meta file handoff and the response
+# Enforced Z-API and Meta webhooks, their file handoff and the response
 # outbox (Group 3b-2).
 # ---------------------------------------------------------------------------
 
@@ -2375,7 +2377,7 @@ async def run_webhook_final(
 
 @dataclass(frozen=True)
 class FileHandoffOutcome:
-    """The enforced Meta file handoff: ``handoff`` (committed with its
+    """The enforced Meta or Z-API file handoff: ``handoff`` (committed with its
     claim, debit and ``credit_effect_id``) or the 200 skip ``answer``."""
 
     handoff: Any = None
@@ -2384,7 +2386,9 @@ class FileHandoffOutcome:
 
 
 def file_handoff_decision(handoff_id: UUID, note: str) -> dict[str, Any]:
-    """The PII-free projection of a Meta file handoff decision (O2)."""
+    """The PII-free projection of a file handoff decision (O2); its kind stays
+    ``meta_file_handoff`` on every channel (whatsapp-image-understanding,
+    Decision 7)."""
 
     return {"kind": "meta_file_handoff", "handoff_id": str(handoff_id), "note": note}
 
@@ -2398,11 +2402,12 @@ async def run_meta_file_handoff(
     initiate: Callable[[], Awaitable[Any]],
     before_commit: Callable[[], Awaitable[None]] | None = None,
 ) -> FileHandoffOutcome:
-    """The Meta file handoff as ONE enforced transaction in the route's
-    session (O2, MEDIUM-5), in the documented order: tenant ``FOR SHARE`` ->
-    session ``FOR UPDATE`` -> account ``FOR UPDATE`` -> hold (rollback,
-    ``credit_pending``: no handoff, no ack) -> lots ``FOR UPDATE`` -> the
-    enforced claim of ``(tenant_id, 'meta', message_id)`` (a conflict rolls
+    """The file handoff of an enforced Meta or Z-API message as ONE
+    transaction in the route's session (O2, MEDIUM-5), in the documented
+    order: tenant ``FOR SHARE`` -> session ``FOR UPDATE`` -> account ``FOR
+    UPDATE`` -> hold (rollback, ``credit_pending``: no handoff, no ack) ->
+    lots ``FOR UPDATE`` -> the enforced claim of ``(tenant_id,
+    enforcement.source, message_id)`` -- ``meta`` or ``zapi`` (a conflict rolls
     back: ``duplicate_message``, no second handoff nor debit) -> ``initiate``
     (``initiate_handoff(..., session=db)``: record and ``handoff.request``
     in this transaction) -> debit/debt -> the effect with its
