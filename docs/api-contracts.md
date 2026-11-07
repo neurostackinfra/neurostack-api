@@ -1136,6 +1136,7 @@ Resposta 200 (também plana):
 ```json
 {
   "clinic_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "tenant_id": "0f9e8d7c-6b5a-4321-9876-fedcba987654",
   "version": 1,
   "service_format": "online",
   "services": [
@@ -1144,6 +1145,12 @@ Resposta 200 (também plana):
   ]
 }
 ```
+
+`tenant_id` é somente leitura e vem da resolução de tenant do servidor: o alvo
+validado de `?tenant_id=` para Builder ou Super Admin, ou o próprio tenant do
+chamador. É o identificador da página pública de privacidade da clínica,
+`/privacidade/{tenant_id}`. `clinic_id` é outra coluna, quase sempre `null`, e
+não serve para essa URL. Enviar `tenant_id` no PATCH não altera nada.
 
 Cada objeto de `services` aceita propriedades extras. Quando presente, o seu
 `service_format` deve ser exatamente `online`, `presential` ou `both`; Strings

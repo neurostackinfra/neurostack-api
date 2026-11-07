@@ -1511,3 +1511,61 @@ async def test_invalid_first_handoff_write_does_not_add_flush_commit_or_cache(
         }
     ]
     assert calls == []
+
+
+# ============================================
+# Resolved tenant in the response (public privacy page URL)
+# ============================================
+#
+# The settings page builds the clinic's public privacy URL,
+# `/privacidade/{tenant_id}`, from this field. The login's `clinic_id` is a
+# different, usually null column, so the page cannot derive it client-side.
+
+
+def test_config_response_names_the_callers_own_tenant(client: TestClient) -> None:
+    tenant_id = uuid4()
+    headers = _headers(tenant_id=tenant_id)
+
+    loaded = client.get(PATH, headers=headers)
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["tenant_id"] == str(tenant_id)
+
+    # A client-sent value is ignored: the field is server-resolved, read-only.
+    patched = client.patch(
+        PATH,
+        headers=headers,
+        json={"clinic_legal_name": "Clínica Exemplo Ltda.", "tenant_id": str(uuid4())},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["tenant_id"] == str(tenant_id)
+    assert patched.json()["clinic_legal_name"] == "Clínica Exemplo Ltda."
+
+    reloaded = client.get(PATH, headers=headers)
+    assert reloaded.status_code == 200, reloaded.text
+    assert reloaded.json()["tenant_id"] == str(tenant_id)
+
+
+def test_config_response_names_the_builder_target_not_the_caller(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = uuid4()
+    target = uuid4()
+    requested: list[str | None] = []
+
+    async def resolve_target(
+        request: Any, tenant: TenantContext, session: Any
+    ) -> TenantContext:
+        requested.append(request.query_params.get("tenant_id"))
+        return TenantContext(tenant_id=target, role=tenant.role, user_id=tenant.user_id)
+
+    monkeypatch.setattr("src.api.routes.config._resolve_config_tenant", resolve_target)
+
+    response = client.get(
+        f"{PATH}?tenant_id={target}",
+        headers=_headers("builder", tenant_id=caller),
+    )
+
+    assert response.status_code == 200, response.text
+    assert requested == [str(target)]
+    assert response.json()["tenant_id"] == str(target)

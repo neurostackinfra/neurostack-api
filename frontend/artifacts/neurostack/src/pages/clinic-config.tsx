@@ -1441,6 +1441,9 @@ export default function ClinicConfig() {
   const [providePrices, setProvidePrices] = useState("no");
   const [lgpdActive, setLgpdActive] = useState("yes");
   const [privacyLink, setPrivacyLink] = useState("");
+  // Tenant the server resolved for this config. The public privacy page is
+  // keyed by it; the login's clinicId is a different, usually empty, value.
+  const [configTenantId, setConfigTenantId] = useState("");
   const [lgpdEnabled, setLgpdEnabled] = useState(false);
   const DEFAULT_LGPD_MESSAGE = "Olá! Bem-vindo(a) ao atendimento da [Nome da Clínica]. 🏥 Para garantir o melhor cuidado com a sua saúde e segurança, nossa assistente virtual processa seus dados de acordo com a Lei Geral de Proteção de Dados (LGPD). Ao continuar esta conversa, você concorda com o uso dos seus dados para fins de agendamento e orientações sobre serviços. 📄 Leia nossa Política de Privacidade completa aqui: {{lgpd_link}} Como posso te ajudar hoje?";
   const [lgpdMessage, setLgpdMessage] = useState(DEFAULT_LGPD_MESSAGE);
@@ -1510,6 +1513,7 @@ export default function ClinicConfig() {
     setProvidePrices(config.provide_prices ?? "no");
     setLgpdActive(config.lgpd_active ?? "yes");
     setPrivacyLink(config.privacy_link ?? "");
+    setConfigTenantId(config.tenant_id ?? "");
     setLgpdEnabled(config.lgpd_enabled === "yes");
     setLgpdMessage(config.lgpd_message || DEFAULT_LGPD_MESSAGE);
     setLgpdLinkMode(config.lgpd_custom_link ? "custom" : "neurostack");
@@ -2556,16 +2560,18 @@ export default function ClinicConfig() {
                   </Field>
                 </div>
 
-                {lgpdLinkMode === "neurostack" && (
+                {lgpdLinkMode === "neurostack" && configTenantId && (
                   <Field label={txt("Sua URL única de Política de Privacidade", "Your unique Privacy Policy URL")} hint={txt("Compartilhe este link com seus pacientes", "Share this link with your patients")}>
                     <div className="flex items-center gap-2">
                       <Input
                         readOnly
-                        value={`${window.location.origin}${API_BASE}/privacidade/${clinicId}`}
+                        data-testid="privacy-policy-url"
+                        value={`${window.location.origin}${API_BASE}/privacidade/${configTenantId}`}
                         className="text-sm font-mono bg-muted/40 text-muted-foreground"
                       />
                       <a
-                        href={`${API_BASE}/privacidade/${clinicId}`}
+                        href={`${API_BASE}/privacidade/${configTenantId}`}
+                        data-testid="privacy-policy-open"
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border hover:bg-accent transition-colors shrink-0"

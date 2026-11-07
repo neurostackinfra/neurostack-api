@@ -45,6 +45,7 @@ def test_service_modality_docs_example_and_openapi_contract() -> None:
     }
     expected_response = {
         "clinic_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "tenant_id": "0f9e8d7c-6b5a-4321-9876-fedcba987654",
         "version": 1,
         **expected_request,
     }

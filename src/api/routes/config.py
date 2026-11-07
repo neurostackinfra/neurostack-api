@@ -85,6 +85,9 @@ def _project_config(flat: dict[str, Any], tenant: TenantContext) -> ConfigRespon
 
     if not _can_access_clinic_admin_only_fields(tenant):
         flat.pop(_CLINIC_ADMIN_ONLY_FIELD, None)
+    # The resolved tenant, not a bucket value: it names the clinic's public
+    # privacy page, so it must come from the server's tenant resolution.
+    flat["tenant_id"] = str(tenant.tenant_id)
     return ConfigResponse(**flat)
 
 
