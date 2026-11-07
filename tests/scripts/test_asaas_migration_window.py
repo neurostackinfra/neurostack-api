@@ -1123,18 +1123,24 @@ def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
     assert declared["040"] == "039"
     assert declared["041"] == "040"
     assert declared["042"] == "041"
-    # 043 (the media category/MIME invariant widened for audio/ogg) is written
-    # and deliberately has NO window: its rollback target is the revision
-    # serving before its own image, which does not exist until that image
-    # deploys, and the reviewed manifest is pinned to the serving revision 16
-    # (#183), so a window naming 16 today would arm itself with no re-pin.
-    # Production therefore stays at 042 until the window is authored.
+    # 043 (the media category/MIME invariant widened for audio/ogg) and 044
+    # (the same invariant widened for audio/mp4) are written and deliberately
+    # have NO window: their rollback target is the revision serving before
+    # their own image, which does not exist until that image deploys, and the
+    # reviewed manifest is pinned to the serving revision 16 (#183), so a
+    # window naming 16 today would arm itself with no re-pin. Production
+    # therefore stays at 042 until a window carrying 043 and 044 is authored.
     assert declared["043"] == "042"
-    assert "043" not in {rev for row in mw.WINDOWS.values() for rev in row.chain}
-    # No later revision can exist unseen: a 044 would need its own window, or
+    assert declared["044"] == "043"
+    # 044 is the only revision chained off 043.
+    assert [rev for rev, down in declared.items() if down == "043"] == ["044"]
+    chained = {rev for row in mw.WINDOWS.values() for rev in row.chain}
+    assert "043" not in chained
+    assert "044" not in chained
+    # No later revision can exist unseen: a 045 would need its own window, or
     # its own entry here saying why it has none.
-    assert "044" not in declared
-    assert not [rev for rev, down in declared.items() if down == "043"]
+    assert "045" not in declared
+    assert not [rev for rev, down in declared.items() if down == "044"]
 
 
 @pytest.mark.parametrize(

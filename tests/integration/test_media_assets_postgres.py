@@ -7,6 +7,7 @@ import ipaddress
 import os
 import re
 import sys
+import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -127,6 +128,60 @@ async def _run_alembic(database_url: URL, *arguments: str) -> None:
     )
     output, _ = await process.communicate()
     assert process.returncode == 0, output.decode(errors="replace")
+
+
+class _AlembicFailed(AssertionError):
+    """An alembic run that exited non-zero; the message is its output."""
+
+
+# Runs one downgrade and, when it fails, prints every SQLSTATE in the chain of
+# causes (SQLAlchemy's error, its DBAPI adapter, asyncpg's exception) so a
+# refusal can be pinned to the PostgreSQL error class, not just to its text.
+_DOWNGRADE_RUNNER = """
+import sys
+
+from alembic import command
+from alembic.config import Config
+
+config = Config(sys.argv[1])
+config.set_main_option("script_location", sys.argv[2])
+sys.path.insert(0, sys.argv[3])
+try:
+    command.downgrade(config, sys.argv[4])
+except Exception as error:
+    states, seen, cause = [], set(), error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if getattr(cause, "sqlstate", None):
+            states.append(str(cause.sqlstate))
+        cause = getattr(cause, "orig", None) or cause.__cause__ or cause.__context__
+    print("sqlstate=" + ",".join(states))
+    print("error=" + " ".join(str(error).split()))
+    sys.exit(3)
+"""
+
+
+async def _alembic_downgrade(database_url: URL, revision: str) -> None:
+    environment = os.environ.copy()
+    environment["DATABASE_URL"] = database_url.render_as_string(hide_password=False)
+    # The checkout's alembic/ directory would shadow the alembic package.
+    environment.pop("PYTHONPATH", None)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _DOWNGRADE_RUNNER,
+        str(_ROOT / "alembic.ini"),
+        str(_ROOT / "alembic"),
+        str(_ROOT),
+        revision,
+        cwd=tempfile.gettempdir(),
+        env=environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    if process.returncode != 0:
+        raise _AlembicFailed(output.decode(errors="replace"))
 
 
 async def _table_exists(engine: AsyncEngine) -> bool:
@@ -356,6 +411,172 @@ async def test_migration_constraints_reject_inconsistent_rows(
                 )
             )
         ) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_category_mime_invariant_admits_audio_mp4_as_audio_only(
+    postgres_harness: _Harness,
+) -> None:
+    tenant_id = uuid4()
+    async with postgres_harness.session() as session:
+        session.add(
+            Tenant(
+                id=tenant_id,
+                name="M4A Tenant",
+                slug=f"m4a-{tenant_id.hex}",
+                api_key_hash=f"m4a-{tenant_id.hex}",
+                config={},
+            )
+        )
+        await session.commit()
+
+    # Migration 044: audio/mp4 joins audio/mpeg and audio/ogg as audio.
+    for mime_type in ("audio/mpeg", "audio/ogg", "audio/mp4"):
+        async with postgres_harness.session() as session:
+            session.add(
+                _asset(
+                    tenant_id,
+                    mime_type.encode(),
+                    original_filename="recado.m4a",
+                    category="audio",
+                    mime_type=mime_type,
+                )
+            )
+            await session.commit()
+    for category in ("video", "pdf", "image"):
+        async with postgres_harness.session() as session:
+            session.add(
+                _asset(tenant_id, b"m4a", category=category, mime_type="audio/mp4")
+            )
+            with pytest.raises(SQLAlchemyError, match="ck_media_assets_category_mime"):
+                await session.commit()
+            await session.rollback()
+
+    async with postgres_harness.session() as session:
+        stored = (
+            await session.execute(
+                select(MediaAsset.category, MediaAsset.mime_type).where(
+                    MediaAsset.tenant_id == tenant_id
+                )
+            )
+        ).all()
+    assert sorted(stored) == [
+        ("audio", "audio/mp4"),
+        ("audio", "audio/mpeg"),
+        ("audio", "audio/ogg"),
+    ]
+
+
+_CATEGORY_MIME_DEFINITION = text(
+    "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+    "WHERE conname = 'ck_media_assets_category_mime'"
+)
+_INSERT_AUDIO_ROW = text(
+    "INSERT INTO media_assets (id, tenant_id, display_name, original_filename, "
+    "category, mime_type, size_bytes, sha256, payload) VALUES (:id, :tenant_id, "
+    "'Recado', 'recado.m4a', 'audio', :mime_type, 3, :sha256, :payload)"
+)
+
+
+@pytest.mark.asyncio
+async def test_the_044_downgrade_refuses_while_an_audio_mp4_row_exists() -> None:
+    """Migration 044 widens the invariant; its downgrade restores 043's and,
+    by design, fails with a CheckViolation while any audio/mp4 row exists.
+
+    A child database of its own: the module harness stays at the head."""
+
+    raw_admin_url = os.getenv("POSTGRES_SMOKE_DATABASE_URL")
+    if raw_admin_url is None:
+        pytest.fail(
+            "POSTGRES_SMOKE_DATABASE_URL is required for media integration tests",
+            pytrace=False,
+        )
+    admin_url = _validated_admin_url(raw_admin_url)
+    child_name = f"neurostack_media_smoke_{uuid4().hex[:12]}"
+    assert _CHILD_PATTERN.fullmatch(child_name)
+    child_url = admin_url.set(database=child_name)
+    admin_engine = create_async_engine(
+        admin_url, isolation_level="AUTOCOMMIT", poolclass=NullPool
+    )
+    engine = create_async_engine(child_url, poolclass=NullPool)
+    created = False
+    tenant_id = uuid4()
+    row = {
+        "id": uuid4(),
+        "tenant_id": tenant_id,
+        "mime_type": "audio/mp4",
+        "sha256": b"\xab" * 32,
+        "payload": b"m4a",
+    }
+
+    async def version_and_definition() -> tuple[str, str]:
+        async with engine.connect() as connection:
+            version = await connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            )
+            definition = await connection.scalar(_CATEGORY_MIME_DEFINITION)
+        return str(version), str(definition)
+
+    try:
+        async with admin_engine.connect() as connection:
+            quoted = connection.dialect.identifier_preparer.quote(child_name)
+            await connection.exec_driver_sql(f"CREATE DATABASE {quoted}")
+            created = True
+
+        await _run_alembic(child_url, "upgrade", "043")
+        version, invariant_043 = await version_and_definition()
+        assert version == "043" and "audio/mp4" not in invariant_043
+        await _run_alembic(child_url, "upgrade", "044")
+        version, invariant_044 = await version_and_definition()
+        assert version == "044" and "audio/mp4" in invariant_044
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO tenants (id, name, slug, api_key_hash, config, "
+                    "is_active) VALUES (:id, 'M4A', :slug, 'h', '{}', true)"
+                ),
+                {"id": tenant_id, "slug": f"m4a-{tenant_id.hex}"},
+            )
+            await connection.execute(_INSERT_AUDIO_ROW, row)
+
+        # 23514 is check_violation.
+        with pytest.raises(
+            _AlembicFailed,
+            match=r"(?s)sqlstate=[\d,]*\b23514\b.*ck_media_assets_category_mime",
+        ):
+            await _alembic_downgrade(child_url, "043")
+        # Transactional DDL: nothing moved.
+        assert await version_and_definition() == ("044", invariant_044)
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM media_assets WHERE id = :id"), {"id": row["id"]}
+            )
+        await _alembic_downgrade(child_url, "043")
+        # 043's invariant is back, byte for byte, and enforced again.
+        assert await version_and_definition() == ("043", invariant_043)
+        with pytest.raises(SQLAlchemyError, match="ck_media_assets_category_mime"):
+            async with engine.begin() as connection:
+                await connection.execute(_INSERT_AUDIO_ROW, row)
+        async with engine.begin() as connection:
+            await connection.execute(
+                _INSERT_AUDIO_ROW, {**row, "id": uuid4(), "mime_type": "audio/ogg"}
+            )
+    finally:
+        await engine.dispose()
+        if created:
+            async with admin_engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                        "WHERE datname = :database AND pid <> pg_backend_pid()"
+                    ),
+                    {"database": child_name},
+                )
+                quoted = connection.dialect.identifier_preparer.quote(child_name)
+                await connection.exec_driver_sql(f"DROP DATABASE {quoted}")
+        await admin_engine.dispose()
 
 
 @pytest.mark.asyncio

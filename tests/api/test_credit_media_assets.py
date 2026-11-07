@@ -6,7 +6,7 @@ credit switch forced per test.  What is pinned here:
 * mídia uses ``media_assets`` (no new table or route);
 * the PDF's per-type limits (image 5 MB, PDF 20 MB, audio/video 16 MB) and the
   allowlist are properties of the category, so they answer the same in every
-  credit mode; M4A stays ``media_type_unsupported``;
+  credit mode; M4A is ``audio/mp4`` under the audio limit;
 * with the switch off, or on before ``credit_enforcement_at``, uploads and
   downloads are answered without reserving, and with the switch on they are
   measured observationally; an injected writer failure changes nothing but a
@@ -100,6 +100,33 @@ def _ogg(size: int) -> bytes:
         + bytes(3)
     )
     return page + b"\x00" * (size - len(page))
+
+
+def _box(box_type: bytes, body: bytes = b"") -> bytes:
+    return (8 + len(body)).to_bytes(4, "big") + box_type + body
+
+
+def _audio_moov() -> bytes:
+    """One track whose handler is ``soun`` (moov -> trak -> mdia -> hdlr)."""
+
+    hdlr = _box(b"hdlr", bytes(8) + b"soun" + bytes(12) + b"\x00")
+    return _box(b"moov", _box(b"trak", _box(b"mdia", hdlr)))
+
+
+def _m4a(size: int) -> bytes:
+    """iPhone Voice Memos: the ``M4A `` major brand."""
+
+    ftyp = _box(b"ftyp", b"M4A " + bytes(4) + b"M4A isommp42")
+    moov = _audio_moov()
+    return ftyp + _box(b"mdat", bytes(size - len(ftyp) - len(moov) - 8)) + moov
+
+
+def _android_m4a(size: int) -> bytes:
+    """Android MediaRecorder: generic brands, one ``soun`` track, moov last."""
+
+    ftyp = _box(b"ftyp", b"mp42" + bytes(4) + b"isommp42")
+    moov = _audio_moov()
+    return ftyp + _box(b"mdat", bytes(size - len(ftyp) - len(moov) - 8)) + moov
 
 
 class World:
@@ -291,16 +318,24 @@ def _comparable(response: Any) -> tuple[int, Any]:
         (_pdf(20_000_001), "application/pdf", (413, "media_size_exceeded")),
         (_mp3(16_000_001), "audio/mpeg", (413, "media_size_exceeded")),
         (_ogg(16_000_001), "audio/ogg", (413, "media_size_exceeded")),
-        (
-            b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64,
-            "audio/mp4",
-            (422, "media_type_unsupported"),
-        ),
+        (_m4a(16_000_001), "audio/mp4", (413, "media_size_exceeded")),
         # Big enough that the aggregate rounding leaves a non-zero reservation.
         (_png(1_000_000), "image/png", None),
         (_ogg(1_000_000), "audio/ogg", None),
+        (_m4a(1_000_000), "audio/mp4", None),
+        (_android_m4a(1_000_000), "audio/x-m4a", None),
     ],
-    ids=["png-over", "pdf-over", "mp3-over", "ogg-over", "m4a", "png-ok", "ogg-ok"],
+    ids=[
+        "png-over",
+        "pdf-over",
+        "mp3-over",
+        "ogg-over",
+        "m4a-over",
+        "png-ok",
+        "ogg-ok",
+        "m4a",
+        "m4a-android",
+    ],
 )
 def test_before_the_enforcement_the_answer_does_not_depend_on_the_switch(
     client: Any,
@@ -416,8 +451,10 @@ def test_an_injected_writer_failure_changes_neither_answer_nor_data(
         (_mp3(16_000_001), "audio/mpeg"),
         (_mp4(16_000_001), "video/mp4"),
         (_ogg(16_000_001), "audio/ogg"),
+        (_m4a(16_000_001), "audio/mp4"),
+        (_android_m4a(16_000_001), "audio/x-m4a"),
     ],
-    ids=["png", "pdf", "mp3", "mp4", "ogg"],
+    ids=["png", "pdf", "mp3", "mp4", "ogg", "m4a", "m4a-android"],
 )
 def test_after_the_enforcement_the_per_type_limits_refuse_before_reserving(
     client: Any, world: World, switch: Callable[[bool], None], payload: bytes, mime: str
@@ -433,21 +470,72 @@ def test_after_the_enforcement_the_per_type_limits_refuse_before_reserving(
         assert client._submit(_rows(model)) == []
 
 
-def test_m4a_stays_unsupported_in_every_credit_mode(
+def test_m4a_is_accepted_in_every_credit_mode_under_the_audio_cap(
     client: Any, world: World, switch: Callable[[bool], None]
 ) -> None:
-    payload = b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64
+    too_large = {"detail": {"code": "media_size_exceeded"}}
     switch(False)
-    off = _upload(client, world, payload, "audio/mp4")
+    off_over = _upload(client, world, _m4a(16_000_001), "audio/mp4")
+    off = _upload(client, world, _m4a(16_000_000), "audio/mp4")
     client._submit(_enforce())
-    enforced = _upload(client, world, payload, "audio/mp4")
-    for response in (off, enforced):
-        assert (response.status_code, response.json()) == (
-            422,
-            {"detail": {"code": "media_type_unsupported"}},
+    switch(True)
+    enforced_over = _upload(client, world, _m4a(16_000_001), "audio/mp4")
+    # The builder's first reservation is served as debt (Group 5).
+    enforced = _upload(client, world, _android_m4a(1_000_000), "audio/x-m4a")
+    for over in (off_over, enforced_over):
+        assert (over.status_code, over.json()) == (413, too_large)
+    for accepted in (off, enforced):
+        assert accepted.status_code == 201, accepted.text
+        assert (accepted.json()["category"], accepted.json()["mime_type"]) == (
+            "audio",
+            "audio/mp4",
         )
-    for model in _FINANCIAL:
-        assert client._submit(_rows(model)) == []
+    stored = client._submit(_rows(MediaAsset))
+    assert sorted((a.mime_type, a.size_bytes) for a in stored) == [
+        ("audio/mp4", 1_000_000),
+        ("audio/mp4", 16_000_000),
+    ]
+    # Only the enforced upload reserves, and as media.
+    [reservation] = [
+        row
+        for row in client._submit(_rows(CreditAllocation))
+        if row.allocation_kind == "reservation"
+    ]
+    assert reservation.effect_id == (
+        f"media:{world.tenant}:{enforced.json()['id']}:reserve"
+    )
+
+
+def test_an_android_m4a_round_trips_as_audio_mp4_with_the_m4a_extension(
+    client: Any, world: World, switch: Callable[[bool], None]
+) -> None:
+    payload = _android_m4a(4_096)
+    created = _upload(client, world, payload, "audio/x-m4a", name="recado.m4a")
+    assert created.status_code == 201, created.text
+    media_id = created.json()["id"]
+    assert {
+        key: created.json()[key]
+        for key in ("category", "mime_type", "size_bytes", "original_filename")
+    } == {
+        "category": "audio",
+        "mime_type": "audio/mp4",
+        "size_bytes": 4_096,
+        "original_filename": "recado.m4a",
+    }
+
+    listing = client.get(MEDIA, headers=world.headers())
+    assert listing.status_code == 200
+    [item] = [row for row in listing.json()["items"] if row["id"] == media_id]
+    assert (item["category"], item["mime_type"]) == ("audio", "audio/mp4")
+
+    download = client.get(f"{MEDIA}/{media_id}/content", headers=world.headers())
+    assert download.status_code == 200
+    assert download.content == payload
+    assert download.headers["content-type"] == "audio/mp4"
+    assert download.headers["x-content-type-options"] == "nosniff"
+    assert download.headers["content-disposition"] == (
+        f"attachment; filename=\"media-{media_id}.m4a\"; filename*=UTF-8''recado.m4a"
+    )
 
 
 def test_after_the_enforcement_an_upload_reserves_its_media_once(

@@ -673,11 +673,11 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     assert postgres_harness.schemas_equivalent is True
     assert postgres_harness.legacy_survived_downgrade is True
     async with postgres_harness.engine.connect() as connection:
-        # Head: 043, audio/ogg in the media category/MIME invariant, on top of
-        # 042's enforcement cutoff acceptances.
+        # Head: 044, audio/mp4 in the media category/MIME invariant, on top of
+        # 043's audio/ogg and 042's enforcement cutoff acceptances.
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "043"
+            == "044"
         )
         legacy = (
             await connection.execute(

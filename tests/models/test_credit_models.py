@@ -207,8 +207,9 @@ def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     assert (migration.revision, migration.down_revision) == ("038", "037")
     # Group 4b: 040 follows 039; Group 5: 041 follows 040; Group 7: 042
     # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg in the
-    # media category/MIME invariant) follows 042 and is the head.
-    assert current_head() == "043"
+    # media category/MIME invariant) follows 042; 044 (audio/mp4 in the same
+    # invariant) follows 043 and is the head.
+    assert current_head() == "044"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 

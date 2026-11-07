@@ -42,6 +42,8 @@ _OGG_OPUS = (
     + (48_000).to_bytes(4, "little")
     + bytes(3)  # output gain and channel mapping family
 )
+# ftyp with the M4A major brand (iPhone Voice Memos); the brand alone decides.
+_M4A = b"\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00M4A isommp42"
 
 
 def _scope(*, content_length: int | None = None) -> Scope:
@@ -332,6 +334,7 @@ def _raw_multipart_body(*, boundary: str, charset: str) -> bytes:
         (b"\xff\xfb\x90\x64mp3", "audio/mpeg", "audio"),
         (b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp42", "video/mp4", "video"),
         (_OGG_OPUS, "audio/ogg", "audio"),
+        (_M4A, "audio/mp4", "audio"),
     ],
 )
 async def test_upload_order_and_all_formats_preserve_payload_and_metadata(
