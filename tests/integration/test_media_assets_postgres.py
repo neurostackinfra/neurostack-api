@@ -1558,6 +1558,117 @@ async def test_patch_revalidates_again_between_metadata_read_and_update(
 
 
 @pytest.mark.asyncio
+async def test_media_route_postgres_category_and_name_filters(
+    postgres_harness: _Harness,
+) -> None:
+    tenant_id = uuid4()
+    foreign_tenant_id = uuid4()
+    now = datetime.now(timezone.utc)
+    # The search matches original_filename only: it is the name the catalog
+    # shows, downloads and sends. The display names here deliberately share no
+    # text with it, so a match below can never come from display_name.
+    specs = [
+        ("rotulo-1", "Relatório Clínico.pdf", "pdf", "application/pdf"),
+        ("rotulo-2", "ANTES E DEPOIS.png", "image", "image/png"),
+        ("rotulo-3", "Orientações pós.png", "image", "image/png"),
+        ("rotulo-4", "Desconto 100% real.png", "image", "image/png"),
+        ("rotulo-5", "Desconto 1000 real.png", "image", "image/png"),
+        ("rotulo-6", "foto_a.jpg", "image", "image/jpeg"),
+        ("rotulo-7", "fotoxa.jpg", "image", "image/jpeg"),
+        ("Boas-vindas", "IMG_1234.mp3", "audio", "audio/mpeg"),
+        # Decomposed (NFD), the way macOS hands a file name to the browser.
+        ("rotulo-9", "Prontua\u0301rio.pdf", "pdf", "application/pdf"),
+    ]
+    assets = []
+    for index, (display_name, original_filename, category, mime_type) in enumerate(
+        specs
+    ):
+        asset = _asset(
+            tenant_id,
+            f"payload-{index}".encode(),
+            display_name=display_name,
+            original_filename=original_filename,
+            category=category,
+            mime_type=mime_type,
+        )
+        asset.created_at = now - timedelta(seconds=index)
+        asset.updated_at = asset.created_at
+        assets.append(asset)
+    foreign_asset = _asset(
+        foreign_tenant_id,
+        b"foreign",
+        original_filename="Relatório de outra clínica.pdf",
+    )
+    async with postgres_harness.session() as session:
+        session.add_all(
+            [
+                Tenant(
+                    id=tenant,
+                    name=f"Filter Clinic {tenant.hex[:6]}",
+                    slug=f"filter-{tenant.hex}",
+                    api_key_hash=f"filter-{tenant.hex}",
+                    plan_type="clinic",
+                    config={},
+                )
+                for tenant in (tenant_id, foreign_tenant_id)
+            ]
+        )
+        await session.flush()
+        session.add_all([*assets, foreign_asset])
+        await session.commit()
+
+    tenant = TenantContext(tenant_id, api_key="tenant-scoped")
+    request = _route_request()
+
+    async def names(
+        *, page_size: int = 25, cursor: str | None = None, **filters: Any
+    ) -> tuple[list[str], str | None]:
+        async with postgres_harness.session() as session:
+            page = await media_route.list_media_assets(
+                request=request,
+                tenant_id=None,
+                cursor=cursor,
+                page_size=page_size,
+                tenant=tenant,
+                session=session,
+                **filters,
+            )
+        return [item.original_filename for item in page.items], page.next_cursor
+
+    assert (await names(category="audio"))[0] == ["IMG_1234.mp3"]
+    assert (await names(category="video"))[0] == []
+    # Case and accents fold on both sides.
+    assert (await names(name="relatorio"))[0] == ["Relatório Clínico.pdf"]
+    assert (await names(name="RELATÓRIO"))[0] == ["Relatório Clínico.pdf"]
+    assert (await names(name="orientacoes"))[0] == ["Orientações pós.png"]
+    assert (await names(name="antes e depois"))[0] == ["ANTES E DEPOIS.png"]
+    assert (await names(name="img_1234"))[0] == ["IMG_1234.mp3"]
+    # A decomposed name is found from either spelling of the query.
+    assert (await names(name="prontuario"))[0] == ["Prontua\u0301rio.pdf"]
+    assert (await names(name="Prontuário"))[0] == ["Prontua\u0301rio.pdf"]
+    # display_name is not searched.
+    assert (await names(name="boas-vindas"))[0] == []
+    assert (await names(name="rotulo"))[0] == []
+    # % and _ are literal, not wildcards.
+    assert (await names(name="100%"))[0] == ["Desconto 100% real.png"]
+    assert (await names(name="foto_a"))[0] == ["foto_a.jpg"]
+    # Category and name combine, and the other tenant never leaks.
+    assert (await names(category="pdf", name="relat"))[0] == ["Relatório Clínico.pdf"]
+    assert (await names(category="audio", name="relat"))[0] == []
+    # A filtered page follows its own keyset without skipping or repeating.
+    first, cursor = await names(category="image", page_size=3)
+    assert first == [
+        "ANTES E DEPOIS.png",
+        "Orientações pós.png",
+        "Desconto 100% real.png",
+    ]
+    assert cursor is not None
+    second, last_cursor = await names(category="image", page_size=3, cursor=cursor)
+    assert second == ["Desconto 1000 real.png", "foto_a.jpg", "fotoxa.jpg"]
+    assert last_cursor is None
+
+
+@pytest.mark.asyncio
 async def test_media_route_postgres_keyset_patch_download_delete_roundtrip(
     postgres_harness: _Harness,
 ) -> None:

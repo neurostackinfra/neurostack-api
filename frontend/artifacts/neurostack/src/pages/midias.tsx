@@ -10,6 +10,7 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  Search,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -38,6 +39,14 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { CreditAllocationNotice } from "@/components/plan-usage-summary";
 import { useAuth } from "@/context/auth";
@@ -68,7 +77,12 @@ interface MediaListResponse {
 
 type FeedbackKind = "upload" | "edit" | "delete" | "download";
 
-interface CatalogState {
+interface ListFilters {
+  category: MediaCategory | "";
+  name: string;
+}
+
+interface CatalogState extends ListFilters {
   scope: string;
   items: MediaAsset[];
   nextCursor: string | null;
@@ -81,8 +95,7 @@ interface CatalogState {
 interface EditState {
   scope: string;
   asset: MediaAsset;
-  displayName: string;
-  originalFilename: string;
+  name: string;
   usageTrigger: string;
   usageTriggerIsNull: boolean;
   autoSuggest: boolean;
@@ -93,13 +106,42 @@ interface DeleteState {
   asset: MediaAsset;
 }
 
-const EMPTY_CATALOG: Omit<CatalogState, "scope"> = {
+const EMPTY_CATALOG: Omit<CatalogState, "scope" | "category" | "name"> = {
   items: [],
   nextCursor: null,
   hasMore: false,
   loading: false,
   loadingMore: false,
   error: false,
+};
+
+// The order the owner lists the four types in, used by both selects.
+const MEDIA_CATEGORIES: readonly MediaCategory[] = [
+  "image",
+  "video",
+  "audio",
+  "pdf",
+];
+
+const CATEGORY_LABEL_KEY: Record<MediaCategory, TranslationKey> = {
+  image: "media_category_image",
+  video: "media_category_video",
+  audio: "media_category_audio",
+  pdf: "media_category_pdf",
+};
+
+const CATEGORY_HELP_KEY: Record<MediaCategory, TranslationKey> = {
+  image: "media_file_help_image",
+  video: "media_file_help_video",
+  audio: "media_file_help_audio",
+  pdf: "media_file_help_pdf",
+};
+
+const CATEGORY_TOO_LARGE_KEY: Record<MediaCategory, TranslationKey> = {
+  image: "media_file_too_large_image",
+  video: "media_file_too_large_video",
+  audio: "media_file_too_large_audio",
+  pdf: "media_file_too_large_pdf",
 };
 
 // Mirrors MEDIA_CATEGORY_MAX_BYTES in src/services/media_assets.py. The server
@@ -111,25 +153,26 @@ const MAX_BYTES_BY_CATEGORY: Record<MediaCategory, number> = {
   video: 16_000_000,
 };
 
-const CATEGORY_BY_MIME: Record<string, MediaCategory> = {
-  "video/mp4": "video",
-  "audio/mpeg": "audio",
-  "audio/ogg": "audio",
-  "application/pdf": "pdf",
-  "image/jpeg": "image",
-  "image/png": "image",
-};
+interface MediaFormat {
+  mime: string;
+  category: MediaCategory;
+  // Extensions a file of this format may carry; the first one is canonical.
+  extensions: readonly string[];
+}
 
-const CATEGORY_BY_EXTENSION: Record<string, MediaCategory> = {
-  mp4: "video",
-  mp3: "audio",
-  ogg: "audio",
-  opus: "audio",
-  pdf: "pdf",
-  jpg: "image",
-  jpeg: "image",
-  png: "image",
-};
+// Mirrors MEDIA_CANONICAL_MIME_TYPES in src/services/media_assets.py. The
+// server decides the real format from the content signature.
+const MEDIA_FORMATS: readonly MediaFormat[] = [
+  { mime: "image/jpeg", category: "image", extensions: ["jpg", "jpeg"] },
+  { mime: "image/png", category: "image", extensions: ["png"] },
+  { mime: "video/mp4", category: "video", extensions: ["mp4"] },
+  { mime: "audio/mpeg", category: "audio", extensions: ["mp3"] },
+  { mime: "audio/ogg", category: "audio", extensions: ["ogg", "opus"] },
+  { mime: "application/pdf", category: "pdf", extensions: ["pdf"] },
+];
+
+const NAME_SEARCH_DEBOUNCE_MS = 300;
+const NAME_MAX_LENGTH = 200;
 
 const UPLOAD_ERROR_KEY: Record<string, TranslationKey> = {
   media_size_exceeded: "media_upload_error_size",
@@ -145,11 +188,112 @@ const UPLOAD_ERROR_KEY: Record<string, TranslationKey> = {
   media_storage_unavailable: "media_upload_error_busy",
 };
 
-function categoryOf(file: File): MediaCategory | undefined {
-  const mime = CATEGORY_BY_MIME[file.type.split(";")[0].trim().toLowerCase()];
-  if (mime) return mime;
-  const extension = /\.([^.]+)$/.exec(file.name.toLowerCase())?.[1];
-  return extension ? CATEGORY_BY_EXTENSION[extension] : undefined;
+function canonicalMime(type: string) {
+  return type.split(";")[0].trim().toLowerCase();
+}
+
+function extensionOf(name: string) {
+  return /\.([^.]+)$/.exec(name.toLowerCase())?.[1];
+}
+
+function formatOfMime(mime: string) {
+  return MEDIA_FORMATS.find((format) => format.mime === mime);
+}
+
+// The accepted format a picked file claims: by its declared type first, then
+// by its extension, because some systems declare no type at all.
+function formatOfFile(file: File) {
+  const extension = extensionOf(file.name);
+  return (
+    formatOfMime(canonicalMime(file.type)) ??
+    MEDIA_FORMATS.find(
+      (format) => extension !== undefined && format.extensions.includes(extension),
+    )
+  );
+}
+
+// A name keeps its own extension when its format allows it (photo.jpeg stays
+// .jpeg); anything else gets the format's canonical one.
+function extensionFor(mime: string, filename: string) {
+  const format = formatOfMime(mime);
+  const own = extensionOf(filename);
+  if (!format) return own ?? "";
+  return own && format.extensions.includes(own) ? own : format.extensions[0];
+}
+
+function stripExtension(name: string, mime: string) {
+  const format = formatOfMime(mime);
+  const own = extensionOf(name);
+  return format && own && format.extensions.includes(own)
+    ? name.slice(0, -(own.length + 1))
+    : name;
+}
+
+// "Nome do arquivo" is the one name the clinic sees: the list, the download
+// and the file a patient receives all use it. The extension is locked to the
+// real format so a rename can never claim another type.
+function storedNames(name: string, mime: string, extension: string) {
+  // NFC so a name macOS handed over decomposed is stored as it is typed; the
+  // trailing dots and spaces would otherwise end up before the extension.
+  const base = stripExtension(name.normalize("NFC").trim(), mime).replace(
+    /[.\s]+$/,
+    "",
+  );
+  return {
+    display_name: base,
+    original_filename: extension ? `${base}.${extension}` : base,
+  };
+}
+
+// The name the catalog shows is the one that goes out: the download and the
+// file a patient receives both carry original_filename. Rows saved before the
+// single name field may still hold a different display_name; it is not shown.
+function fileNameOf(asset: MediaAsset) {
+  return asset.original_filename;
+}
+
+function formatLabel(mime: string, filename: string) {
+  if (mime === "audio/ogg") return "OGG/OPUS";
+  return extensionFor(mime, filename).toUpperCase();
+}
+
+function acceptFor(category: MediaCategory | "") {
+  return MEDIA_FORMATS.filter(
+    (format) => !category || format.category === category,
+  )
+    .flatMap((format) => [
+      format.mime,
+      ...format.extensions.map((extension) => `.${extension}`),
+    ])
+    .join(",");
+}
+
+// Mirrors _NAME_SEARCH_* in src/api/routes/media_assets.py exactly: lower
+// case, the listed accented letters to their base, combining marks dropped.
+const NAME_SEARCH_ACCENTED =
+  "\u00e1\u00e0\u00e2\u00e3\u00e4\u00e5\u00e9\u00e8\u00ea\u00eb\u00ed\u00ec\u00ee\u00ef" +
+  "\u00f3\u00f2\u00f4\u00f5\u00f6\u00fa\u00f9\u00fb\u00fc\u00e7\u00f1";
+const NAME_SEARCH_PLAIN = "aaaaaaeeeeiiiiooooouuuucn";
+
+function foldName(text: string) {
+  let folded = "";
+  for (const character of text.toLowerCase()) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code >= 0x0300 && code <= 0x036f) continue;
+    const index = NAME_SEARCH_ACCENTED.indexOf(character);
+    folded += index === -1 ? character : NAME_SEARCH_PLAIN[index];
+  }
+  return folded;
+}
+
+// Client-side twin of the list filters, used only to place an item the user
+// just uploaded or renamed; the server stays the source of every page.
+function matchesFilters(asset: MediaAsset, filters: ListFilters) {
+  if (filters.category && asset.category !== filters.category) return false;
+  return (
+    !filters.name ||
+    foldName(asset.original_filename).includes(foldName(filters.name))
+  );
 }
 
 async function uploadErrorKey(response: Response): Promise<TranslationKey> {
@@ -172,22 +316,15 @@ function authToken() {
   }
 }
 
-function formatBytes(bytes: number, locale: "pt" | "en") {
-  const megabytes = bytes / 1_000_000;
-  if (megabytes >= 1) {
-    return `${new Intl.NumberFormat(locale === "pt" ? "pt-BR" : "en-US", {
-      maximumFractionDigits: 1,
-    }).format(megabytes)} MB`;
-  }
-  return `${Math.max(1, Math.round(bytes / 1_000))} KB`;
-}
-
 function categoryIcon(category: MediaCategory) {
   if (category === "video") return FileVideo;
   if (category === "audio") return FileAudio;
   if (category === "pdf") return FileText;
   return FileImage;
 }
+
+const SELECT_CLASS =
+  "h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
 export default function Midias() {
   const {
@@ -214,17 +351,28 @@ export default function Midias() {
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
 
-  const controllersRef = useRef(new Set<AbortController>());
+  const [categoryFilter, setCategoryFilter] = useState<MediaCategory | "">("");
+  const [nameQuery, setNameQuery] = useState("");
+  const [appliedName, setAppliedName] = useState("");
+  const listKey = JSON.stringify([scope, categoryFilter, appliedName]);
+  const listKeyRef = useRef(listKey);
+  listKeyRef.current = listKey;
+
+  const mutationControllersRef = useRef(new Set<AbortController>());
+  const listControllersRef = useRef(new Set<AbortController>());
   const catalogRevisionRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const autoNameRef = useRef("");
   const [reloadVersion, setReloadVersion] = useState(0);
   const [catalog, setCatalog] = useState<CatalogState>({
     scope,
+    category: categoryFilter,
+    name: appliedName,
     ...EMPTY_CATALOG,
   });
   const [file, setFile] = useState<File | null>(null);
-  const [displayName, setDisplayName] = useState("");
-  const [originalFilename, setOriginalFilename] = useState("");
+  const [fileType, setFileType] = useState<MediaCategory | "">("");
+  const [fileName, setFileName] = useState("");
   const [usageTrigger, setUsageTrigger] = useState("");
   const [autoSuggest, setAutoSuggest] = useState(false);
   const [uploadingScope, setUploadingScope] = useState<string | null>(null);
@@ -241,118 +389,167 @@ export default function Midias() {
     success: boolean;
     messageKey?: TranslationKey;
   } | null>(null);
-  const [fileError, setFileError] = useState(false);
+  const [fileError, setFileError] = useState<TranslationKey | null>(null);
 
-  function abortRequests() {
-    for (const controller of controllersRef.current) controller.abort();
-    controllersRef.current.clear();
+  function abortAll(controllers: Set<AbortController>) {
+    for (const controller of controllers) controller.abort();
+    controllers.clear();
   }
 
-  function requestController() {
+  function requestController(controllers: Set<AbortController>) {
     const controller = new AbortController();
-    controllersRef.current.add(controller);
+    controllers.add(controller);
     return controller;
   }
 
-  function finishRequest(controller: AbortController) {
-    controllersRef.current.delete(controller);
-  }
-
-  function mediaUrl(path = "", cursor?: string | null) {
+  function mediaUrl(
+    path = "",
+    cursor?: string | null,
+    filters?: ListFilters,
+  ) {
     const params = new URLSearchParams();
     if (requiresSelectedClinic) params.set("tenant_id", viewingClinicId);
+    if (filters?.category) params.set("category", filters.category);
+    if (filters?.name) params.set("name", filters.name);
     if (cursor) params.set("cursor", cursor);
     const query = params.toString();
     return `/v1/media-assets${path}${query ? `?${query}` : ""}`;
   }
 
-  useEffect(() => {
-    abortRequests();
-    setCatalog({ scope, ...EMPTY_CATALOG, loading: canManage });
+  function clearFileInput() {
     setFile(null);
-    setDisplayName("");
-    setOriginalFilename("");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  useEffect(() => {
+    const handle = setTimeout(
+      () => setAppliedName(nameQuery.trim()),
+      NAME_SEARCH_DEBOUNCE_MS,
+    );
+    return () => clearTimeout(handle);
+  }, [nameQuery]);
+
+  // A clinic change drops every in-flight mutation and every per-clinic draft.
+  useEffect(() => {
+    const mutations = mutationControllersRef.current;
+    abortAll(mutations);
+    clearFileInput();
+    setFileType("");
+    setFileName("");
+    autoNameRef.current = "";
     setUsageTrigger("");
     setAutoSuggest(false);
-    setFileError(false);
+    setFileError(null);
     setUploadingScope(null);
     setEditState(null);
     setDeleteState(null);
     setBusyAsset(null);
     setFeedback(null);
-    if (fileInputRef.current) fileInputRef.current.value = "";
+    return () => abortAll(mutations);
+  }, [scope]);
 
-    if (!canManage) return abortRequests;
+  // The first page for the current clinic and filters. Changing a filter only
+  // replaces the list; it never aborts an upload, edit or delete.
+  useEffect(() => {
+    const lists = listControllersRef.current;
+    abortAll(lists);
+    const filters: ListFilters = {
+      category: categoryFilter,
+      name: appliedName,
+    };
+    setCatalog({ scope, ...filters, ...EMPTY_CATALOG, loading: canManage });
+
+    if (!canManage) return () => abortAll(lists);
 
     const requestScope = scope;
-    const requestRevision = catalogRevisionRef.current;
-    const controller = requestController();
-    void fetch(mediaUrl(), {
-      headers: { Authorization: `Bearer ${authToken()}` },
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`media-list-${response.status}`);
-        return (await response.json()) as MediaListResponse;
+    const requestKey = listKey;
+    // A first page answered after an upload, edit or delete landed may predate
+    // it, so it is asked for again rather than shown or dropped: dropping it
+    // would leave a filtered list empty, and showing it could undo the change.
+    const loadFirstPage = () => {
+      const requestRevision = catalogRevisionRef.current;
+      const controller = requestController(lists);
+      void fetch(mediaUrl("", null, filters), {
+        headers: { Authorization: `Bearer ${authToken()}` },
+        signal: controller.signal,
       })
-      .then((page) => {
-        if (scopeRef.current !== requestScope || controller.signal.aborted)
-          return;
-        if (catalogRevisionRef.current !== requestRevision) {
-          setCatalog((current) =>
-            current.scope === requestScope
-              ? { ...current, loading: false, loadingMore: false }
-              : current,
-          );
-          return;
-        }
-        setCatalog({
-          scope: requestScope,
-          items: page.items,
-          nextCursor: page.next_cursor,
-          hasMore: page.has_more,
-          loading: false,
-          loadingMore: false,
-          error: false,
-        });
-      })
-      .catch((error: unknown) => {
-        if (
-          controller.signal.aborted ||
-          (error instanceof DOMException && error.name === "AbortError") ||
-          scopeRef.current !== requestScope
-        ) {
-          return;
-        }
-        if (catalogRevisionRef.current !== requestRevision) {
-          setCatalog((current) =>
-            current.scope === requestScope
-              ? { ...current, loading: false, loadingMore: false }
-              : current,
-          );
-          return;
-        }
-        setCatalog({
-          scope: requestScope,
-          ...EMPTY_CATALOG,
-          error: true,
-        });
-      })
-      .finally(() => finishRequest(controller));
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`media-list-${response.status}`);
+          return (await response.json()) as MediaListResponse;
+        })
+        .then((page) => {
+          if (listKeyRef.current !== requestKey || controller.signal.aborted)
+            return;
+          if (catalogRevisionRef.current !== requestRevision) {
+            loadFirstPage();
+            return;
+          }
+          setCatalog({
+            scope: requestScope,
+            ...filters,
+            items: page.items,
+            nextCursor: page.next_cursor,
+            hasMore: page.has_more,
+            loading: false,
+            loadingMore: false,
+            error: false,
+          });
+        })
+        .catch((error: unknown) => {
+          if (
+            controller.signal.aborted ||
+            (error instanceof DOMException && error.name === "AbortError") ||
+            listKeyRef.current !== requestKey
+          ) {
+            return;
+          }
+          if (catalogRevisionRef.current !== requestRevision) {
+            loadFirstPage();
+            return;
+          }
+          setCatalog({
+            scope: requestScope,
+            ...filters,
+            ...EMPTY_CATALOG,
+            error: true,
+          });
+        })
+        .finally(() => lists.delete(controller));
+    };
+    loadFirstPage();
 
-    return abortRequests;
+    return () => abortAll(lists);
     // reloadVersion intentionally replays the initial keyset page for Retry.
-  }, [canManage, reloadVersion, scope]);
+  }, [canManage, reloadVersion, listKey]);
 
   const currentCatalog =
-    catalog.scope === scope
+    catalog.scope === scope &&
+    catalog.category === categoryFilter &&
+    catalog.name === appliedName
       ? catalog
-      : { scope, ...EMPTY_CATALOG, loading: canManage };
+      : {
+          scope,
+          category: categoryFilter,
+          name: appliedName,
+          ...EMPTY_CATALOG,
+          loading: canManage,
+        };
+  const filtersActive = Boolean(categoryFilter || appliedName);
   const currentEdit = editState?.scope === scope ? editState : null;
   const currentDelete = deleteState?.scope === scope ? deleteState : null;
   const currentBusy = busyAsset?.scope === scope ? busyAsset : null;
   const currentFeedback = feedback?.scope === scope ? feedback : null;
   const isUploading = uploadingScope === scope;
+  const fileFormat = file ? formatOfFile(file) : undefined;
+  const fileExtension =
+    file && fileFormat ? extensionFor(fileFormat.mime, file.name) : "";
+  const uploadNames = fileFormat
+    ? storedNames(fileName, fileFormat.mime, fileExtension)
+    : null;
+  const canUpload =
+    canManage &&
+    !isUploading &&
+    Boolean(file && fileFormat && fileType && uploadNames?.display_name);
 
   async function loadMore() {
     if (
@@ -364,22 +561,27 @@ export default function Midias() {
       return;
     }
     const requestScope = scope;
+    const requestKey = listKey;
+    const filters: ListFilters = {
+      category: currentCatalog.category,
+      name: currentCatalog.name,
+    };
     const cursor = currentCatalog.nextCursor;
     const requestRevision = catalogRevisionRef.current;
-    const controller = requestController();
+    const controller = requestController(listControllersRef.current);
     setCatalog((current) =>
       current.scope === requestScope
         ? { ...current, loadingMore: true, error: false }
         : current,
     );
     try {
-      const response = await fetch(mediaUrl("", cursor), {
+      const response = await fetch(mediaUrl("", cursor, filters), {
         headers: { Authorization: `Bearer ${authToken()}` },
         signal: controller.signal,
       });
       if (!response.ok) throw new Error(`media-list-${response.status}`);
       const page = (await response.json()) as MediaListResponse;
-      if (scopeRef.current !== requestScope || controller.signal.aborted)
+      if (listKeyRef.current !== requestKey || controller.signal.aborted)
         return;
       setCatalog((current) => {
         if (current.scope !== requestScope) return current;
@@ -402,7 +604,7 @@ export default function Midias() {
       if (
         controller.signal.aborted ||
         (error instanceof DOMException && error.name === "AbortError") ||
-        scopeRef.current !== requestScope
+        listKeyRef.current !== requestKey
       ) {
         return;
       }
@@ -419,47 +621,80 @@ export default function Midias() {
           : current,
       );
     } finally {
-      finishRequest(controller);
+      listControllersRef.current.delete(controller);
     }
+  }
+
+  function rejectFile(
+    event: React.ChangeEvent<HTMLInputElement>,
+    key: TranslationKey,
+  ) {
+    event.target.value = "";
+    setFile(null);
+    setFileError(key);
   }
 
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const selected = event.target.files?.[0] ?? null;
     setFeedback(null);
-    // A file this page cannot classify is still offered to the server, which
-    // decides the category from the content signature rather than the name.
-    const category = selected ? categoryOf(selected) : undefined;
-    if (
-      selected &&
-      category &&
-      selected.size > MAX_BYTES_BY_CATEGORY[category]
-    ) {
-      event.target.value = "";
+    if (!selected) {
       setFile(null);
-      setFileError(true);
+      setFileError(null);
       return;
     }
-    setFileError(false);
-    setFile(selected);
-    if (selected) {
-      setOriginalFilename(selected.name);
-      setDisplayName(
-        (current) => current || selected.name.replace(/\.[^.]+$/, ""),
-      );
-    } else {
-      setOriginalFilename("");
+    const format = formatOfFile(selected);
+    if (!format) {
+      rejectFile(event, "media_upload_error_format");
+      return;
     }
+    if (fileType && format.category !== fileType) {
+      rejectFile(event, "media_file_wrong_type");
+      return;
+    }
+    if (selected.size > MAX_BYTES_BY_CATEGORY[format.category]) {
+      rejectFile(event, CATEGORY_TOO_LARGE_KEY[format.category]);
+      return;
+    }
+    setFileError(null);
+    setFile(selected);
+    setFileType(format.category);
+    // A name the user typed survives a new file; one we filled in does not.
+    // The updater runs later, so it must compare against the previous fill.
+    const suggested = selected.name
+      .normalize("NFC")
+      .replace(/\.[^.]+$/, "")
+      .slice(0, NAME_MAX_LENGTH);
+    const previousSuggestion = autoNameRef.current;
+    autoNameRef.current = suggested;
+    setFileName((current) =>
+      current === "" || current === previousSuggestion ? suggested : current,
+    );
+  }
+
+  function handleTypeChange(value: MediaCategory | "") {
+    setFileType(value);
+    setFeedback(null);
+    setFileError(null);
+    if (file && formatOfFile(file)?.category !== value) clearFileInput();
   }
 
   async function uploadAsset(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!file || !displayName || !originalFilename || !canManage) return;
+    if (!canUpload || !file || !fileFormat || !uploadNames) return;
     const requestScope = scope;
-    const controller = requestController();
+    const controller = requestController(mutationControllersRef.current);
+    // Some systems declare no type for .opus or .jpeg; the server needs the
+    // declared type to agree with the signature, so send the one we resolved.
+    const payload = formatOfMime(canonicalMime(file.type))
+      ? file
+      : new File([file], file.name, {
+          type: fileFormat.mime,
+          lastModified: file.lastModified,
+        });
     const form = new FormData();
-    form.append("file", file);
-    form.append("display_name", displayName);
-    form.append("original_filename", originalFilename);
+    form.append("file", payload);
+    form.append("display_name", uploadNames.display_name);
+    form.append("original_filename", uploadNames.original_filename);
     if (usageTrigger !== "") form.append("usage_trigger", usageTrigger);
     form.append("auto_suggest", autoSuggest ? "true" : "false");
     setUploadingScope(requestScope);
@@ -487,26 +722,21 @@ export default function Midias() {
       if (scopeRef.current !== requestScope || controller.signal.aborted)
         return;
       catalogRevisionRef.current += 1;
-      setCatalog((current) =>
-        current.scope === requestScope
-          ? {
-              ...current,
-              loading: false,
-              loadingMore: false,
-              error: false,
-              items: [
-                created,
-                ...current.items.filter((item) => item.id !== created.id),
-              ],
-            }
-          : current,
-      );
-      setFile(null);
-      setDisplayName("");
-      setOriginalFilename("");
+      setCatalog((current) => {
+        if (current.scope !== requestScope) return current;
+        const rest = current.items.filter((item) => item.id !== created.id);
+        return {
+          ...current,
+          error: false,
+          items: matchesFilters(created, current) ? [created, ...rest] : rest,
+        };
+      });
+      clearFileInput();
+      setFileType("");
+      setFileName("");
+      autoNameRef.current = "";
       setUsageTrigger("");
       setAutoSuggest(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
       setFeedback({ scope: requestScope, kind: "upload", success: true });
     } catch (error) {
       if (
@@ -518,7 +748,7 @@ export default function Midias() {
       }
       setFeedback({ scope: requestScope, kind: "upload", success: false });
     } finally {
-      finishRequest(controller);
+      mutationControllersRef.current.delete(controller);
       if (scopeRef.current === requestScope) setUploadingScope(null);
     }
   }
@@ -528,25 +758,33 @@ export default function Midias() {
     setEditState({
       scope,
       asset,
-      displayName: asset.display_name,
-      originalFilename: asset.original_filename,
+      // original_filename may hold up to 255 characters; display_name only 200.
+      name: stripExtension(asset.original_filename, asset.mime_type).slice(
+        0,
+        NAME_MAX_LENGTH,
+      ),
       usageTrigger: asset.usage_trigger ?? "",
       usageTriggerIsNull: asset.usage_trigger === null,
       autoSuggest: asset.auto_suggest,
     });
   }
 
+  const editExtension = currentEdit
+    ? extensionFor(
+        currentEdit.asset.mime_type,
+        currentEdit.asset.original_filename,
+      )
+    : "";
+  const editNames = currentEdit
+    ? storedNames(currentEdit.name, currentEdit.asset.mime_type, editExtension)
+    : null;
+
   async function saveEdit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (
-      !currentEdit ||
-      !currentEdit.displayName ||
-      !currentEdit.originalFilename
-    )
-      return;
+    if (!currentEdit || !editNames?.display_name) return;
     const requestScope = scope;
     const assetId = currentEdit.asset.id;
-    const controller = requestController();
+    const controller = requestController(mutationControllersRef.current);
     setBusyAsset({ scope: requestScope, id: assetId, kind: "edit" });
     setFeedback(null);
     try {
@@ -557,8 +795,8 @@ export default function Midias() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          display_name: currentEdit.displayName,
-          original_filename: currentEdit.originalFilename,
+          display_name: editNames.display_name,
+          original_filename: editNames.original_filename,
           usage_trigger: currentEdit.usageTriggerIsNull
             ? null
             : currentEdit.usageTrigger,
@@ -575,12 +813,11 @@ export default function Midias() {
         current.scope === requestScope
           ? {
               ...current,
-              loading: false,
-              loadingMore: false,
               error: false,
-              items: current.items.map((item) =>
-                item.id === updated.id ? updated : item,
-              ),
+              items: current.items.flatMap((item) => {
+                if (item.id !== updated.id) return [item];
+                return matchesFilters(updated, current) ? [updated] : [];
+              }),
             }
           : current,
       );
@@ -596,14 +833,14 @@ export default function Midias() {
       }
       setFeedback({ scope: requestScope, kind: "edit", success: false });
     } finally {
-      finishRequest(controller);
+      mutationControllersRef.current.delete(controller);
       if (scopeRef.current === requestScope) setBusyAsset(null);
     }
   }
 
   async function downloadAsset(asset: MediaAsset) {
     const requestScope = scope;
-    const controller = requestController();
+    const controller = requestController(mutationControllersRef.current);
     setBusyAsset({ scope: requestScope, id: asset.id, kind: "download" });
     setFeedback(null);
     try {
@@ -638,7 +875,7 @@ export default function Midias() {
       }
       setFeedback({ scope: requestScope, kind: "download", success: false });
     } finally {
-      finishRequest(controller);
+      mutationControllersRef.current.delete(controller);
       if (scopeRef.current === requestScope) setBusyAsset(null);
     }
   }
@@ -647,7 +884,7 @@ export default function Midias() {
     if (!currentDelete) return;
     const requestScope = scope;
     const assetId = currentDelete.asset.id;
-    const controller = requestController();
+    const controller = requestController(mutationControllersRef.current);
     setBusyAsset({ scope: requestScope, id: assetId, kind: "delete" });
     setFeedback(null);
     try {
@@ -664,8 +901,6 @@ export default function Midias() {
         current.scope === requestScope
           ? {
               ...current,
-              loading: false,
-              loadingMore: false,
               error: false,
               items: current.items.filter((item) => item.id !== assetId),
             }
@@ -683,7 +918,7 @@ export default function Midias() {
       }
       setFeedback({ scope: requestScope, kind: "delete", success: false });
     } finally {
-      finishRequest(controller);
+      mutationControllersRef.current.delete(controller);
       if (scopeRef.current === requestScope) setBusyAsset(null);
     }
   }
@@ -728,6 +963,8 @@ export default function Midias() {
     );
   }
 
+  const deleteName = currentDelete ? fileNameOf(currentDelete.asset) : "";
+
   return (
     <div className="mx-auto max-w-6xl space-y-6" data-testid="media-catalog">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -745,14 +982,6 @@ export default function Midias() {
           </div>
         </div>
         <Badge variant="outline">{t("media_supported_formats")}</Badge>
-      </div>
-
-      <div
-        className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-foreground"
-        role="note"
-      >
-        <strong>{t("media_catalog_only_title")}</strong>{" "}
-        {t("media_catalog_only_description")}
       </div>
 
       {/* Credits (Group 6): the clinic's builder's media allocation, read
@@ -780,47 +1009,66 @@ export default function Midias() {
                 ref={fileInputRef}
                 id="media-file"
                 type="file"
-                accept="video/mp4,audio/mpeg,audio/ogg,application/pdf,image/jpeg,image/png,.mp4,.mp3,.ogg,.opus,.pdf,.jpg,.jpeg,.png"
+                accept={acceptFor(fileType)}
                 onChange={handleFileChange}
                 required
                 disabled={isUploading}
               />
               <p className="text-xs text-muted-foreground">
-                {t("media_file_help")}
+                {t(fileType ? CATEGORY_HELP_KEY[fileType] : "media_file_help")}
               </p>
               {fileError && (
                 <p className="text-sm text-destructive" role="alert">
-                  {t("media_file_too_large")}
+                  {t(fileError)}
                 </p>
               )}
             </div>
 
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-1.5">
-                <Label htmlFor="media-display-name">
-                  {t("media_display_name_label")}
+                <Label htmlFor="media-file-name">
+                  {t("media_file_name_label")}
                 </Label>
-                <Input
-                  id="media-display-name"
-                  value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  maxLength={200}
-                  required
-                  disabled={isUploading}
-                />
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="media-file-name"
+                    value={fileName}
+                    onChange={(event) => setFileName(event.target.value)}
+                    maxLength={NAME_MAX_LENGTH}
+                    required
+                    disabled={isUploading}
+                  />
+                  {fileExtension && (
+                    <span
+                      className="shrink-0 text-sm text-muted-foreground"
+                      data-testid="media-file-extension"
+                    >
+                      .{fileExtension}
+                    </span>
+                  )}
+                </div>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="media-original-filename">
-                  {t("media_original_filename_label")}
+                <Label htmlFor="media-file-type">
+                  {t("media_file_type_label")}
                 </Label>
-                <Input
-                  id="media-original-filename"
-                  value={originalFilename}
-                  onChange={(event) => setOriginalFilename(event.target.value)}
-                  maxLength={255}
+                <select
+                  id="media-file-type"
+                  className={SELECT_CLASS}
+                  value={fileType}
+                  onChange={(event) =>
+                    handleTypeChange(event.target.value as MediaCategory | "")
+                  }
                   required
                   disabled={isUploading}
-                />
+                >
+                  <option value="">{t("media_file_type_placeholder")}</option>
+                  {MEDIA_CATEGORIES.map((category) => (
+                    <option key={category} value={category}>
+                      {t(CATEGORY_LABEL_KEY[category])}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
 
@@ -856,12 +1104,7 @@ export default function Midias() {
             </div>
 
             <div className="flex justify-end">
-              <Button
-                type="submit"
-                disabled={
-                  isUploading || !file || !displayName || !originalFilename
-                }
-              >
+              <Button type="submit" disabled={!canUpload}>
                 {isUploading ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 ) : (
@@ -893,15 +1136,49 @@ export default function Midias() {
       )}
 
       <Card>
-        <CardHeader className="flex-row items-center justify-between space-y-0">
-          <CardTitle className="text-base">
-            {t("media_library_title")}
-          </CardTitle>
-          {!currentCatalog.loading && (
-            <span className="text-xs text-muted-foreground">
-              {currentCatalog.items.length} {t("media_items_loaded")}
-            </span>
-          )}
+        <CardHeader className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle className="text-base">
+              {t("media_library_title")}
+            </CardTitle>
+            {!currentCatalog.loading && (
+              <span className="text-xs text-muted-foreground">
+                {currentCatalog.items.length} {t("media_items_loaded")}
+              </span>
+            )}
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <div className="relative flex-1">
+              <Search
+                className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <Input
+                type="search"
+                className="pl-8"
+                value={nameQuery}
+                onChange={(event) => setNameQuery(event.target.value)}
+                maxLength={NAME_MAX_LENGTH}
+                placeholder={t("media_search_placeholder")}
+                aria-label={t("media_search_label")}
+              />
+            </div>
+            <select
+              className={`${SELECT_CLASS} sm:w-48`}
+              value={categoryFilter}
+              onChange={(event) =>
+                setCategoryFilter(event.target.value as MediaCategory | "")
+              }
+              aria-label={t("media_filter_type_label")}
+            >
+              <option value="">{t("media_filter_all_types")}</option>
+              {MEDIA_CATEGORIES.map((category) => (
+                <option key={category} value={category}>
+                  {t(CATEGORY_LABEL_KEY[category])}
+                </option>
+              ))}
+            </select>
+          </div>
         </CardHeader>
         <CardContent>
           {currentCatalog.loading ? (
@@ -929,90 +1206,112 @@ export default function Midias() {
             </div>
           ) : currentCatalog.items.length === 0 ? (
             <div className="py-12 text-center text-sm text-muted-foreground">
-              {t("media_empty")}
+              {t(filtersActive ? "media_empty_filtered" : "media_empty")}
             </div>
           ) : (
             <div className="space-y-3">
-              <ul
-                className="divide-y divide-border"
-                aria-label={t("media_library_title")}
-              >
-                {currentCatalog.items.map((asset) => {
-                  const Icon = categoryIcon(asset.category);
-                  const assetBusy = currentBusy?.id === asset.id;
-                  return (
-                    <li
-                      key={asset.id}
-                      className="flex flex-col gap-3 py-4 first:pt-0 sm:flex-row sm:items-center"
-                      data-testid={`media-item-${asset.id}`}
-                    >
-                      <div className="flex min-w-0 flex-1 items-start gap-3">
-                        <div className="mt-0.5 rounded-lg bg-sky-500/10 p-2 text-sky-500">
-                          <Icon className="h-5 w-5" aria-hidden="true" />
-                        </div>
-                        <div className="min-w-0 space-y-1">
-                          <p className="break-words font-semibold">
-                            {asset.display_name}
-                          </p>
-                          <p className="break-all text-xs text-muted-foreground">
-                            {asset.original_filename} ·{" "}
-                            {formatBytes(asset.size_bytes, locale)}
-                          </p>
-                          <p className="break-words text-sm text-muted-foreground">
-                            <span className="font-medium text-foreground">
-                              {t("media_usage_trigger_label")}:
-                            </span>{" "}
-                            {asset.usage_trigger ?? t("media_no_usage_trigger")}
-                          </p>
-                          <Badge
-                            variant={asset.auto_suggest ? "default" : "outline"}
-                          >
-                            {asset.auto_suggest
-                              ? t("media_auto_suggest_on")
-                              : t("media_auto_suggest_off")}
-                          </Badge>
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap gap-2 sm:justify-end">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => void downloadAsset(asset)}
-                          disabled={assetBusy}
-                          aria-label={`${t("media_download_action")}: ${asset.display_name}`}
-                        >
-                          {assetBusy && currentBusy?.kind === "download" ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Download className="h-4 w-4" />
-                          )}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => openEdit(asset)}
-                          disabled={assetBusy}
-                          aria-label={`${t("media_edit_action")}: ${asset.display_name}`}
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => setDeleteState({ scope, asset })}
-                          disabled={assetBusy}
-                          aria-label={`${t("media_delete_action")}: ${asset.display_name}`}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
+              <Table aria-label={t("media_library_title")}>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{t("media_column_name")}</TableHead>
+                    <TableHead className="hidden sm:table-cell">
+                      {t("media_column_type")}
+                    </TableHead>
+                    <TableHead className="hidden sm:table-cell">
+                      {t("media_column_format")}
+                    </TableHead>
+                    <TableHead className="text-right">
+                      <span className="sr-only">
+                        {t("media_column_actions")}
+                      </span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {currentCatalog.items.map((asset) => {
+                    const Icon = categoryIcon(asset.category);
+                    const assetBusy = currentBusy?.id === asset.id;
+                    const name = fileNameOf(asset);
+                    const typeLabel = t(CATEGORY_LABEL_KEY[asset.category]);
+                    const format = formatLabel(
+                      asset.mime_type,
+                      asset.original_filename,
+                    );
+                    return (
+                      <TableRow
+                        key={asset.id}
+                        data-testid={`media-item-${asset.id}`}
+                      >
+                        <TableCell>
+                          <div className="flex min-w-0 items-start gap-2">
+                            <Icon
+                              className="mt-0.5 h-4 w-4 shrink-0 text-sky-500"
+                              aria-hidden="true"
+                            />
+                            <div className="min-w-0">
+                              <span className="font-medium [overflow-wrap:anywhere]">
+                                {name}
+                              </span>
+                              {/* Below sm the type and format columns fold
+                                  under the name so it keeps the row width. */}
+                              <p className="mt-0.5 text-xs text-muted-foreground sm:hidden">
+                                {typeLabel} · {format}
+                              </p>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="hidden sm:table-cell">
+                          {typeLabel}
+                        </TableCell>
+                        <TableCell className="hidden whitespace-nowrap sm:table-cell">
+                          {format}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex justify-end gap-1">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-8 w-8 p-0"
+                              onClick={() => void downloadAsset(asset)}
+                              disabled={assetBusy}
+                              aria-label={`${t("media_download_action")}: ${name}`}
+                            >
+                              {assetBusy && currentBusy?.kind === "download" ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <Download className="h-4 w-4" />
+                              )}
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-8 w-8 p-0"
+                              onClick={() => openEdit(asset)}
+                              disabled={assetBusy}
+                              aria-label={`${t("media_edit_action")}: ${name}`}
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-8 w-8 p-0"
+                              onClick={() => setDeleteState({ scope, asset })}
+                              disabled={assetBusy}
+                              aria-label={`${t("media_delete_action")}: ${name}`}
+                            >
+                              <Trash2 className="h-4 w-4 text-destructive" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
 
               {currentCatalog.error && (
                 <p
@@ -1057,43 +1356,44 @@ export default function Midias() {
           </DialogHeader>
           {currentEdit && (
             <form className="space-y-4" onSubmit={saveEdit}>
-              <div className="space-y-1.5">
-                <Label htmlFor="media-edit-display-name">
-                  {t("media_display_name_label")}
-                </Label>
-                <Input
-                  id="media-edit-display-name"
-                  value={currentEdit.displayName}
-                  onChange={(event) =>
-                    setEditState((current) =>
-                      current?.scope === scope
-                        ? { ...current, displayName: event.target.value }
-                        : current,
-                    )
-                  }
-                  maxLength={200}
-                  required
-                  disabled={currentBusy?.kind === "edit"}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="media-edit-original-filename">
-                  {t("media_original_filename_label")}
-                </Label>
-                <Input
-                  id="media-edit-original-filename"
-                  value={currentEdit.originalFilename}
-                  onChange={(event) =>
-                    setEditState((current) =>
-                      current?.scope === scope
-                        ? { ...current, originalFilename: event.target.value }
-                        : current,
-                    )
-                  }
-                  maxLength={255}
-                  required
-                  disabled={currentBusy?.kind === "edit"}
-                />
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <Label htmlFor="media-edit-file-name">
+                    {t("media_file_name_label")}
+                  </Label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      id="media-edit-file-name"
+                      value={currentEdit.name}
+                      onChange={(event) =>
+                        setEditState((current) =>
+                          current?.scope === scope
+                            ? { ...current, name: event.target.value }
+                            : current,
+                        )
+                      }
+                      maxLength={NAME_MAX_LENGTH}
+                      required
+                      disabled={currentBusy?.kind === "edit"}
+                    />
+                    {editExtension && (
+                      <span className="shrink-0 text-sm text-muted-foreground">
+                        .{editExtension}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="media-edit-file-type">
+                    {t("media_file_type_label")}
+                  </Label>
+                  <Input
+                    id="media-edit-file-type"
+                    value={t(CATEGORY_LABEL_KEY[currentEdit.asset.category])}
+                    readOnly
+                    disabled
+                  />
+                </div>
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="media-edit-usage-trigger">
@@ -1114,6 +1414,7 @@ export default function Midias() {
                     )
                   }
                   maxLength={500}
+                  placeholder={t("media_usage_trigger_placeholder")}
                   disabled={
                     currentBusy?.kind === "edit" ||
                     currentEdit.usageTriggerIsNull
@@ -1167,9 +1468,7 @@ export default function Midias() {
                 <Button
                   type="submit"
                   disabled={
-                    currentBusy?.kind === "edit" ||
-                    !currentEdit.displayName ||
-                    !currentEdit.originalFilename
+                    currentBusy?.kind === "edit" || !editNames?.display_name
                   }
                 >
                   {currentBusy?.kind === "edit" && (
@@ -1193,15 +1492,16 @@ export default function Midias() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("media_delete_title")}</AlertDialogTitle>
+            <AlertDialogTitle className="break-words">
+              {t("media_delete_title").split("{name}").join(deleteName)}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              {t("media_delete_description")}{" "}
-              <strong>{currentDelete?.asset.display_name}</strong>
+              {t("media_delete_description")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={currentBusy?.kind === "delete"}>
-              {t("media_cancel")}
+              {t("media_delete_cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               onClick={(event) => {

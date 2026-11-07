@@ -130,6 +130,20 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
         "default": 25,
         "title": "Page Size",
     }
+    category = _parameter(listing, "category")
+    assert category["required"] is False
+    assert category["schema"]["anyOf"][0] == {
+        "type": "string",
+        "enum": ["video", "audio", "pdf", "image"],
+    }
+    name = _parameter(listing, "name")
+    assert name["required"] is False
+    assert name["schema"]["anyOf"][0] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "pattern": "^[^\\x00\\r\\n]*$",
+    }
 
     download = _operation(schema, "/v1/media-assets/{media_id}/content", "get")
     content = download["responses"]["200"]["content"]
