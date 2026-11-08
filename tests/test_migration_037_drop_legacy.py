@@ -104,10 +104,10 @@ def test_037_revises_036_and_038_follows_it(migration: ModuleType) -> None:
     assert [rev for rev, parent in revisions.values() if parent == "037"] == ["038"]
     # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
     # (lifecycle, legal hold, purge and roles) follows 040; Group 7: 042
-    # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg in the
-    # media category/MIME invariant) follows 042; 044 (audio/mp4 in the same
-    # invariant) is the head.
-    assert current_head() == "044"
+    # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg) and 044
+    # (audio/mp4) widen the media category/MIME invariant; envio-midia-agente:
+    # 045 (the media bridge) follows 044 and is the head.
+    assert current_head() == "045"
 
 
 def test_scope_is_the_four_legacy_tables_and_their_ten_functions(

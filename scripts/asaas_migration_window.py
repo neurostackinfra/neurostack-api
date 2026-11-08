@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Pure run tooling for the production migration windows 035, 036, 037 and 042.
+"""Pure run tooling for the production migration windows 035, 036, 037, 042 and 045.
 
-Four windows, each run only on its own explicit owner instruction, each with
+Five windows, each run only on its own explicit owner instruction, each with
 one entry in ``WINDOWS`` (the single source of truth; the planner
 ``scripts/asaas_production_wiring.py`` validates the manifest steps and
 renders the migrations task definition from the same table):
@@ -13,7 +13,12 @@ window   baked command              before  after  RDS snapshot
 ``036``  ``alembic upgrade 036``    035     036    ``pre-036-<date>``
 ``037``  ``alembic upgrade 037``    036     037    ``pre-037-<date>``
 ``042``  ``alembic upgrade 042``    037     042    ``pre-038-042-<date>``
+``045``  ``alembic upgrade 045``    042     045    ``pre-043-045-<date>``
 =======  =========================  ======  =====  ========================
+
+Window ``045`` also applies ``043`` and ``044`` (the media category/MIME
+invariant widened for ``audio/ogg``, then ``audio/mp4``), which have no window
+of their own: one ``alembic upgrade 045`` from ``042``, one transaction.
 
 Like ``scripts/asaas_deploy_hook.py`` (whose readback, log-paging and
 service building blocks it reuses) this tool never calls AWS. It reads a
@@ -44,7 +49,10 @@ always the system clock (no ``--now``).
                               window, SQLSTATE 55P03 / 40P01 / 55000.
 ``plan-post-read`` / ``render-post-read`` / ``verify-post-read``
                               ``alembic_version`` read back after the run; it
-                              must be exactly the window's ``after``.
+                              must be exactly the window's ``after`` (037 also
+                              reads the dropped tables gone, 045 the
+                              application role's privileges on what 045
+                              adds).
 
 ``scripts/asaas_rollout_readback.py`` reuses the read machinery (program,
 read family contract, RunTask hardening, log reader, exposure scan, output
@@ -127,10 +135,13 @@ RULE_VERSION_ONLY = "version_only"
 RULE_ZERO_COUNTS = "zero_counts"
 RULE_VERDICT_OK = "verdict_ok"
 RULE_RELATIONS_GONE = "relations_gone"
+# Every row names one object and reads true when the reading role holds every
+# privilege the next release needs on it (window 045's post-read).
+RULE_PRIVILEGES_HELD = "privileges_held"
 # 035: the service may still run the tagged revision 8 (expand-only window);
-# the migrations revision carries the bridge image. 036, 037 and 042 (every
-# window after the first; the table guard below refuses anything else): the
-# image containing the migration runs on every service task and is the
+# the migrations revision carries the bridge image. 036, 037, 042 and 045
+# (every window after the first; the table guard below refuses anything
+# else): the image containing the migration runs on every service task and is the
 # migrations revision's image, by digest, and the manifest's rollback_target
 # is the window's rollback_target_revision, with no pending re-pin, ACTIVE,
 # by digest. Two modes (asaas-rollout-opening Group 5b):
@@ -145,7 +156,9 @@ RULE_RELATIONS_GONE = "relations_gone"
 #   in the app image alone (the planner's reviewed_change). That is what the
 #   tool proves, by content; that the target is the very revision L2b
 #   replaced comes from the planner's L2b gate (the service on the target)
-#   and the runbook's stop rule, not from this check.
+#   and the runbook's stop rule, not from this check. 045 the same way, with
+#   revision 17 (the revision serving before the media bridge image; the
+#   owner confirmed it on 2026-11-07) and the service on the bridge image.
 IMAGE_RULE_BRIDGE = "migrations_revision_on_bridge_image"
 IMAGE_RULE_DEPLOYED = "service_runs_the_migrations_image"
 ROLLBACK_LAST_SAFETY_PIN = 10
@@ -262,6 +275,21 @@ PREFLIGHT_042 = (
     "038 functions present",
     "041 functions present",
     "042 functions present",
+)
+# Window 045 (envio-midia-agente, the media bridge release, with 043 and 044
+# riding along): the table 045 creates and the column it adds, each counted
+# when it already exists (a test keeps the SQL lists equal to the migration's
+# constants), and the media category/MIME check counted when it is not 042's
+# exactly (043 and 044 rewrite it); then, after the run, the application
+# role's privileges on what 045 adds (RULE_PRIVILEGES_HELD).
+PREFLIGHT_045 = (
+    "045 tables present",
+    "045 columns present",
+    "media mime check not at 042",
+)
+PRIVILEGES_045 = (
+    "dml on public.media_deliveries",
+    "dml on public.media_assets.trigger_intents",
 )
 
 WINDOW_035 = MigrationWindow(
@@ -420,8 +448,65 @@ WINDOW_042 = MigrationWindow(
         ("post_read", "S27"),
     ),
 )
+# The media bridge release of envio-midia-agente (Group 1, PR-A): migration
+# 045 adds media_assets.trigger_intents (NOT NULL DEFAULT '{}') and the table
+# media_deliveries, and no ORM model maps either, so the image that serves
+# before the window (the bridge image) keeps working on either schema. The
+# window also applies 043 and 044 (the media category/MIME invariant widened
+# for audio/ogg, then audio/mp4), which have no window of their own: 042 to
+# 045 in one run, one transaction. It runs after the bridge image serves
+# (IMAGE_RULE_DEPLOYED: the credit switch reads the schema revision against
+# the image's own chain, so the image must contain 045 before the database
+# does), and the behaviour release that maps both objects merges only after
+# it. The pre-read, as the application role, requires every count 0; the
+# post-read requires the revision and every privilege the behaviour release
+# needs on what 045 added, as that same role (the migrations carry no
+# GRANT). The revision 045 also stands for 043 and 044: one transaction, so
+# alembic_version reads 045 only once all three committed.
+WINDOW_045 = MigrationWindow(
+    name="045",
+    manifest_step="migrations_043_045",
+    before="042",
+    after="045",
+    chain=("042", "043", "044", "045"),
+    command=("alembic", "upgrade", "045"),
+    snapshot_prefix="pre-043-045-",
+    image_rule=IMAGE_RULE_DEPLOYED,
+    # The revision serving on 2026-11-07, read on ECS (us-east-1); the bridge
+    # image replaces it. The owner confirmed revision 17 on 2026-11-07.
+    rollback_target_revision=17,
+    started_by="neurostack-migration-window-045",
+    pre_read=ReadSpec(
+        phase="pre",
+        sql_file="scripts/migration_043_045_preflight.sql",
+        rule=RULE_ZERO_COUNTS,
+        checks=PREFLIGHT_045,
+        role=READ_ROLE_APP,
+        expected_version="042",
+    ),
+    post_read=ReadSpec(
+        phase="post",
+        sql_file="scripts/migration_043_045_post_read.sql",
+        rule=RULE_PRIVILEGES_HELD,
+        checks=PRIVILEGES_045,
+        role=READ_ROLE_APP,
+        expected_version="045",
+    ),
+    # S28-S30 continue the numbering after window 042's S25-S27.
+    plan_steps=(
+        ("register", "S28"),
+        ("snapshot", "S28"),
+        ("pre_read", "S29"),
+        ("run", "S29"),
+        ("verify", "S30"),
+        ("post_read", "S30"),
+    ),
+)
 WINDOWS: Mapping[str, MigrationWindow] = MappingProxyType(
-    {window.name: window for window in (WINDOW_035, WINDOW_036, WINDOW_037, WINDOW_042)}
+    {
+        window.name: window
+        for window in (WINDOW_035, WINDOW_036, WINDOW_037, WINDOW_042, WINDOW_045)
+    }
 )
 # The window the VPS deploy pin (scripts/deploy-vps.sh APPROVED_ALEMBIC_REVISION)
 # and docs/configuration.md name: the first production window. It is NOT a
@@ -446,7 +531,7 @@ def _assert_window_table() -> None:
 
     rows = list(WINDOWS.values())
     _require(
-        [row.name for row in rows] == ["035", "036", "037", "042"]
+        [row.name for row in rows] == ["035", "036", "037", "042", "045"]
         and PINNED_WINDOW in WINDOWS,
         "window_table_names",
     )
@@ -1634,12 +1719,13 @@ def _rollback_target(
     checks: hook._Checks,
     manifest: Path | None,
 ) -> dict[str, Any]:
-    """036, 037 and 042: the manifest's rollback_target re-pinned, revision ACTIVE.
+    """036, 037, 042 and 045: the manifest's rollback_target re-pinned,
+    revision ACTIVE.
 
     Read through the planner (its strict loader and full manifest validation),
     imported here only: the planner imports this module's window table.
-    Above the last safety pin (042) the target is also checked by content
-    against the service revision (_rollback_target_replaced).
+    Above the last safety pin (042 and 045) the target is also checked by
+    content against the service revision (_rollback_target_replaced).
     """
 
     window = context.window
@@ -1833,9 +1919,10 @@ _READ_HEADER = re.compile(
 # (scripts/asaas_rollout_readback.py), the same program on the read family,
 # labelled with the window whose schema it reads and a phase of its own. A
 # program labelled ``rollout`` is recognized only with one of these windows:
-# 037 (the schema until window 042 runs, live step L3) and 042 (after it);
-# the readback names one explicitly, never by default.
-ROLLOUT_READ_WINDOWS = ("037", "042")
+# 037 (the schema until window 042 runs, live step L3), 042 (after it, until
+# window 045 runs) and 045 (after the media bridge window); the readback
+# names one explicitly, never by default.
+ROLLOUT_READ_WINDOWS = ("037", "042", "045")
 ROLLOUT_READ_PHASE = "rollout"
 
 
@@ -2589,6 +2676,26 @@ def judge_read(
                 }
             )
         report["rows"] = verdicts
+        return reasons, report
+    if spec.rule == RULE_PRIVILEGES_HELD:
+        names = [row[0] if len(row) == 2 else None for row in rows]
+        if sorted(map(str, names)) != sorted(spec.checks) or len(set(names)) != len(
+            rows
+        ):
+            fail("read_checks_mismatch")
+        held = {
+            str(row[0]): row[1]
+            for row in rows
+            if len(row) == 2 and isinstance(row[0], str)
+        }
+        # Only the boolean true is held: false, NULL (the object is missing)
+        # or anything else is not.
+        for name in spec.checks:
+            if held.get(name) is not True:
+                fail(f"read_privilege_not_held:{_slug(name)}")
+        report["rows"] = [
+            {"object": name, "held": held.get(name) is True} for name in spec.checks
+        ]
         return reasons, report
     # RULE_RELATIONS_GONE
     names = [row[0] if len(row) == 2 else None for row in rows]

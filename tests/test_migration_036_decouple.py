@@ -86,10 +86,10 @@ def test_036_revises_035_and_037_follows_it(migration: ModuleType) -> None:
     assert [rev for rev, parent in revisions.values() if parent == "036"] == ["037"]
     # neurostack-credit-system Group 1a: 038 (credit schema) follows 037;
     # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
-    # (lifecycle, legal hold, purge and roles) follows 040; 043 (audio/ogg in
-    # the media category/MIME invariant) follows 042; 044 (audio/mp4 in the
-    # same invariant) is the head.
-    assert current_head() == "044"
+    # (lifecycle, legal hold, purge and roles) follows 040; 043 (audio/ogg) and
+    # 044 (audio/mp4) widen the media category/MIME invariant;
+    # envio-midia-agente: 045 (the media bridge) follows 044 and is the head.
+    assert current_head() == "045"
 
 
 def test_frozen_file_is_pinned_rendered_and_outside_versions(

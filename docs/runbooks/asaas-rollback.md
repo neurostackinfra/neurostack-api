@@ -37,6 +37,55 @@ a restore from a snapshot (`pre-037-2026-10-24`, `pre-036-2026-10-24` or
 `pre-033-035-2026-10-22`), each restore its own owner decision; never an
 Alembic downgrade and never revision 8.
 
+## Migration 045: the media bridge release and the behaviour release
+
+Migration `045` (envio-midia-agente) ships in a bridge release of its own:
+its image contains `045` and maps neither `media_assets.trigger_intents` nor
+`media_deliveries` in the ORM, window `045` applies it once that image
+serves, together with `043` and `044` (the media category/MIME invariant
+widened for `audio/ogg`, then `audio/mp4`), which have no window of their
+own, and only then is the behaviour release (PR-B, the image that maps both)
+merged and deployed ([`asaas-deployment.md`](./asaas-deployment.md),
+"Migration 045").
+
+Before the window (the bridge image serving on `042`), the bridge image back
+to the revision it replaced (revision 17, the rollback target) is an
+ordinary image rollback: the schema did not change, `042` is in both images'
+chains, and the credit switch stays **on**. It also closes the OGG/M4A upload
+gap: any image built from the current `main` (#184 and #194, migrations
+`043` and `044` with no window of their own) answers a valid `audio/ogg` or
+`audio/mp4` upload with 503 `media_storage_unavailable` while the schema is
+at `042`. The bridge deploy and window `045` are approved together and run
+back to back; if the window cannot run promptly after the bridge deploy,
+return to revision 17, whose image (`build-20261104-fbda835a`) predates #184
+and never offers OGG or M4A. After the window:
+
+- **The behaviour release back to the bridge image is safe.** The bridge
+  image contains `045`, so its migration chain keeps the database's revision
+  and the credit switch stays **on**; it maps neither object, so the rows the
+  behaviour release wrote stay, unread. Close the behaviour release's flag
+  first, then deploy the bridge revision (18). It is the rollback target
+  while the behaviour release serves: the target is re-pinned from 17 to 18
+  after the window and before PR-B deploys (the planner blocks PR-B's image
+  change while the target is still 17).
+- **The bridge image back to the revision it replaced (revision 17, the
+  rollback target while the bridge serves, before that re-pin) takes the
+  serving image out of the chain.** That image's chain
+  ends before `045` while the database reads `045`, so its credit switch reads
+  `revision_outside_image_chain` and stays **off** (credit routes answer 503
+  `credit_unavailable`) until an image containing `045` serves again. The
+  schema stays valid for it (the column has a default, the table is unused,
+  and the media check only admits more). It is the way back from an image
+  failure, not a free one: go forward to the bridge image again as soon as
+  possible.
+- **The migrations come back only by a restore** of the window's snapshot
+  (`pre-043-045-<date>`, taken at `042`, so it undoes `043` and `044` too),
+  as after windows `036`, `037` and `042`: an owner decision of last resort
+  that loses every write made after it. Never the Alembic downgrade in
+  production (with nothing changed, `045`'s refuses while `media_deliveries`
+  holds a row or a media asset has trigger intents, and `044`'s and `043`'s
+  fail while an `audio/mp4` or `audio/ogg` asset exists).
+
 ## Current state (2026-10-25)
 
 Operator-recorded evidence, not derivable from this repository (details in

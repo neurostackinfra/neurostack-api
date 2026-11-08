@@ -41,7 +41,8 @@ def test_asaas_producer_migrations_extend_026_through_037_linearly() -> None:
     # an ASAAS producer migration) follows 037; Group 4a's credit inventory
     # Group 4b's additive object-copy revision (040) follows 039; Group 5's
     # retention revision (041) follows 040; Group 7's enforcement cutoff
-    # acceptances (042) follow 041; 043 (audio/ogg in the media category/MIME
-    # invariant, not an ASAAS producer migration either) follows 042; 044
-    # (audio/mp4 in the same invariant, not one either) is head.
-    assert heads(revisions) == ["044"]
+    # acceptances (042) follow 041; 043 (audio/ogg) and 044 (audio/mp4) in the
+    # media category/MIME invariant follow 042; envio-midia-agente's media
+    # bridge (045, not an ASAAS producer migration either) follows 044 and is
+    # head.
+    assert heads(revisions) == ["045"]

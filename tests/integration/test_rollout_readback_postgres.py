@@ -5,14 +5,15 @@ One of the release-candidate PostgreSQL suites
 run by CI); it needs ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback
 cluster, as every PostgreSQL suite here). It migrates a fresh database with
 this tree's migrations and runs the exact programs
-``scripts/asaas_rollout_readback.py`` renders for its two windows (``--window
-037`` before the 038-042 window, ``--window 042`` after it), as the cluster
+``scripts/asaas_rollout_readback.py`` renders for its three windows
+(``--window 037`` before the 038-042 window, ``--window 042`` after it,
+``--window 045`` after the media bridge window), as the cluster
 superuser and as a throwaway non-superuser login role (its own password,
 ``SELECT`` through default privileges set before the migrations, as the
 application role gets it): at 036 both judges stop on the revision and on
-every legacy object of migration 037; at 037 the 037 judge accepts the table
-and the 042 judge stops on the revision alone; at 042 the reverse; the reads
-changed nothing; with row-level security on, the non-superuser is not exempt
+every legacy object of migration 037; at each of 037, 042 and 045 only that
+window's judge accepts the table and the others stop on the revision alone;
+the reads changed nothing; with row-level security on, the non-superuser is not exempt
 (its rows are hidden), while the superuser sees them and only the RLS row
 stops.
 """
@@ -163,7 +164,7 @@ async def _rollout_rows(url: URL) -> list[tuple[Any, ...]]:
 async def test_each_window_passes_only_on_its_own_revision(database: _Database) -> None:
     await _run_alembic(database.superuser, "upgrade", "036")
     for url in (database.superuser, database.application):
-        for window in ("037", "042"):
+        for window in rr.READ_WINDOWS:
             reasons, report = await _judged(url, window)
             assert report["alembic_version"] == ["036"]
             assert "read_alembic_version_mismatch" in reasons
@@ -171,11 +172,12 @@ async def test_each_window_passes_only_on_its_own_revision(database: _Database) 
             assert sum(r.startswith("legacy_function_present:") for r in reasons) == 10
             assert len(reasons) == 15, reasons
 
-    for revision in ("037", "042"):
+    assert tuple(rr.READ_WINDOWS) == ("037", "042", "045")
+    for revision in rr.READ_WINDOWS:
         await _run_alembic(database.superuser, "upgrade", revision)
         before = await _rollout_rows(database.superuser)
         for url in (database.superuser, database.application):
-            for window in ("037", "042"):
+            for window in rr.READ_WINDOWS:
                 reasons, report = await _judged(url, window)
                 assert report["alembic_version"] == [revision]
                 if window != revision:
@@ -195,7 +197,7 @@ async def test_each_window_passes_only_on_its_own_revision(database: _Database) 
         assert await _rollout_rows(database.superuser) == before
 
 
-@pytest.mark.parametrize("window", ["037", "042"])
+@pytest.mark.parametrize("window", ["037", "042", "045"])
 async def test_row_level_security_is_not_bypassed_for_the_application_role(
     database: _Database, window: str
 ) -> None:

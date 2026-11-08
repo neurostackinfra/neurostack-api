@@ -1,7 +1,7 @@
 """Credit lifecycle and retention rules on real PostgreSQL (Group 5).
 
 PostgreSQL only -- no S3, no Qdrant.  A fresh child database at ``head``
-(042) of the smoke cluster.  Pinned here:
+(045) of the smoke cluster.  Pinned here:
 
 * every append-only table of 042 (transitions, threshold alerts, roles,
   authorizations and their receipts, hold events, purge fences, tombstones,
@@ -99,7 +99,7 @@ async def harness() -> AsyncIterator[_Harness]:
         async with engine.connect() as connection:
             assert (
                 await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "044"
+                == "045"
             )
         async with engine.begin() as connection:
             await connection.execute(
