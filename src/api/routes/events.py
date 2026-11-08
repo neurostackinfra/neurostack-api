@@ -479,7 +479,12 @@ async def process_event(
     # TenantIdentityMiddleware): JWT role allowlist (403 caller_role_forbidden,
     # the rate-limit slot stays consumed) → reserved origin field (422) →
     # session proved by the tenant-scoped lock (403 tenant_identity_mismatch).
-    effective_tenant_id = await resolve_effective_tenant(http_request, tenant, None, db)
+    # Only a super administrator's assertion reaches here when it differs from
+    # the token (the simulator's selected clinic); the shared resolver applies
+    # the same role rules as POST /v1/sessions.
+    effective_tenant_id = await resolve_effective_tenant(
+        http_request, tenant, request.tenant_id, db
+    )
 
     if _client_sent_interaction_origin(await http_request.json()):
         raise HTTPException(

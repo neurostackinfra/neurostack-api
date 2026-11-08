@@ -109,7 +109,7 @@ class TenantIdentityMiddleware:
         asserted = body.get("tenant_id") if body is not None else None
         asserted_uuid = _optional_uuid(asserted)
         if asserted is not None and asserted_uuid is not None:
-            if asserted_uuid != tenant.tenant_id:
+            if asserted_uuid != tenant.tenant_id and not _selects_clinic(tenant):
                 await self._reject(
                     scope,
                     receive,
@@ -437,6 +437,22 @@ def _optional_uuid(value: object) -> UUID | None:
         return UUID(str(value))
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _selects_clinic(tenant: TenantContext) -> bool:
+    """A super administrator's panel JWT may name the clinic it operates.
+
+    Only the assertion check is relaxed: the route resolves the named tenant
+    through ``resolve_effective_tenant`` and the session must belong to it.
+    API keys, clinic administrators and builders stay bound to their token.
+    """
+
+    return (
+        tenant.authentication_mode == "jwt"
+        and not tenant.api_key
+        and tenant.user_id is not None
+        and tenant.role == "super_admin"
+    )
 
 
 def _scope_tenant(scope: Scope) -> TenantContext | None:

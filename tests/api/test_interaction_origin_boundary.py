@@ -682,6 +682,64 @@ def test_builder_cannot_select_an_owned_clinic_in_the_event_body(
     _assert_no_effects(spies)
 
 
+def test_super_admin_selects_the_clinic_in_the_event_body(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The simulator's clinic selection: same rule as POST /v1/sessions."""
+
+    own_tenant, clinic, session_id = uuid4(), uuid4(), uuid4()
+    spy = _SpyService()
+    monkeypatch.setattr(events_route, "get_event_service", lambda: spy)
+    audit = MagicMock()
+    monkeypatch.setattr(
+        "src.api.middleware.tenant_identity._audit_logger.warning", audit
+    )
+
+    response = client.post(
+        "/v1/events",
+        headers=_jwt_headers("super_admin", own_tenant),
+        json=_event_body(session_id, channel="web", tenant_id=clinic),
+    )
+
+    assert response.status_code == 200
+    (_, run_request, context), (_, finish_request, finished) = spy.calls
+    assert run_request.tenant_id == clinic == finish_request.tenant_id
+    assert context.effective_tenant_id == clinic
+    assert context.session_id == session_id
+    assert finished is context
+    # Panel JWT stays a simulator interaction: never production, never billed.
+    assert context.origin is InteractionOrigin.SIMULATOR
+    audit.assert_not_called()
+
+
+def test_super_admin_selected_clinic_cannot_reach_another_clinics_session(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own_tenant, clinic, other_clinic = uuid4(), uuid4(), uuid4()
+    foreign_session = _session_row(other_clinic)
+    _seed(
+        client,
+        _tenant(own_tenant),
+        _tenant(clinic),
+        _tenant(other_clinic),
+        foreign_session,
+    )
+    pipeline = AsyncMock(side_effect=AssertionError("foreign session reached LLM"))
+    from src.core.pipeline import CognitivePipeline
+
+    monkeypatch.setattr(CognitivePipeline, "process", pipeline)
+
+    response = client.post(
+        "/v1/events",
+        headers=_jwt_headers("super_admin", own_tenant),
+        json=_event_body(foreign_session.id, tenant_id=clinic),
+    )
+
+    assert response.status_code == 403
+    assert response.json() == TENANT_MISMATCH
+    pipeline.assert_not_awaited()
+
+
 @pytest.mark.parametrize("credential", ["api_key", "jwt-builder", "jwt-clinic_admin"])
 def test_foreign_session_keeps_the_68_code_and_refund(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, credential: str

@@ -308,10 +308,11 @@ function InvestorMockChat() {
 }
 
 export default function Chat() {
-  const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isBuilder, isSuperAdmin, viewingClinicId } = useAuth();
+  const { clinicId: activeClinicId, tenantId, userId, isInvestor, isReadOnly, isSuperAdmin, viewingClinicId } = useAuth();
 
   if (isInvestor) return <InvestorMockChat />;
-  const effectiveTenantId = (isBuilder || isSuperAdmin) ? viewingClinicId : tenantId;
+  // Builders never reach this page (App redirects `/` to /builder).
+  const effectiveTenantId = isSuperAdmin ? viewingClinicId : tenantId;
   const { t, locale } = useI18n();
   const { toast } = useToast();
 
@@ -427,8 +428,8 @@ export default function Chat() {
       return;
     }
 
-    // Guard: builder/super-admin must have a clinic selected
-    if ((isBuilder || isSuperAdmin) && !effectiveTenantId) {
+    // Guard: super-admin must have a clinic selected
+    if (isSuperAdmin && !effectiveTenantId) {
       toast({
         title: t("chat_no_clinic_selected_title") ?? "Nenhuma clínica selecionada",
         description: t("chat_no_clinic_selected_desc") ?? "Selecione uma clínica no menu lateral antes de usar o simulador.",

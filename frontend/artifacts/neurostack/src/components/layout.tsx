@@ -183,7 +183,7 @@ export function Layout({ children }: LayoutProps) {
   }
 
   const navItems = [
-    { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: [] },
+    { href: "/",         label: t("nav_chat"),      icon: MessageSquare,  id: "chat-simulator", hideFor: ["builder"] },
     { href: "/handoff-queue", label: t("nav_handoff_queue"), icon: Users2, id: "handoff-queue", hideFor: [] },
     { href: "/inactive-queue", label: t("nav_inactive_queue"), icon: UserX, id: "inactive-queue", hideFor: [] },
     { href: "/traces",   label: t("nav_traces"),    icon: Activity,       id: "trace-history",  hideFor: [] },
