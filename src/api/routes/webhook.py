@@ -1463,6 +1463,18 @@ def _extract_normalised_send_id(send_result: Any) -> str:
       Uazapi's ``id`` field by stripping everything up to the last ``:``.
       The pure ``messageid`` value (what actually comes back on the echo)
       is what dedup layers need to store.
+    - Falls back to ``key.id``, returned verbatim, when no top-level key
+      matched. Evolution v2 documents its ``sendText`` /
+      ``sendWhatsAppAudio`` response as the Baileys message
+      (``{"key": {"remoteJid", "fromMe", "id"}, "message", "status", ...}``)
+      with no top-level id (``openapi-v2.json``; ``prepareMessage`` in
+      2.3.7 ``whatsapp.baileys.service.ts``), so that is where its outbound
+      id lives. It is read last so every response that already yielded an
+      id keeps yielding the same one. Defensive: Evolution reports its own
+      API sends as ``send.message`` (2.3.7 L2545), which
+      ``evolution_webhook`` ignores, and runs Baileys with
+      ``emitOwnEvents: false`` (2.3.7 L658), so no echo of an API send is
+      matched against this id today.
     - Returns ``""`` when nothing usable was found. Never raises — callers
       use this on fire-and-forget tracking paths.
 
@@ -1481,6 +1493,11 @@ def _extract_normalised_send_id(send_result: Any) -> str:
             # the last ``:``, so we always store the same value the echo
             # will produce.
             return candidate.rsplit(":", 1)[-1] if ":" in candidate else candidate
+    message_key = send_result.get("key")
+    if isinstance(message_key, dict):
+        key_id = message_key.get("id")
+        if isinstance(key_id, str) and key_id:
+            return key_id
     return ""
 
 
@@ -3514,6 +3531,9 @@ async def evolution_webhook(
     body: dict[str, Any] = await request.json()
 
     # ── only handle messages.upsert ──
+    # This also drops ``send.message``, the event Evolution emits for every
+    # message sent through its API (the agent's replies included), so those
+    # never reach the ``fromMe`` takeover below.
     event_type = body.get("event", "")
     if event_type != "messages.upsert":
         return {"ok": True, "skipped": "non_message_event"}
@@ -3711,9 +3731,10 @@ async def evolution_webhook(
             ),
         )
         # Normalise the outbound id (Decisions 4 + 11): both dedup layers
-        # receive the same value, and Evolution's ``id`` — the only key it
-        # used to write to ``_store_ai_msg_id_to_db`` — no longer diverges
-        # from what ``_track_sent_message`` looks for.
+        # receive the same value. Evolution's documented send response
+        # carries it only as ``key.id``. Tracking it is defensive: Evolution
+        # reports this send as ``send.message``, skipped at the top of this
+        # handler, not as a ``messages.upsert`` echo.
         _reply_mid = _extract_normalised_send_id(send_result)
         if _reply_mid:
             _track_sent_message({"messageid": _reply_mid})

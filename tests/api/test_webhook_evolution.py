@@ -122,17 +122,53 @@ def _fake_event_response(suggested: str | None = "Olá, tudo bem?"):
     )
 
 
-def _fake_evolution_send_result(message_id: str | None = None) -> dict:
-    """Evolution's send response — the ``id`` key carries the outbound id."""
+def _baileys_id() -> str:
+    """An outbound id in the format Evolution 2.3.7 sends with.
+
+    Baileys 7.0.0-rc.9 (pinned by Evolution 2.3.7) builds message ids as
+    ``'3EB0' + 18 uppercase hex`` (``src/Utils/generics.ts`` L194).
+    """
+    return "3EB0" + uuid4().hex[:18].upper()
+
+
+def _fake_evolution_send_result(
+    message_id: str | None = None,
+    *,
+    text: str = "Olá!",
+    to_phone: str = "5511900000000",
+) -> dict[str, Any]:
+    """Evolution v2's documented send response: the outbound id is ``key.id``.
+
+    Shape of the documented ``POST /message/sendText/{instance}`` 201 example
+    (``openapi-v2.json`` in ``evolution-foundation/docs-evolution``) and of
+    ``prepareMessage`` in 2.3.7 ``whatsapp.baileys.service.ts`` (L4652), which
+    is what the server returns: there is no top-level ``id``. Evolution also
+    reports the send as a ``send.message`` webhook whose ``data`` is this same
+    object (L2545); ``evolution_webhook`` ignores that event.
+    """
     return {
         "key": {
-            "remoteJid": "5511999999999@s.whatsapp.net",
+            "remoteJid": f"{to_phone}@s.whatsapp.net",
             "fromMe": True,
-            "id": message_id or f"evo_reply_{uuid4().hex[:10]}",
+            "id": message_id or _baileys_id(),
         },
-        # Also mimic the shape that ``id`` sometimes appears at the top
-        "id": message_id or f"evo_reply_{uuid4().hex[:10]}",
+        "pushName": "Você",
+        "status": "PENDING",
+        "message": {"conversation": text},
+        "messageType": "conversation",
+        "messageTimestamp": 1717689097,
+        "instanceId": str(uuid4()),
+        "source": "web",
     }
+
+
+def _legacy_top_level_id_send_result(message_id: str) -> dict[str, Any]:
+    """A send response that carries the id at the top level only.
+
+    Not what Evolution returns; kept so the top-level ``id`` read that every
+    other caller of the extractor relies on stays covered.
+    """
+    return {"id": message_id}
 
 
 def _lgpd_config(enabled: bool = True) -> dict:
@@ -324,13 +360,17 @@ class TestEvolutionPrivacyNotice:
         assert mock_send.await_args_list[0].args[4] == "Reply body"
 
 
-class TestEvolutionReplyIdNormalisation:
-    """Group 1b Deliverable 6 (Evolution half): id normalisation applied
-    to Evolution's reply path — the ``id`` key that previously diverged
-    between the two dedup layers is now used in the normalised form.
+class TestEvolutionReplyIdSharedBetweenDedupLayers:
+    """Group 1b Deliverable 6 (Evolution half): both dedup layers receive the
+    same outbound id on Evolution's reply path.
+
+    The send fake is Evolution's documented response, whose only id is
+    ``key.id``; it is stored verbatim. The ``owner:MSGID`` strip belongs to
+    Uazapi's composite top-level ``id`` and is covered by
+    ``TestExtractNormalisedSendIdKeyId`` and the Uazapi suite.
     """
 
-    def test_reply_id_normalised_and_shared_between_dedup_layers(
+    def test_reply_key_id_shared_between_dedup_layers(
         self,
         client: TestClient,
         tenant_id: UUID,
@@ -345,9 +385,8 @@ class TestEvolutionReplyIdNormalisation:
             message_id=f"evo_ping_{uuid4().hex[:8]}",
         )
 
-        # Reply send_result carries composite ``id`` — normalisation must
-        # strip the ``owner:`` prefix on both dedup layers.
-        composite_send = {"id": "owner_evo:REPLY_TAIL"}
+        reply_id = _baileys_id()
+        reply_send = _fake_evolution_send_result(reply_id)
 
         stored_ids: list[str] = []
 
@@ -364,7 +403,7 @@ class TestEvolutionReplyIdNormalisation:
             ) as mock_get_service,
             patch(
                 "src.api.routes.webhook.send_evolution_text",
-                new=AsyncMock(return_value=composite_send),
+                new=AsyncMock(return_value=reply_send),
             ),
             patch(
                 "src.api.routes.webhook._store_ai_msg_id_to_db",
@@ -385,14 +424,388 @@ class TestEvolutionReplyIdNormalisation:
             resp = client.post(WEBHOOK_PATH, json=payload)
 
         assert resp.status_code == 200, resp.text
-        # Stored id is the tail, no colon
-        assert stored_ids == ["REPLY_TAIL"], stored_ids
-        assert all(":" not in v for v in stored_ids)
-        # _track_sent_message called with the same normalised messageid form
+        # The DB layer stores ``key.id`` verbatim ...
+        assert stored_ids == [reply_id], stored_ids
+        # ... and the in-process / Redis layer receives the same value.
         assert mock_track.call_count == 1
-        tracked_arg = mock_track.call_args.args[0]
-        assert tracked_arg == {"messageid": "REPLY_TAIL"}
-        assert ":" not in tracked_arg["messageid"]
+        assert mock_track.call_args.args[0] == {"messageid": reply_id}
+
+
+class TestExtractNormalisedSendIdKeyId:
+    """``_extract_normalised_send_id`` reads Evolution's ``key.id``, last."""
+
+    def test_evolution_text_response_yields_key_id(self) -> None:
+        from src.api.routes.webhook import _extract_normalised_send_id
+
+        reply_id = _baileys_id()
+        send = _fake_evolution_send_result(reply_id)
+        assert _extract_normalised_send_id(send) == reply_id
+
+    def test_evolution_audio_response_yields_key_id(self) -> None:
+        from src.api.routes.webhook import _extract_normalised_send_id
+
+        audio_id = _baileys_id()
+        send = {
+            "key": {
+                "remoteJid": "5511900000699@s.whatsapp.net",
+                "fromMe": True,
+                "id": audio_id,
+            },
+            "message": {"audioMessage": {"mimetype": "audio/mp4", "ptt": True}},
+            "messageTimestamp": "1717689097",
+            "status": "PENDING",
+        }
+        assert _extract_normalised_send_id(send) == audio_id
+
+    def test_top_level_keys_keep_precedence_over_key_id(self) -> None:
+        from src.api.routes.webhook import _extract_normalised_send_id
+
+        for top in ("messageid", "MessageID", "messageId", "zapiMessageId", "id"):
+            send = {top: "TOP_LEVEL", "key": {"id": "NESTED"}}
+            assert _extract_normalised_send_id(send) == "TOP_LEVEL", top
+
+    def test_uazapi_composite_id_still_normalised(self) -> None:
+        from src.api.routes.webhook import _extract_normalised_send_id
+
+        send = {"id": "5511999999999:3EB0ABC", "key": {"id": "IGNORED"}}
+        assert _extract_normalised_send_id(send) == "3EB0ABC"
+
+    def test_key_id_is_returned_verbatim(self) -> None:
+        from src.api.routes.webhook import _extract_normalised_send_id
+
+        assert _extract_normalised_send_id({"key": {"id": "A:B"}}) == "A:B"
+
+    @pytest.mark.parametrize(
+        "send",
+        [
+            None,
+            "3EB0",
+            ["3EB0"],
+            {},
+            {"key": None},
+            {"key": "3EB0"},
+            {"key": ["3EB0"]},
+            {"key": {}},
+            {"key": {"id": ""}},
+            {"key": {"id": 12345}},
+            {"key": {"id": None}},
+            {"id": "", "key": {"id": None}},
+        ],
+    )
+    def test_unusable_shapes_return_empty_without_raising(self, send: Any) -> None:
+        from src.api.routes.webhook import _extract_normalised_send_id
+
+        assert _extract_normalised_send_id(send) == ""
+
+
+def _evolution_session_row(client: TestClient, tenant_id: UUID, phone: str) -> Any:
+    """The phone's session (``id``, ``is_paused``, ``ai_msg_ids``), or ``None``."""
+    from sqlalchemy import select
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> Any:
+        db = get_db_session()
+        try:
+            result = await db.execute(
+                select(SessionRow).where(
+                    SessionRow.tenant_id == tenant_id,
+                    SessionRow.user_id == phone,
+                )
+            )
+            row = result.scalars().first()
+            if row is None:
+                return None
+            meta = dict(row.session_metadata or {})
+            return SimpleNamespace(
+                id=row.id,
+                is_paused=row.is_paused,
+                ai_msg_ids=[entry[0] for entry in meta.get("ai_msg_ids", [])],
+            )
+        finally:
+            await db.close()
+
+    return client._submit(_run())
+
+
+def _evolution_patient_turn(
+    client: TestClient,
+    *,
+    instance: str,
+    phone: str,
+    send_results: list[dict[str, Any]],
+    clinic_config: dict[str, Any] | None = None,
+) -> Any:
+    """One patient turn whose agent reply is sent with ``send_results``."""
+    payload = _evolution_text_payload(
+        instance_name=instance,
+        from_phone=phone,
+        text_body="Olá, queria marcar uma consulta",
+        message_id=f"evo_in_{uuid4().hex[:8]}",
+    )
+    with (
+        patch("src.api.routes.webhook.get_event_service") as get_service,
+        patch(
+            "src.api.routes.webhook.send_evolution_text",
+            new=AsyncMock(side_effect=send_results),
+        ),
+    ):
+        service = MagicMock()
+        service._load_clinic_config = AsyncMock(return_value=clinic_config or {})
+        service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+        service.finish_response = AsyncMock(
+            return_value=_fake_event_response("Claro! Qual o melhor dia?")
+        )
+        get_service.return_value = service
+        return client.post(WEBHOOK_PATH, json=payload)
+
+
+class TestEvolutionOwnReplyEcho:
+    """Defensive coverage: if an echo of the agent's own Evolution send ever
+    arrived as a ``messages.upsert`` with ``fromMe`` true, its ``key.id``
+    would be recognised and the session would not be taken over.
+
+    Released Evolution builds do not send that echo. They run Baileys with
+    ``emitOwnEvents: false`` (2.3.7 ``whatsapp.baileys.service.ts`` L658; the
+    same in every release checked, 1.8.2 to 2.4.0-rc2) and report API sends
+    as ``send.message`` (L2545), which ``evolution_webhook`` skips (see
+    ``TestEvolutionSendMessageEvent``). The upserts posted here are synthetic;
+    they pin the two dedup layers. The real session, the real tracking layers
+    and the real ``_handle_clinic_message`` run; only the pipeline and the
+    HTTP send are faked.
+    """
+
+    def _echo(
+        self, client: TestClient, *, instance: str, phone: str, message_id: str
+    ) -> Any:
+        with patch("src.api.routes.webhook.get_event_service") as get_service:
+            get_service.return_value = _mock_pipeline_service()
+            return client.post(
+                WEBHOOK_PATH,
+                json=_evolution_text_payload(
+                    instance_name=instance,
+                    from_phone=phone,
+                    text_body="Claro! Qual o melhor dia?",
+                    message_id=message_id,
+                    from_me=True,
+                ),
+            )
+
+    def test_reply_echo_is_recognised_on_the_fast_path(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000610"
+        reply_id = _baileys_id()
+
+        first = _evolution_patient_turn(
+            client,
+            instance=instance,
+            phone=phone,
+            send_results=[_fake_evolution_send_result(reply_id)],
+        )
+        assert first.status_code == 200, first.text
+        assert first.json() == {"ok": True, "replied": True}
+
+        echo = self._echo(client, instance=instance, phone=phone, message_id=reply_id)
+
+        assert echo.status_code == 200, echo.text
+        assert echo.json() == {"ok": True, "skipped": "ai_echo"}
+        assert _evolution_session_row(client, tenant_id, phone).is_paused is False
+
+    def test_reply_echo_is_recognised_by_the_db_layer_on_another_worker(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000611"
+        reply_id = _baileys_id()
+
+        first = _evolution_patient_turn(
+            client,
+            instance=instance,
+            phone=phone,
+            send_results=[_fake_evolution_send_result(reply_id)],
+        )
+        assert first.status_code == 200, first.text
+        assert _evolution_session_row(client, tenant_id, phone).ai_msg_ids == [reply_id]
+
+        # The echo lands on a worker whose in-process / Redis fast path
+        # has never seen the id: only the session's ``ai_msg_ids`` can tell.
+        with patch(
+            "src.api.routes.webhook._is_ai_sent_message",
+            return_value=False,
+        ):
+            echo = self._echo(
+                client, instance=instance, phone=phone, message_id=reply_id
+            )
+
+        assert echo.status_code == 200, echo.text
+        assert echo.json() == {"ok": True, "skipped": "ai_echo_db"}
+        assert _evolution_session_row(client, tenant_id, phone).is_paused is False
+
+    def test_privacy_notice_echo_is_recognised(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000612"
+        notice_id = _baileys_id()
+        reply_id = _baileys_id()
+
+        first = _evolution_patient_turn(
+            client,
+            instance=instance,
+            phone=phone,
+            send_results=[
+                _fake_evolution_send_result(notice_id),
+                _fake_evolution_send_result(reply_id),
+            ],
+            clinic_config=_lgpd_config(enabled=True),
+        )
+        assert first.status_code == 200, first.text
+        assert first.json() == {"ok": True, "replied": True}
+
+        for mid in (notice_id, reply_id):
+            echo = self._echo(client, instance=instance, phone=phone, message_id=mid)
+            assert echo.status_code == 200, echo.text
+            assert echo.json() == {"ok": True, "skipped": "ai_echo"}, mid
+        assert _evolution_session_row(client, tenant_id, phone).is_paused is False
+
+    def test_legacy_top_level_id_echo_is_still_recognised(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000613"
+        reply_id = "LEGACY_TOP_LEVEL_1"
+
+        first = _evolution_patient_turn(
+            client,
+            instance=instance,
+            phone=phone,
+            send_results=[_legacy_top_level_id_send_result(reply_id)],
+        )
+        assert first.status_code == 200, first.text
+
+        echo = self._echo(client, instance=instance, phone=phone, message_id=reply_id)
+
+        assert echo.status_code == 200, echo.text
+        assert echo.json() == {"ok": True, "skipped": "ai_echo"}
+        assert _evolution_session_row(client, tenant_id, phone).is_paused is False
+
+    def test_untracked_from_me_message_still_pauses(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        """Control: a ``fromMe`` upsert whose id the agent never sent (a staff
+        message typed on the clinic's phone) still takes over, so the tests
+        above are not passing because nothing pauses.
+        """
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000614"
+
+        first = _evolution_patient_turn(
+            client,
+            instance=instance,
+            phone=phone,
+            send_results=[_fake_evolution_send_result(_baileys_id())],
+        )
+        assert first.status_code == 200, first.text
+
+        echo = self._echo(
+            client, instance=instance, phone=phone, message_id=uuid4().hex.upper()
+        )
+
+        assert echo.status_code == 200, echo.text
+        assert echo.json() == {"ok": True, "action": "human_takeover"}
+        assert _evolution_session_row(client, tenant_id, phone).is_paused is True
+
+
+def _evolution_send_message_event(
+    *, instance: str, send_result: dict[str, Any]
+) -> dict[str, Any]:
+    """The webhook Evolution 2.3.7 posts after an API send.
+
+    ``sendMessageWithTyping`` calls ``sendDataWebhook(Events.SEND_MESSAGE,
+    messageRaw)`` (``whatsapp.baileys.service.ts`` L2545), ``SEND_MESSAGE`` is
+    ``'send.message'`` (``wa.types.ts`` L17), and the body is built in
+    ``webhook.controller.ts`` L93-103. ``data`` is the same ``messageRaw`` the
+    HTTP send returns.
+    """
+    return {
+        "event": "send.message",
+        "instance": instance,
+        "data": send_result,
+        "destination": "https://api.example.test/v1/webhook/evolution",
+        "date_time": "2026-11-08T12:00:00.000Z",
+        "sender": "5511900000000@s.whatsapp.net",
+        "server_url": "https://evolution.example.com",
+        "apikey": f"evk_{uuid4().hex}",
+    }
+
+
+class TestEvolutionSendMessageEvent:
+    """What protects production today: Evolution reports the agent's own API
+    sends as ``send.message``, and ``evolution_webhook`` skips every event
+    other than ``messages.upsert`` before the ``fromMe`` takeover runs.
+    """
+
+    def test_own_send_report_is_skipped_and_never_pauses(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000615"
+        reply_id = _baileys_id()
+        reply = "Claro! Qual o melhor dia?"
+
+        first = _evolution_patient_turn(
+            client,
+            instance=instance,
+            phone=phone,
+            send_results=[
+                _fake_evolution_send_result(reply_id, text=reply, to_phone=phone)
+            ],
+        )
+        assert first.status_code == 200, first.text
+        assert first.json() == {"ok": True, "replied": True}
+
+        # Evolution emits ``send.message`` (L2545) before the HTTP send
+        # returns (L2557), so the report can arrive before the reply's id is
+        # tracked: cover the tracked id and one that was never tracked.
+        for sent_id in (reply_id, _baileys_id()):
+            report = _evolution_send_message_event(
+                instance=instance,
+                send_result=_fake_evolution_send_result(
+                    sent_id, text=reply, to_phone=phone
+                ),
+            )
+            with patch("src.api.routes.webhook.get_event_service") as get_service:
+                get_service.return_value = _mock_pipeline_service()
+                resp = client.post(WEBHOOK_PATH, json=report)
+
+            assert resp.status_code == 200, resp.text
+            assert resp.json() == {"ok": True, "skipped": "non_message_event"}
+
+        session = _evolution_session_row(client, tenant_id, phone)
+        assert session.is_paused is False
+        # The DB dedup layer was not reached: the tracked id was not consumed.
+        assert session.ai_msg_ids == [reply_id]
 
 
 class TestEvolutionVoiceReplyOrigin:
