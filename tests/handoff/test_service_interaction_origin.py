@@ -46,12 +46,15 @@ from tests.handoff.test_service import (
 
 # ``HandoffRequest`` stays unchanged (D1): no trust object or origin rides on a
 # data model.  The exact field set is pinned so any new field is a decision.
+# ``pending_media`` was one (owner, 2026-11-08): the queue card's marker for a
+# long audio or a file the AI never processed; plain data, not a trust object.
 HANDOFF_REQUEST_FIELDS = frozenset(
     {
         "current_mode",
         "detected_intent",
         "funnel_stage",
         "key_info",
+        "pending_media",
         "reason",
         "recent_messages",
         "requested_by",

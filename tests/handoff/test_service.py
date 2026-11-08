@@ -26,6 +26,7 @@ from src.core.exceptions import (
 from src.handoff.models import (
     ConversationSummary,
     HandoffListItem,
+    HandoffPendingMedia,
     HandoffReason,
     HandoffRequest,
     HandoffResponse,
@@ -1039,6 +1040,7 @@ class TestHandoffService:
             "data_hora_saida",
             "sla_target_seconds",
             "status",
+            "pending_media",
         ]
         sql = str(statement)
         assert "handoff_records.tenant_id" in sql
@@ -1140,6 +1142,65 @@ class TestHandoffService:
         assert "LINK DE AGENDAMENTO ENVIADO" in response.summary.summary_text
         assert detail.verification_status == "link_sent"
         assert detail.sector == "agendamento"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("pending_media", "marker"),
+        [
+            (
+                HandoffPendingMedia.LONG_AUDIO,
+                "[ÁUDIO LONGO ENVIADO - ouvir no WhatsApp]",
+            ),
+            (HandoffPendingMedia.FILE, "[ARQUIVO ENVIADO - revisar no WhatsApp]"),
+        ],
+    )
+    async def test_pending_media_opens_the_summary_and_is_persisted(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+        pending_media,
+        marker,
+    ):
+        """A file handoff (no messages) says what the team must review."""
+        request = HandoffRequest(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason=HandoffReason.USER_REQUEST,
+            urgency=HandoffUrgency.NORMAL,
+            pending_media=pending_media,
+            key_info={"phone": "5511999990000"},
+        )
+
+        response = await handoff_service.initiate_handoff(request)
+
+        persisted = handoff_store.records[response.id]
+        assert persisted.context["pending_media"] == pending_media.value
+        assert response.summary.summary_text.splitlines()[0] == marker
+        assert persisted.summary.splitlines()[0] == marker
+
+    @pytest.mark.asyncio
+    async def test_without_pending_media_nothing_is_added(
+        self,
+        handoff_service,
+        handoff_store,
+        tenant_id,
+        session_id,
+        sample_messages,
+    ):
+        request = HandoffRequest(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            reason=HandoffReason.USER_REQUEST,
+            recent_messages=sample_messages,
+        )
+
+        response = await handoff_service.initiate_handoff(request)
+
+        persisted = handoff_store.records[response.id]
+        assert "pending_media" not in persisted.context
+        assert "ENVIADO - " not in persisted.summary
 
     @pytest.mark.asyncio
     async def test_enrich_scheduling_verification_updates_same_handoff(

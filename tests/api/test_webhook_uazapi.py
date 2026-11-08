@@ -271,6 +271,11 @@ def _fake_event_response(suggested: str | None = "Olá, tudo bem?"):
     )
 
 
+def _fake_uazapi_send_result_id(send_mock: AsyncMock) -> str:
+    """The ``MessageID`` the last send of ``send_mock`` answered with."""
+    return str(send_mock.return_value["MessageID"])
+
+
 def _fake_uazapi_send_result(message_id: str | None = None) -> dict:
     """Return a payload shaped like the Uazapi (wuzapi) send response."""
     return {
@@ -2912,6 +2917,58 @@ def _build_uazapi_media_body(
     return body
 
 
+def _uazapi_tenant_state(client: TestClient, tenant_id: UUID) -> SimpleNamespace:
+    """The tenant's handoff records, ``message.in`` count (traces) and
+    sessions, read in a fresh database session."""
+    from sqlalchemy import func, select
+
+    from src.models.event import Event
+    from src.models.handoff import HandoffRecord
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> SimpleNamespace:
+        db = get_db_session()
+        try:
+            handoffs = list(
+                (
+                    await db.execute(
+                        select(HandoffRecord).where(
+                            HandoffRecord.tenant_id == tenant_id
+                        )
+                    )
+                ).scalars()
+            )
+            traces = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(Event)
+                    .where(
+                        Event.tenant_id == tenant_id, Event.event_type == "message.in"
+                    )
+                )
+            ).scalar_one()
+            sessions = [
+                SimpleNamespace(
+                    id=row.id,
+                    is_paused=row.is_paused,
+                    metadata=dict(row.session_metadata or {}),
+                )
+                for row in (
+                    await db.execute(
+                        select(SessionRow).where(SessionRow.tenant_id == tenant_id)
+                    )
+                ).scalars()
+            ]
+            return SimpleNamespace(
+                handoffs=handoffs, traces=int(traces), sessions=sessions
+            )
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
 class TestUazapiAudioWhenEgressClosed:
     def _clear_state(self) -> None:
         webhook_module._INMEM_INCOMING.clear()
@@ -3087,6 +3144,10 @@ class TestUazapiAudioWhenEgressClosed:
         assert duplicate.json() == {"ok": True, "skipped": "duplicate_message"}
         download.assert_not_awaited()
         safe_client.assert_not_called()
+        # The team still gets the handoff (once): only the notice was held.
+        state = _uazapi_tenant_state(client, tenant_id)
+        assert [record.status for record in state.handoffs] == ["pending"]
+        assert state.traces == 0
         self._clear_state()
 
     def test_closed_tts_audio_does_not_fallback_to_text(
@@ -3726,6 +3787,71 @@ class TestUazapiGroup4PatientAudioTranscription:
         download_mock.assert_not_called()
         assert send_mock.await_count == 1
         assert send_mock.await_args.args[3] == _AUDIO_TOO_LONG_MSG_PT
+        # The real handoff service ran after the session existed; the notice
+        # is stored like an AI reply, so its echo never reads as a takeover;
+        # and no ``message.in`` (a trace) exists for an audio nobody heard.
+        state = _uazapi_tenant_state(client, tenant_id)
+        [session] = state.sessions
+        assert [(r.status, r.session_id) for r in state.handoffs] == [
+            ("pending", session.id)
+        ]
+        assert state.traces == 0
+        assert session.is_paused is False
+        notice_mid = _fake_uazapi_send_result_id(send_mock)
+        assert notice_mid in [entry[0] for entry in session.metadata["ai_msg_ids"]]
+
+    def test_patient_audio_long_duration_in_a_paused_session_hands_nothing_off(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ):
+        """A paused session is already with a human: no second handoff."""
+        from sqlalchemy import update
+
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        self._clear_state()
+        instance = f"clinica_{uuid4().hex[:8]}"
+        _seed_uazapi_audio_tenant(
+            client, tenant_id, instance, stt=True, audio_max_seconds=60
+        )
+        send_mock = AsyncMock(return_value=_fake_uazapi_send_result())
+
+        def _long(label: str) -> dict:
+            return _build_uazapi_media_body(
+                "audio",
+                instance=instance,
+                message_id=f"3EB0_{label}_{uuid4().hex[:10]}",
+                seconds_override=180,
+            )
+
+        with patch("src.api.routes.webhook.send_uazapi_text", send_mock):
+            first = client.post(WEBHOOK_PATH, json=_long("first"))
+            [session] = _uazapi_tenant_state(client, tenant_id).sessions
+
+            async def _pause() -> None:
+                db = get_db_session()
+                try:
+                    await db.execute(
+                        update(SessionRow)
+                        .where(SessionRow.id == session.id)
+                        .values(is_paused=True, paused_until=None)
+                    )
+                    await db.commit()
+                finally:
+                    await db.close()
+
+            client._submit(_pause())  # type: ignore[attr-defined]
+            second = client.post(WEBHOOK_PATH, json=_long("second"))
+
+        assert first.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert second.status_code == 202, second.text
+        assert second.json() == {"ok": True, "skipped": "session_paused"}
+        state = _uazapi_tenant_state(client, tenant_id)
+        assert len(state.handoffs) == 1
+        assert state.traces == 0  # nothing captured for the paused audio
+        assert send_mock.await_count == 1
 
     def test_patient_audio_no_capability_reroutes_without_downloading(
         self,

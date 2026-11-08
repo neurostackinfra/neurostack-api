@@ -1879,9 +1879,6 @@ _NOT_ALLOWLISTED: dict[str, Callable[[Any, World], Any]] = {
         c._submit(_pause(w.zapi_tenant, "5511900000444")),
         _zapi(c, w, _zapi_body(w, "zapi-paused", phone="5511900000444")),
     )[1],
-    "zapi_audio_too_long": lambda c, w: _zapi(
-        c, w, _audio_body(w, "zapi-long-audio", seconds=600)
-    ),
     "zapi_stt_unsupported_provider": lambda c, w: (
         c._submit(_set_credentials(w.zapi_tenant, stt_provider="google_stt")),
         _zapi(c, w, _audio_body(w, "zapi-stt-skip", seconds=5)),
@@ -2166,11 +2163,12 @@ def test_the_writer_runs_only_at_the_governed_decision_points() -> None:
     # writer's only call, its enforced branch the handoff in ``db``.
     # whatsapp-image-understanding G2 adds Uazapi's forward-on-request, which
     # takes the observational branch (no enforcement on Uazapi); G3 adds
-    # Z-API's, enforced like Meta's when the pre-check says so.
+    # Z-API's, enforced like Meta's when the pre-check says so. The Z-API
+    # and Uazapi ``audio_too_long`` handoffs join them the same way.
     [handoff_writer] = webhook_calls["record_meta_file_handoff"]
     assert _enclosing(webhook, handoff_writer) == "_meta_file_handoff"
     decision_sites = webhook_calls["_meta_file_handoff"]
-    assert len(decision_sites) == 4
+    assert len(decision_sites) == 6
     assert {_enclosing(webhook, c) for c in decision_sites} == {
         "meta_webhook",
         "uazapi_webhook",
@@ -2823,23 +2821,26 @@ def test_meta_under_a_hold_sends_no_file_ack_and_runs_no_stt(
 def test_zapi_under_a_hold_still_answers_what_runs_before_the_precheck(
     client: Any, enforced: World, providers: Providers, hold: None
 ) -> None:
-    """Accepted per channel (D4/OWNER-c): Z-API runs ``audio_too_long``, the
-    STT and its fallback before the pre-check, so their fixed messages still
-    reach the patient of a builder on hold; none of them is a decision."""
+    """Accepted per channel (D4/OWNER-c): Z-API runs the STT and its fallback
+    before the pre-check, so their fixed messages still reach the patient of
+    a builder on hold; neither is a decision. ``audio_too_long`` is a
+    decision (the handoff) and waits for the pre-check, as on Meta: under a
+    hold, no handoff, no notice and no session."""
 
     world = enforced
     long_audio = _zapi(client, world, _audio_body(world, "zapi-held-long", seconds=600))
-    assert long_audio.json() == {"ok": True, "skipped": "audio_too_long"}
+    assert long_audio.json() == {"ok": True, "skipped": "credit_pending"}
     reroute = _zapi(client, world, _audio_body(world, "zapi-held-stt", seconds=5))
     assert reroute.json()["action"] == "stt_fallback"
     phone = "5511900000555"  # _audio_body's patient
     texts = _sends(providers, "send_text_message", phone)
-    assert len(texts) == 2
-    assert texts[0] in (webhook._AUDIO_TOO_LONG_MSG_PT, webhook._AUDIO_TOO_LONG_MSG_EN)
-    assert texts[1] in (
+    assert len(texts) == 1
+    assert texts[0] in (
         webhook._STT_NEVER_CONFIGURED_MSG_PT,
         webhook._STT_NEVER_CONFIGURED_MSG_EN,
     )
+    assert _all_rows(client, HandoffRecord) == []
+    assert client._submit(_patient_sessions(world.zapi_tenant, phone)) == []
     assert _credit_rows(client) == _NO_CREDIT_ROWS
 
 
@@ -3840,6 +3841,143 @@ def test_an_observed_zapi_forward_records_one_production_trace(
         1_000,
     )
     assert _all_rows(client, CreditEffect) == []
+
+
+def test_the_enforced_zapi_long_audio_handoff_commits_claim_handoff_debit_and_link(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    redis_forgets: None,
+    file_handoff_outcomes: list[tuple[Any, Any]],
+) -> None:
+    """The Z-API ``audio_too_long`` is Meta's (O2): one transaction for the
+    claim, the handoff, the debit and the link; never a ``message.in``."""
+
+    world, phone = enforced, "5511900000555"  # _audio_body's patient
+    long_audio = _audio_body(world, "zapi-long-1", seconds=600)
+    assert _zapi(client, world, long_audio).json() == {
+        "ok": True,
+        "skipped": "audio_too_long",
+    }
+    [(enforcement, outcome)] = file_handoff_outcomes
+    assert (enforcement.source, enforcement.provider_message_id) == (
+        "zapi",
+        "zapi-long-1",
+    )
+    assert outcome.answer is None and outcome.handoff is not None
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "enforced",
+        "zapi-long-1",
+    )
+    effect_id = trace_effect_id(world.zapi_tenant, claim.interaction_id)
+    [record] = _all_rows(client, HandoffRecord)
+    assert record.id == outcome.handoff.id
+    assert record.context["credit_effect_id"] == effect_id
+    assert (record.numero_whatsapp, record.status) == (phone, "pending")
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # one trace
+    assert announced == [record.id]
+    texts = _sends(providers, "send_text_message", phone)
+    assert texts[-1] == webhook._AUDIO_TOO_LONG_MSG_PT
+    assert _message_in_contents(client) == []  # never reached the pipeline
+    assert _effects(client) == []  # the observational writer stood down
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert session.is_paused is False  # a handoff never pauses the AI
+    # A redelivery (the replay store forgot): no second handoff nor debit.
+    assert _zapi(client, world, long_audio).json() == {
+        "ok": True,
+        "skipped": "duplicate_message",
+    }
+    assert len(_all_rows(client, HandoffRecord)) == 1
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+    assert _sends(providers, "send_text_message", phone) == texts  # nothing sent
+
+
+def test_an_observed_zapi_long_audio_records_one_production_trace(
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    file_handoffs: list[dict[str, Any]],
+) -> None:
+    long_audio = _audio_body(world, "zapi-long-observed", seconds=600)
+    assert _zapi(client, world, long_audio).json() == {
+        "ok": True,
+        "skipped": "audio_too_long",
+    }
+    [call] = file_handoffs
+    assert call["note"] == "audio_too_long"
+    assert call["context"].origin is InteractionOrigin.PRODUCTION
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "observational",
+        "zapi-long-observed",
+    )
+    assert claim.interaction_id == call["id"]  # anchored on the handoff
+    effect = _only_effect(client)
+    assert effect.trace_id == call["id"]
+    assert (effect.origin, effect.authenticated, effect.would_debit_mc) == (
+        "production",
+        True,
+        1_000,
+    )
+    assert _all_rows(client, CreditEffect) == []
+    assert _message_in_contents(client) == []
+
+
+def _uazapi_long_audio(world: World, message_id: str) -> dict[str, Any]:
+    return {
+        "instanceName": world.uazapi_instance,
+        "message": {
+            "messageid": message_id,
+            "messageType": "AudioMessage",
+            "type": "media",
+            "mediaType": "ptt",
+            "content": {"seconds": 600, "mimetype": "audio/ogg; codecs=opus"},
+            "fromMe": False,
+            "sender_pn": "5511900000302@s.whatsapp.net",
+        },
+        "chat": {"wa_chatid": "5511900000302@s.whatsapp.net"},
+    }
+
+
+def test_the_uazapi_long_audio_handoff_is_observed_and_never_enforced(
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    file_handoffs: list[dict[str, Any]],
+) -> None:
+    """Uazapi's ``audio_too_long`` takes its file forward's branch: the
+    observational writer, at the ``unknown`` origin (no debit, ever)."""
+
+    response = client.post(
+        "/v1/webhook/uazapi", json=_uazapi_long_audio(world, "uazapi-long-1")
+    )
+    assert response.json() == {"ok": True, "skipped": "audio_too_long"}
+    [call] = file_handoffs
+    assert call["note"] == "audio_too_long"
+    assert call["context"].origin is InteractionOrigin.UNKNOWN
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "uazapi",
+        "observational",
+        "uazapi-long-1",
+    )
+    effect = _only_effect(client)
+    assert effect.trace_id == call["id"]
+    assert (effect.origin, effect.authenticated, effect.would_debit_mc) == (
+        "unknown",
+        False,
+        0,
+    )
+    assert _all_rows(client, CreditEffect) == []
+    assert _message_in_contents(client) == []
+    texts = _sends(providers, "send_uazapi_text", "5511900000302")
+    assert texts[-1] == webhook._AUDIO_TOO_LONG_MSG_PT
 
 
 @pytest.mark.parametrize("source", ["uazapi", "evolution"])

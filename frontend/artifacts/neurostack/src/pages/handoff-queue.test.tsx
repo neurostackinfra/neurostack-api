@@ -44,6 +44,7 @@ interface QueueItemFixture {
   sla_target_seconds: number | null;
   status: string;
   safety_flag: boolean;
+  pending_media?: string | null;
 }
 
 interface QueueStatsFixture {
@@ -178,6 +179,34 @@ afterEach(() => {
 });
 
 describe("<HandoffQueuePage />", () => {
+  it.each([
+    ["pt", "Áudio longo: ouvir no WhatsApp", "Arquivo: revisar no WhatsApp"],
+    ["en", "Long audio: listen on WhatsApp", "File: review on WhatsApp"],
+  ] as const)(
+    "marks a long audio and a file for review on the card (%s), nothing else",
+    async (locale, longAudio, file) => {
+      const items = [
+        { ...item("a"), pending_media: "long_audio" },
+        { ...item("b"), pending_media: "file" },
+        { ...item("c"), pending_media: "video" },
+        { ...item("d"), pending_media: null },
+        item("e"),
+      ];
+      mocks.fetch.mockResolvedValue(queueResponse(items));
+      renderPage(locale);
+      await waitFor(() => expect(cardIds()).toEqual(["a", "b", "c", "d", "e"]));
+
+      const markers = screen
+        .getAllByTestId("handoff-card")
+        .map((card) =>
+          within(card)
+            .queryAllByTestId("handoff-pending-media")
+            .map((badge) => badge.textContent),
+        );
+      expect(markers).toEqual([[longAudio], [file], [], [], []]);
+    },
+  );
+
   it("lets the clinic resolve the initial period and formats cards in its timezone", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-02T00:30:00.000Z"));

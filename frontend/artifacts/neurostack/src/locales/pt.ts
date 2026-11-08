@@ -608,6 +608,8 @@ export const pt: Record<TranslationKey, string> = {
   handoff_filter_intent: "Grupo de intenção",
   handoff_filter_all_intents: "Todas",
   handoff_safety_marker: "Sinalização de segurança",
+  handoff_pending_long_audio: "Áudio longo: ouvir no WhatsApp",
+  handoff_pending_file: "Arquivo: revisar no WhatsApp",
   handoff_filters_cards_only:
     "Os filtros de segurança e intenção se aplicam somente aos cards.",
   handoff_clear_filters: "Limpar filtros",

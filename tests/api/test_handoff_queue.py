@@ -293,6 +293,55 @@ def test_queue_confirmation_routes_preserve_distinct_contracts_and_fifo(
     assert duplicate.json()["detail"] == "handoff_conflict"
 
 
+def test_queue_exposes_pending_media_and_reads_anything_else_as_absent(
+    client: TestClient,
+) -> None:
+    """The file handoffs' marker (a long audio, a file) reaches the card in the
+    listing and in the checkout; any other stored value reads as absent."""
+
+    tenant_id = uuid4()
+    session = _session(tenant_id, "queue-pending-media")
+    now = datetime.now(timezone.utc) - timedelta(minutes=1)
+    cases: list[tuple[dict[str, Any], str | None]] = [
+        ({"pending_media": "long_audio"}, "long_audio"),
+        ({"pending_media": "file"}, "file"),
+        ({}, None),
+        ({"pending_media": "video"}, None),
+        ({"pending_media": 1}, None),
+        ({"pending_media": {"kind": "long_audio"}}, None),
+    ]
+    records = [
+        _record(
+            tenant_id,
+            session.id,
+            created_at=now + timedelta(seconds=index),
+            reason=HandoffReason.USER_REQUEST.value,
+            intent=None,
+            context=context,
+            first_message=f"private-{index}",
+        )
+        for index, (context, _) in enumerate(cases)
+    ]
+    _seed(client, tenants=[tenant_id], sessions=[session], handoffs=records)
+    headers = _jwt_headers("clinic_admin", tenant_id)
+
+    listed = client.get(
+        "/v1/handoffs/queue",
+        params={"tenant_id": str(tenant_id)},
+        headers=headers,
+    )
+
+    assert listed.status_code == 200, listed.text
+    assert [item["pending_media"] for item in listed.json()["items"]] == [
+        expected for _, expected in cases
+    ]
+    checked_out = client.post(
+        f"/v1/handoffs/queue/{records[0].id}/checkout", headers=headers
+    )
+    assert checked_out.status_code == 200, checked_out.text
+    assert checked_out.json()["pending_media"] == "long_audio"
+
+
 def test_queue_preserves_authentication_and_tenant_boundaries(
     client: TestClient,
 ) -> None:
@@ -1225,6 +1274,7 @@ def test_checkout_response_uses_winner_projection_without_requery_or_second_call
         "data_hora_saida": confirmed_at.isoformat().replace("+00:00", "Z"),
         "sla_target_seconds": 600,
         "status": "in_progress",
+        "pending_media": None,
         "wait_seconds": -5.0,
     }
     service.confirm_queue_handoff.assert_awaited_once_with(

@@ -17,6 +17,8 @@ import {
   CalendarRange,
   MessageCircle,
   ShieldAlert,
+  Mic,
+  FileText,
 } from "lucide-react";
 
 interface HandoffQueueItem {
@@ -31,6 +33,38 @@ interface HandoffQueueItem {
   sla_target_seconds: number | null;
   status: string;
   safety_flag: boolean;
+  /** Media the AI never processed; absent from an older API. */
+  pending_media?: PendingMedia | null;
+}
+
+/** The card marker for each pending media, next to the safety badge. */
+const PENDING_MEDIA_PRESENTATION = {
+  long_audio: { icon: Mic, label: "handoff_pending_long_audio" },
+  file: { icon: FileText, label: "handoff_pending_file" },
+} as const;
+
+type PendingMedia = keyof typeof PENDING_MEDIA_PRESENTATION;
+
+function isPendingMedia(value: unknown): value is PendingMedia {
+  return (
+    typeof value === "string" &&
+    Object.prototype.hasOwnProperty.call(PENDING_MEDIA_PRESENTATION, value)
+  );
+}
+
+function PendingMediaBadge({ media }: { media: PendingMedia }) {
+  const { t } = useI18n();
+  const { icon: Icon, label } = PENDING_MEDIA_PRESENTATION[media];
+  return (
+    <Badge
+      variant="secondary"
+      className="gap-1"
+      data-testid="handoff-pending-media"
+    >
+      <Icon className="h-3 w-3" aria-hidden="true" />
+      {t(label)}
+    </Badge>
+  );
 }
 
 interface QueueStats {
@@ -1041,6 +1075,9 @@ export default function HandoffQueuePage() {
                       <ShieldAlert className="h-3 w-3" aria-hidden="true" />
                       {t("handoff_safety_marker")}
                     </Badge>
+                  )}
+                  {isPendingMedia(item.pending_media) && (
+                    <PendingMediaBadge media={item.pending_media} />
                   )}
                 </div>
 

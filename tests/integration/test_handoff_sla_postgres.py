@@ -540,3 +540,56 @@ async def test_handoff_sla_postgres_smoke(
             tzinfo=ZoneInfo("Asia/Tokyo"),
         ).astimezone(timezone.utc)
         assert dst.period.start_utc != browser_start
+
+
+async def test_the_queue_projection_reads_pending_media_through_jsonb(
+    postgres_sla_database: SessionMaker,
+) -> None:
+    """``context.pending_media`` through PostgreSQL's JSONB ``->>``: a string
+    as is, anything else as its text (the API reads those as absent), and the
+    positional row mapping around it intact."""
+    from src.repositories.handoff import HandoffRecordRepository
+
+    factory = postgres_sla_database
+    tenant_id, session_id = uuid4(), uuid4()
+    start = datetime(2026, 9, 1, 3, tzinfo=timezone.utc)
+    extras: list[dict[str, object]] = [
+        {"pending_media": "long_audio"},
+        {"pending_media": "file"},
+        {},
+        {"pending_media": 1},
+        {"pending_media": {"kind": "file"}},
+    ]
+    records = []
+    for index, extra in enumerate(extras):
+        record = _handoff(
+            tenant_id, session_id, created_at=start + timedelta(minutes=index)
+        )
+        record.context = {**record.context, **extra}
+        records.append(record)
+    async with factory() as database:
+        async with database.begin():
+            database.add_all(_identity(tenant_id, session_id, "UTC"))
+            database.add_all(records)
+
+    async with factory() as database:
+        rows = [
+            row
+            async for row in HandoffRecordRepository(database).stream_sla_cohort(
+                tenant_id=tenant_id,
+                start_utc=start,
+                end_exclusive_utc=start + timedelta(days=1),
+            )
+        ]
+
+    assert [row.pending_media for row in rows] == [
+        "long_audio",
+        "file",
+        None,
+        "1",
+        '{"kind": "file"}',
+    ]
+    assert [(row.status, row.sla_target_seconds) for row in rows] == [
+        ("pending", 600)
+    ] * 5
+    assert all(row.primeira_linha_mensagem is None for row in rows)
