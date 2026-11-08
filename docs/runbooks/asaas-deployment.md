@@ -1481,7 +1481,9 @@ and 2, approved together; see "Known gap" below):
 0. Re-pin the manifest's rollback target from 16 to the serving revision 17,
    by its own manifest PR, before any image change (the planner's image gate
    requires the target to be the revision an image change replaces;
-   "Re-pinning the rollback target along the live chain").
+   "Re-pinning the rollback target along the live chain"). Done by the
+   re-pin PR of 2026-11-08 (evidence read only that day, `closed_at`
+   2026-11-08T14:42Z; "History (16 to 17)"): the reviewed manifest is at 17.
 1. Deploy the bridge image: one revision with the app image alone moved
    (revision 18, from 17).
 2. Run window `045` (below), on that image, with the rollback target 17.
@@ -3022,12 +3024,12 @@ new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
 13) it is a starting point, to confirm by running the runbook readers, since
 it depends on how L2c rewrote these tests: in
 `tests/scripts/test_asaas_migration_window.py`,
-`test_the_reviewed_manifest_is_pinned_to_revision_16` and the `MANIFEST`
+`test_the_reviewed_manifest_is_pinned_to_revision_17` and the `MANIFEST`
 line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
 `042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
 in `tests/scripts/test_asaas_production_wiring.py`,
 `test_manifest_and_template_validate`,
-`test_rollback_target_is_re_pinned_to_revision_16_without_a_note`,
+`test_rollback_target_is_re_pinned_to_revision_17_without_a_note`,
 `test_manifest_validator_rejects_an_invalid_rollback_target`,
 `test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
 `test_the_repository_parameters_propose_the_l2a_rows_revision`,
@@ -3093,11 +3095,38 @@ and declared the observation closed at 2026-11-04T01:12Z, the manifest's fifth
 `closed_at` marker. With the target on 16 the image change plans with no gate
 block.
 
+**History (16 to 17).** Revision 17 (revision 16 with the app image alone
+moved to the image of `main` after the ASAAS sandbox-by-key change,
+`build-20261104-fbda835a-41748073151`, the image change the 13 to 16 re-pin
+prepared; deployment `COMPLETED` 2026-11-04 02:13:05Z, 2/2 running, steady
+state through 2026-11-08) serves. Before the next image change (the media
+bridge image, step 1 of "Migration 045"), and because window `045` requires
+revision 17, the manifest was re-pinned from 16 to the serving revision 17
+(step 0 of that production order) with `effective_after:
+revision_serving_verified_and_observation_closed`, its image digest and its
+`request_sha256` (read only on 2026-11-08: `ACTIVE`, exactly one
+`BILLING_FACT_WORKER_ENABLED` `'true'`, both staged rows `'true'`, the
+complete AppConfig group; revision 17's request with the app image set back
+to revision 16's digest hashes to revision 16's recorded `request_sha256`,
+so the two differ in the app image alone). Its 6 h floor
+(2026-11-04T08:14Z) had long passed, so nothing was waived; the owner
+declared the observation closed at 2026-11-08T14:42Z, when approving the
+re-pin PR, the manifest's sixth `closed_at` marker. Besides the checklist
+above it also updated the 10 to 11 evidence test (one `request_sha256` per
+re-pin), the context line of
+`test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time` and
+the window `045` reads of the reviewed manifest, and added
+`test_the_16_to_17_re_pin_records_its_request_sha256_and_image_digest`. With
+the target on 17 window `045`'s own target check passes on the reviewed
+manifest; a manifest at 16 still refuses it.
+
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production
 is at `037`; they would run only after a snapshot restore, planned with a
 manifest at 10). Window `042` requires revision 12 by number and by content
-("Window 042: migrations 038-042").
+("Window 042: migrations 038-042"). Window `045` requires revision 17 the
+same way ("Migration 045"); since the re-pin 16 to 17 the reviewed manifest
+is its own target, and only its.
 
 **The circuit breaker.** ECS rolls a failed deployment back to the last
 completed one. With this order that is the target itself for L2a (11) and

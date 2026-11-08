@@ -225,12 +225,13 @@ re-pins the target to the serving revision (any revision above 13), by a
 manifest PR alone.
 
 **Revision 8 is unsafe after migration 036**: it reads columns 036 drops,
-and 036 ran on 2026-10-24, so roll back to the field's revision (16 since
-the sixth re-pin, to the serving revision before an image change), never
-to 8. Read "revision R" below as the field's current value, revision 16
-(check with `plan`, `rollback_target`); it was revision 8 in phase 1,
+and 036 ran on 2026-10-24, so roll back to the field's revision (17 since
+the seventh re-pin, to the serving revision before the media bridge image),
+never to 8. Read "revision R" below as the field's current value, revision
+17 (check with `plan`, `rollback_target`); it was revision 8 in phase 1,
 revision 9 in phase 2, revision 10 in phase 3, revision 11 until L2c,
-revision 12 until L4 and revision 13 until the re-pin to 16. A
+revision 12 until L4, revision 13 until the re-pin to 16 and revision 16
+until the re-pin to 17. A
 failed post-deploy webhook registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a
 reason to roll back.
 
@@ -264,10 +265,11 @@ reason to roll back.
     --services neurostack-staging-app
   ```
 
-  `R` is the rollback target, `16` since the sixth re-pin (to the serving
-  revision before an image change; it was `8` until the first re-pin
+  `R` is the rollback target, `17` since the seventh re-pin (to the serving
+  revision before the media bridge image; it was `8` until the first re-pin
   merged, `9` until the second, `10` until the third, `11` until the
-  fourth, `12` until the fifth and `13` until the sixth); never `8`,
+  fourth, `12` until the fifth, `13` until the sixth and `16` until the
+  seventh); never `8`,
   because migration 036 has run. After L6 do not roll back by hand to R
   (13): the rendering is then R plus two flips, a dead end of more than one
   kind of change for `plan`
