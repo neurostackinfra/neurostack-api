@@ -572,12 +572,12 @@ def test_rollback_runbook_states_every_rollback_target_phase() -> None:
         "**Revision 8 is unsafe after migration 036**: it reads columns 036"
         " drops, and 036 ran on 2026-10-24",
         "--task-definition neurostack-staging-app:R",
-        "`R` is the rollback target, `16` since the sixth re-pin (to the serving"
-        " revision before an image change; it was `8` until the first re-pin"
-        " merged, `9` until the second, `10` until the third, `11` until the"
-        " fourth, `12` until the fifth and `13` until the sixth); never `8`,"
-        " because migration 036 has run",
-        'Read "revision R" below as the field\'s current value, revision 16',
+        "`R` is the rollback target, `17` since the seventh re-pin (to the"
+        " serving revision before the media bridge image; it was `8` until the"
+        " first re-pin merged, `9` until the second, `10` until the third, `11`"
+        " until the fourth, `12` until the fifth, `13` until the sixth and `16`"
+        " until the seventh); never `8`, because migration 036 has run",
+        'Read "revision R" below as the field\'s current value, revision 17',
         "After L6 do not roll back by hand to R (13)",
         "`service_on_rollback_target_plan_stuck:<revision 13 ARN>`",
         # The breaker after L6: a safe state, not the documented way back.
@@ -857,6 +857,10 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
     order = [
         "0. Re-pin the manifest's rollback target from 16 to the serving"
         " revision 17",
+        # Step 0 done by its own manifest PR (the reviewed manifest at 17).
+        "Done by the re-pin PR of 2026-11-08 (evidence read only that day,"
+        ' `closed_at` 2026-11-08T14:42Z; "History (16 to 17)"): the reviewed'
+        " manifest is at 17.",
         "1. Deploy the bridge image",
         "2. Run window `045`",
         "3. Re-pin the rollback target from 17 to the bridge revision 18",
