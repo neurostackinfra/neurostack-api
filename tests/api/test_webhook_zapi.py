@@ -1266,6 +1266,19 @@ class TestZapiSttFallbackChain:
         assert send_mock.await_args.args[3] != _STT_NEVER_CONFIGURED_MSG_PT
         assert unread_mock.await_count == 1
         download_mock.assert_not_called()
+        # The real handoff service ran: the team's queue has it, and no
+        # ``message.in`` (a trace) was written for an audio nobody heard.
+        records, traces = _tenant_handoffs_and_messages_in(client, tenant_id)
+        assert [(r.status, r.numero_whatsapp) for r in records] == [
+            ("pending", "5511900000003")
+        ]
+        assert traces == 0
+        # The card's marker and the summary's first line say what it is.
+        [record] = records
+        assert record.context["pending_media"] == "long_audio"
+        assert record.summary.splitlines()[0] == (
+            "[ÁUDIO LONGO ENVIADO - ouvir no WhatsApp]"
+        )
 
     def test_english_clinic_gets_english_copy(
         self,
@@ -2387,11 +2400,12 @@ class _ZapiFileWorld:
             from_me=from_me,
         )
 
-    def audio(self) -> dict:
+    def audio(self, *, seconds: int = 5, message_id: str | None = None) -> dict:
         return _zapi_audio_body(
             instance_id=self.instance_id,
-            message_id=_g3_mid("audio"),
+            message_id=message_id or _g3_mid("audio"),
             phone=self.phone,
+            seconds=seconds,
         )
 
     def sent(self) -> list[str]:
@@ -3685,3 +3699,271 @@ class TestZapiGroupAndChannelSkip:
         assert [row.user_id for row in _tenant_sessions(client, tenant_id)] == [
             "5511900000902"
         ]
+
+
+def _g3_long_audio_notice(language: str = "pt") -> str:
+    from src.api.routes import webhook as webhook_module
+
+    return (
+        webhook_module._AUDIO_TOO_LONG_MSG_EN
+        if language == "en"
+        else webhook_module._AUDIO_TOO_LONG_MSG_PT
+    )
+
+
+def _tenant_handoffs_and_messages_in(
+    client: TestClient, tenant_id: UUID
+) -> tuple[list[Any], int]:
+    """The tenant's handoff records and how many ``message.in`` (traces) it has."""
+    from sqlalchemy import func, select
+
+    from src.models.event import Event
+    from src.models.handoff import HandoffRecord
+    from src.repositories.database import get_db_session
+
+    async def _run() -> tuple[list[Any], int]:
+        db = get_db_session()
+        try:
+            records = list(
+                (
+                    await db.execute(
+                        select(HandoffRecord).where(
+                            HandoffRecord.tenant_id == tenant_id
+                        )
+                    )
+                ).scalars()
+            )
+            traces = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(Event)
+                    .where(
+                        Event.tenant_id == tenant_id, Event.event_type == "message.in"
+                    )
+                )
+            ).scalar_one()
+            return records, int(traces)
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+class TestZapiLongAudioOpensAHandoff:
+    """A patient audio above ``audio_max_seconds`` is handed off like Meta's:
+    after the AI-off, pause and credit gates and the session, never
+    transcribed, with a tracked notice."""
+
+    _LONG = 180  # the seeded audio_max_seconds is 60
+
+    def test_long_audio_opens_the_handoff_and_sends_a_tracked_notice(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        from src.api.routes import webhook as webhook_module
+        from src.interaction_context import (
+            InteractionOrigin,
+            ResolvedInteractionContext,
+        )
+
+        world = zapi_file_world()
+        audio = world.audio(seconds=self._LONG)
+        ingress_marker = object()
+        ingress = MagicMock(return_value=ingress_marker)
+        record = AsyncMock(return_value=None)
+        unread = AsyncMock(return_value={})
+
+        with (
+            patch("src.api.routes.webhook.zapi_ingress", ingress),
+            patch("src.api.routes.webhook.record_meta_file_handoff", record),
+            patch("src.api.routes.webhook.mark_conversation_unread", unread),
+            patch("src.api.routes.webhook.safe_download_audio") as download,
+        ):
+            resp = world.post(audio)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        download.assert_not_called()
+        session_id = world.session().id
+        world.handoff.assert_awaited_once()
+        assert world.handoff.await_args.args == (
+            world.tenant_id,
+            session_id,
+            world.phone,
+            "audio_too_long",
+        )
+        context = world.handoff.await_args.kwargs["context"]
+        assert type(context) is ResolvedInteractionContext
+        assert context.origin is InteractionOrigin.PRODUCTION
+        assert context.session_id == session_id
+        # Metered like the file forward (observational here: no enforcement).
+        ingress.assert_called_once()
+        assert ingress.call_args.kwargs["body"] == audio
+        record.assert_awaited_once()
+        assert record.await_args.args[2] is world.handoff.return_value
+        assert record.await_args.kwargs == {"note": "audio_too_long"}
+
+        assert world.sent() == [_g3_long_audio_notice()]
+        assert world.pipeline_contents() == []
+        unread.assert_awaited_once()
+        assert unread.await_args.args[0] == world.instance_id
+        notice_mid = world.send_results[-1]["messageId"]
+        assert notice_mid in [entry[0] for entry in world.metadata()["ai_msg_ids"]]
+        assert notice_mid in webhook_module._INMEM_SENT
+        assert world.session().is_paused is False  # a handoff never pauses
+
+    def test_english_clinic_gets_the_english_notice(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world(clinic_config=_G3_EN_CONFIG)
+
+        resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert world.sent() == [_g3_long_audio_notice("en")]
+
+    def test_a_new_session_gets_the_lgpd_notice_first(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world(clinic_config=_G3_LGPD_CONFIG)
+
+        resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        sent = world.sent()
+        assert len(sent) == 2 and sent[1] == _g3_long_audio_notice()
+        world.handoff.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("cross_worker", "skipped"),
+        [(False, "ai_echo"), (True, "ai_echo_db")],
+    )
+    def test_the_notice_echo_is_an_ai_echo_and_never_pauses(
+        self,
+        zapi_file_world: Callable[..., _ZapiFileWorld],
+        cross_worker: bool,
+        skipped: str,
+    ) -> None:
+        from src.api.routes import webhook as webhook_module
+
+        world = zapi_file_world()
+        world.post(world.audio(seconds=self._LONG))
+        notice_mid = world.send_results[-1]["messageId"]
+        if cross_worker:
+            # Another worker, Redis down: only the database knows the id.
+            webhook_module._INMEM_SENT.clear()
+
+        echo = world.text(_g3_long_audio_notice(), message_id=notice_mid, from_me=True)
+        resp = world.post(echo)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": skipped}
+        assert world.session().is_paused is False
+
+    def test_ai_off_hands_nothing_off(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world()
+
+        with patch(
+            "src.api.routes.webhook._check_bot_active",
+            new=AsyncMock(return_value={"ok": True, "skipped": "bot_paused"}),
+        ):
+            resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.status_code == 202
+        assert resp.json() == {"ok": True, "skipped": "bot_paused"}
+        world.handoff.assert_not_awaited()
+        world.send.assert_not_awaited()
+
+    def test_a_paused_session_is_already_with_a_human(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world()
+        _create_paused_session(world.client, world.tenant_id, world.phone)
+
+        resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.status_code == 202
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+        world.handoff.assert_not_awaited()
+        world.send.assert_not_awaited()
+        _, traces = _tenant_handoffs_and_messages_in(world.client, world.tenant_id)
+        assert traces == 0  # an untranscribed audio has no text to capture
+
+    def test_a_pending_file_review_is_left_as_it_is(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world()
+        world.seed_session(_g3_review(timedelta(minutes=5)))
+
+        resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert world.handoff.await_args.args[3] == "audio_too_long"
+        assert world.metadata()["pending_file_review"] is True
+
+    def test_a_short_audio_is_still_transcribed(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world(stt=True)
+
+        with (
+            patch(
+                "src.api.routes.webhook.safe_download_audio",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(content=b"ogg", mime_type="audio/ogg")
+                ),
+            ),
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(return_value="Quero marcar uma consulta"),
+            ),
+        ):
+            resp = world.post(world.audio(seconds=30))
+
+        assert resp.json().get("replied") is True, resp.json()
+        world.handoff.assert_not_awaited()
+        assert world.pipeline_contents() == ["Quero marcar uma consulta"]
+
+
+@pytest.mark.parametrize(
+    ("note", "expected"),
+    [
+        ("audio_too_long", "long_audio"),
+        ("file_pending_review", "file"),
+        ("something_else", None),
+    ],
+)
+def test_the_file_handoff_note_names_the_pending_media(
+    note: str, expected: str | None
+) -> None:
+    """Every channel's file handoff goes through ``_meta_initiate_file_handoff``:
+    its note decides the queue card's marker."""
+    import asyncio
+
+    from src.api.routes import webhook as webhook_module
+    from src.interaction_context import InteractionOrigin
+
+    tenant_id, session_id = uuid4(), uuid4()
+    service = MagicMock()
+    service.initiate_handoff = AsyncMock(return_value=SimpleNamespace(id=uuid4()))
+    context = webhook_module.build_interaction_context(
+        effective_tenant_id=tenant_id,
+        session_id=session_id,
+        origin=InteractionOrigin.PRODUCTION,
+        event_type=webhook_module.EventType.MESSAGE_IN,
+    )
+
+    with patch(
+        "src.services.handoff_service.get_handoff_service", return_value=service
+    ):
+        asyncio.run(
+            webhook_module._meta_initiate_file_handoff(
+                tenant_id, session_id, "5511900000003", note, context=context
+            )
+        )
+
+    [request] = service.initiate_handoff.await_args.args
+    pending = request.pending_media
+    assert (pending.value if pending is not None else None) == expected
+    assert request.key_info["file_review_note"] == note

@@ -601,6 +601,8 @@ export const en = {
   handoff_filter_intent: "Intent group",
   handoff_filter_all_intents: "All",
   handoff_safety_marker: "Safety flag",
+  handoff_pending_long_audio: "Long audio: listen on WhatsApp",
+  handoff_pending_file: "File: review on WhatsApp",
   handoff_filters_cards_only: "Safety and intent filters apply only to cards.",
   handoff_clear_filters: "Clear filters",
   handoff_filtered_empty: "No cards match the selected filters.",

@@ -67,6 +67,15 @@ class HandoffReason(str, Enum):
     SCHEDULING = "scheduling"
 
 
+class HandoffPendingMedia(str, Enum):
+    """Media the patient sent that the AI did not process and the team must
+    review on WhatsApp (the file handoffs: forward-on-request and
+    ``audio_too_long``). Shown on the queue card; never the media itself."""
+
+    LONG_AUDIO = "long_audio"
+    FILE = "file"
+
+
 class WebhookStatus(str, Enum):
     """Status of webhook delivery."""
 
@@ -202,6 +211,7 @@ class HandoffRequest(BaseModel):
     urgency: HandoffUrgency = HandoffUrgency.NORMAL
     sector: Optional[HandoffSector] = None
     sla: Optional[HandoffSLA] = None
+    pending_media: Optional[HandoffPendingMedia] = None
 
     # Optional pre-built summary
     summary: Optional[str] = None

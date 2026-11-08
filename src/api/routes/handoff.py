@@ -48,6 +48,7 @@ from src.core.exceptions import (
     WebhookError,
 )
 from src.handoff.models import (
+    HandoffPendingMedia,
     HandoffReason,
     HandoffStatus,
     HandoffUrgency,
@@ -74,6 +75,7 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 _LEGACY_HANDOFF_INTENTS = frozenset(reason.value for reason in HandoffReason)
+_PENDING_MEDIA_VALUES = frozenset(media.value for media in HandoffPendingMedia)
 
 
 # ============================================
@@ -148,6 +150,12 @@ def _handoff_queue_fields(
         "data_hora_saida": record.data_hora_saida,
         "sla_target_seconds": record.sla_target_seconds,
         "status": record.status,
+        # Anything else stored there reads as absent, never as a 500.
+        "pending_media": (
+            record.pending_media
+            if record.pending_media in _PENDING_MEDIA_VALUES
+            else None
+        ),
     }
 
 

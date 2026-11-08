@@ -11,10 +11,17 @@ from uuid import UUID
 from src.handoff.models import (
     ConversationMessage,
     ConversationSummary,
+    HandoffPendingMedia,
     HandoffReason,
     HandoffUrgency,
     KeyInformation,
 )
+
+# Opening line of the summary of a handoff whose media the AI never processed.
+_PENDING_MEDIA_MARKERS: dict[HandoffPendingMedia, str] = {
+    HandoffPendingMedia.LONG_AUDIO: "[ÁUDIO LONGO ENVIADO - ouvir no WhatsApp]",
+    HandoffPendingMedia.FILE: "[ARQUIVO ENVIADO - revisar no WhatsApp]",
+}
 
 # ============================================
 # Extraction Patterns
@@ -129,6 +136,7 @@ class ConversationSummarizer:
         verification_status: Optional[str] = None,
         max_recent_messages: Optional[int] = None,
         omit_contact_symptoms_reason: bool = False,
+        pending_media: Optional[HandoffPendingMedia] = None,
     ) -> ConversationSummary:
         """
         Generate a structured summary of the conversation.
@@ -156,6 +164,9 @@ class ConversationSummarizer:
                 ``Sintomas mencionados:`` and ``Motivo do encaminhamento:``
                 lines are suppressed. The full human-facing summary that
                 ``HandoffRecord`` persists always calls with ``False``.
+            pending_media: Media the AI did not process (a long audio, a
+                file); its marker opens the summary so the team knows to
+                review it on WhatsApp.
 
         Returns:
             ConversationSummary with all extracted information
@@ -186,6 +197,8 @@ class ConversationSummarizer:
                 "[LINK DE AGENDAMENTO ENVIADO - verificar se o paciente concluiu]\n"
                 + summary_text
             )
+        if pending_media is not None:
+            summary_text = _PENDING_MEDIA_MARKERS[pending_media] + "\n" + summary_text
 
         # Get recent messages — explicit per-call override wins over the
         # constructor default so a single shared singleton can serve both the

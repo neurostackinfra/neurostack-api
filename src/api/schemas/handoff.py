@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from src.handoff.models import (
     HandoffDetail,
     HandoffListItem,
+    HandoffPendingMedia,
     HandoffStatus,
     HandoffUrgency,
     WebhookConfigCreate,
@@ -75,6 +76,8 @@ class HandoffQueueItem(BaseModel):
     data_hora_saida: Optional[_dt] = None
     sla_target_seconds: Optional[int] = Field(ge=60, le=7200)
     status: HandoffStatus
+    # Media the AI never processed, for the team to review on WhatsApp.
+    pending_media: Optional[HandoffPendingMedia] = None
 
 
 class HandoffQueueResponse(BaseModel):

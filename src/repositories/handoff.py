@@ -72,6 +72,9 @@ class HandoffSlaCohortRow:
     data_hora_saida: datetime | None
     sla_target_seconds: int | None
     status: str
+    # ``context.pending_media``: built positionally from the statement below,
+    # so it stays right after ``status`` there and here.
+    pending_media: str | None = None
     # Listing intentionally never selects the persisted private first message.
     primeira_linha_mensagem: str | None = None
 
@@ -304,6 +307,9 @@ class HandoffRecordRepository(BaseRepository[HandoffRecord]):
                 HandoffRecord.data_hora_saida,
                 HandoffRecord.sla_target_seconds,
                 HandoffRecord.status,
+                HandoffRecord.context["pending_media"]
+                .as_string()
+                .label("pending_media"),
             )
             .where(
                 HandoffRecord.tenant_id == tenant_id,

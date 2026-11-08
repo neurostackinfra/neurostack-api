@@ -191,6 +191,7 @@ class HandoffQueueConfirmation:
     data_hora_saida: datetime | None
     sla_target_seconds: int | None
     status: str
+    pending_media: str | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +263,11 @@ def _context_dict(record: HandoffRecord) -> dict[str, Any]:
 def _record_safety_concern(record: HandoffRecord) -> bool | None:
     value = _context_dict(record).get("safety_concern")
     return value if type(value) is bool else None
+
+
+def _record_pending_media(record: HandoffRecord) -> str | None:
+    value = _context_dict(record).get("pending_media")
+    return value if isinstance(value, str) else None
 
 
 @overload
@@ -709,6 +715,8 @@ class HandoffService:
             context["verification_status"] = request.verification_status
         if request.safety_concern is not None:
             context["safety_concern"] = request.safety_concern
+        if request.pending_media is not None:
+            context["pending_media"] = request.pending_media.value
 
         return HandoffRecord(
             id=handoff_id,
@@ -746,6 +754,7 @@ class HandoffService:
             sector=request.sector,
             sla=request.sla,
             verification_status=request.verification_status,
+            pending_media=request.pending_media,
         )
 
     async def _emit_handoff_request(
@@ -992,6 +1001,7 @@ class HandoffService:
             data_hora_saida=_aware_utc(record.data_hora_saida),
             sla_target_seconds=record.sla_target_seconds,
             status=record.status,
+            pending_media=_record_pending_media(record),
         )
 
     async def complete_handoff(

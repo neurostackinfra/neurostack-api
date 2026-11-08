@@ -114,10 +114,10 @@ pre-check (:func:`precheck_zapi` / :func:`precheck_meta`, the same as
 3b-1's: ``credit_enforcement_at`` read once, standalone, account on demand,
 hold) right after ``_check_pause_state`` and before the session is created;
 ``credit_pending`` answers 200 ``{"ok": true, "skipped": "credit_pending"}``
-with no session row, no LGPD notice, no Meta file ack and no Meta STT (on
-Z-API ``audio_too_long``, the STT and its fallback, and the mark-as-read run
-before the pre-check and still reach the patient: accepted per channel,
-D4/OWNER-c).  An enforced decision claims ``(tenant_id, source,
+with no session row, no LGPD notice, no Meta file ack, no Meta STT and no
+``audio_too_long`` handoff on either channel (on Z-API the STT and its
+fallback, and the mark-as-read run before the pre-check and still reach the
+patient: accepted per channel, D4/OWNER-c).  An enforced decision claims ``(tenant_id, source,
 provider_message_id)`` in a short transaction right before phase 1
 (:func:`acquire_webhook_claim`); its fences are 3b-1's without the lease
 clause (no takeover, no ``event_failed``); a redelivery answers ALWAYS 200
@@ -968,8 +968,9 @@ async def record_meta_file_handoff(
     note: str,
 ) -> ObservationalOutcome | None:
     """The file handoff (Meta's forward-on-request and ``audio_too_long``, O2;
-    the Z-API and Uazapi forward-on-request, whatsapp-image-understanding):
-    the handoff is the decision, anchored on its handoff id."""
+    the Z-API and Uazapi forward-on-request, whatsapp-image-understanding,
+    and their ``audio_too_long``): the handoff is the decision, anchored on
+    its handoff id."""
 
     if ingress is None:
         return None

@@ -2734,6 +2734,40 @@ async def _send_zapi_file_ack(
     return {"ok": True, "replied": True, "action": "file_ack"}
 
 
+async def _send_zapi_handoff_notice(
+    *,
+    session_id: UUID,
+    phone: str,
+    z_inst: str,
+    z_tok: str,
+    z_ct: str,
+    message: str,
+    label: str,
+    db: AsyncSession,
+) -> None:
+    """Send the fixed notice of an already committed file handoff.
+
+    Like Meta, a notice that cannot go out is logged and the route still
+    answers as if it had. A sent notice is tracked and stored like the AI
+    reply, so its echo is an ``ai_echo`` and never reads as a human takeover.
+    """
+    if not z_inst or not z_tok:
+        logger.warning("Z-API credentials missing for %s to %s", label, phone)
+        return
+    try:
+        send_result = await send_text_message(
+            z_inst, z_tok, phone, message, client_token=z_ct
+        )
+    except Exception as exc:
+        logger.warning("Z-API %s send failed for %s — %s", label, phone, exc)
+        return
+    _track_sent_message(send_result)
+    sent_mid = _zapi_sent_message_id(send_result)
+    if sent_mid:
+        await _store_ai_msg_id_to_db(session_id, sent_mid, db)
+    await db.commit()
+
+
 async def _send_zapi_file_forwarded(
     *,
     session_id: UUID,
@@ -2744,35 +2778,47 @@ async def _send_zapi_file_forwarded(
     agent_language: str,
     db: AsyncSession,
 ) -> None:
-    """Confirm a forward-on-request handoff to the patient (Decision 17).
-
-    The handoff is already committed; like Meta, a confirmation that cannot
-    go out is logged and the route still answers ``file_handoff``. A sent
-    confirmation is tracked and stored like the AI reply, so its echo is an
-    ``ai_echo``.
-    """
-    if not z_inst or not z_tok:
-        logger.warning(
-            "Z-API credentials missing for file-forward confirmation to %s", phone
-        )
-        return
-    message = (
-        _FILE_FORWARDED_MSG_EN if agent_language == "en" else _FILE_FORWARDED_MSG_PT
+    """Confirm a forward-on-request handoff to the patient (Decision 17)."""
+    await _send_zapi_handoff_notice(
+        session_id=session_id,
+        phone=phone,
+        z_inst=z_inst,
+        z_tok=z_tok,
+        z_ct=z_ct,
+        message=(
+            _FILE_FORWARDED_MSG_EN if agent_language == "en" else _FILE_FORWARDED_MSG_PT
+        ),
+        label="file-forward confirmation",
+        db=db,
     )
-    try:
-        send_result = await send_text_message(
-            z_inst, z_tok, phone, message, client_token=z_ct
-        )
-    except Exception as exc:
-        logger.warning(
-            "Z-API file-forward confirmation send failed for %s — %s", phone, exc
-        )
-        return
-    _track_sent_message(send_result)
-    forward_mid = _zapi_sent_message_id(send_result)
-    if forward_mid:
-        await _store_ai_msg_id_to_db(session_id, forward_mid, db)
-    await db.commit()
+
+
+async def _send_zapi_audio_too_long(
+    *,
+    session_id: UUID,
+    phone: str,
+    z_inst: str,
+    z_tok: str,
+    z_ct: str,
+    agent_language: str,
+    db: AsyncSession,
+) -> None:
+    """Tell the patient their long audio went to the team, then mark the
+    conversation unread so the clinic sees it on the phone as well."""
+    await _send_zapi_handoff_notice(
+        session_id=session_id,
+        phone=phone,
+        z_inst=z_inst,
+        z_tok=z_tok,
+        z_ct=z_ct,
+        message=(
+            _AUDIO_TOO_LONG_MSG_EN if agent_language == "en" else _AUDIO_TOO_LONG_MSG_PT
+        ),
+        label="long-audio notice",
+        db=db,
+    )
+    if z_inst and z_tok:
+        await mark_conversation_unread(z_inst, z_tok, phone, client_token=z_ct)
 
 
 @router.post(
@@ -3019,6 +3065,9 @@ async def _process_zapi_authenticated_body(
     # under a *different* guard (``audio_obj and message_text``), which is also
     # true for payloads carrying both text and audio, so it must stay bound.
     whisper_model: Optional[str] = None
+    # A patient audio above ``audio_max_seconds``: never downloaded or
+    # transcribed, handed off to the team at the insertion point below.
+    audio_too_long = False
     if audio_obj and not message_text and not is_from_me:
         audio_url = audio_obj.get("url") or audio_obj.get("audioUrl")
         mimetype = audio_obj.get("mimeType") or "audio/ogg"
@@ -3055,92 +3104,82 @@ async def _process_zapi_authenticated_body(
             z_tok = (creds.get("zapi_token") or "").strip()
             z_ct = (creds.get("zapi_client_token") or "").strip()
 
-            # Duration-based limit: long audios trigger human handoff instead
-            # of transcription. It runs above the capability gate too, because
-            # Meta's long-audio handoff runs before anything is known about
-            # STT; leaving it inside the gate would give the same 3-minute
-            # audio a handoff on Meta and "please type" on Z-API. The duration
-            # comes from the payload, so this costs no download.
+            # Duration-based limit: a long audio goes to the clinic team
+            # instead of being transcribed. It runs above the capability gate,
+            # like Meta's: otherwise a 3-minute audio would get a handoff on
+            # Meta and "please type" on Z-API. The duration comes from the
+            # payload, so this costs no download. Only the decision is taken
+            # here: the handoff and its notice wait below the AI-off, pause
+            # and credit gates and the session, where Meta's run too.
             audio_max_seconds = int((creds or {}).get("audio_max_seconds") or 60)
             audio_seconds = int(audio_obj.get("seconds") or 0)
             if audio_seconds > audio_max_seconds:
-                if z_inst and z_tok:
-                    handoff_msg = (
-                        _AUDIO_TOO_LONG_MSG_EN
-                        if agent_lang == "en"
-                        else _AUDIO_TOO_LONG_MSG_PT
-                    )
-                    await send_text_message(
-                        z_inst, z_tok, phone, handoff_msg, client_token=z_ct
-                    )
-                    # Mark conversation as unread so the clinic team sees the pending audio
-                    await mark_conversation_unread(
-                        z_inst, z_tok, phone, client_token=z_ct
-                    )
+                audio_too_long = True
                 logger.info(
                     "Audio too long (%ds > %ds limit), skipping transcription for %s",
                     audio_seconds,
                     audio_max_seconds,
                     phone,
                 )
-                return {"ok": True, "skipped": "audio_too_long"}
-
-            # Capability gate: download when *either* rung of the chain can
-            # use the bytes. With neither, nothing is downloaded at all and
-            # the chain reports "never configured" from ``audio_bytes=None``.
-            audio_bytes: Optional[bytes] = None
-            effective_mime = mimetype
-            if whisper_key or _multimodal_operational(creds):
-                # Bound the streaming download by the same audio_max_seconds
-                # window the config exposes; safe_download_audio enforces MIME,
-                # host, and Content-Length policy uniformly.
-                max_bytes = min(
-                    audio_max_seconds * 16 * 1024,
-                    10 * 1024 * 1024,
-                )
-                try:
-                    download = await safe_download_audio(audio_url, max_bytes=max_bytes)
-                except UnsafeEgressError as exc:
-                    # Media acquisition failure never enters the chain: there
-                    # is no transcription to reroute from, and this exit also
-                    # covers hosts we refuse to talk to.
-                    logger.warning(
-                        "Z-API audio egress rejected: %s",
-                        exc.code,
+            else:
+                # Capability gate: download when *either* rung of the chain can
+                # use the bytes. With neither, nothing is downloaded at all and
+                # the chain reports "never configured" from ``audio_bytes=None``.
+                audio_bytes: Optional[bytes] = None
+                effective_mime = mimetype
+                if whisper_key or _multimodal_operational(creds):
+                    # Bound the streaming download by the same audio_max_seconds
+                    # window the config exposes; safe_download_audio enforces MIME,
+                    # host, and Content-Length policy uniformly.
+                    max_bytes = min(
+                        audio_max_seconds * 16 * 1024,
+                        10 * 1024 * 1024,
                     )
-                    envelope = {
-                        "unsafe_api_url": "unsafe_audio_url",
-                        "audio_too_large": "audio_too_large",
-                        "unsupported_audio_mime": "unsupported_audio_mime",
-                        "audio_download_failed": "audio_download_failed",
-                        "redirect_forbidden": "unsafe_audio_url",
-                    }.get(exc.code, "audio_download_failed")
-                    return {"ok": True, "skipped": envelope}
-                audio_bytes = download.content
-                effective_mime = download.mime_type or mimetype
-                logger.info(
-                    "Audio received for transcription: size=%d bytes, mimetype=%s",
-                    len(audio_bytes),
-                    effective_mime,
-                )
+                    try:
+                        download = await safe_download_audio(
+                            audio_url, max_bytes=max_bytes
+                        )
+                    except UnsafeEgressError as exc:
+                        # Media acquisition failure never enters the chain: there
+                        # is no transcription to reroute from, and this exit also
+                        # covers hosts we refuse to talk to.
+                        logger.warning(
+                            "Z-API audio egress rejected: %s",
+                            exc.code,
+                        )
+                        envelope = {
+                            "unsafe_api_url": "unsafe_audio_url",
+                            "audio_too_large": "audio_too_large",
+                            "unsupported_audio_mime": "unsupported_audio_mime",
+                            "audio_download_failed": "audio_download_failed",
+                            "redirect_forbidden": "unsafe_audio_url",
+                        }.get(exc.code, "audio_download_failed")
+                        return {"ok": True, "skipped": envelope}
+                    audio_bytes = download.content
+                    effective_mime = download.mime_type or mimetype
+                    logger.info(
+                        "Audio received for transcription: size=%d bytes, mimetype=%s",
+                        len(audio_bytes),
+                        effective_mime,
+                    )
 
-            message_text, chain_failure = await _transcribe_audio_chain(
-                audio_bytes,
-                creds,
-                mime_type=effective_mime,
-                agent_language=agent_lang,
-                channel="Z-API",
-            )
-            if chain_failure:
-                return await _send_zapi_stt_fallback(
-                    tenant_id=tenant_id,
-                    phone=phone,
-                    z_inst=z_inst,
-                    z_tok=z_tok,
-                    z_ct=z_ct,
+                message_text, chain_failure = await _transcribe_audio_chain(
+                    audio_bytes,
+                    creds,
+                    mime_type=effective_mime,
                     agent_language=agent_lang,
-                    failure_reason=chain_failure,
+                    channel="Z-API",
                 )
+                if chain_failure:
+                    return await _send_zapi_stt_fallback(
+                        tenant_id=tenant_id,
+                        phone=phone,
+                        z_inst=z_inst,
+                        z_tok=z_tok,
+                        z_ct=z_ct,
+                        agent_language=agent_lang,
+                        failure_reason=chain_failure,
+                    )
 
     if not text_obj and not audio_obj and patient_file_kind is None:
         return {"ok": True, "skipped": "non-text"}
@@ -3150,7 +3189,13 @@ async def _process_zapi_authenticated_body(
     # match the trigger phrase, so it falls through to human takeover. A
     # patient file is the other: it has no text of its own (a caption is the
     # file's, never the patient's message) and never takes the fromMe block.
-    if not message_text and not staff_audio and patient_file_kind is None:
+    # A long patient audio is the third: it is handed off, never transcribed.
+    if (
+        not message_text
+        and not staff_audio
+        and patient_file_kind is None
+        and not audio_too_long
+    ):
         return {"ok": True, "skipped": "empty"}
 
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
@@ -3206,9 +3251,11 @@ async def _process_zapi_authenticated_body(
     # Right after the pause check and before the session exists: under a
     # hold (or for a standalone tenant) once credits are enforced, a new
     # patient gets no session row and no LGPD notice.  Accepted per channel
-    # (D4/OWNER-c): on Z-API ``audio_too_long``, the STT and its fallback ran
-    # above and their fixed messages already reached the patient, and the
-    # message was already marked read.
+    # (D4/OWNER-c): on Z-API the STT and its fallback ran above and their
+    # fixed messages already reached the patient, and the message was
+    # already marked read.  ``audio_too_long`` is no longer among them: its
+    # handoff and notice run below, so under a hold, as on Meta, neither
+    # happens.
     enforcement: Optional[WebhookEnforcement] = None
     if request is not None:
         try:
@@ -3285,6 +3332,43 @@ async def _process_zapi_authenticated_body(
     # paused session, and a new session's notice already went out. No claim
     # of its own: the replay claim at the top of ``zapi_webhook`` covers it.
     agent_lang = _get_agent_language(clinic_config)
+
+    # ── long patient audio: hand off to the team, never transcribed ──
+    # Same place and same decision as Meta's ``audio_too_long``: after the
+    # AI-off and pause gates (a paused session is already with a human), the
+    # credit pre-check, the session and the LGPD notice. The handoff is the
+    # decision: no pipeline and no ``message.in``, metered like the file
+    # forward below. A pending file review is left as it is, as on Meta.
+    if audio_too_long:
+        skipped = await _meta_file_handoff(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            from_phone=phone,
+            note="audio_too_long",
+            context=context,
+            db=db,
+            metering=(
+                None
+                if request is None or enforcement is not None
+                else zapi_ingress(request, body=body, context=context)
+            ),
+            enforcement=enforcement,
+            clear_pending_review=False,
+        )
+        if skipped is not None:
+            return skipped
+        audio_creds = await _tenant_creds()
+        await _send_zapi_audio_too_long(
+            session_id=session_id,
+            phone=phone,
+            z_inst=str(audio_creds.get("zapi_instance_id") or "").strip(),
+            z_tok=str(audio_creds.get("zapi_token") or "").strip(),
+            z_ct=str(audio_creds.get("zapi_client_token") or "").strip(),
+            agent_language=agent_lang,
+            db=db,
+        )
+        return {"ok": True, "skipped": "audio_too_long"}
+
     if patient_file_kind is None:
         # A textual message (text, or audio transcribed above) resolves an
         # active pending review. A file's caption never does: files never
@@ -4020,6 +4104,44 @@ async def _send_uazapi_file_ack(
     return {"ok": True, "replied": True, "action": "file_ack"}
 
 
+async def _send_uazapi_handoff_notice(
+    *,
+    session_id: UUID,
+    phone: str,
+    u_url: str,
+    u_token: str,
+    message: str,
+    label: str,
+    db: AsyncSession,
+) -> bool:
+    """Send the fixed notice of an already committed file handoff.
+
+    Like Meta, a notice that cannot go out is logged and the route still
+    answers as if it had. A sent notice is tracked and stored like the AI
+    reply, so its echo is an ``ai_echo``. Returns ``False`` only when the
+    egress switch held the notice back, so a caller can say so.
+    """
+    if not u_url or not u_token:
+        logger.warning("Uazapi credentials missing for %s to %s", label, phone)
+        return True
+    try:
+        send_result = await send_uazapi_text(u_url, u_token, phone, message)
+    except EgressDisabledError:
+        logger.warning("Uazapi %s to %s suppressed: egress disabled", label, phone)
+        return False
+    except Exception:
+        logger.exception("Uazapi %s send failed for %s", label, phone)
+        return True
+    sent_mid = _extract_normalised_send_id(send_result)
+    if sent_mid:
+        _track_sent_message({"messageid": sent_mid})
+        await _store_ai_msg_id_to_db(session_id, sent_mid, db)
+    else:
+        _track_sent_message(send_result)
+    await db.commit()
+    return True
+
+
 async def _send_uazapi_file_forwarded(
     *,
     session_id: UUID,
@@ -4029,37 +4151,18 @@ async def _send_uazapi_file_forwarded(
     agent_language: str,
     db: AsyncSession,
 ) -> None:
-    """Confirm a forward-on-request handoff to the patient (Decision 17).
-
-    The handoff is already committed; like Meta, a confirmation that cannot
-    go out is logged and the route still answers ``file_handoff``.
-    """
-    if not u_url or not u_token:
-        logger.warning(
-            "Uazapi credentials missing for file-forward confirmation to %s", phone
-        )
-        return
-    message = (
-        _FILE_FORWARDED_MSG_EN if agent_language == "en" else _FILE_FORWARDED_MSG_PT
+    """Confirm a forward-on-request handoff to the patient (Decision 17)."""
+    await _send_uazapi_handoff_notice(
+        session_id=session_id,
+        phone=phone,
+        u_url=u_url,
+        u_token=u_token,
+        message=(
+            _FILE_FORWARDED_MSG_EN if agent_language == "en" else _FILE_FORWARDED_MSG_PT
+        ),
+        label="file-forward confirmation",
+        db=db,
     )
-    try:
-        send_result = await send_uazapi_text(u_url, u_token, phone, message)
-    except EgressDisabledError:
-        logger.warning(
-            "Uazapi file-forward confirmation to %s suppressed: egress disabled",
-            phone,
-        )
-        return
-    except Exception:
-        logger.exception("Uazapi file-forward confirmation send failed for %s", phone)
-        return
-    forward_mid = _extract_normalised_send_id(send_result)
-    if forward_mid:
-        _track_sent_message({"messageid": forward_mid})
-        await _store_ai_msg_id_to_db(session_id, forward_mid, db)
-    else:
-        _track_sent_message(send_result)
-    await db.commit()
 
 
 # ── Uazapi webhook endpoint ─────────────────────────────────────────
@@ -4321,6 +4424,9 @@ async def uazapi_webhook(
     # download → chain → reroute on failure. This block only runs for
     # patient audio (``is_audio_media and not is_from_me``); staff voice
     # notes were already routed above and returned before this point.
+    # A patient audio above ``audio_max_seconds`` is never downloaded or
+    # transcribed: it is handed off at the insertion point below.
+    audio_too_long = False
     if audio_is_transcribable:
         creds = await _tenant_creds()
         u_url = (creds.get("uazapi_api_url") or "").strip()
@@ -4341,6 +4447,8 @@ async def uazapi_webhook(
         # (media-payload.json: ``message.content.seconds`` is an int). This
         # runs above the capability gate so a 3-minute audio hands off
         # instead of getting "please type" on Uazapi — matching Z-API/Meta.
+        # Only the decision is taken here: the handoff and its notice wait
+        # below the AI-off and pause gates and the session, as on Meta.
         content_obj = msg.get("content") or {}
         audio_seconds = 0
         if isinstance(content_obj, dict):
@@ -4350,115 +4458,96 @@ async def uazapi_webhook(
             duplicate = _claim_deferred_message()
             if duplicate is not None:
                 return duplicate
-            if u_url and u_token:
-                handoff_msg = (
-                    _AUDIO_TOO_LONG_MSG_EN
-                    if agent_lang == "en"
-                    else _AUDIO_TOO_LONG_MSG_PT
-                )
-                try:
-                    await send_uazapi_text(u_url, u_token, from_phone, handoff_msg)
-                except EgressDisabledError:
-                    return {
-                        "ok": True,
-                        "skipped": "audio_too_long",
-                        "reason": "uazapi_egress_disabled",
-                    }
-                except Exception:
-                    logger.exception(
-                        "Uazapi long-audio handoff send failed for %s",
-                        from_phone,
-                    )
+            audio_too_long = True
             logger.info(
                 "Uazapi audio too long (%ds > %ds limit), skipping transcription for %s",
                 audio_seconds,
                 audio_max_seconds,
                 from_phone,
             )
-            return {"ok": True, "skipped": "audio_too_long"}
-
-        # Capability gate: download only when at least one chain rung can
-        # actually use the bytes. Matches Z-API — no bytes fetched from
-        # WhatsApp / Uazapi when the tenant has neither STT nor multimodal.
-        whisper_key = (
-            creds.get("stt_api_key") or creds.get("whisper_api_key") or ""
-        ).strip()
-        audio_bytes: Optional[bytes] = None
-        effective_mime = str(
-            (content_obj.get("mimetype") if isinstance(content_obj, dict) else None)
-            or "audio/ogg"
-        )
-        if whisper_key or _multimodal_operational(creds):
-            try:
-                audio_bytes, downloaded_mime = await download_uazapi_media(
-                    u_url, u_token, msg_id
-                )
-            except EgressDisabledError:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "ok": False,
-                        "error": "uazapi_egress_disabled",
-                        "retryable": True,
-                    },
-                )
-            except UazapiMediaDownloadError as exc:
+        else:
+            # Capability gate: download only when at least one chain rung can
+            # actually use the bytes. Matches Z-API — no bytes fetched from
+            # WhatsApp / Uazapi when the tenant has neither STT nor multimodal.
+            whisper_key = (
+                creds.get("stt_api_key") or creds.get("whisper_api_key") or ""
+            ).strip()
+            audio_bytes: Optional[bytes] = None
+            effective_mime = str(
+                (content_obj.get("mimetype") if isinstance(content_obj, dict) else None)
+                or "audio/ogg"
+            )
+            if whisper_key or _multimodal_operational(creds):
+                try:
+                    audio_bytes, downloaded_mime = await download_uazapi_media(
+                        u_url, u_token, msg_id
+                    )
+                except EgressDisabledError:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "ok": False,
+                            "error": "uazapi_egress_disabled",
+                            "retryable": True,
+                        },
+                    )
+                except UazapiMediaDownloadError as exc:
+                    duplicate = _claim_deferred_message()
+                    if duplicate is not None:
+                        return duplicate
+                    # Media never materialised — Uazapi's download endpoint
+                    # rejected the request or returned garbage. There is no
+                    # transcription to reroute from; skip with a distinct label
+                    # so operators can grep for it in logs.
+                    logger.warning(
+                        "Uazapi media download failed for %s — %s",
+                        msg_id,
+                        exc,
+                    )
+                    return {"ok": True, "skipped": "audio_download_failed"}
                 duplicate = _claim_deferred_message()
                 if duplicate is not None:
                     return duplicate
-                # Media never materialised — Uazapi's download endpoint
-                # rejected the request or returned garbage. There is no
-                # transcription to reroute from; skip with a distinct label
-                # so operators can grep for it in logs.
-                logger.warning(
-                    "Uazapi media download failed for %s — %s",
-                    msg_id,
-                    exc,
+                if downloaded_mime:
+                    effective_mime = downloaded_mime
+                logger.info(
+                    "Uazapi audio received for transcription: size=%d bytes, mimetype=%s",
+                    len(audio_bytes),
+                    effective_mime,
                 )
-                return {"ok": True, "skipped": "audio_download_failed"}
-            duplicate = _claim_deferred_message()
-            if duplicate is not None:
-                return duplicate
-            if downloaded_mime:
-                effective_mime = downloaded_mime
-            logger.info(
-                "Uazapi audio received for transcription: size=%d bytes, mimetype=%s",
-                len(audio_bytes),
-                effective_mime,
-            )
-        else:
-            duplicate = _claim_deferred_message()
-            if duplicate is not None:
-                return duplicate
+            else:
+                duplicate = _claim_deferred_message()
+                if duplicate is not None:
+                    return duplicate
 
-        transcript, chain_failure = await _transcribe_audio_chain(
-            audio_bytes,
-            creds,
-            mime_type=effective_mime,
-            agent_language=agent_lang,
-            channel="Uazapi",
-        )
-        if chain_failure:
-            try:
-                return await _send_uazapi_stt_fallback(
-                    tenant_id=tenant_id,
-                    phone=from_phone,
-                    u_url=u_url,
-                    u_token=u_token,
-                    agent_language=agent_lang,
-                    failure_reason=chain_failure,
-                )
-            except EgressDisabledError:
-                return {
-                    "ok": True,
-                    "replied": False,
-                    "action": "stt_fallback_suppressed",
-                    "reason": "uazapi_egress_disabled",
-                }
-        # Success: feed the transcript into the normal pipeline. The
-        # load-bearing ``assert message_text is not None`` below is now
-        # satisfied on the patient-audio path.
-        message_text = transcript
+            transcript, chain_failure = await _transcribe_audio_chain(
+                audio_bytes,
+                creds,
+                mime_type=effective_mime,
+                agent_language=agent_lang,
+                channel="Uazapi",
+            )
+            if chain_failure:
+                try:
+                    return await _send_uazapi_stt_fallback(
+                        tenant_id=tenant_id,
+                        phone=from_phone,
+                        u_url=u_url,
+                        u_token=u_token,
+                        agent_language=agent_lang,
+                        failure_reason=chain_failure,
+                    )
+                except EgressDisabledError:
+                    return {
+                        "ok": True,
+                        "replied": False,
+                        "action": "stt_fallback_suppressed",
+                        "reason": "uazapi_egress_disabled",
+                    }
+            # Success: feed the transcript into the normal pipeline. The
+            # load-bearing ``assert message_text is not None`` below is now
+            # satisfied on the patient-audio path.
+            message_text = transcript
 
     # ── bot_active check — if AI is paused, drop silently ──
     bot_skip = await _check_bot_active(tenant_id, from_phone, db)
@@ -4467,8 +4556,13 @@ async def uazapi_webhook(
         return JSONResponse(status_code=202, content=bot_skip)
 
     # ── pause check for patient messages ──
+    # A long audio was never transcribed: it has no text to capture.
     pause_result = await _check_pause_state(
-        tenant_id, from_phone, db, message_text=message_text, origin=origin
+        tenant_id,
+        from_phone,
+        db,
+        message_text=None if audio_too_long else message_text,
+        origin=origin,
     )
     if pause_result:
         await db.commit()
@@ -4538,6 +4632,45 @@ async def uazapi_webhook(
     # Here, after the AI-off and pause gates, the session and the LGPD
     # notice: nothing below runs for a paused session or with the AI off.
     agent_lang = _get_agent_language(clinic_config)
+
+    # ── long patient audio: hand off to the team, never transcribed ──
+    # Same decision as Meta's and Z-API's ``audio_too_long``, metered like
+    # the file forward below (observational: Uazapi has no enforcement). No
+    # pipeline and no ``message.in``. A pending file review is left as is.
+    if audio_too_long:
+        skipped = await _meta_file_handoff(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            from_phone=from_phone,
+            note="audio_too_long",
+            context=context,
+            db=db,
+            metering=uazapi_ingress(request, message=msg, context=context),
+            enforcement=None,
+            clear_pending_review=False,
+        )
+        if skipped is not None:
+            return skipped
+        egress_open = await _send_uazapi_handoff_notice(
+            session_id=session_id,
+            phone=from_phone,
+            u_url=u_url,
+            u_token=u_token,
+            message=(
+                _AUDIO_TOO_LONG_MSG_EN if agent_lang == "en" else _AUDIO_TOO_LONG_MSG_PT
+            ),
+            label="long-audio notice",
+            db=db,
+        )
+        if not egress_open:
+            # The handoff is committed; only the notice was held back.
+            return {
+                "ok": True,
+                "skipped": "audio_too_long",
+                "reason": "uazapi_egress_disabled",
+            }
+        return {"ok": True, "skipped": "audio_too_long"}
+
     if patient_file_kind is None:
         # A textual message (plain text, or audio transcribed above) resolves
         # an active pending review. A file's caption never does: files never
@@ -4977,15 +5110,26 @@ async def _meta_initiate_file_handoff(
     and the creation webhook waits for its commit (``initiate_handoff``'s
     caller-session mode, #145).  Without it the handoff commits on its own.
     """
-    from src.handoff.models import HandoffReason, HandoffRequest, HandoffUrgency
+    from src.handoff.models import (
+        HandoffPendingMedia,
+        HandoffReason,
+        HandoffRequest,
+        HandoffUrgency,
+    )
     from src.services.handoff_service import get_handoff_service
 
+    # What the queue card and the summary say the team must review.
+    pending_media = {
+        "audio_too_long": HandoffPendingMedia.LONG_AUDIO,
+        "file_pending_review": HandoffPendingMedia.FILE,
+    }.get(note)
     handoff_service = get_handoff_service()
     request = HandoffRequest(
         tenant_id=tenant_id,
         session_id=session_id,
         reason=HandoffReason.USER_REQUEST,
         urgency=HandoffUrgency.NORMAL,
+        pending_media=pending_media,
         key_info={
             "numero_whatsapp": from_phone,
             "phone": from_phone,
@@ -5029,9 +5173,9 @@ async def _meta_file_handoff(
     enforcement: Optional[WebhookEnforcement],
     clear_pending_review: bool,
 ) -> Optional[dict[str, Any]]:
-    """The Meta file handoff decision of both call sites (forward-on-request
-    and ``audio_too_long``).  ``None``: the handoff is committed, the route
-    sends the patient's text as today.  A dict: the 200 body to answer with,
+    """The file handoff decision of every call site: forward-on-request and
+    ``audio_too_long``, on Meta, Z-API and Uazapi.  ``None``: the handoff is
+    committed, the route sends the patient's text as today.  A dict: the 200 body to answer with,
     nothing handed off and nothing sent.
 
     Without ``enforcement``, main's sequence (the handoff commits on its own;
