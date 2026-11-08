@@ -12,8 +12,9 @@ import time as _time
 from collections import OrderedDict as _OrderedDict
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import (
     Any,
     Awaitable,
@@ -63,8 +64,13 @@ from src.repositories import (
     SessionRepository,
     get_db_session_dependency,
 )
-from src.services import credit_metering
-from src.services.api_credentials import OPERATIONAL_MULTIMODAL_PROVIDERS
+from src.repositories.database import get_db_session_factory
+from src.services import credit_metering, reply_media_runner
+from src.services.api_credentials import (
+    OPERATIONAL_MULTIMODAL_PROVIDERS,
+    MediaDeliveryProvider,
+    media_delivery_provider,
+)
 from src.services.credit_metering import (
     REPLY_PAYLOAD_KIND,
     CreditEnforcementUnavailable,
@@ -79,6 +85,7 @@ from src.services.credit_metering import (
     uazapi_ingress,
     zapi_ingress,
 )
+from src.services.credit_switch import request_credit_switch
 from src.services.egress_policy import EgressDisabledError, require_uazapi_egress
 from src.services.event_service import get_event_service
 from src.services.handoff_service import (
@@ -93,6 +100,8 @@ from src.services.meta_service import (
     send_meta_cloud_audio,
     send_meta_cloud_text,
 )
+from src.services.reply_media import PermitPool, RecordSentId, reply_media_channel
+from src.services.reply_media_runner import ReplyMediaJob, cut_safe_sessions
 from src.services.safe_egress import (
     IMAGE_MIME_ALLOWLIST,
     UnsafeEgressError,
@@ -301,6 +310,191 @@ class _ReplyTarget:
     input_was_audio: bool
 
 
+# ── Agent media after the reply (envio-midia-agente Group 6) ─────────
+
+
+def _route_media_provider(whatsapp_provider: str) -> MediaDeliveryProvider:
+    provider = media_delivery_provider(whatsapp_provider)
+    if provider is None:  # pragma: no cover - a broken map fails at import
+        raise RuntimeError(f"no media delivery provider for {whatsapp_provider}")
+    return provider
+
+
+# The delivery provider of each webhook's replies: the route's own WhatsApp
+# provider through the ONE map the Central de Mídias reads too
+# (``media_delivery_provider``), so the screen, the selection and the
+# delivery always name the same provider.  A server parameter, never the
+# payload's (``channel`` is ``"whatsapp"`` on all four).
+_ZAPI_MEDIA_PROVIDER: Final = _route_media_provider("zapi")
+_EVOLUTION_MEDIA_PROVIDER: Final = _route_media_provider("evolution")
+_UAZAPI_MEDIA_PROVIDER: Final = _route_media_provider("uazapi")
+_META_MEDIA_PROVIDER: Final = _route_media_provider("meta_cloud")
+# The enforced replies' channels (``_ReplyTarget.channel``) -> the same
+# providers, for the file of a stored reply.
+_CREDIT_MEDIA_PROVIDERS: Final[Mapping[str, MediaDeliveryProvider]] = MappingProxyType(
+    {"zapi": _ZAPI_MEDIA_PROVIDER, "meta": _META_MEDIA_PROVIDER}
+)
+
+
+@dataclass(frozen=True)
+class _InlineMedia:
+    """What one webhook turn needs to send its file after its text: the
+    delivery provider -- given to the selection (``finish_response`` /
+    ``generate_response``) AND bound by the delivery, the very same value --,
+    the process's one ``agent_sends`` pool (the outbox publisher's too) and
+    the credit switch the request captured at entry."""
+
+    provider: MediaDeliveryProvider
+    agent_sends: PermitPool
+    credit_switch_on: Optional[bool]
+
+
+def _inline_media(
+    request: Optional[Request], provider: MediaDeliveryProvider
+) -> Optional[_InlineMedia]:
+    """The turn's media wiring, or ``None``: then the turn is offered no file
+    at all (the selection gets no provider) -- without the application's
+    ``agent_sends`` pool nothing could send it, and a reply never promises a
+    file nothing sends."""
+
+    if request is None:
+        return None
+    try:
+        agent_sends = request.app.state.media_concurrency.agent_sends
+    except Exception:
+        return None
+    if agent_sends is None:
+        return None
+    try:
+        switch_on: Optional[bool] = request_credit_switch(request)
+    except Exception:
+        switch_on = None
+    return _InlineMedia(provider, agent_sends, switch_on)
+
+
+def _media_provider(media: Optional[_InlineMedia]) -> Optional[MediaDeliveryProvider]:
+    return None if media is None else media.provider
+
+
+def _turn_media_id(response: object) -> Optional[UUID]:
+    """The file the turn chose (``EventResponse.attachment``), or ``None``; a
+    response without the field (a suite's stand-in) chose none."""
+
+    media_id = getattr(getattr(response, "attachment", None), "media_id", None)
+    return media_id if isinstance(media_id, UUID) else None
+
+
+def _media_send_id(provider: MediaDeliveryProvider, send_result: dict[str, Any]) -> str:
+    """Track a message the media delivery sent (the file or its notice)
+    exactly as the provider's text reply tracks its own, and return the id
+    to store for the ``fromMe`` echo (``""``: none)."""
+
+    if provider == "meta":
+        _track_meta_sent_message(send_result)
+        return extract_meta_message_id(send_result) or ""
+    if provider == "zapi":
+        _track_sent_message(send_result)
+        mid = send_result.get("messageId") or send_result.get("zapiMessageId")
+        return mid if isinstance(mid, str) else ""
+    mid = _extract_normalised_send_id(send_result)
+    if mid:
+        _track_sent_message({"messageid": mid})
+    else:
+        _track_sent_message(send_result)
+    return mid
+
+
+def _reply_media_recorder(
+    provider: MediaDeliveryProvider,
+    session_id: UUID,
+    session_factory: Callable[[], AsyncSession],
+) -> RecordSentId:
+    """The delivery's ``record_sent_id`` on an inline path: the id tracked
+    (``_track_sent_message`` / ``_track_meta_sent_message``) and stored for
+    the cross-worker echo (``_store_ai_msg_id_to_db``) on a session of its
+    own, committed at once.  A cancellation propagates: the delivery bounds
+    each record, and a cut-safe session invalidates a connection it cut."""
+
+    async def record_sent_id(sent: Mapping[str, object]) -> None:
+        mid = _media_send_id(provider, dict(sent))
+        if not mid:
+            return
+        async with session_factory() as db:
+            await _store_ai_msg_id_to_db(session_id, mid, db)
+            await db.commit()
+
+    return record_sent_id
+
+
+async def _send_inline_reply_media(
+    media: Optional[_InlineMedia],
+    response: object,
+    *,
+    db: AsyncSession,
+    credentials: Mapping[str, Any],
+    phone: str,
+    tenant_id: UUID,
+    session_id: UUID,
+) -> None:
+    """After the provider accepted the reply's text (its 2xx): START the
+    delivery of the turn's file, if it chose one, as a task of its own
+    (:func:`reply_media_runner.start_reply_media`) and return at once -- the
+    webhook answers as before.  A turn with no file returns here, with
+    nothing else done.
+
+    The channel is bound to the provider the selection was given
+    (``media.provider``); credentials it refuses (``ValueError``) skip the
+    file, logged -- never a 500 after the text went out.  The request's
+    transaction is ended first: everything the path wrote is committed, and
+    the request must hold no pooled connection while the delivery waits up
+    to a minute for the process's permit.  Never raises but for a
+    cancellation."""
+
+    media_id = _turn_media_id(response)
+    if media is None or media_id is None:
+        return
+    try:
+        channel = reply_media_channel(media.provider, credentials, phone)
+    except ValueError as error:
+        logger.warning(
+            "agent media not started for tenant %s session %s media %s (%s)",
+            tenant_id,
+            session_id,
+            media_id,
+            error,
+        )
+        return
+    with suppress(Exception):
+        await db.rollback()
+    try:
+        factory = get_db_session_factory()
+    except Exception as error:
+        logger.warning(
+            "agent media not started for tenant %s session %s media %s (%s)",
+            tenant_id,
+            session_id,
+            media_id,
+            type(error).__name__,
+        )
+        return
+    language = getattr(response, "response_language", None)
+    reply_media_runner.start_reply_media(
+        ReplyMediaJob(
+            channel=channel,
+            media_id=media_id,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            response_language=language if isinstance(language, str) else "pt-BR",
+            record_sent_id=_reply_media_recorder(
+                media.provider, session_id, cut_safe_sessions(factory)
+            ),
+            credit_switch_on=media.credit_switch_on,
+        ),
+        session_factory=factory,
+        agent_sends=media.agent_sends,
+    )
+
+
 def _suggested_reply(response: EventResponse) -> Optional[str]:
     if response.prompt and response.prompt.suggested_response:
         return response.prompt.suggested_response
@@ -320,7 +514,7 @@ def _credit_reply_payload(
     suggested = _suggested_reply(response)
     if not suggested:
         return None
-    return {
+    payload: dict[str, Any] = {
         "kind": REPLY_PAYLOAD_KIND,
         "channel": target.channel,
         "tenant_id": str(event_request.tenant_id),
@@ -337,6 +531,12 @@ def _credit_reply_payload(
             or (response.decision and response.decision.handoff_required)
         ),
     }
+    media_id = _turn_media_id(response)
+    if media_id is not None:
+        # envio-midia-agente: the turn's file -- all the outbox carries of it
+        # (the delivery re-reads the asset); only when the turn chose one.
+        payload["media_id"] = str(media_id)
+    return payload
 
 
 @dataclass(frozen=True)
@@ -505,6 +705,73 @@ class CreditReplySender:
             except Exception as exc:
                 logger.warning("Z-API mark_unread FAILED for %s — %s", phone, exc)
 
+    def media_recorder(
+        self,
+        prepared: _PreparedReply,
+        session_factory: Callable[[], AsyncSession],
+    ) -> RecordSentId:
+        """:meth:`record` as the file delivery's ``record_sent_id``
+        (envio-midia-agente G6): the same tracking and stored echo id, for
+        the file's and the notice's answers, each on a session of its own
+        (``record`` commits).  ``handoff`` is off: that bookkeeping never
+        marks the conversation unread.  ``record`` catches ``Exception`` only,
+        so a cancellation -- the delivery's bound on each record -- is never
+        swallowed, and the cut-safe session invalidates what it cut."""
+
+        bookkeeping = replace(prepared, handoff=False)
+
+        async def record_sent_id(sent: Mapping[str, object]) -> None:
+            async with session_factory() as db:
+                await self.record(bookkeeping, dict(sent), db)
+
+        return record_sent_id
+
+    def start_media(
+        self,
+        prepared: _PreparedReply,
+        *,
+        media_id: UUID,
+        tenant_id: UUID,
+        session_factory: Callable[[], AsyncSession],
+        agent_sends: PermitPool,
+    ) -> None:
+        """Start the stored reply's file (``ReplySender.start_media``): the
+        channel bound to the provider its turn's selection was given, the
+        phone and the credentials of ``prepared`` (in memory: the row's are
+        erased by now).  Returns at once; never raises."""
+
+        provider = _CREDIT_MEDIA_PROVIDERS.get(prepared.channel)
+        if provider is None:
+            logger.warning("agent media not started: reply channel unknown")
+            return
+        try:
+            channel = reply_media_channel(
+                provider, prepared.credentials, prepared.phone
+            )
+        except ValueError as error:
+            logger.warning(
+                "agent media not started for tenant %s session %s media %s (%s)",
+                tenant_id,
+                prepared.session_id,
+                media_id,
+                error,
+            )
+            return
+        reply_media_runner.start_reply_media(
+            ReplyMediaJob(
+                channel=channel,
+                media_id=media_id,
+                tenant_id=tenant_id,
+                session_id=prepared.session_id,
+                response_language=prepared.language_code,
+                record_sent_id=self.media_recorder(
+                    prepared, cut_safe_sessions(session_factory)
+                ),
+            ),
+            session_factory=session_factory,
+            agent_sends=agent_sends,
+        )
+
 
 CREDIT_REPLY_SENDER: Final = CreditReplySender()
 
@@ -562,6 +829,7 @@ async def _run_enforced_webhook_decision(
     context: ResolvedInteractionContext,
     enforcement: WebhookEnforcement,
     reply: _ReplyTarget,
+    media: Optional[_InlineMedia] = None,
 ) -> dict[str, Any]:
     """The enforced branch of ``_run_pipeline_transactionally`` (credit Group
     3b-2): the claim (its own short transaction; a redelivery is ALWAYS
@@ -570,6 +838,8 @@ async def _run_enforced_webhook_decision(
     outside every transaction (``generate_response``) -> the final
     transaction (bundle, one trace or ``trace_no_response``, the ``pending``
     reply, the final fence) -> the inline send, which claims the reply first.
+    ``media`` (envio-midia-agente): the delivery provider for the selection,
+    and the pool with which a delivered reply starts its file.
     Returns the webhook body."""
 
     leased = await credit_metering.acquire_webhook_claim(db, enforcement)
@@ -602,6 +872,7 @@ async def _run_enforced_webhook_decision(
         phase1.clinic_config,
         phase1.message_history,
         context=context,
+        media_delivery_provider=_media_provider(media),
     )
     response = cast(EventResponse, generated.response)
 
@@ -639,7 +910,9 @@ async def _run_enforced_webhook_decision(
         )
         return {"ok": True, "replied": False, "reason": "no_llm_response"}
     delivery = await credit_metering.deliver_reply_inline(
-        final.outbox_id, sender=CREDIT_REPLY_SENDER
+        final.outbox_id,
+        sender=CREDIT_REPLY_SENDER,
+        agent_sends=None if media is None else media.agent_sends,
     )
     return _inline_answer(delivery)
 
@@ -652,6 +925,7 @@ async def _run_pipeline_transactionally(
     db: AsyncSession,
     context: ResolvedInteractionContext,
     metering: Optional[ObservationalIngress] = None,
+    media: Optional[_InlineMedia] = None,
 ) -> EventResponse: ...
 
 
@@ -665,6 +939,7 @@ async def _run_pipeline_transactionally(
     metering: Optional[ObservationalIngress] = None,
     enforcement: Optional[WebhookEnforcement],
     reply: _ReplyTarget,
+    media: Optional[_InlineMedia] = None,
 ) -> EventResponse | dict[str, Any]: ...
 
 
@@ -677,6 +952,7 @@ async def _run_pipeline_transactionally(
     metering: Optional[ObservationalIngress] = None,
     enforcement: Optional[WebhookEnforcement] = None,
     reply: Optional[_ReplyTarget] = None,
+    media: Optional[_InlineMedia] = None,
 ) -> EventResponse | dict[str, Any]:
     """Run the locked phase, commit it, then start post-commit response I/O.
 
@@ -706,6 +982,11 @@ async def _run_pipeline_transactionally(
     bundle in one commit and its reply sent inline from the response
     outbox -- and the WEBHOOK BODY is returned instead of the response (the
     reply was already sent or queued).  Without it, ``main``'s path.
+
+    ``media`` (envio-midia-agente Group 6) is the turn's media wiring: its
+    provider goes to the selection of both branches, and the caller sends
+    the turn's file with the same object after the text.  ``None``: the
+    turn is offered no file.
     """
     if enforcement is not None:
         if reply is None:
@@ -717,6 +998,7 @@ async def _run_pipeline_transactionally(
             context=context,
             enforcement=enforcement,
             reply=reply,
+            media=media,
         )
     try:
         result, clinic_config, message_history = await service.run_pipeline(
@@ -746,6 +1028,7 @@ async def _run_pipeline_transactionally(
             clinic_config,
             message_history,
             context=context,
+            media_delivery_provider=_media_provider(media),
         ),
     )
     await record_webhook_decision(metering, db, response)
@@ -3469,6 +3752,7 @@ async def _process_zapi_authenticated_body(
         ),
     )
 
+    media = _inline_media(request, _ZAPI_MEDIA_PROVIDER)
     outcome = await _run_pipeline_transactionally(
         service=service,
         event_request=event_request,
@@ -3481,6 +3765,7 @@ async def _process_zapi_authenticated_body(
         ),
         enforcement=enforcement,
         reply=_ReplyTarget("zapi", phone, patient_audio_input),
+        media=media,
     )
     if isinstance(outcome, dict):
         # Enforced: claimed, charged and its reply sent from the outbox.
@@ -3580,6 +3865,16 @@ async def _process_zapi_authenticated_body(
         except Exception as exc:
             logger.warning("Z-API mark_unread FAILED for %s — %s", phone, exc)
 
+    # ── the turn's file, after the text's 2xx (envio-midia-agente) ──
+    await _send_inline_reply_media(
+        media,
+        response,
+        db=db,
+        credentials=creds,
+        phone=phone,
+        tenant_id=tenant_id,
+        session_id=session_id,
+    )
     return {"ok": True, "replied": True}
 
 
@@ -3816,12 +4111,14 @@ async def evolution_webhook(
         ),
     )
 
+    media = _inline_media(request, _EVOLUTION_MEDIA_PROVIDER)
     response = await _run_pipeline_transactionally(
         service=service,
         event_request=event_request,
         db=db,
         context=context,
         metering=evolution_ingress(request, data=data, context=context),
+        media=media,
     )
 
     # ── send LLM response back via Evolution API ──
@@ -3884,6 +4181,16 @@ async def evolution_webhook(
         logger.exception("Evolution send failed for %s", phone)
         return {"ok": True, "replied": False, "reason": "send_failed"}
 
+    # ── the turn's file, after the text's 2xx (envio-midia-agente) ──
+    await _send_inline_reply_media(
+        media,
+        response,
+        db=db,
+        credentials=creds,
+        phone=phone,
+        tenant_id=tenant_id,
+        session_id=session_id,
+    )
     return {"ok": True, "replied": True}
 
 
@@ -4747,12 +5054,14 @@ async def uazapi_webhook(
         ),
     )
 
+    media = _inline_media(request, _UAZAPI_MEDIA_PROVIDER)
     response = await _run_pipeline_transactionally(
         service=service,
         event_request=event_request,
         db=db,
         context=context,
         metering=uazapi_ingress(request, message=msg, context=context),
+        media=media,
     )
 
     suggested = (
@@ -4821,6 +5130,16 @@ async def uazapi_webhook(
         logger.exception("Uazapi send failed for %s", from_phone)
         return {"ok": True, "replied": False, "reason": "send_failed"}
 
+    # ── the turn's file, after the text's 2xx (envio-midia-agente) ──
+    await _send_inline_reply_media(
+        media,
+        response,
+        db=db,
+        credentials=creds,
+        phone=from_phone,
+        tenant_id=tenant_id,
+        session_id=session_id,
+    )
     return {"ok": True, "replied": True}
 
 
@@ -6079,6 +6398,7 @@ async def meta_webhook(
                 ),
             )
 
+            media = _inline_media(request, _META_MEDIA_PROVIDER)
             outcome = await _run_pipeline_transactionally(
                 service=service,
                 event_request=event_request,
@@ -6087,6 +6407,7 @@ async def meta_webhook(
                 metering=metering,
                 enforcement=enforcement,
                 reply=_ReplyTarget("meta", from_phone, input_was_audio),
+                media=media,
             )
             if isinstance(outcome, dict):
                 # Enforced: claimed, charged and its reply sent from the outbox.
@@ -6153,6 +6474,16 @@ async def meta_webhook(
                     "error": str(exc),
                 }
 
+            # ── the turn's file, after the text's 2xx (envio-midia-agente) ──
+            await _send_inline_reply_media(
+                media,
+                response,
+                db=db,
+                credentials=creds,
+                phone=from_phone,
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
             return {"ok": True, "replied": True}
 
     return {"ok": True, "skipped": "no_message"}

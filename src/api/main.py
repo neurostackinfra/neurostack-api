@@ -23,6 +23,7 @@ from neurostack_core import enable_metrics
 from src.api.middleware.auth import AuthMiddleware
 from src.api.middleware.ingress_body_limit import IngressBodyLimitMiddleware
 from src.api.middleware.media_limits import (
+    AGENT_MEDIA_SENDS_PER_PROCESS,
     MediaConcurrencyLimiters,
     MediaUploadLimitsMiddleware,
 )
@@ -69,6 +70,7 @@ from src.api.spa import install_spa
 from src.config.logging import configure_logging, get_logger
 from src.config.settings import settings
 from src.core.exceptions import ConfigurationError
+from src.services import reply_media_runner
 from src.services.billing_fact_worker import (
     BillingFactWorker,
     FactTransport,
@@ -302,7 +304,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # only with the credit config on; it claims nothing while the switch
         # is not effective nor before credit_enforcement_at.  The send
         # adapter comes from the webhook route (no import cycle, LOW-13).
-        credit_publisher = start_credit_response_publisher(webhook.CREDIT_REPLY_SENDER)
+        # The agent's media sends of the rows it delivers share the inline
+        # webhooks' pool: ONE ``agent_sends`` per process (envio-midia-agente).
+        credit_publisher = start_credit_response_publisher(
+            webhook.CREDIT_REPLY_SENDER,
+            agent_sends=getattr(
+                getattr(app.state, "media_concurrency", None), "agent_sends", None
+            ),
+        )
         # The retention sweep of the outbox's personal data runs config on or
         # off (OD-3: the one exception to the dominance rule, and only to
         # ERASE expired payloads; it never sends).
@@ -337,6 +346,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Before the pool closes; it never raises.  A reply cut mid-send
         # stays ``sending`` and is reclaimed after its lease.
         await stop_credit_response_publisher(credit_publisher)
+        # The agent's media deliveries still running (inline webhooks and the
+        # outbox start them as tasks), cancelled before the pool closes; it
+        # never raises.
+        await reply_media_runner.shutdown()
         await stop_credit_retention_sweeper(credit_sweeper)
         await stop_credit_object_workers(credit_object_workers)
         await stop_credit_lifecycle_worker(credit_lifecycle_worker)
@@ -393,6 +406,9 @@ def create_app() -> FastAPI:
     media_limiters = MediaConcurrencyLimiters(
         uploads=settings.media_max_concurrent_uploads,
         downloads=settings.media_max_concurrent_downloads,
+        # The agent's media sends (envio-midia-agente Decision 9): their own
+        # pool, a constant, never a setting.
+        agent_sends=AGENT_MEDIA_SENDS_PER_PROCESS,
     )
     app.state.media_concurrency = media_limiters
 

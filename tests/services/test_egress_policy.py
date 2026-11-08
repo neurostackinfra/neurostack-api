@@ -304,3 +304,153 @@ async def test_lifespan_starts_and_stops_the_egress_flag_refresher(
     assert stopped == [True]
     with pytest.raises(EgressDisabledError):
         await egress_policy.require_financial_egress()
+
+
+# ---------------------------------------------------------------------------
+# envio-midia-agente Group 2: agent_media_send_enabled, a question that never
+# raises (only cancellation propagates).
+# ---------------------------------------------------------------------------
+
+
+class _ValueFlagReader:
+    def __init__(self, value: object) -> None:
+        self.value = value
+        self.calls: list[str] = []
+
+    async def is_enabled(self, flag_name: str) -> object:
+        self.calls.append(flag_name)
+        return self.value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(True, True), (False, False), ("true", False), (1, False), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_media_question_is_true_only_for_an_exact_true(
+    value: object, expected: bool
+) -> None:
+    reader = _ValueFlagReader(value)
+    policy = EgressPolicy(reader)  # type: ignore[arg-type]
+
+    assert await policy.agent_media_send_enabled() is expected
+    assert reader.calls == ["agent_media_send_enabled"]
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("agent down"), OSError("reset"), ValueError("bad")]
+)
+@pytest.mark.asyncio
+async def test_media_question_reads_closed_when_the_reader_fails(
+    error: Exception,
+) -> None:
+    policy = EgressPolicy(_FailingFlagReader(error))
+
+    assert await policy.agent_media_send_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_media_question_propagates_cancellation() -> None:
+    policy = EgressPolicy(_FailingFlagReader(asyncio.CancelledError()))
+
+    with pytest.raises(asyncio.CancelledError):
+        await policy.agent_media_send_enabled()
+    with pytest.raises(asyncio.CancelledError):
+        await _module_helper_with_reader(_FailingFlagReader(asyncio.CancelledError()))
+
+
+async def _module_helper_with_reader(reader: object) -> bool:
+    original = egress_policy._flag_reader
+    egress_policy._flag_reader = lambda: reader  # type: ignore[assignment]
+    try:
+        return await egress_policy.agent_media_send_enabled()
+    finally:
+        egress_policy._flag_reader = original  # type: ignore[assignment]
+
+
+@pytest.mark.asyncio
+async def test_media_helper_reads_closed_when_no_reader_can_be_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable() -> None:
+        raise RuntimeError("reader unavailable")
+
+    monkeypatch.setattr(egress_policy, "_flag_reader", unavailable)
+
+    assert await egress_policy.agent_media_send_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_media_helper_unconfigured_is_closed_without_any_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, source="agent", enabled=False)
+    _no_agent_http(monkeypatch)
+    fake = _FakeAppConfigData([])
+    _install_reader(monkeypatch, fake)
+
+    assert await egress_policy.agent_media_send_enabled() is False
+    assert fake.sessions == [] and fake.gets == []
+
+
+@pytest.mark.parametrize(
+    "case", ["open", "closed", "absent", "invalid", "stale", "error", "never_read"]
+)
+@pytest.mark.asyncio
+async def test_media_helper_sdk_source_is_open_only_when_open_and_fresh(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    _configure(monkeypatch, source="sdk", enabled=True)
+    _no_agent_http(monkeypatch)
+    flag = "agent_media_send_enabled"
+    others = {"financial_egress_enabled": True, "uazapi_egress_enabled": True}
+    documents = {
+        "open": _flags(**{flag: True}),
+        "closed": _flags(**{flag: False}, **others),
+        "absent": _flags(**others),
+        "invalid": _flags(**{flag: "true"}, **others),
+        "stale": _flags(**{flag: True}),
+        "error": _flags(**{flag: True}),
+        "never_read": _flags(**{flag: True}),
+    }
+    clock = _Clock()
+    fake = _FakeAppConfigData([documents[case], RuntimeError("appconfig down")])
+    reader = _install_reader(monkeypatch, fake, clock)
+    if case != "never_read":
+        assert await reader.refresh_now() is True
+    if case == "stale":
+        clock.now += 3 * reader.poll_interval
+    if case == "error":
+        assert await reader.refresh_now() is False
+
+    assert await egress_policy.agent_media_send_enabled() is (case == "open")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.asyncio
+async def test_media_helper_agent_source_reads_the_agent_each_time(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    import httpx
+
+    _configure(monkeypatch, source="agent", enabled=True)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json={"agent_media_send_enabled": {"enabled": enabled}}
+        )
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)
+
+    original = egress_policy.AppConfigClient
+    monkeypatch.setattr(
+        egress_policy,
+        "AppConfigClient",
+        lambda config: original(config, client_factory=factory),
+    )
+
+    assert await egress_policy.agent_media_send_enabled() is enabled
+    assert len(requests) == 1

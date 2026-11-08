@@ -28,6 +28,7 @@ MEDIA_ASSET_CLONE_FIELDS: tuple[str, ...] = (
     "payload",
     "usage_trigger",
     "auto_suggest",
+    "trigger_intents",
 )
 MEDIA_ASSET_CLONE_REGENERATED_FIELDS: frozenset[str] = frozenset(
     {"id", "tenant_id", "created_at", "updated_at"}
@@ -212,10 +213,13 @@ def build_media_asset_clone(
     """Create an independent media copy from the explicit column allowlist.
 
     ``source`` holds exactly the allowlisted columns of one locked source row.
-    Timestamps are left unset so the destination row receives its own.
+    Timestamps are left unset so the destination row receives its own.  The
+    ``trigger_intents`` list is copied, never shared with the source row.
     """
+    values = {field: source[field] for field in MEDIA_ASSET_CLONE_FIELDS}
+    values["trigger_intents"] = list(values["trigger_intents"])
     return MediaAsset(
         id=uuid4(),
         tenant_id=destination_tenant_id,
-        **{field: source[field] for field in MEDIA_ASSET_CLONE_FIELDS},
+        **values,
     )

@@ -20,6 +20,8 @@ from prometheus_client import Gauge as PrometheusGauge
 from prometheus_client import Histogram as PrometheusHistogram
 from prometheus_client.metrics import MetricWrapperBase
 
+from src.services.api_credentials import MEDIA_DELIVERY_PROVIDERS
+
 LabelSource = Literal["enum", "template", "normalizer"]
 
 
@@ -203,6 +205,69 @@ _ENDPOINT = LabelPolicy(
 _BILLING_OPERATION_ROLE = _enum("deployer", "approver", "reviewer", "unknown")
 _BILLING_OPERATION_OUTCOME = _enum("accepted", "rejected", "consumed")
 _BILLING_TOPUP_DIRECTION = _enum("enable", "disable")
+# Each generated turn that offered media candidates to the LLM counts one
+# final outcome (selected, none, invalid_marker or dropped); a capped turn
+# also counts candidates_capped, so it increments two series and
+# candidates_capped is not part of the "turns with candidates" denominator:
+#   selected          -- a valid [[MIDIA:n]] marker: the turn carries the file;
+#   none              -- candidates offered, the LLM chose no file (also when
+#                        the LLM call failed or returned nothing after the
+#                        offer);
+#   invalid_marker    -- a marker whose index the server did not generate;
+#   dropped           -- a valid choice dropped afterwards (empty text once the
+#                        marker is removed, the scheduling gate or a
+#                        deterministic reply replaced the text);
+#   candidates_capped -- more candidates than the prompt carries (5), capped;
+#                        counted in addition to the final outcome.
+_AGENT_MEDIA_SELECTION_OUTCOME = _enum(
+    "selected", "none", "invalid_marker", "dropped", "candidates_capped"
+)
+# The WhatsApp provider that carried (or would carry) the file: the delivery
+# providers' ONE vocabulary (``api_credentials.MediaDeliveryProvider``, also
+# the selection's and the delivery's), never a copy of it.
+_AGENT_MEDIA_PROVIDER = _enum(*sorted(MEDIA_DELIVERY_PROVIDERS))
+# One delivery per selected file, in the order the delivery core checks:
+#   flag_off       -- agent_media_send_enabled not effective at delivery;
+#   asset_gone     -- no longer deliverable on this channel: deleted (or left
+#                     the tenant) since selection, or after the claim, before
+#                     the bytes were read (asset_gone_before_send); no longer
+#                     automatic (auto_suggest off or no trigger_intents); a
+#                     format the provider does not send (mime_not_sendable);
+#                     refused by the sender's own check on the re-read's first
+#                     bytes (ogg_opus_not_mono: a non-mono OGG on Meta, or
+#                     empty_media_payload / unsupported_media_type); or the
+#                     tenant gone at the egress charge (tenant_gone);
+#   too_large      -- above its category limit (MEDIA_CATEGORY_MAX_BYTES);
+#   busy           -- no agent_sends permit of this process handed over within
+#                     the bounded wait (AGENT_MEDIA_PERMIT_WAIT_SECONDS, 60 s,
+#                     in arrival order behind the process's other sends);
+#   credit_refused -- credit mode unavailable (credit_enforcement_unavailable)
+#                     or unreadable (credit_mode_failed), the suspension
+#                     unreadable (suspension_unreadable), tenant_suspended,
+#                     credit_pending, or the egress charge errored
+#                     (egress_failed);
+#   deduplicated   -- the 24-hour claim was taken (sent to this session
+#                     within the window), or this process is waiting for
+#                     or sending the same pair right now: skipped in
+#                     silence;
+#   sent           -- the provider accepted the file;
+#   failed         -- the provider call failed, or a database step of the
+#                     delivery (asset re-read, claim, payload read) errored,
+#                     or the runner cut it before its outcome: the outer
+#                     bound (outer_bound) or the lifespan's shutdown
+#                     (shutdown, ``reply_media_runner``); only the log's
+#                     ``reason`` tells them apart (as it does for asset_gone
+#                     and credit_refused).
+_AGENT_MEDIA_DELIVERY_OUTCOME = _enum(
+    "sent",
+    "deduplicated",
+    "failed",
+    "asset_gone",
+    "too_large",
+    "busy",
+    "credit_refused",
+    "flag_off",
+)
 
 
 # Keys are prometheus-client family names (Counter strips the ``_total``
@@ -542,6 +607,18 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
                 "hold_requested", "hold_activated", "hold_released", "purge"
             ),
             outcome=_enum("recorded", "refused", "disabled"),
+        ),
+        # envio-midia-agente (Decision 14): the agent's Central de Mídias
+        # sends.  Counters ``neurostack_agent_media_selection_total{outcome}``
+        # and ``neurostack_agent_media_delivery_total{provider,outcome}``; the
+        # vocabularies are the DESIGN's (Scope IN 10), closed, and never carry
+        # a tenant, session, media or phone identity (those go to the logs).
+        "neurostack_agent_media_selection": _contract(
+            outcome=_AGENT_MEDIA_SELECTION_OUTCOME
+        ),
+        "neurostack_agent_media_delivery": _contract(
+            provider=_AGENT_MEDIA_PROVIDER,
+            outcome=_AGENT_MEDIA_DELIVERY_OUTCOME,
         ),
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(

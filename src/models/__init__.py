@@ -85,6 +85,7 @@ from src.models.event import Event
 from src.models.handoff import HandoffRecord
 from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
+from src.models.media_delivery import MediaDelivery
 from src.models.operational_capability import (
     CreditOperationalAuthorization,
     CreditOperationalAuthorizationReceipt,
@@ -179,6 +180,7 @@ __all__ = [
     "Policy",
     "KnowledgeDocument",
     "MediaAsset",
+    "MediaDelivery",
     "HandoffRecord",
     "RlhfRating",
     "RlhfAuditReview",

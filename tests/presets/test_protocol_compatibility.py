@@ -14,6 +14,12 @@ from uuid import uuid4
 import pytest
 
 from neurostack_core.presets import get_preset
+from neurostack_core.protocol import (
+    MEDIA_BINDABLE_INTENT_IDS,
+    MEDIA_BINDABLE_INTENT_SEQUENCE,
+    OFFICIAL_INTENT_IDS,
+    OFFICIAL_INTENT_SEQUENCE,
+)
 from neurostack_core.protocol import FunnelStage as ProtocolFunnelStage
 from neurostack_core.srm import FunnelStage as PublicFunnelStage
 from neurostack_core.srm import engine as srm_engine
@@ -226,3 +232,53 @@ def test_missing_or_extra_preset_stage_ids_raise_preset_error(
     assert "srm.toml" in completed.stdout
     assert "funnel.stages" in completed.stdout
     assert mode in completed.stdout
+
+
+# envio-midia-agente Group 2: the intents a Central de Mídias file may be
+# bound to.  Zero tolerance: media never attaches to scheduling, and
+# fora_do_horario enqueues a handoff.
+_MEDIA_BINDABLE_INTENTS = (
+    "saudacao",
+    "interesse_tratamento",
+    "pedido_preco",
+    "comparacao_tratamentos",
+    "objecao_vou_pensar",
+    "detalhes_servicos",
+    "pre_atendimento",
+    "faq",
+    "cultura_historia",
+    "qualificacao_publico",
+    "informacoes_profissionais",
+    "pos_atendimento_duvida",
+)
+_NEVER_MEDIA_BINDABLE = frozenset(
+    {
+        "agendar",
+        "reagendar",
+        "cancelar",
+        "confirmar_presenca",
+        "disponibilidade_horarios",
+        "fora_do_horario",
+    }
+)
+
+
+def test_media_bindable_intents_are_exactly_the_twelve_informative_ones() -> None:
+    assert MEDIA_BINDABLE_INTENT_SEQUENCE == _MEDIA_BINDABLE_INTENTS
+    assert MEDIA_BINDABLE_INTENT_IDS == frozenset(_MEDIA_BINDABLE_INTENTS)
+    assert len(MEDIA_BINDABLE_INTENT_IDS) == len(MEDIA_BINDABLE_INTENT_SEQUENCE) == 12
+    assert isinstance(MEDIA_BINDABLE_INTENT_SEQUENCE, tuple)
+    assert isinstance(MEDIA_BINDABLE_INTENT_IDS, frozenset)
+
+
+def test_media_bindable_intents_are_official_and_never_scheduling() -> None:
+    assert MEDIA_BINDABLE_INTENT_IDS <= OFFICIAL_INTENT_IDS
+    assert _NEVER_MEDIA_BINDABLE <= OFFICIAL_INTENT_IDS  # the names are real
+    assert not MEDIA_BINDABLE_INTENT_IDS & _NEVER_MEDIA_BINDABLE
+    # The canonical order the API stores and returns is the official one.
+    official_order = [
+        intent
+        for intent in OFFICIAL_INTENT_SEQUENCE
+        if intent in MEDIA_BINDABLE_INTENT_IDS
+    ]
+    assert list(MEDIA_BINDABLE_INTENT_SEQUENCE) == official_order

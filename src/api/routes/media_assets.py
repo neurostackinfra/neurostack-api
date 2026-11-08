@@ -46,6 +46,7 @@ from src.api.middleware.auth import (
 )
 from src.api.middleware.media_limits import MEDIA_MULTIPART_MAX_BYTES, ImmediatePermit
 from src.api.schemas.media_assets import (
+    TRIGGER_INTENTS_SCHEMA,
     MediaAssetAuthErrorResponse,
     MediaAssetErrorResponse,
     MediaAssetForbiddenResponse,
@@ -53,14 +54,21 @@ from src.api.schemas.media_assets import (
     MediaAssetPatchRequest,
     MediaAssetResponse,
     MediaAssetValidationErrorResponse,
+    MediaBindableIntentsResponse,
+    media_category_byte_limits,
 )
 from src.config.logging import get_logger
 from src.config.settings import settings
 from src.interaction_context import InteractionOrigin, classify_interaction_origin
+from src.models.clinic_config_table import ClinicConfigTable
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.repositories import get_db_session_dependency
 from src.services import credit_inventory, credit_lifecycle
+from src.services.api_credentials import (
+    media_delivery_provider,
+    media_delivery_provider_ready,
+)
 from src.services.credit_allocations import reservation_effect_id
 from src.services.credit_metering import (
     CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
@@ -68,11 +76,15 @@ from src.services.credit_metering import (
     CreditTenantGone,
 )
 from src.services.credit_switch import request_credit_switch
+from src.services.egress_policy import agent_media_send_enabled
 from src.services.media_assets import (
     MEDIA_AUDIO_VIDEO_MAX_BYTES,
+    MEDIA_BINDABLE_INTENT_SEQUENCE,
+    MEDIA_FILE_EXTENSIONS,
     MEDIA_FILE_MAX_BYTES,
     MEDIA_IMAGE_MAX_BYTES,
     MEDIA_PDF_MAX_BYTES,
+    MEDIA_TRIGGER_INTENTS_MAX_ITEMS,
     MediaAssetDomainError,
     MediaStorageCapacityExceeded,
     MediaStorageGuardError,
@@ -81,7 +93,9 @@ from src.services.media_assets import (
     read_media_payload_limited,
     validate_media_classification,
     validate_media_metadata,
+    validate_trigger_intents,
 )
+from src.services.media_send_body import sendable_mime_types
 from src.services.tenant_classification import real_clinic_tenant_filter
 
 router = APIRouter()
@@ -91,16 +105,10 @@ _FILE_FIELD = "file"
 _TEXT_FIELDS = frozenset(
     {"display_name", "original_filename", "usage_trigger", "auto_suggest"}
 )
+# The one repeatable multipart field: one part per bound intent, at most
+# MEDIA_TRIGGER_INTENTS_MAX_ITEMS of them.
+_TRIGGER_INTENTS_FIELD = "trigger_intents"
 _CURSOR_VERSION = 1
-_MIME_EXTENSIONS = {
-    "video/mp4": ".mp4",
-    "audio/mpeg": ".mp3",
-    "audio/ogg": ".ogg",
-    "audio/mp4": ".m4a",
-    "application/pdf": ".pdf",
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-}
 _MEDIA_LIMIT_SUMMARY = (
     f"image {MEDIA_IMAGE_MAX_BYTES:,} bytes, PDF {MEDIA_PDF_MAX_BYTES:,} bytes, "
     f"audio and video {MEDIA_AUDIO_VIDEO_MAX_BYTES:,} bytes"
@@ -115,6 +123,7 @@ _METADATA_COLUMNS = (
     MediaAsset.size_bytes,
     MediaAsset.usage_trigger,
     MediaAsset.auto_suggest,
+    MediaAsset.trigger_intents,
     MediaAsset.created_at,
     MediaAsset.updated_at,
 )
@@ -153,8 +162,10 @@ _FORBIDDEN_RESPONSE = {
 _VALIDATION_RESPONSE = {
     "description": (
         "Invalid path/query/JSON input or a stable media validation error such as "
-        "media_multipart_invalid, media_metadata_invalid, media_signature_invalid, "
-        "media_type_unsupported or media_type_mismatch."
+        "media_multipart_invalid, media_metadata_invalid, "
+        "media_trigger_intent_unknown, media_signature_invalid, "
+        "media_type_unsupported, media_type_mismatch or, for an OGG-Opus that "
+        "is not mono, media_audio_not_mono."
     ),
     "model": MediaAssetValidationErrorResponse,
 }
@@ -318,14 +329,17 @@ async def _single_chunk(payload: bytes) -> AsyncIterator[bytes]:
 
 
 def _content_disposition(asset_id: UUID, original_filename: str, mime_type: str) -> str:
-    extension = _MIME_EXTENSIONS[mime_type]
+    extension = MEDIA_FILE_EXTENSIONS[mime_type]
     fallback = f"media-{asset_id}{extension}"
     encoded = quote(original_filename, safe="", encoding="utf-8", errors="strict")
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
-async def _parse_upload(request: Request) -> tuple[UploadFile, dict[str, str]]:
-    """Parse exactly one file part and only the four approved text fields."""
+async def _parse_upload(
+    request: Request,
+) -> tuple[UploadFile, dict[str, str], list[str]]:
+    """Parse exactly one file part, the four approved text fields (each at
+    most once) and the repeated ``trigger_intents`` parts, in arrival order."""
     _, content_type_options = parse_options_header(
         request.headers.get("content-type", "")
     )
@@ -340,14 +354,27 @@ async def _parse_upload(request: Request) -> tuple[UploadFile, dict[str, str]]:
             raise _media_error(422, "media_multipart_invalid")
 
     try:
-        form = await request.form(max_files=1, max_fields=4, max_part_size=1_000_000)
+        form = await request.form(
+            max_files=1,
+            max_fields=len(_TEXT_FIELDS) + MEDIA_TRIGGER_INTENTS_MAX_ITEMS,
+            max_part_size=1_000_000,
+        )
     except (StarletteHTTPException, ValueError) as error:
         raise _media_error(422, "media_multipart_invalid") from error
 
     upload: UploadFile | None = None
     fields: dict[str, str] = {}
+    trigger_intents: list[str] = []
     seen: set[str] = set()
     for key, value in form.multi_items():
+        if key == _TRIGGER_INTENTS_FIELD:
+            if (
+                not isinstance(value, str)
+                or len(trigger_intents) >= MEDIA_TRIGGER_INTENTS_MAX_ITEMS
+            ):
+                raise _media_error(422, "media_multipart_invalid")
+            trigger_intents.append(value)
+            continue
         if key in seen or key not in _TEXT_FIELDS | {_FILE_FIELD}:
             raise _media_error(422, "media_multipart_invalid")
         seen.add(key)
@@ -366,7 +393,7 @@ async def _parse_upload(request: Request) -> tuple[UploadFile, dict[str, str]]:
         or "original_filename" not in fields
     ):
         raise _media_error(422, "media_multipart_invalid")
-    return upload, fields
+    return upload, fields, trigger_intents
 
 
 async def _authorized_target(
@@ -462,9 +489,11 @@ def _authorized_media_target_exists(
         "requestBody": {
             "required": True,
             "description": (
-                "Closed multipart body with exactly one file part and no fields "
-                "outside the four named metadata fields. Maximum request size: "
-                f"{MEDIA_MULTIPART_MAX_BYTES:,} bytes."
+                "Closed multipart body with exactly one file part, the four named "
+                "metadata fields at most once each and trigger_intents repeated "
+                "once per bound intent (unknown names are "
+                "media_trigger_intent_unknown; duplicates are removed). Maximum "
+                f"request size: {MEDIA_MULTIPART_MAX_BYTES:,} bytes."
             ),
             "x-maxBytes": MEDIA_MULTIPART_MAX_BYTES,
             "content": {
@@ -472,16 +501,17 @@ def _authorized_media_target_exists(
                     "schema": {
                         "type": "object",
                         "additionalProperties": False,
-                        "maxProperties": 5,
+                        "maxProperties": 6,
                         "required": ["file", "display_name", "original_filename"],
                         "properties": {
                             "file": {
                                 "type": "string",
                                 "format": "binary",
                                 "description": (
-                                    "Exactly one MP4, MP3, OGG-Opus, M4A, PDF, JPEG "
-                                    "or PNG file; the payload limit is the one of its "
-                                    f"derived category ({_MEDIA_LIMIT_SUMMARY})."
+                                    "Exactly one MP4, MP3, OGG-Opus (mono only), M4A, "
+                                    "PDF, JPEG or PNG file; the payload limit is the "
+                                    "one of its derived category "
+                                    f"({_MEDIA_LIMIT_SUMMARY})."
                                 ),
                                 "x-maxBytes": MEDIA_FILE_MAX_BYTES,
                             },
@@ -501,6 +531,7 @@ def _authorized_media_target_exists(
                                 "enum": ["true", "false"],
                                 "default": "false",
                             },
+                            "trigger_intents": TRIGGER_INTENTS_SCHEMA,
                         },
                     }
                 }
@@ -525,13 +556,14 @@ async def upload_media_asset(
         # Authorization and target classification deliberately precede multipart
         # parsing, validation and every access to media_assets.
         target = await _authorized_target(request, tenant, tenant_id, session)
-        upload, fields = await _parse_upload(request)
+        upload, fields, raw_trigger_intents = await _parse_upload(request)
         metadata = validate_media_metadata(
             display_name=fields["display_name"],
             original_filename=fields["original_filename"],
             usage_trigger=fields.get("usage_trigger"),
             auto_suggest=fields.get("auto_suggest"),
         )
+        trigger_intents = validate_trigger_intents(raw_trigger_intents)
         payload = await read_media_payload_limited(upload)
         classification = validate_media_classification(
             payload,
@@ -555,6 +587,7 @@ async def upload_media_asset(
                 payload=payload,
                 usage_trigger=metadata.usage_trigger,
                 auto_suggest=metadata.auto_suggest,
+                trigger_intents=trigger_intents,
             )
             session.add(asset)
             await session.flush()
@@ -781,6 +814,102 @@ async def list_media_assets(
         raise
 
 
+def _clinic_sendable_mime_types(credentials: object) -> list[str]:
+    """Sorted MIME types the clinic's WhatsApp provider sends; [] for none."""
+
+    # The provider map every webhook maps its own provider through
+    # (``media_delivery_provider``): the screen, the selection and the
+    # delivery name the same provider.
+    delivery_provider = media_delivery_provider(
+        credentials.get("whatsapp_provider") if isinstance(credentials, dict) else None
+    )
+    if delivery_provider is None:
+        return []
+    return sorted(sendable_mime_types(delivery_provider))
+
+
+@router.get(
+    "/bindable-intents",
+    response_model=MediaBindableIntentsResponse,
+    summary="List bindable intents and delivery state",
+    description=(
+        "Return the intents a media asset may be bound to (trigger_intents), "
+        "whether the agent sends bound media for the effective clinic today "
+        "(delivery_enabled), the byte limit of each category and the formats "
+        "the clinic's WhatsApp provider sends (sendable_mime_types). Reads no "
+        "media."
+    ),
+    responses={
+        401: _AUTHENTICATION_RESPONSE,
+        403: _FORBIDDEN_RESPONSE,
+        422: _VALIDATION_RESPONSE,
+        503: _UNAVAILABLE_RESPONSE,
+    },
+    openapi_extra={"security": _MEDIA_SECURITY},
+)
+async def get_media_bindable_intents(
+    request: Request,
+    tenant_id: UUID | None = Query(
+        default=None,
+        description=_TENANT_ID_DESCRIPTION,
+    ),
+    tenant: TenantContext = Depends(get_tenant_context),
+    session: AsyncSession = Depends(get_db_session_dependency),
+) -> MediaBindableIntentsResponse:
+    """Publish the allowlist, the effective delivery state and the limits.
+
+    ``delivery_enabled`` is the promise the Central de Mídias makes: true only
+    when the clinic's WhatsApp provider delivers production turns
+    (:func:`media_delivery_provider_ready`) and the ``agent_media_send_enabled``
+    flag is effective.  The flag is read only for a ready provider; it never
+    raises (closed on any doubt).  The credentials are revalidated against the
+    authorized target in the same statement, like every media read: a target
+    revoked in between reads no row and answers ``false``.
+
+    ``sendable_mime_types`` comes from the same credentials and the senders'
+    own set (:func:`sendable_mime_types`), whatever the readiness: the screen
+    warns about a format only while ``delivery_enabled`` is true.
+    """
+    try:
+        target = await _authorized_target(request, tenant, tenant_id, session)
+        # Read before the rollback below: it expires every loaded instance.
+        target_id = target.id
+        credentials = (
+            await session.execute(
+                select(ClinicConfigTable.api_credentials).where(
+                    ClinicConfigTable.tenant_id == target_id,
+                    _authorized_media_target_exists(target_id, tenant),
+                )
+            )
+        ).scalar_one_or_none()
+        # End the read transaction before the flag read (an Agent HTTP call
+        # under APPCONFIG_SOURCE=agent): no connection is held across it.
+        await _rollback(session)
+        provider_ready = media_delivery_provider_ready(credentials or {})
+        delivery_enabled = provider_ready and await agent_media_send_enabled()
+        logger.info(
+            "media_bindable_intents",
+            tenant_id=str(target_id),
+            delivery_enabled=delivery_enabled,
+            result="read",
+        )
+        return MediaBindableIntentsResponse(
+            intents=list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+            delivery_enabled=delivery_enabled,
+            max_bytes_by_category=media_category_byte_limits(),
+            sendable_mime_types=_clinic_sendable_mime_types(credentials),
+        )
+    except HTTPException:
+        await _rollback(session)
+        raise
+    except SQLAlchemyError as error:
+        await _rollback(session)
+        raise _media_error(503, "media_storage_unavailable") from error
+    except BaseException:
+        await _rollback(session)
+        raise
+
+
 @router.get(
     "/{media_id}/content",
     summary="Download media asset content",
@@ -794,7 +923,7 @@ async def list_media_assets(
             "description": "Exact media bytes as a non-sniffable attachment.",
             "content": {
                 mime_type: {"schema": {"type": "string", "format": "binary"}}
-                for mime_type in _MIME_EXTENSIONS
+                for mime_type in MEDIA_FILE_EXTENSIONS
             },
             "headers": {
                 "Content-Length": {"schema": {"type": "integer"}},
@@ -940,7 +1069,9 @@ async def download_media_asset(
     summary="Update media asset metadata",
     description=(
         "Update one or more approved metadata fields. Unknown fields are rejected; "
-        "usage_trigger may be null to clear it."
+        "usage_trigger may be null to clear it, and trigger_intents replaces the "
+        "bound intents ([] unbinds every one; unknown names are "
+        "media_trigger_intent_unknown; duplicates are removed)."
     ),
     responses={
         401: _AUTHENTICATION_RESPONSE,
@@ -965,7 +1096,7 @@ async def patch_media_asset(
     tenant: TenantContext = Depends(get_tenant_context),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> MediaAssetResponse:
-    """Atomically update only the four approved author metadata fields."""
+    """Atomically update only the five approved author metadata fields."""
     target: Tenant | None = None
     try:
         target = await _authorized_target(request, tenant, tenant_id, session)
@@ -1000,6 +1131,11 @@ async def patch_media_asset(
         if "auto_suggest" in fields:
             assert patch.auto_suggest is not None
             auto_suggest = patch.auto_suggest
+        trigger_intents = list(current.trigger_intents)
+        if "trigger_intents" in fields:
+            if patch.trigger_intents is None:
+                raise MediaAssetDomainError("media_metadata_invalid")
+            trigger_intents = validate_trigger_intents(patch.trigger_intents)
         metadata = validate_media_metadata(
             display_name=display_name,
             original_filename=original_filename,
@@ -1023,6 +1159,7 @@ async def patch_media_asset(
                     original_filename=metadata.original_filename,
                     usage_trigger=metadata.usage_trigger,
                     auto_suggest=metadata.auto_suggest,
+                    trigger_intents=trigger_intents,
                 )
                 .returning(*_METADATA_COLUMNS)
             )

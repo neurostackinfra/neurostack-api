@@ -281,6 +281,7 @@ async def test_disabled_incomplete_and_unknown_flags_make_zero_http_requests() -
     assert SUPPORTED_FLAGS == {
         "financial_egress_enabled",
         "uazapi_egress_enabled",
+        "agent_media_send_enabled",
     }
     assert creations == []
 
@@ -547,9 +548,10 @@ async def test_data_reader_error_closes_immediately_and_restarts_the_session(
 
     assert await reader.refresh_now() is False
 
-    # Fresh by the clock, but the last read failed: closed for both flags.
+    # Fresh by the clock, but the last read failed: closed for every flag.
     assert await reader.is_enabled("financial_egress_enabled") is False
     assert await reader.is_enabled("uazapi_egress_enabled") is False
+    assert await reader.is_enabled("agent_media_send_enabled") is False
     assert "appconfig unavailable" not in caplog.text
 
     # The consumed token is discarded: the next poll starts a new session.
@@ -1114,7 +1116,7 @@ async def test_runbook_retrieved_flags_example_is_what_the_reader_accepts() -> N
 
     document = _parse_flag_document(retrieved.encode())
     assert document is not None
-    # The runbook example is the closed state; both flags present and false.
+    # The runbook example is the closed state; every flag present and false.
     assert [key for key, _ in document] == sorted(SUPPORTED_FLAGS)
     assert all(
         json.loads(retrieved)[name] == {"enabled": False} for name in SUPPORTED_FLAGS
@@ -1209,3 +1211,71 @@ async def test_data_reader_ion_payload_fails_closed_and_recovers(
     warnings = [row for row in _event_rows(logs) if row[0] is False]
     assert warnings == [(False, False, None, "_PollFailed", None)]
     assert len(fake.sessions) == 2
+
+
+# ---------------------------------------------------------------------------
+# envio-midia-agente Group 2: agent_media_send_enabled.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        ({"agent_media_send_enabled": {"enabled": True}}, True),
+        ({"agent_media_send_enabled": {"enabled": False}}, False),
+        # Absent, while every other flag is open.
+        (
+            {
+                "financial_egress_enabled": {"enabled": True},
+                "uazapi_egress_enabled": {"enabled": True},
+            },
+            False,
+        ),
+        ({"agent_media_send_enabled": {"enabled": "true"}}, False),
+        ({"agent_media_send_enabled": {"enabled": 1}}, False),
+        ({"agent_media_send_enabled": True}, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_client_reads_the_media_flag_only_when_exactly_true(
+    document: dict[str, Any], expected: bool
+) -> None:
+    client = AppConfigClient(
+        _settings(),
+        client_factory=_factory(lambda _: httpx.Response(200, json=document), []),
+    )
+
+    assert await client.is_enabled("agent_media_send_enabled") is expected
+
+
+@pytest.mark.asyncio
+async def test_the_media_flag_alone_opens_nothing_else_and_logs_its_change() -> None:
+    from structlog.testing import capture_logs
+
+    fake = _FakeAppConfigData(
+        [
+            _flags(agent_media_send_enabled=True),
+            _flags(agent_media_send_enabled=False),
+        ]
+    )
+    reader = _data_reader(fake)
+
+    with capture_logs() as logs:
+        assert await reader.refresh_now() is True
+        assert await reader.is_enabled("agent_media_send_enabled") is True
+        assert await reader.is_enabled("financial_egress_enabled") is False
+        assert await reader.is_enabled("uazapi_egress_enabled") is False
+        # Only the media flag changes: still a transition worth one line.
+        assert await reader.refresh_now() is True
+        assert await reader.is_enabled("agent_media_send_enabled") is False
+
+    events = [
+        (
+            entry["financial_egress_enabled"],
+            entry["uazapi_egress_enabled"],
+            entry["agent_media_send_enabled"],
+        )
+        for entry in logs
+        if entry["event"] == "appconfig_egress_flags_changed"
+    ]
+    assert events == [(False, False, True), (False, False, False)]

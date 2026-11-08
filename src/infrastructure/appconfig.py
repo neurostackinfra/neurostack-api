@@ -24,7 +24,12 @@ from pydantic import SecretStr
 from src.config.logging import get_logger
 
 SUPPORTED_FLAGS: Final = frozenset(
-    {"financial_egress_enabled", "uazapi_egress_enabled"}
+    {
+        "financial_egress_enabled",
+        "uazapi_egress_enabled",
+        # envio-midia-agente: the agent sends Central de Mídias files.
+        "agent_media_send_enabled",
+    }
 )
 _MAX_RESPONSE_BYTES: Final = 16 * 1024
 _REQUEST_TIMEOUT: Final = httpx.Timeout(
@@ -381,6 +386,7 @@ class AppConfigDataFlagReader:
             poll_ok,
             _flag_value(self._document, "financial_egress_enabled"),
             _flag_value(self._document, "uazapi_egress_enabled"),
+            _flag_value(self._document, "agent_media_send_enabled"),
             self._version_label,
             error_type,
             error_code,
@@ -394,6 +400,7 @@ class AppConfigDataFlagReader:
                 poll_ok=poll_ok,
                 financial_egress_enabled=state[1],
                 uazapi_egress_enabled=state[2],
+                agent_media_send_enabled=state[3],
                 version_label=self._version_label,
                 error_type=error_type,
                 error_code=error_code,

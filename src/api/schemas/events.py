@@ -4,7 +4,7 @@ Contracts for event processing endpoints (/v1/events).
 """
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -578,6 +578,41 @@ class HandoffSummary(BaseModel):
     )
 
 
+class EventAttachment(BaseModel):
+    """The Central de Mídias file the agent chose to send after this reply.
+
+    envio-midia-agente: at most one per turn, chosen by the LLM among the
+    candidates the server offered (``[[MIDIA:n]]``, never a client field).
+    Only a WhatsApp delivery path sends it; every other caller receives it
+    for information or as ``null``.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "media_id": "e5f6a7b8-c9d0-1234-ef01-345678901234",
+                "display_name": "Preparo para o exame",
+                "category": "pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 182044,
+            }
+        }
+    )
+
+    media_id: UUID = Field(..., description="Media asset of the effective tenant")
+    display_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Display name of the media asset",
+    )
+    category: Literal["video", "audio", "pdf", "image"] = Field(
+        ..., description="Media category; it decides how the provider sends it"
+    )
+    mime_type: str = Field(..., description="Stored canonical MIME type")
+    size_bytes: int = Field(..., gt=0, description="Stored size in bytes")
+
+
 class EventResponse(BaseModel):
     """
     Response model for event processing.
@@ -666,6 +701,14 @@ class EventResponse(BaseModel):
     handoff_summary: Optional[HandoffSummary] = Field(
         default=None,
         description="Handoff summary if handoff is required",
+    )
+    attachment: Optional[EventAttachment] = Field(
+        default=None,
+        description=(
+            "Central de Mídias file the agent chose to send after this reply; "
+            "null when the turn sends none. Only WhatsApp turns of production "
+            "origin can carry one."
+        ),
     )
     processed_at: str = Field(
         ...,

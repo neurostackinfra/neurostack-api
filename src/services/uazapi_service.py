@@ -15,13 +15,30 @@ but public unicast IPs only, no redirects, timeout enforced).
 import base64
 import binascii
 import logging
+from collections.abc import Mapping
+from typing import Final
 
 import httpx
 
 from src.services.egress_policy import require_uazapi_egress
+from src.services.media_send_body import (
+    MEDIA_SEND_TIMEOUT,
+    MediaCategory,
+    base64_json_body,
+    require_sendable_media,
+    sanitize_transport_error,
+)
 from src.services.safe_egress import safe_async_client
 
 logger = logging.getLogger(__name__)
+
+# media_assets category -> uazapi ``type``.
+_UAZAPI_MEDIA_TYPES: Final[Mapping[str, str]] = {
+    "image": "image",
+    "pdf": "document",
+    "audio": "audio",
+    "video": "video",
+}
 
 
 class UazapiMediaDownloadError(RuntimeError):
@@ -49,6 +66,13 @@ def _response_json_object(response: httpx.Response) -> dict[str, object]:
             raise RuntimeError("invalid_upstream_response")
         result[key] = value
     return result
+
+
+def _sanitize_http_status_error(exc: httpx.HTTPStatusError) -> RuntimeError:
+    """Return a URL-free RuntimeError carrying only the upstream HTTP status."""
+
+    status = exc.response.status_code if exc.response is not None else "unknown"
+    return RuntimeError(f"upstream_http_error status={status}")
 
 
 async def send_uazapi_text(
@@ -126,6 +150,85 @@ async def send_uazapi_audio(
         resp.raise_for_status()
         data = _response_json_object(resp)
         logger.info("Uazapi send_audio to %s - status %s", phone, resp.status_code)
+        return data
+
+
+async def send_uazapi_media(
+    api_url: str,
+    token: str,
+    phone: str,
+    payload: bytes,
+    *,
+    category: MediaCategory,
+    mime_type: str,
+    filename: str,
+) -> dict[str, object]:
+    """Send a media asset through Uazapi ``/send/media``.
+
+    Contract (checked 2026-11-07): https://docs.uazapi.com/endpoint/post/send~media
+    ``POST /send/media`` with header ``token`` and JSON ``number``, ``type``
+    (image|video|document|audio|ptt|...), ``file`` (URL or base64; sent here
+    as a data URI, the same shape ``send_uazapi_audio`` already uses),
+    optional ``mimetype`` and ``docName`` (document only).
+
+    Args:
+        api_url: Uazapi base URL (trailing slashes tolerated).
+        token: Uazapi per-instance token.
+        phone: Recipient phone in E.164 without leading '+'.
+        payload: The asset bytes.
+        category: ``media_assets.category``: image, pdf, audio or video.
+        mime_type: Canonical MIME type of the asset.
+        filename: ``media_assets.original_filename`` (``docName`` for PDFs).
+
+    Returns:
+        Uazapi response dict (message id at ``messageid``/``id``).
+
+    Raises:
+        EgressDisabledError: ``uazapi_egress_enabled`` is off; nothing is sent.
+        ValueError: unsupported category/MIME pair or empty payload.
+        RuntimeError: sanitized upstream failure (no URL, no token).
+    """
+
+    await require_uazapi_egress()
+    require_sendable_media("uazapi", category, mime_type, payload)
+    media_type = _UAZAPI_MEDIA_TYPES[category]
+
+    fields: dict[str, object] = {
+        "number": phone,
+        "type": media_type,
+        "mimetype": mime_type,
+    }
+    if media_type == "document":
+        fields["docName"] = filename
+    body, content_length = base64_json_body(
+        fields, "file", payload, data_uri_mime=mime_type
+    )
+
+    url = f"{api_url.rstrip('/')}/send/media"
+    async with safe_async_client(url, kind="uazapi", timeout=MEDIA_SEND_TIMEOUT) as (
+        client,
+        validated,
+    ):
+        headers = {
+            "Token": token,
+            "Content-Type": "application/json",
+            "Content-Length": str(content_length),
+            "Host": validated.sni_host,
+        }
+        try:
+            resp = await client.post(validated.url, content=body, headers=headers)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        except httpx.RequestError as exc:
+            raise sanitize_transport_error(exc) from None
+        data = _response_json_object(resp)
+        logger.info(
+            "Uazapi send_media to %s - type %s status %s",
+            phone,
+            media_type,
+            resp.status_code,
+        )
         return data
 
 

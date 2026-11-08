@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import secrets
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
@@ -1905,3 +1906,50 @@ def _no_slot_leak(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         handoff_service_module.dispatch_committed_handoff_webhooks,
     )
     assert after == before
+
+
+def test_the_enforced_path_never_offers_media_and_strips_the_marker(
+    client: Any,
+    enforced: World,
+    switch: Any,
+    llm: _FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """envio-midia-agente LOW-6: the enforced ``generate_response`` call
+    passes no delivery provider, even for ``channel = "whatsapp"`` with a
+    ``metadata.provider``; the flag is never read, a marker in the reply is
+    stripped and ``attachment`` is null."""
+
+    from src.services import media_selection
+
+    flag_reads: list[str] = []
+
+    async def read_flag(*_args: Any, **_kwargs: Any) -> bool:
+        flag_reads.append("flag")
+        return True
+
+    monkeypatch.setattr(media_selection, "agent_media_send_enabled", read_flag)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_LLM_REPLY", "Segue o preparo. [[MIDIA:1]]"
+    )
+    seen: list[dict[str, Any]] = []
+    real_generate = EventService.generate_response
+
+    async def spy(self: EventService, *args: Any, **kwargs: Any) -> Any:
+        seen.append(dict(kwargs))
+        return await real_generate(self, *args, **kwargs)
+
+    monkeypatch.setattr(EventService, "generate_response", spy)
+    body = _body(enforced.api_session, "me manda o preparo")
+    body["payload"]["metadata"] = {"source": "whatsapp", "provider": "zapi"}
+
+    response = _post(client, enforced, key="media-1", body=body)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["attachment"] is None
+    assert response.json()["prompt"]["suggested_response"] == "Segue o preparo."
+    (kwargs,) = seen
+    assert kwargs["context"].origin is InteractionOrigin.PRODUCTION
+    assert kwargs.get("media_delivery_provider") is None
+    assert flag_reads == []
+    assert llm.calls == 1

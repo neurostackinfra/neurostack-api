@@ -2,9 +2,15 @@
 
 Item 5 (ii) of Group 1b.  The real application (``src.api.main.app``, its
 settings read from the environment, its lifespan, middleware and pool) runs
-against disposable PostgreSQL databases at ``037`` and at the credit-ready
-head (``040`` since Group 4b; ``039`` before it), with
-``CREDIT_HOT_PATH_ENABLED`` false and true.  Each run replays the fixed corpus
+against disposable PostgreSQL databases at the head of the migration chain,
+with ``CREDIT_HOT_PATH_ENABLED`` false and true.  Since envio-midia-agente
+Group 2 (option A, owner 2026-11-08) the image maps migration 045's media
+objects and serves only head, so the credit switch's two states come from
+the image's credit minimum, not from an older database: a "ready" run uses
+the real ``CREDIT_SCHEMA_MIN_REVISION`` (at or below head), a "below the
+minimum" run pins it, in the replay's own process, one revision above head
+(an image one credit migration ahead of its database).  Every run asserts
+the revision its database was at.  Each run replays the fixed corpus
 ``tests/fixtures/credit_dominance/requests.json`` through every ingress (JWT,
 API key, Z-API, Meta, Uazapi, Evolution; the LLM and the providers are faked)
 in a fresh interpreter, so no in-process cache, rate-limit bucket or replay
@@ -13,13 +19,15 @@ store crosses runs, and every run starts from a clone of one seeded template.
 * With the config on, status and body equal the config-off run at the same
   revision once the server-generated fields are masked (the corpus' named
   fields plus any UUID the world did not seed and any instant), and the
-  stored events are equal by content.  The two config-off runs at ``037`` and
-  ``039`` are equal too; the additional-copy migration alone changes nothing.
-* The verdict: config off => off; config on at ``037`` => off
-  (``schema_below_minimum``); config on at ``040`` => on.
+  stored events are equal by content.  The credit migrations alone change
+  nothing: config off, a database at ``037`` answers and stores exactly like
+  one at ``042`` (the one comparison on those revisions, without the corpus'
+  media cases, which the image serves only from 045).
+* The verdict: config off => off; config on below the image's minimum =>
+  off (``schema_below_minimum``); config on at a ready head => on.
 * A ``before_cursor_execute`` listener, attached only after start-up, sees no
-  SQL touching ``credit_*`` while the switch is not effective; no ``credit_*``
-  row exists after a run at ``038`` with the config off.
+  SQL touching ``credit_*`` while the switch is not effective, and every
+  ``credit_*`` table is empty after such a run.
 * Group 3a: with the switch effective (config on at ``038``) the only credit
   SQL is the observational writer's -- ``credit_enforcement_state``,
   ``credit_ingress_claims``, ``credit_observational_effects`` -- and every
@@ -49,8 +57,8 @@ store crosses runs, and every run starts from a clone of one seeded template.
   switch is not effective" is the outbox's retention sweeper (owner decision
   OD-3: it only ERASES expired payloads, config on or off); its first tick
   comes one interval (``RETENTION_SWEEP_INTERVAL_SECONDS``) after start-up,
-  so it never runs inside a replay (pinned below), and it skips a ``037``
-  database (no outbox).
+  so it never runs inside a replay (pinned below), and it skips a database
+  without the outbox (below ``038``).
 * Group 4a: the corpus carries a knowledge text upload (JSON), a media
   upload, a download of a seeded media asset and the multipart DOCX/PDF
   knowledge upload.  The first three answer like the config-off run in every
@@ -59,24 +67,25 @@ store crosses runs, and every run starts from a clone of one seeded template.
   delivery), with the enforcement set they are reserved and charged
   (``credit_allocations``, the ledger) with the same answers.  The multipart
   upload is a credit surface: 503 ``credit_unavailable`` while the switch is
-  not effective (``037``, config off), 201 with it -- the one corpus case
+  not effective (below the minimum, config off), 201 with it -- the one corpus case
   left out of the on/off comparison and asserted on its own.
 * Group 6: the corpus ends with the credit read API (``GET
   /v1/credits/*``) read by the builder's JWT, by the same JWT for a tenant
   outside its builder and for an absent tenant, and by an API key.  Credit
   surfaces: 503 ``credit_unavailable`` while the switch is not effective
-  (``037``, config off) -- and then no SQL at all --, with it the builder
+  (below the minimum, config off) -- and then no SQL at all --, with it the builder
   reads its figures (observational before the enforcement: zero balance,
   the would-be consumption), the two foreign reads get the same 403 and
   the API key ``credit_scope_forbidden``; the reads write nothing (the
   no-write check below) and, in the enforced run, show exactly the debt the
   corpus charged, the open exhaustion episode and its export deadline.
-* In one process, the background refresh turns the switch on after
-  ``upgrade 037 -> 040`` and off again after the downgrade, each within one
+* In one process, the background refresh turns the switch on after a real
+  ``alembic upgrade`` across the image's minimum (pinned at head: the head
+  migration itself) and off again after the downgrade, each within one
   interval, while requests keep answering.
 
 Groups 3-7 append their surfaces to the corpus and to these runs, always
-also against a ``037`` database.
+also below the image's credit minimum.
 """
 
 from __future__ import annotations
@@ -92,7 +101,7 @@ import secrets
 import socket
 import sys
 from collections.abc import AsyncIterator, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -100,6 +109,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+
+from tests.alembic_graph import current_head, migration_revisions
 
 pytestmark = pytest.mark.integration
 
@@ -199,8 +210,77 @@ _ENFORCEMENT_READ = re.compile(
 )
 
 
+# envio-midia-agente Group 2, option A (owner, 2026-11-08).  The behaviour
+# image maps ``media_assets.trigger_intents`` and ``media_deliveries``
+# (migration 045), so it serves only a schema at the head of its own chain:
+# every corpus run is on a head database.  The credit switch's two states
+# come from the image's credit minimum instead of the database's revision:
+#   _READY -- the real ``CREDIT_SCHEMA_MIN_REVISION`` (at or below head);
+#   _BELOW -- the image's minimum pinned one revision above head, as an image
+#             one credit migration ahead of its database would be.
+_HEAD = current_head()
+_READY = "head"
+_BELOW = "below-minimum"
+# A revision id no migration uses: appended to the image chain the switch
+# reads, so the pinned minimum is IN the chain and the verdict is
+# ``schema_below_minimum`` (a minimum outside the chain would be the
+# ``revision_outside_image_chain`` fault instead).
+_ABOVE_HEAD = "credit-minimum-above-head"
+# The credit migrations alone (037 -> 042) are compared on the two credit
+# revisions themselves, config off; the behaviour image cannot read or write
+# media below 045, so those two runs leave out the corpus' media cases (and
+# their databases hold no media asset).
+_CREDIT_PAIR = ("037", "042")
+_MEDIA_CASES = ("media-upload-pdf", "media-download-seeded")
+
+
 def _corpus() -> dict[str, Any]:
     return json.loads(_CORPUS_PATH.read_text(encoding="utf-8"))
+
+
+def _pinned_schema_evaluation(minimum: str) -> Any:
+    """``credit_switch.evaluate_schema_revision`` for an image whose credit
+    minimum is ``minimum``.
+
+    The verdict reads its minimum as a default argument bound when the module
+    was defined, so pinning ``CREDIT_SCHEMA_MIN_REVISION`` alone would change
+    nothing; ``_schema_reading`` looks this function up at call time, so
+    replacing it is the narrowest seam.  A minimum the image chain does not
+    ship (above head) is appended to that chain.
+    """
+
+    from src.services import credit_switch
+
+    real = credit_switch.evaluate_schema_revision
+
+    def evaluate(
+        version_rows: tuple[str, ...],
+        chain: tuple[str, ...],
+        _minimum: str = minimum,
+    ) -> Any:
+        image_chain = chain if minimum in chain else (*chain, minimum)
+        return real(version_rows, image_chain, minimum)
+
+    return evaluate
+
+
+@contextmanager
+def _credit_minimum_pinned(minimum: str) -> Iterator[None]:
+    """This process's credit switch, for an image whose minimum is ``minimum``."""
+
+    from unittest.mock import patch
+
+    from src.services import credit_switch
+
+    with (
+        patch.object(
+            credit_switch,
+            "evaluate_schema_revision",
+            _pinned_schema_evaluation(minimum),
+        ),
+        patch.object(credit_switch, "CREDIT_SCHEMA_MIN_REVISION", minimum),
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -281,13 +361,16 @@ _SEEDED_MEDIA = b"%PDF-1.4\n% credit dominance seeded media\n" + b"0" * 900
 
 
 async def _seed_world(url: Any, world: _World) -> None:
+    """Everything but the media asset, at ``037`` (before every credit
+    migration, as production's rows were); the media asset is seeded at head
+    (:func:`_seed_media`), the only schema the behaviour image maps."""
+
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
     from sqlalchemy.pool import NullPool
 
     from src.api.middleware.auth import pwd_context
     from src.models.builder import Builder
     from src.models.clinic_config_table import ClinicConfigTable
-    from src.models.media_asset import MediaAsset
     from src.models.session import Session
     from src.models.tenant import Tenant
 
@@ -338,19 +421,6 @@ async def _seed_world(url: Any, world: _World) -> None:
                     session(world.api_session, world.api_tenant),
                     session(world.handoff_session, world.api_tenant),
                     session(world.jwt_session, world.jwt_tenant),
-                    MediaAsset(
-                        id=UUID(world.media_asset),
-                        tenant_id=UUID(world.api_tenant),
-                        display_name="Cardápio",
-                        original_filename="cardapio.pdf",
-                        category="pdf",
-                        mime_type="application/pdf",
-                        size_bytes=len(_SEEDED_MEDIA),
-                        sha256=hashlib.sha256(_SEEDED_MEDIA).digest(),
-                        payload=_SEEDED_MEDIA,
-                        usage_trigger=None,
-                        auto_suggest=False,
-                    ),
                     ClinicConfigTable(
                         tenant_id=UUID(world.meta_tenant),
                         api_credentials={
@@ -391,6 +461,52 @@ async def _seed_world(url: Any, world: _World) -> None:
                     ),
                 ]
             )
+    finally:
+        await engine.dispose()
+
+
+async def _seed_media(url: Any, world: _World) -> None:
+    """The API-key tenant's media asset, through the ORM, on a head database."""
+
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from src.models.media_asset import MediaAsset
+
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with AsyncSession(engine) as database, database.begin():
+            database.add(
+                MediaAsset(
+                    id=UUID(world.media_asset),
+                    tenant_id=UUID(world.api_tenant),
+                    display_name="Cardápio",
+                    original_filename="cardapio.pdf",
+                    category="pdf",
+                    mime_type="application/pdf",
+                    size_bytes=len(_SEEDED_MEDIA),
+                    sha256=hashlib.sha256(_SEEDED_MEDIA).digest(),
+                    payload=_SEEDED_MEDIA,
+                    usage_trigger=None,
+                    auto_suggest=False,
+                )
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _alembic_version(url: Any) -> list[str]:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            rows = await connection.execute(
+                text("SELECT version_num FROM alembic_version ORDER BY 1")
+            )
+            return [str(row[0]) for row in rows]
     finally:
         await engine.dispose()
 
@@ -743,6 +859,7 @@ async def _read_back(
     dict[str, int],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
+    list[str],
 ]:
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -790,9 +907,16 @@ async def _read_back(
             ledger = (
                 await _ledger_rows(connection) if "credit_allocations" in tables else {}
             )
+            # The revision this run's database was at: the oracle asserts it.
+            versions = [
+                str(version)
+                for (version,) in await connection.execute(
+                    text("SELECT version_num FROM alembic_version ORDER BY 1")
+                )
+            ]
     finally:
         await engine.dispose()
-    return events, credit_rows, metering, ledger
+    return events, credit_rows, metering, ledger, versions
 
 
 async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
@@ -800,7 +924,12 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
     from sqlalchemy import event
 
     world = _World(**spec["world"])
-    with _fake_llm_and_providers():
+    minimum = spec.get("credit_minimum")
+    excluded = frozenset(spec.get("excluded") or ())
+    with (
+        _fake_llm_and_providers(),
+        nullcontext() if minimum is None else _credit_minimum_pinned(minimum),
+    ):
         from src.api.main import app
         from src.repositories.database import get_db_engine
         from src.services.credit_switch import credit_switch_reading
@@ -823,6 +952,8 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
                     transport=transport, base_url="http://testserver"
                 ) as client:
                     for item in _corpus()["requests"]:
+                        if item["id"] in excluded:
+                            continue
                         path, raw, headers = _request_for(item, world)
                         response = await client.request(
                             item["method"], path, content=raw, headers=headers
@@ -842,7 +973,9 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
                     await _await_fact_handled(spec["database_url"], spec["fact"])
             finally:
                 event.remove(engine, "before_cursor_execute", record)
-    events, credit_rows, metering, ledger = await _read_back(spec["database_url"])
+    events, credit_rows, metering, ledger, versions = await _read_back(
+        spec["database_url"]
+    )
     result = {
         "reading": asdict(reading),
         "responses": responses,
@@ -851,6 +984,7 @@ async def _replay(spec: dict[str, Any]) -> dict[str, Any]:
         "credit_rows": credit_rows,
         "metering": metering,
         "ledger": ledger,
+        "alembic_version": versions,
     }
     if spec.get("fact") is not None:
         result["fact"] = await _fact_outcome(spec["database_url"], spec["fact"])
@@ -979,6 +1113,8 @@ async def _run_in_subprocess(
     enabled: bool,
     workdir: Path,
     fact: str | None = None,
+    credit_minimum: str | None = None,
+    excluded: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     label = f"{database_url.database}-{'on' if enabled else 'off'}"
     spec_path = workdir / f"{label}.spec.json"
@@ -991,6 +1127,8 @@ async def _run_in_subprocess(
                 "world": asdict(world),
                 "output": str(output),
                 "fact": fact,
+                "credit_minimum": credit_minimum,
+                "excluded": list(excluded),
             }
         ),
         encoding="utf-8",
@@ -1061,6 +1199,9 @@ class _Oracle:
     runs: dict[tuple[str, bool, bool, bool], dict[str, Any]]
 
     async def clone(self, revision: str) -> str:
+        """A fresh database from the template ``revision`` (``"head"``,
+        ``"037"`` or ``"042"``)."""
+
         name = f"neurostack_asaas_smoke_{uuid4().hex[:12]}"
         async with self.admin.connect() as connection:
             quote = connection.dialect.identifier_preparer.quote
@@ -1101,28 +1242,45 @@ class _Oracle:
 
     async def run(
         self,
-        revision: str,
+        schema: str,
         enabled: bool,
         *,
         enforced: bool = False,
         transport: bool = False,
     ) -> dict[str, Any]:
-        key = (revision, enabled, enforced, transport)
+        """One replay of the corpus.  ``schema`` is ``_READY`` or ``_BELOW``
+        (a head database; ``_BELOW`` pins the image's credit minimum above
+        head), or one of ``_CREDIT_PAIR`` (that revision, config off, without
+        the media cases)."""
+
+        key = (schema, enabled, enforced, transport)
         if key not in self.runs:
-            name = await self.clone(revision)
+            if schema in _CREDIT_PAIR:
+                assert not (enabled or enforced or transport), key
+                template, revision = schema, schema
+            else:
+                assert schema in (_READY, _BELOW), schema
+                template, revision = "head", _HEAD
+            name = await self.clone(template)
             try:
                 if enforced:
                     await self.enforce(name)
                 url = self.admin_url.set(database=name)
-                self.runs[key] = await _run_in_subprocess(
+                result = await _run_in_subprocess(
                     url,
                     self.world,
                     enabled=enabled,
                     workdir=self.workdir,
                     fact=await _seed_one_fact(url) if transport else None,
+                    credit_minimum=_ABOVE_HEAD if schema == _BELOW else None,
+                    excluded=_MEDIA_CASES if schema in _CREDIT_PAIR else (),
                 )
             finally:
                 await self.drop(name)
+            # Every run is proven at its revision: the ready and the
+            # below-minimum runs at head, the credit pair at 037 or 042.
+            assert result["alembic_version"] == [revision], (key, result)
+            self.runs[key] = result
         return self.runs[key]
 
 
@@ -1164,10 +1322,19 @@ async def oracle(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[_Ora
         await _run_alembic(admin_url.set(database=at_037), "upgrade", "037")
         await _seed_world(admin_url.set(database=at_037), world)
         oracle.templates["037"] = at_037
-        # The credit-ready head: 042 (Group 5; 040 and 039 before it).
+        # The credit migrations' own revision (Group 7; 040 and 039 before
+        # it): only the config-off comparison of the credit pair runs on it.
         at_042 = await oracle.clone("037")
         await _run_alembic(admin_url.set(database=at_042), "upgrade", "042")
         oracle.templates["042"] = at_042
+        # Every other run: the head of the chain, the one schema the
+        # behaviour image serves (envio-midia-agente: 045 maps media).
+        at_head = await oracle.clone("042")
+        head_url = admin_url.set(database=at_head)
+        await _run_alembic(head_url, "upgrade", "head")
+        assert await _alembic_version(head_url) == [_HEAD]
+        await _seed_media(head_url, world)
+        oracle.templates["head"] = at_head
         yield oracle
     finally:
         for name in list(reversed(created)):
@@ -1239,29 +1406,30 @@ def _assert_same(on: dict[str, Any], off: dict[str, Any], world: _World) -> None
     assert actual["events"] == expected["events"]
 
 
-@pytest.mark.parametrize("revision", ["037", "042"])
+@pytest.mark.parametrize("schema", [_BELOW, _READY])
 async def test_config_on_answers_and_stores_like_config_off(
-    oracle: _Oracle, revision: str
+    oracle: _Oracle, schema: str
 ) -> None:
-    off = await oracle.run(revision, enabled=False)
-    on = await oracle.run(revision, enabled=True)
+    off = await oracle.run(schema, enabled=False)
+    on = await oracle.run(schema, enabled=True)
 
     assert off["reading"] == {
         "effective": False,
         "reason": "config_disabled",
         "revision": None,
     }
-    if revision == "037":
+    if schema == _BELOW:
+        # A head database below the image's credit minimum: off.
         assert on["reading"] == {
             "effective": False,
             "reason": "schema_below_minimum",
-            "revision": "037",
+            "revision": _HEAD,
         }
     else:
         assert on["reading"] == {
             "effective": True,
             "reason": "schema_ready",
-            "revision": "042",
+            "revision": _HEAD,
         }
     _assert_same(on, off, oracle.world)
 
@@ -1269,7 +1437,7 @@ async def test_config_on_answers_and_stores_like_config_off(
 async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
     """Not vacuous: accepted and rejected requests of every ingress happened."""
 
-    run = await oracle.run("037", enabled=False)
+    run = await oracle.run(_BELOW, enabled=False)
     status = {response["id"]: response["status"] for response in run["responses"]}
     body = {response["id"]: response["body"] for response in run["responses"]}
 
@@ -1341,7 +1509,7 @@ async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None
 
     import copy
 
-    run = await oracle.run("037", enabled=False)
+    run = await oracle.run(_BELOW, enabled=False)
     _assert_same(run, run, oracle.world)
 
     changed_status = copy.deepcopy(run)
@@ -1358,31 +1526,35 @@ async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None
 
 
 async def test_the_schema_revision_alone_changes_nothing(oracle: _Oracle) -> None:
-    _assert_same(
-        await oracle.run("042", enabled=False),
-        await oracle.run("037", enabled=False),
-        oracle.world,
-    )
+    """The credit migrations (037 -> 042) alone, config off, change no answer
+    and no stored event.  The behaviour image serves media only at 045 and
+    later, so this one comparison runs without the media cases (neither
+    database holds the media asset); every other surface is compared."""
+
+    at_042 = await oracle.run("042", enabled=False)
+    at_037 = await oracle.run("037", enabled=False)
+    assert {r["id"] for r in at_037["responses"]} & set(_MEDIA_CASES) == set()
+    assert len(at_037["responses"]) == len(_corpus()["requests"]) - len(_MEDIA_CASES)
+    assert at_037["reading"] == at_042["reading"]
+    _assert_same(at_042, at_037, oracle.world)
 
 
 @pytest.mark.parametrize(
-    ("revision", "enabled"),
-    [("037", False), ("037", True), ("042", False)],
+    ("schema", "enabled"),
+    [(_BELOW, False), (_BELOW, True), (_READY, False)],
 )
 async def test_no_sql_touches_credit_tables_and_no_credit_row_exists(
-    oracle: _Oracle, revision: str, enabled: bool
+    oracle: _Oracle, schema: str, enabled: bool
 ) -> None:
-    """While the switch is not effective (config off, or a 037 database)."""
+    """While the switch is not effective (config off, or a database below
+    the image's credit minimum): the credit tables exist, and stay empty."""
 
-    run = await oracle.run(revision, enabled=enabled)
+    run = await oracle.run(schema, enabled=enabled)
 
     assert run["statements"], "the listener saw no SQL at all"
     touching = [s for s in run["statements"] if _CREDIT_SQL.search(s)]
     assert touching == []
-    if revision == "042":
-        assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
-    else:
-        assert run["credit_rows"] == {}
+    assert run["credit_rows"] and set(run["credit_rows"].values()) == {0}
 
 
 async def test_the_effective_switch_only_meters_observationally(
@@ -1392,7 +1564,7 @@ async def test_the_effective_switch_only_meters_observationally(
     writers' tables are touched, and nothing financial is ever written
     before the enforcement."""
 
-    run = await oracle.run("042", enabled=True)
+    run = await oracle.run(_READY, enabled=True)
 
     names = {
         match.group(0).lower()
@@ -1420,7 +1592,7 @@ def _event_id(run: dict[str, Any], case: str) -> str:
 async def test_every_allowlisted_decision_leaves_its_claim_and_trace(
     oracle: _Oracle,
 ) -> None:
-    run = await oracle.run("042", enabled=True)
+    run = await oracle.run(_READY, enabled=True)
     world = oracle.world
     status = {r["id"]: r["status"] for r in run["responses"]}
     claims = run["metering"]["credit_ingress_claims"]
@@ -1537,18 +1709,18 @@ def _bodies(run: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    ("revision", "enabled", "expected"),
+    ("schema", "enabled", "expected"),
     [
-        ("037", False, 503),
-        ("037", True, 503),
-        ("042", False, 503),
-        ("042", True, 201),
+        (_BELOW, False, 503),
+        (_BELOW, True, 503),
+        (_READY, False, 503),
+        (_READY, True, 201),
     ],
 )
 async def test_the_multipart_upload_exists_only_with_the_switch_effective(
-    oracle: _Oracle, revision: str, enabled: bool, expected: int
+    oracle: _Oracle, schema: str, enabled: bool, expected: int
 ) -> None:
-    run = await oracle.run(revision, enabled=enabled)
+    run = await oracle.run(schema, enabled=enabled)
     [answer] = [r for r in run["responses"] if r["id"] == "knowledge-files-upload"]
     assert answer["status"] == expected, answer
     if expected == 503:
@@ -1560,20 +1732,20 @@ async def test_the_multipart_upload_exists_only_with_the_switch_effective(
 
 
 @pytest.mark.parametrize(
-    ("revision", "enabled", "export", "purge"),
+    ("schema", "enabled", "export", "purge"),
     [
-        ("037", True, 503, 503),
-        ("042", False, 503, 503),
-        ("042", True, 200, 403),
+        (_BELOW, True, 503, 503),
+        (_READY, False, 503, 503),
+        (_READY, True, 200, 403),
     ],
 )
 async def test_group5_surfaces_exist_only_with_the_switch_effective(
-    oracle: _Oracle, revision: str, enabled: bool, export: int, purge: int
+    oracle: _Oracle, schema: str, enabled: bool, export: int, purge: int
 ) -> None:
     """The export answers with the switch effective; the admin purge refuses
     an API key (never an actor) -- and is ``purge_disabled`` for everyone."""
 
-    run = await oracle.run(revision, enabled=enabled)
+    run = await oracle.run(schema, enabled=enabled)
     answers = {r["id"]: r for r in run["responses"]}
     assert answers["credits-export"]["status"] == export, answers["credits-export"]
     assert answers["credits-admin-purge"]["status"] == purge
@@ -1586,16 +1758,16 @@ _GROUP6_CASES = (*_GROUP6_READS, *_GROUP6_FOREIGN, "credits-balance-api-key")
 
 
 @pytest.mark.parametrize(
-    ("revision", "enabled"),
-    [("037", False), ("037", True), ("042", False)],
+    ("schema", "enabled"),
+    [(_BELOW, False), (_BELOW, True), (_READY, False)],
 )
 async def test_group6_reads_answer_unavailable_without_the_switch(
-    oracle: _Oracle, revision: str, enabled: bool
+    oracle: _Oracle, schema: str, enabled: bool
 ) -> None:
     """Not effective: 503 for every caller, before any credit SQL (the run's
     statement listener is asserted empty of credit_* by the test above)."""
 
-    run = await oracle.run(revision, enabled=enabled)
+    run = await oracle.run(schema, enabled=enabled)
     answers = {r["id"]: r for r in run["responses"]}
     for case in _GROUP6_CASES:
         assert (answers[case]["status"], answers[case]["body"]) == (
@@ -1613,7 +1785,7 @@ async def test_group6_reads_observe_without_charging_before_the_enforcement(
     same 403; the API key is refused; nothing is written (the no-write check
     of ``test_the_effective_switch_only_meters_observationally``)."""
 
-    run = await oracle.run("042", enabled=True)
+    run = await oracle.run(_READY, enabled=True)
     world = oracle.world
     answers = {r["id"]: r for r in run["responses"]}
     for case in _GROUP6_READS:
@@ -1669,7 +1841,7 @@ async def test_uploads_and_downloads_are_metered_observationally_only(
     and download WOULD debit, the window's maintenance once per category,
     the delivery -- and nothing financial."""
 
-    run = await oracle.run("042", enabled=True)
+    run = await oracle.run(_READY, enabled=True)
     world = oracle.world
     bodies = _bodies(run)
     effects = {
@@ -1774,8 +1946,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
     """``credit_enforcement_at`` set but the switch off: ``main`` exactly,
     no SQL touches a ``credit_*`` table, nothing is claimed or charged."""
 
-    off = await oracle.run("042", enabled=False)
-    enforced = await oracle.run("042", enabled=False, enforced=True)
+    off = await oracle.run(_READY, enabled=False)
+    enforced = await oracle.run(_READY, enabled=False, enforced=True)
 
     assert enforced["reading"] == off["reading"]
     _assert_same(enforced, off, oracle.world)
@@ -1788,8 +1960,8 @@ async def test_with_the_config_off_an_enforced_database_answers_like_main(
 async def test_the_enforced_run_charges_each_production_decision_once(
     oracle: _Oracle,
 ) -> None:
-    off = await oracle.run("042", enabled=False)
-    run = await oracle.run("042", enabled=True, enforced=True)
+    off = await oracle.run(_READY, enabled=False)
+    run = await oracle.run(_READY, enabled=True, enforced=True)
     world = oracle.world
 
     assert run["reading"]["effective"] is True
@@ -1989,7 +2161,7 @@ async def test_group6_reads_show_the_debt_the_enforced_run_charged(
     episode (``grace``, with the export deadline), nothing is usable and all
     the consumption was charged."""
 
-    run = await oracle.run("042", enabled=True, enforced=True)
+    run = await oracle.run(_READY, enabled=True, enforced=True)
     world = oracle.world
     answers = {r["id"]: r for r in run["responses"]}
     summary = answers["credits-summary-builder"]
@@ -2025,7 +2197,7 @@ async def test_the_enforced_run_refuses_only_uploads_that_need_capacity(
     the media upload, which fits the baseline's coverage (zero delta), is
     accepted (201) with the episode open."""
 
-    run = await oracle.run("042", enabled=True, enforced=True)
+    run = await oracle.run(_READY, enabled=True, enforced=True)
     answers = {r["id"]: r for r in run["responses"]}
     for case in _CATEGORY_GATED:
         assert (answers[case]["status"], answers[case]["body"]) == (
@@ -2042,15 +2214,15 @@ async def test_the_enforced_run_refuses_only_uploads_that_need_capacity(
 
 
 @pytest.mark.parametrize(
-    ("revision", "enabled", "effective"),
+    ("schema", "enabled", "effective"),
     [
-        pytest.param("037", True, False, id="037-config-on-schema-below"),
-        pytest.param("042", False, False, id="042-config-off"),
-        pytest.param("042", True, True, id="042-config-on-effective"),
+        pytest.param(_BELOW, True, False, id="below-minimum-config-on"),
+        pytest.param(_READY, False, False, id="head-config-off"),
+        pytest.param(_READY, True, True, id="head-config-on-effective"),
     ],
 )
 async def test_the_transport_on_keeps_dominance_and_presents_only_when_effective(
-    oracle: _Oracle, revision: str, enabled: bool, effective: bool
+    oracle: _Oracle, schema: str, enabled: bool, effective: bool
 ) -> None:
     """The app with ``BILLING_FACT_WORKER_ENABLED`` and
     ``BILLING_FACT_TRANSPORT_ENABLED`` on, over one fact the producer wrote,
@@ -2058,8 +2230,8 @@ async def test_the_transport_on_keeps_dominance_and_presents_only_when_effective
     reaches the credit consumer only while the switch is effective, and is
     otherwise turned away without an attempt and without any credit SQL."""
 
-    plain = await oracle.run(revision, enabled=enabled)
-    wired = await oracle.run(revision, enabled=enabled, transport=True)
+    plain = await oracle.run(schema, enabled=enabled)
+    wired = await oracle.run(schema, enabled=enabled, transport=True)
 
     assert wired["reading"] == plain["reading"]
     assert wired["reading"]["effective"] is effective
@@ -2080,13 +2252,10 @@ async def test_the_transport_on_keeps_dominance_and_presents_only_when_effective
             "attempt_count": 0,
             "tried": True,  # the worker did reach it: turned away, not spent
             "acks": 0,
-            "inbox": None if revision == "037" else 0,
+            "inbox": 0,  # the consumer's inbox exists and stays empty
         }
         assert [s for s in wired["statements"] if _CREDIT_SQL.search(s)] == []
-        if revision == "042":
-            assert set(wired["credit_rows"].values()) == {0}
-        else:
-            assert wired["credit_rows"] == {}
+        assert wired["credit_rows"] and set(wired["credit_rows"].values()) == {0}
 
 
 # ---------------------------------------------------------------------------
@@ -2111,6 +2280,15 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     monkeypatch: pytest.MonkeyPatch,
     _inject_isolated_database: None,
 ) -> None:
+    """One process follows a real ``alembic upgrade`` and ``downgrade`` across
+    the image's credit minimum, each within one refresh interval.
+
+    The behaviour image serves only head, so the minimum is pinned AT head
+    and the crossing is the head migration itself: the database starts one
+    revision below (off), goes up to head (on, the one schema the image
+    serves) and back down (off).  The requests are rejected at
+    authentication, so the revision below head is never asked for media."""
+
     import httpx
     from sqlalchemy import event
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -2119,6 +2297,7 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     from src.api.main import app
     from src.config.settings import settings
     from src.repositories.database import get_db_engine
+    from src.services import credit_switch
     from src.services.credit_switch import credit_switch_reading
     from tests.conftest import _production_init_database
     from tests.integration.test_asaas_billing_postgres import _run_alembic
@@ -2126,8 +2305,16 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     interval = 1
     # One refresh interval plus a margin for the read and the scheduler.
     bound = interval + 1.5
-    name = await oracle.clone("037")
+    below_head = dict(migration_revisions().values())[_HEAD]
+    assert below_head is not None
+    name = await oracle.clone("head")
     url = oracle.admin_url.set(database=name)
+    await _run_alembic(url, "downgrade", below_head)
+    assert await _alembic_version(url) == [below_head]
+    monkeypatch.setattr(
+        credit_switch, "evaluate_schema_revision", _pinned_schema_evaluation(_HEAD)
+    )
+    monkeypatch.setattr(credit_switch, "CREDIT_SCHEMA_MIN_REVISION", _HEAD)
     monkeypatch.setattr(settings, "credit_hot_path_enabled", True)
     monkeypatch.setattr(settings, "credit_switch_refresh_seconds", interval)
     monkeypatch.setattr(
@@ -2147,7 +2334,9 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     unknown_key = {"X-API-Key": oracle.world.unknown_api_key}
     try:
         async with app.router.lifespan_context(app):
-            assert credit_switch_reading().reason == "schema_below_minimum"
+            assert credit_switch_reading() == credit_switch.CreditSwitchReading(
+                False, "schema_below_minimum", below_head
+            )
             engine = get_db_engine().sync_engine
             event.listen(engine, "before_cursor_execute", record)
             transport = httpx.ASGITransport(app=app, client=("testclient", 50000))
@@ -2156,14 +2345,18 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
             ) as client:
                 before = await client.post("/v1/events", json={}, headers=unknown_key)
 
-                await _run_alembic(url, "upgrade", "042")
+                await _run_alembic(url, "upgrade", "head")
                 assert await _wait_for(True, bound) <= bound
-                assert credit_switch_reading().revision == "042"
+                assert credit_switch_reading() == credit_switch.CreditSwitchReading(
+                    True, "schema_ready", _HEAD
+                )
                 during = await client.post("/v1/events", json={}, headers=unknown_key)
 
-                await _run_alembic(url, "downgrade", "037")
+                await _run_alembic(url, "downgrade", below_head)
                 assert await _wait_for(False, bound) <= bound
-                assert credit_switch_reading().reason == "schema_below_minimum"
+                assert credit_switch_reading() == credit_switch.CreditSwitchReading(
+                    False, "schema_below_minimum", below_head
+                )
                 after = await client.post("/v1/events", json={}, headers=unknown_key)
             event.remove(engine, "before_cursor_execute", record)
         assert credit_switch_reading().reason == "stopped"

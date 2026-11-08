@@ -32,8 +32,9 @@ windows of their own) and ``045`` in one run, one transaction.  Pinned here:
   behind a reader of ``media_assets`` and change nothing, and the upgrade
   gives up too behind a writer of ``sessions`` or ``tenants`` (the foreign
   keys' SHARE ROW EXCLUSIVE lock conflicts with it);
-* no ORM model maps ``trigger_intents`` or ``media_deliveries`` (the bridge
-  image runs on either schema).
+* the bridge image mapped neither ``trigger_intents`` nor
+  ``media_deliveries`` (it ran on either schema); the behaviour release maps
+  both, equal to this DDL (``test_media_deliveries_postgres``).
 
 Needs ``POSTGRES_SMOKE_DATABASE_URL``; without it the module skips, and only
 ``scripts/check-credit-integration.sh`` turns that skip into a failure.
@@ -252,14 +253,17 @@ def test_045_revises_044_and_is_the_single_head() -> None:
     assert _MIGRATION.ADDED_COLUMNS == (("media_assets", "trigger_intents"),)
 
 
-def test_no_orm_model_maps_the_bridge_objects() -> None:
-    """The bridge image runs on 042 and on 045: its ORM names neither
-    object (the behaviour release maps them after the window)."""
+def test_the_behaviour_release_maps_the_bridge_objects() -> None:
+    """The bridge image (PR-A, #201) ran on 042 and on 045 because its ORM
+    named neither object.  The behaviour release (Group 2 on) maps both, so
+    its image serves only a schema at 045 or later: it merges and deploys
+    after window 045 (Decision 17).  The mapping equals the DDL of this
+    migration: ``tests/integration/test_media_deliveries_postgres.py``."""
 
     import src.models  # noqa: F401  (registers every model on Base.metadata)
 
-    assert "media_deliveries" not in Base.metadata.tables
-    assert "trigger_intents" not in Base.metadata.tables["media_assets"].columns
+    assert "media_deliveries" in Base.metadata.tables
+    assert "trigger_intents" in Base.metadata.tables["media_assets"].columns
 
 
 # ---------------------------------------------------------------------------

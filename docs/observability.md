@@ -69,6 +69,19 @@ de dados para correlação.
 | `neurostack_prompt_tokens_total` | Counter | `mode` | Tokens estimados dos prompts |
 | `neurostack_output_validations_total` | Counter | `mode`, `valid` | Validações de output |
 
+### Métricas de envio de mídia pelo agente
+
+A API registra as 2 famílias abaixo em `METRIC_DIMENSION_CONTRACTS`
+(`src/observability/metric_dimensions.py`), com vocabulários fechados e sem
+identidade de tenant, sessão, mídia ou telefone (essas ficam nos logs). O
+significado de cada `outcome` está em
+[Envio de mídia pelo agente](./agent-media-delivery.md#outcomes-and-metrics).
+
+| Métrica | Tipo | Labels exatas | Descrição |
+|---------|------|---------------|-----------|
+| `neurostack_agent_media_selection_total` | Counter | `outcome` | Turnos que ofereceram arquivos ao LLM: `selected`, `none`, `invalid_marker`, `dropped`, `candidates_capped` |
+| `neurostack_agent_media_delivery_total` | Counter | `provider`, `outcome` | Uma amostra por entrega iniciada: `sent`, `deduplicated`, `failed`, `asset_gone`, `too_large`, `busy`, `credit_refused`, `flag_off` |
+
 ## Uso das Métricas em Código
 
 ```python

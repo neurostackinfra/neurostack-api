@@ -402,7 +402,10 @@ async def test_webhook_commit_releases_lock_before_finish_response(
             return object(), {}, []
 
         async def finish_response(
-            self, *_args: object, context: object = None
+            self,
+            *_args: object,
+            context: object = None,
+            media_delivery_provider: object = None,
         ) -> SimpleNamespace:
             async with factory() as observer:
                 row = await asyncio.wait_for(

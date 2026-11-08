@@ -31,17 +31,25 @@ from src.services.media_assets import (
     MediaAssetDomainError,
 )
 
-_OGG_OPUS = (
-    b"OggS"
-    + bytes([0, 0x02])
-    + bytes(20)  # granule, serial, sequence, CRC
-    + b"\x01\x13"  # one segment, 19 bytes long
-    + b"OpusHead"
-    + bytes([1, 2])
-    + (312).to_bytes(2, "little")
-    + (48_000).to_bytes(4, "little")
-    + bytes(3)  # output gain and channel mapping family
-)
+
+def _ogg_opus(channels: int) -> bytes:
+    """One RFC 3533 first page whose only packet is an RFC 7845 OpusHead."""
+
+    return (
+        b"OggS"
+        + bytes([0, 0x02])
+        + bytes(20)  # granule, serial, sequence, CRC
+        + b"\x01\x13"  # one segment, 19 bytes long
+        + b"OpusHead"
+        + bytes([1, channels])
+        + (312).to_bytes(2, "little")
+        + (48_000).to_bytes(4, "little")
+        + bytes(3)  # output gain and channel mapping family
+    )
+
+
+# Mono: the only OGG-Opus upload accepts (Meta sends audio/ogg mono only).
+_OGG_OPUS = _ogg_opus(1)
 # ftyp with the M4A major brand (iPhone Voice Memos); the brand alone decides.
 _M4A = b"\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00M4A isommp42"
 
@@ -1087,3 +1095,262 @@ async def test_upload_guard_receives_known_size_and_maps_failures_without_insert
         "guard_exit",
         "rollback",
     ]
+
+
+# ---------------------------------------------------------------------------
+# envio-midia-agente Group 2: trigger_intents, one multipart part per intent.
+# ---------------------------------------------------------------------------
+
+_BINDABLE_INTENTS = [
+    "saudacao",
+    "interesse_tratamento",
+    "pedido_preco",
+    "comparacao_tratamentos",
+    "objecao_vou_pensar",
+    "detalhes_servicos",
+    "pre_atendimento",
+    "faq",
+    "cultura_historia",
+    "qualificacao_publico",
+    "informacoes_profissionais",
+    "pos_atendimento_duvida",
+]
+
+
+async def _post_real_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    data: dict[str, Any],
+    file: tuple[str, bytes, str] = (
+        "transport.pdf",
+        b"%PDF-1.7\nbody",
+        "application/pdf",
+    ),
+) -> tuple[Any, dict[str, Any]]:
+    """POST one file (a PDF by default) through the registered app."""
+
+    from datetime import datetime, timezone
+
+    from src.api.main import create_app
+    from src.repositories import get_db_session_dependency
+
+    tenant_id = UUID("a0000000-0000-0000-0000-000000000001")
+    target = Tenant(
+        id=tenant_id,
+        name="Real route clinic",
+        api_key_hash="not-used-by-development-fallback",
+        is_active=True,
+        plan_type="clinic",
+        config={},
+    )
+    seen: dict[str, Any] = {"guard": False, "asset": None}
+
+    class Result:
+        def scalar_one_or_none(self) -> Tenant:
+            return target
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            return Result()
+
+        def add(self, asset: MediaAsset) -> None:
+            seen["asset"] = asset
+
+        async def flush(self) -> None:
+            asset = seen["asset"]
+            asset.id = uuid4()
+            asset.created_at = datetime.now(timezone.utc)
+            asset.updated_at = asset.created_at
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    session = Session()
+
+    async def session_dependency() -> Any:
+        yield session
+
+    class Guard(AbstractAsyncContextManager[Any]):
+        async def __aenter__(self) -> Any:
+            seen["guard"] = True
+            return self
+
+        async def validate_projection(self, size: int) -> None:
+            return None
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        route, "media_storage_capacity_guard", lambda *args, **kwargs: Guard()
+    )
+    app = create_app()
+    app.dependency_overrides[get_db_session_dependency] = session_dependency
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/media-assets",
+            headers={"X-API-Key": "test-api-key"},
+            files={"file": file},
+            data={
+                "display_name": "Tabela",
+                "original_filename": "tabela.pdf",
+                **data,
+            },
+        )
+    return response, seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sent", "stored"),
+    [
+        ([], []),
+        (["faq"], ["faq"]),
+        # Duplicates go; the canonical (allowlist) order stays, whatever the
+        # order of the parts.
+        (["faq", "saudacao", "faq"], ["saudacao", "faq"]),
+        (list(reversed(_BINDABLE_INTENTS)), _BINDABLE_INTENTS),
+    ],
+)
+async def test_upload_stores_repeated_trigger_intents_deduplicated_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    sent: list[str],
+    stored: list[str],
+) -> None:
+    data: dict[str, Any] = {"usage_trigger": "quando pedirem", "auto_suggest": "true"}
+    if sent:
+        data["trigger_intents"] = sent
+    response, seen = await _post_real_upload(monkeypatch, data)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["trigger_intents"] == stored
+    assert seen["asset"].trigger_intents == stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channels", [2, 6, 8, 255])
+async def test_upload_refuses_an_ogg_opus_that_is_not_mono_before_storing(
+    monkeypatch: pytest.MonkeyPatch, channels: int
+) -> None:
+    # Meta sends audio/ogg with mono input only and no other provider sends
+    # OGG, so a stereo or surround OGG could never reach a patient.
+    response, seen = await _post_real_upload(
+        monkeypatch,
+        {},
+        ("recado.ogg", _ogg_opus(channels), "audio/ogg; codecs=opus"),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": {"code": "media_audio_not_mono"}}
+    assert seen == {"guard": False, "asset": None}
+
+
+@pytest.mark.asyncio
+async def test_upload_stores_a_mono_ogg_opus_through_the_registered_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response, seen = await _post_real_upload(
+        monkeypatch, {}, ("recado.ogg", _OGG_OPUS, "audio/ogg; codecs=opus")
+    )
+
+    assert response.status_code == 201, response.text
+    assert (response.json()["category"], response.json()["mime_type"]) == (
+        "audio",
+        "audio/ogg",
+    )
+    assert seen["guard"] is True
+    assert seen["asset"].payload == _OGG_OPUS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unknown",
+    ["agendar", "fora_do_horario", "FAQ", "", "pedido_atendente_humano"],
+)
+async def test_upload_refuses_an_unknown_trigger_intent_before_storing(
+    monkeypatch: pytest.MonkeyPatch, unknown: str
+) -> None:
+    response, seen = await _post_real_upload(
+        monkeypatch, {"trigger_intents": ["faq", unknown]}
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": {"code": "media_trigger_intent_unknown"}}
+    assert seen == {"guard": False, "asset": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # 13 intent parts beside only two text fields: within the parser's
+        # field budget (16), refused by the route's own per-field bound.
+        {"trigger_intents": [*_BINDABLE_INTENTS, "faq"]},
+        # Every text field plus 13 parts: above the parser's field budget.
+        {
+            "usage_trigger": "x",
+            "auto_suggest": "false",
+            "trigger_intents": [*_BINDABLE_INTENTS, "faq"],
+        },
+    ],
+)
+async def test_upload_refuses_more_intent_parts_than_bindable_intents(
+    monkeypatch: pytest.MonkeyPatch, extra: dict[str, Any]
+) -> None:
+    response, seen = await _post_real_upload(monkeypatch, extra)
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": {"code": "media_multipart_invalid"}}
+    assert seen == {"guard": False, "asset": None}
+
+
+@pytest.mark.asyncio
+async def test_upload_accepts_every_field_and_every_intent_at_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response, _seen = await _post_real_upload(
+        monkeypatch,
+        {
+            "usage_trigger": "x",
+            "auto_suggest": "false",
+            "trigger_intents": _BINDABLE_INTENTS,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["trigger_intents"] == _BINDABLE_INTENTS
+
+
+@pytest.mark.asyncio
+async def test_parser_collects_intent_parts_and_refuses_a_file_named_like_one() -> None:
+    items: list[tuple[str, Any]] = [
+        ("file", UploadFile(BytesIO(b"x"))),
+        ("trigger_intents", "faq"),
+        ("display_name", "x"),
+        ("trigger_intents", "saudacao"),
+        ("original_filename", "x"),
+    ]
+    _upload, fields, intents = await route._parse_upload(
+        _FakeRequest(FormData(items))  # type: ignore[arg-type]
+    )
+    # Arrival order here; the route normalizes after.
+    assert intents == ["faq", "saudacao"]
+    assert set(fields) == {"display_name", "original_filename"}
+
+    with pytest.raises(Exception) as caught:
+        await route._parse_upload(
+            _FakeRequest(  # type: ignore[arg-type]
+                FormData(
+                    [
+                        ("file", UploadFile(BytesIO(b"x"))),
+                        ("trigger_intents", UploadFile(BytesIO(b"faq"))),
+                        ("display_name", "x"),
+                        ("original_filename", "x"),
+                    ]
+                )
+            )
+        )
+    assert getattr(caught.value, "detail", {})["code"] == "media_multipart_invalid"

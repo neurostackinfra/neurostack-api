@@ -19,7 +19,10 @@ from starlette.types import Message
 from src.api.middleware.auth import TenantContext
 from src.api.middleware.media_limits import MediaConcurrencyLimiters
 from src.api.routes import media_assets as route
-from src.api.schemas.media_assets import MediaAssetPatchRequest
+from src.api.schemas.media_assets import (
+    MediaAssetPatchRequest,
+    MediaBindableIntentsResponse,
+)
 from src.models.tenant import Tenant
 
 
@@ -32,7 +35,10 @@ def _asset_row(
     original_filename: str = "relatório clínico final.pdf",
     usage_trigger: str | None = "quando solicitado",
     auto_suggest: bool = True,
+    trigger_intents: tuple[str, ...] = ("detalhes_servicos",),
     payload: bytes = b"%PDF-1.7\nbody",
+    category: str = "pdf",
+    mime_type: str = "application/pdf",
 ) -> SimpleNamespace:
     timestamp = created_at or datetime.now(timezone.utc)
     return SimpleNamespace(
@@ -40,11 +46,12 @@ def _asset_row(
         tenant_id=tenant_id,
         display_name=display_name,
         original_filename=original_filename,
-        category="pdf",
-        mime_type="application/pdf",
+        category=category,
+        mime_type=mime_type,
         size_bytes=len(payload),
         usage_trigger=usage_trigger,
         auto_suggest=auto_suggest,
+        trigger_intents=list(trigger_intents),
         created_at=timestamp,
         updated_at=timestamp,
         payload=payload,
@@ -370,11 +377,38 @@ async def test_invalid_or_cross_tenant_cursor_fails_before_media_query(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("category", "mime_type", "payload", "original_filename", "extension"),
+    [
+        ("pdf", "application/pdf", b"%PDF-1.7\nbody", "relatório final.pdf", ".pdf"),
+        # The fallback name is the server's own: ``.jpeg`` from the shared
+        # table, whatever the author called the file.
+        (
+            "image",
+            "image/jpeg",
+            b"\xff\xd8\xff\xe0body",
+            "foto da clínica.jpg",
+            ".jpeg",
+        ),
+    ],
+    ids=["pdf", "jpeg"],
+)
 async def test_download_returns_exact_attachment_and_releases_success_permit(
     monkeypatch: pytest.MonkeyPatch,
+    category: str,
+    mime_type: str,
+    payload: bytes,
+    original_filename: str,
+    extension: str,
 ) -> None:
     tenant_id = uuid4()
-    asset = _asset_row(tenant_id)
+    asset = _asset_row(
+        tenant_id,
+        category=category,
+        mime_type=mime_type,
+        payload=payload,
+        original_filename=original_filename,
+    )
     limiters = MediaConcurrencyLimiters(uploads=4, downloads=1)
     request = _request(limiters)
 
@@ -408,7 +442,7 @@ async def test_download_returns_exact_attachment_and_releases_success_permit(
     assert response.headers["content-length"] == str(len(asset.payload))
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["content-disposition"] == (
-        f'attachment; filename="media-{asset.id}.pdf"; '
+        f'attachment; filename="media-{asset.id}{extension}"; '
         f"filename*=UTF-8''{quote(asset.original_filename, safe='')}"
     )
     assert await _send_response(response) == asset.payload
@@ -833,3 +867,586 @@ async def test_missing_and_cross_tenant_asset_share_the_same_404(
 
     assert caught.value.status_code == 404
     assert getattr(caught.value, "detail") == {"code": "media_asset_not_found"}
+
+
+# ---------------------------------------------------------------------------
+# envio-midia-agente Group 2: trigger_intents on PATCH, and bindable-intents.
+# ---------------------------------------------------------------------------
+
+
+class _PatchSession:
+    """First execute: the locked current row; second: the UPDATE."""
+
+    def __init__(self, current: SimpleNamespace, updated: SimpleNamespace) -> None:
+        self.current = current
+        self.updated = updated
+        self.statements: list[Any] = []
+        self.committed = False
+        self.rolled_back = False
+
+    async def execute(self, statement: Any) -> Any:
+        self.statements.append(statement)
+        row = self.current if len(self.statements) == 1 else self.updated
+        return SimpleNamespace(one_or_none=lambda: row)
+
+    async def commit(self) -> None:
+        self.committed = True
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+
+
+def _updated_trigger_intents(statement: Any) -> Any:
+    from sqlalchemy.dialects import postgresql
+
+    compiled = statement.compile(dialect=postgresql.dialect())
+    return compiled.params["trigger_intents"]
+
+
+async def _patch(
+    monkeypatch: pytest.MonkeyPatch,
+    session: _PatchSession,
+    patch: MediaAssetPatchRequest,
+) -> Any:
+    tenant_id = session.current.tenant_id
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    return await route.patch_media_asset(
+        media_id=session.current.id,
+        patch=patch,
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id),
+        session=session,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_patch_replaces_trigger_intents_deduplicated_in_canonical_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    current = _asset_row(tenant_id, trigger_intents=("detalhes_servicos",))
+    updated = _asset_row(
+        tenant_id, media_id=current.id, trigger_intents=("saudacao", "faq")
+    )
+    session = _PatchSession(current, updated)
+
+    result = await _patch(
+        monkeypatch,
+        session,
+        MediaAssetPatchRequest.model_validate_json(
+            '{"trigger_intents": ["faq", "saudacao", "faq"]}'
+        ),
+    )
+
+    assert _updated_trigger_intents(session.statements[1]) == ["saudacao", "faq"]
+    assert result.trigger_intents == ["saudacao", "faq"]
+    assert session.committed is True
+
+
+@pytest.mark.asyncio
+async def test_patch_without_trigger_intents_keeps_them_and_empty_unbinds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    current = _asset_row(tenant_id, trigger_intents=("pedido_preco", "faq"))
+    session = _PatchSession(current, current)
+    await _patch(monkeypatch, session, MediaAssetPatchRequest(display_name="novo"))
+    assert _updated_trigger_intents(session.statements[1]) == ["pedido_preco", "faq"]
+
+    session = _PatchSession(current, _asset_row(tenant_id, trigger_intents=()))
+    result = await _patch(
+        monkeypatch,
+        session,
+        MediaAssetPatchRequest.model_validate_json('{"trigger_intents": []}'),
+    )
+    assert _updated_trigger_intents(session.statements[1]) == []
+    assert result.trigger_intents == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ('{"trigger_intents": ["agendar"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["faq", "reagendar"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["fora_do_horario"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["Faq"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": [""]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": null}', "media_metadata_invalid"),
+        (
+            '{"trigger_intents": ["faq", "faq", "faq", "faq", "faq", "faq", "faq", '
+            '"faq", "faq", "faq", "faq", "faq", "faq"]}',
+            "media_metadata_invalid",
+        ),
+    ],
+)
+async def test_patch_refuses_unknown_or_null_trigger_intents_before_update(
+    monkeypatch: pytest.MonkeyPatch, body: str, code: str
+) -> None:
+    current = _asset_row(uuid4())
+    session = _PatchSession(current, current)
+
+    with pytest.raises(HTTPException) as caught:
+        await _patch(
+            monkeypatch, session, MediaAssetPatchRequest.model_validate_json(body)
+        )
+
+    assert caught.value.status_code == 422
+    assert getattr(caught.value, "detail") == {"code": code}
+    assert len(session.statements) == 1  # the locked read; no UPDATE
+    assert session.rolled_back is True
+    assert session.committed is False
+
+
+@pytest.mark.asyncio
+async def test_registered_app_patch_answers_the_stable_unknown_intent_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from src.api.main import create_app
+    from src.repositories import get_db_session_dependency
+
+    tenant_id = UUID("a0000000-0000-0000-0000-000000000001")
+    current = _asset_row(tenant_id)
+    session = _PatchSession(current, current)
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    async def session_dependency() -> Any:
+        yield session
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    app = create_app()
+    app.dependency_overrides[get_db_session_dependency] = session_dependency
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        refused = await client.patch(
+            f"/v1/media-assets/{current.id}",
+            headers={"X-API-Key": "test-api-key"},
+            json={"trigger_intents": ["saudacao", "cancelar"]},
+        )
+    assert refused.status_code == 422, refused.text
+    assert refused.json() == {"detail": {"code": "media_trigger_intent_unknown"}}
+    assert len(session.statements) == 1
+
+
+# The credential bundles of the readiness matrix (Decision 8).
+_META_READY = {
+    "whatsapp_provider": "meta_cloud",
+    "meta_phone_number_id": "1234567890",
+    "meta_permanent_token": "meta-permanent-token",
+    "meta_app_secret": "meta-app-secret",
+}
+_ZAPI_READY = {
+    "whatsapp_provider": "zapi",
+    "zapi_instance_id": "zapi-instance",
+    "zapi_token": "zapi-token",
+    "zapi_inbound_token_digest": "ab" * 32,
+}
+_UAZAPI_COMPLETE = {
+    "whatsapp_provider": "uazapi",
+    "uazapi_api_url": "https://uazapi.example",
+    "uazapi_instance_name": "clinic",
+    "uazapi_token": "uazapi-token",
+}
+_EVOLUTION_COMPLETE = {
+    "whatsapp_provider": "evolution",
+    "evolution_api_url": "https://evolution.example",
+    "evolution_instance_name": "clinic",
+    "evolution_api_key": "evolution-key",
+}
+_PROVIDER_CASES: dict[str, tuple[dict[str, Any] | None, bool]] = {
+    "meta_with_app_secret": (_META_READY, True),
+    "meta_without_app_secret": (
+        {k: v for k, v in _META_READY.items() if k != "meta_app_secret"},
+        False,
+    ),
+    "zapi_with_inbound_token": (_ZAPI_READY, True),
+    "zapi_without_inbound_token": (
+        {k: v for k, v in _ZAPI_READY.items() if k != "zapi_inbound_token_digest"},
+        False,
+    ),
+    "uazapi_complete": (_UAZAPI_COMPLETE, False),
+    "evolution_complete": (_EVOLUTION_COMPLETE, False),
+    "no_clinic_config": (None, False),
+}
+
+
+class _CredentialsSession:
+    def __init__(self, credentials: dict[str, Any] | None) -> None:
+        self.credentials = credentials
+        self.statements: list[str] = []
+        self.rolled_back = False
+
+    async def execute(self, statement: Any) -> Any:
+        rendered = str(statement).lower()
+        self.statements.append(rendered)
+        assert "media_assets" not in rendered
+        return SimpleNamespace(scalar_one_or_none=lambda: self.credentials)
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+
+
+def _install_flag_document(monkeypatch: pytest.MonkeyPatch, flag: str) -> list[str]:
+    """The real AppConfig Agent client (``APPCONFIG_SOURCE=agent``) answering
+    one fake flag document over a mock transport; records each read.
+
+    The Agent client parses with the same fail-closed reader as the SDK one
+    and never logs, so no test here becomes the first user of the AppConfig
+    module logger (structlog caches loggers on first use, and a later
+    ``configure_logging`` would leave a cached one outside ``capture_logs``).
+    """
+
+    import httpx
+
+    from src.config.settings import settings
+    from src.services import egress_policy
+
+    documents: dict[str, dict[str, Any]] = {
+        "on": {"agent_media_send_enabled": {"enabled": True}},
+        "off": {"agent_media_send_enabled": {"enabled": False}},
+        # Every other flag open: only the media flag decides.
+        "absent": {
+            "financial_egress_enabled": {"enabled": True},
+            "uazapi_egress_enabled": {"enabled": True},
+        },
+    }
+    monkeypatch.setattr(settings, "appconfig_source", "agent")
+    monkeypatch.setattr(settings, "appconfig_enabled", True)
+    monkeypatch.setattr(settings, "appconfig_origin", "http://127.0.0.1:2772")
+    monkeypatch.setattr(settings, "appconfig_application", "neurostack")
+    monkeypatch.setattr(settings, "appconfig_environment", "production")
+    monkeypatch.setattr(settings, "appconfig_profile", "egress-flags")
+    reads: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reads.append(request.url.path)
+        return httpx.Response(200, json=documents[flag])
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)
+
+    original = egress_policy.AppConfigClient
+    monkeypatch.setattr(
+        egress_policy,
+        "AppConfigClient",
+        lambda config: original(config, client_factory=factory),
+    )
+    return reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["on", "off", "absent"])
+@pytest.mark.parametrize("provider_case", sorted(_PROVIDER_CASES))
+async def test_bindable_intents_delivery_enabled_follows_flag_and_readiness(
+    monkeypatch: pytest.MonkeyPatch, provider_case: str, flag: str
+) -> None:
+    credentials, ready = _PROVIDER_CASES[provider_case]
+    reads = _install_flag_document(monkeypatch, flag)
+    tenant_id = uuid4()
+    target = Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return target
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    session = _CredentialsSession(credentials)
+
+    response = await route.get_media_bindable_intents(
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id, api_key="key"),
+        session=session,  # type: ignore[arg-type]
+    )
+
+    assert response.delivery_enabled is (ready and flag == "on")
+    # The flag is consulted (one Agent read) only for a provider that
+    # delivers production turns.
+    assert reads == (
+        [
+            "/applications/neurostack/environments/production"
+            "/configurations/egress-flags"
+        ]
+        if ready
+        else []
+    )
+    assert response.intents == [
+        "saudacao",
+        "interesse_tratamento",
+        "pedido_preco",
+        "comparacao_tratamentos",
+        "objecao_vou_pensar",
+        "detalhes_servicos",
+        "pre_atendimento",
+        "faq",
+        "cultura_historia",
+        "qualificacao_publico",
+        "informacoes_profissionais",
+        "pos_atendimento_duvida",
+    ]
+    assert response.max_bytes_by_category.model_dump() == {
+        "video": 16_000_000,
+        "audio": 16_000_000,
+        "pdf": 20_000_000,
+        "image": 5_000_000,
+    }
+    # One read of the target's credentials, revalidated in the same statement.
+    assert len(session.statements) == 1
+    assert "from clinic_configs" in session.statements[0]
+    assert "clinic_configs.api_credentials" in session.statements[0]
+    assert "exists" in session.statements[0]
+    assert session.rolled_back is True  # the read ends before the flag read
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_case", sorted(_PROVIDER_CASES))
+async def test_bindable_intents_flag_is_read_only_after_the_transaction_ends(
+    monkeypatch: pytest.MonkeyPatch, provider_case: str
+) -> None:
+    """The flag read (an Agent HTTP call) never happens while the session
+    holds a connection: the read transaction ends first, and a provider that
+    is not ready never reads the flag at all."""
+
+    credentials, ready = _PROVIDER_CASES[provider_case]
+    # One timeline: the Agent transport appends each flag read to it, and
+    # the session appends its statements and its rollback.
+    timeline = _install_flag_document(monkeypatch, "on")
+    tenant_id = uuid4()
+    target = Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return target
+
+    class Session(_CredentialsSession):
+        async def execute(self, statement: Any) -> Any:
+            timeline.append("execute")
+            return await super().execute(statement)
+
+        async def rollback(self) -> None:
+            timeline.append("rollback")
+            await super().rollback()
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    response = await route.get_media_bindable_intents(
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id, api_key="key"),
+        session=Session(credentials),  # type: ignore[arg-type]
+    )
+
+    flag_read = (
+        "/applications/neurostack/environments/production/configurations/egress-flags"
+    )
+    assert timeline == (
+        ["execute", "rollback", flag_read] if ready else ["execute", "rollback"]
+    )
+    assert response.delivery_enabled is ready
+
+
+@pytest.mark.asyncio
+async def test_bindable_intents_limits_and_intents_come_from_the_single_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from neurostack_core.protocol import MEDIA_BINDABLE_INTENT_SEQUENCE
+    from src.services.media_assets import MEDIA_CATEGORY_MAX_BYTES
+
+    tenant_id = uuid4()
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    response = await route.get_media_bindable_intents(
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id, api_key="key"),
+        session=_CredentialsSession(None),  # type: ignore[arg-type]
+    )
+
+    assert response.intents == list(MEDIA_BINDABLE_INTENT_SEQUENCE)
+    assert response.max_bytes_by_category.model_dump() == dict(MEDIA_CATEGORY_MAX_BYTES)
+    # AppConfig is unconfigured in the test settings: the flag reads closed.
+    assert response.delivery_enabled is False
+    # No clinic config, so no provider: nothing is sendable.
+    assert response.sendable_mime_types == []
+
+
+_SENT_BY_EVERY_PROVIDER = [
+    "application/pdf",
+    "audio/mpeg",
+    "image/jpeg",
+    "image/png",
+    "video/mp4",
+]
+_META_SENDABLE = sorted([*_SENT_BY_EVERY_PROVIDER, "audio/ogg", "audio/mp4"])
+# The formats the clinic's provider sends, whatever its readiness: the screen
+# shows the format warning only while delivery_enabled is true.
+_SENDABLE_BY_PROVIDER_CASE: dict[str, list[str]] = {
+    "meta_with_app_secret": _META_SENDABLE,
+    "meta_without_app_secret": _META_SENDABLE,
+    "zapi_with_inbound_token": _SENT_BY_EVERY_PROVIDER,
+    "zapi_without_inbound_token": _SENT_BY_EVERY_PROVIDER,
+    "uazapi_complete": _SENT_BY_EVERY_PROVIDER,
+    "evolution_complete": _SENT_BY_EVERY_PROVIDER,
+    "no_clinic_config": [],
+}
+
+
+async def _bindable_for(
+    monkeypatch: pytest.MonkeyPatch, credentials: Any
+) -> MediaBindableIntentsResponse:
+    tenant_id = uuid4()
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    return await route.get_media_bindable_intents(
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id, api_key="key"),
+        session=_CredentialsSession(credentials),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_case", sorted(_PROVIDER_CASES))
+async def test_bindable_intents_sendable_mime_types_follow_the_clinic_provider(
+    monkeypatch: pytest.MonkeyPatch, provider_case: str
+) -> None:
+    """Meta sends OGG-Opus and M4A; Z-API, uazapi and Evolution do not
+    (Z-API documents only audio/mpeg); no provider sends nothing."""
+
+    from src.services.media_send_body import sendable_mime_types
+
+    assert set(_SENDABLE_BY_PROVIDER_CASE) == set(_PROVIDER_CASES)
+    credentials, _ready = _PROVIDER_CASES[provider_case]
+    response = await _bindable_for(monkeypatch, credentials)
+
+    assert response.sendable_mime_types == _SENDABLE_BY_PROVIDER_CASE[provider_case]
+    if credentials is not None:
+        delivery_name = {"meta_cloud": "meta"}.get(
+            credentials["whatsapp_provider"], credentials["whatsapp_provider"]
+        )
+        # The same set the provider's sender validates against.
+        assert response.sendable_mime_types == sorted(
+            sendable_mime_types(delivery_name)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"whatsapp_provider": "dialog360"},
+        {"whatsapp_provider": "twilio"},
+        {"whatsapp_provider": "meta"},
+        {"whatsapp_provider": None},
+        {"whatsapp_provider": ["zapi"]},
+        {},
+        ["zapi"],
+    ],
+    ids=["dialog360", "twilio", "delivery-name", "null", "list", "empty", "not-a-map"],
+)
+async def test_bindable_intents_sendable_mime_types_empty_without_a_media_provider(
+    monkeypatch: pytest.MonkeyPatch, credentials: Any
+) -> None:
+    response = await _bindable_for(monkeypatch, credentials)
+
+    assert response.sendable_mime_types == []
+    assert response.delivery_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_bindable_intents_storage_failure_is_503_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    rolled_back: list[bool] = []
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    class Session:
+        async def execute(self, statement: Any) -> Any:
+            raise SQLAlchemyError("database down")
+
+        async def rollback(self) -> None:
+            rolled_back.append(True)
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    with pytest.raises(HTTPException) as caught:
+        await route.get_media_bindable_intents(
+            request=_request(),
+            tenant_id=None,
+            tenant=TenantContext(tenant_id, api_key="key"),
+            session=Session(),  # type: ignore[arg-type]
+        )
+    assert caught.value.status_code == 503
+    assert getattr(caught.value, "detail") == {"code": "media_storage_unavailable"}
+    assert rolled_back == [True]
+
+
+@pytest.mark.parametrize("case", sorted(_PROVIDER_CASES))
+def test_media_delivery_provider_ready_matrix(case: str) -> None:
+    from src.services.api_credentials import (
+        credential_status,
+        media_delivery_provider_ready,
+    )
+
+    credentials, ready = _PROVIDER_CASES[case]
+    assert media_delivery_provider_ready(credentials or {}) is ready
+    # Derived from the readiness the credentials panel shows, never wider.
+    if ready:
+        assert credential_status(credentials or {})["whatsapp_readiness"] == "active"
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        None,
+        [],
+        "meta_cloud",
+        {**_META_READY, "whatsapp_provider": ["meta_cloud"]},
+        {**_META_READY, "whatsapp_provider": "meta"},
+        {**_META_READY, "meta_app_secret": ""},
+        {**_META_READY, "meta_permanent_token": None},
+        {**_ZAPI_READY, "zapi_inbound_token_digest": ""},
+        {**_ZAPI_READY, "zapi_instance_id": ""},
+        {**_ZAPI_READY, "whatsapp_provider": "ZAPI"},
+        {"whatsapp_provider": "dialog360"},
+        {"whatsapp_provider": "twilio"},
+    ],
+)
+def test_media_delivery_provider_ready_is_false_for_anything_else(
+    credentials: Any,
+) -> None:
+    from src.services.api_credentials import media_delivery_provider_ready
+
+    assert media_delivery_provider_ready(credentials) is False
+
+
+def test_the_ready_providers_are_the_authenticated_webhook_kinds() -> None:
+    """Drift alarm: the providers media may use are exactly the ingress kinds
+    the credit principal counts as authenticated (Meta HMAC, Z-API capability
+    token); when cloud-readiness authenticates uazapi or Evolution this fails
+    and the readiness single point must be revisited with it."""
+
+    from src.services import api_credentials, credit_principal
+
+    authenticated_webhook_kinds = {"meta", "zapi", "uazapi", "evolution"} - set(
+        credit_principal._UNAUTHENTICATED_KINDS
+    )
+    provider_of_kind = {"meta": "meta_cloud", "zapi": "zapi"}
+    assert {
+        provider_of_kind[kind] for kind in authenticated_webhook_kinds
+    } == api_credentials._PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS

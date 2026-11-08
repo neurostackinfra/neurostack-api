@@ -7,7 +7,8 @@ It is the single credential contract used by public routes and runtime callers.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 MASKED_SECRET = "••••••••"
@@ -857,6 +858,79 @@ def _whatsapp_readiness(credentials: Mapping[str, Any]) -> str:
     }
     fields = requirements.get(str(provider))
     return "active" if fields and _complete(credentials, fields) else "incomplete"
+
+
+# The WhatsApp providers whose inbound webhook proves its caller, so their
+# turns are ``InteractionOrigin.PRODUCTION``: Meta by the X-Hub-Signature-256
+# HMAC over ``meta_app_secret`` (``TenantIdentityMiddleware`` publishes the
+# ``meta_hmac`` context the webhook classifies), Z-API by the capability URL
+# whose digest is ``zapi_inbound_token_digest`` (``zapi_webhook``).  Uazapi and
+# Evolution are routed by instance name only: their webhooks classify
+# ``UNKNOWN`` (the credit principal's ``_UNAUTHENTICATED_KINDS``).  The
+# cloud-readiness wish plugs its provider gate in here when it authenticates
+# them; nothing else decides media delivery readiness.
+_PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS: frozenset[str] = frozenset(
+    {"meta_cloud", "zapi"}
+)
+
+
+# The WhatsApp providers that can carry an agent media reply, by the names of
+# their media senders (envio-midia-agente): the ONE vocabulary of the
+# selection's ``delivery_provider``, the delivery's channel and the
+# ``provider`` label of ``neurostack_agent_media_delivery_total``.
+MediaDeliveryProvider = Literal["meta", "zapi", "uazapi", "evolution"]
+MEDIA_DELIVERY_PROVIDERS: Final[frozenset[str]] = frozenset(
+    get_args(MediaDeliveryProvider)
+)
+# ``api_credentials.whatsapp_provider`` -> the delivery provider of its media
+# senders.  Read by the Central de Mídias (the formats the clinic's provider
+# sends) and by every webhook, which maps its own provider through it, so the
+# screen, the selection and the delivery always name the same provider (a
+# drift would refuse every file at delivery, or warn "not sent" on every
+# file).  dialog360 and twilio have no media sender: nothing is sent.
+MEDIA_DELIVERY_PROVIDER_BY_WHATSAPP_PROVIDER: Final[
+    Mapping[str, MediaDeliveryProvider]
+] = MappingProxyType(
+    {
+        "meta_cloud": "meta",
+        "zapi": "zapi",
+        "uazapi": "uazapi",
+        "evolution": "evolution",
+    }
+)
+
+
+def media_delivery_provider(whatsapp_provider: object) -> MediaDeliveryProvider | None:
+    """The delivery provider of a ``whatsapp_provider`` name; ``None`` for one
+    without a media sender (or anything that is not a known name).  Pure."""
+
+    if not isinstance(whatsapp_provider, str):
+        return None
+    return MEDIA_DELIVERY_PROVIDER_BY_WHATSAPP_PROVIDER.get(whatsapp_provider)
+
+
+def media_delivery_provider_ready(credentials: Mapping[str, Any]) -> bool:
+    """Whether the clinic's WhatsApp provider can carry agent media today.
+
+    The single point behind ``delivery_enabled`` (envio-midia-agente
+    Decision 8).  True only for a provider whose webhook yields production
+    turns AND whose readiness is ``active`` -- the same readiness the
+    credentials panel shows: Meta needs its phone number id, permanent token
+    and ``meta_app_secret`` (without the secret it is ``signature_pending``
+    and the webhook answers 401); Z-API needs its instance, token and
+    ``zapi_inbound_token_digest``.  Uazapi and Evolution are never ready
+    here.  Pure; anything that is not a mapping is not ready.
+    """
+
+    if not isinstance(credentials, Mapping):
+        return False
+    provider = credentials.get("whatsapp_provider")
+    if (
+        not isinstance(provider, str)
+        or provider not in _PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS
+    ):
+        return False
+    return _whatsapp_readiness(credentials) == "active"
 
 
 def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:

@@ -18,7 +18,10 @@ from src.config.logging import get_logger
 from src.observability.metric_dimensions import ContractCounter as Counter
 from src.observability.metric_dimensions import ContractGauge as Gauge
 from src.observability.metric_dimensions import ContractHistogram as Histogram
-from src.observability.metric_dimensions import bounded_metric_labels
+from src.observability.metric_dimensions import (
+    bounded_metric_labels,
+    precreate_closed_children,
+)
 
 logger = get_logger(__name__)
 
@@ -239,6 +242,29 @@ LLM_GENERATION_ATTEMPTS_TOTAL = Counter(
     "neurostack_llm_generation_attempts_total",
     "Total completed LLM generation attempts by tier and outcome",
     ["tier", "outcome"],
+)
+
+# envio-midia-agente: the agent's Central de Mídias sends.  Registered here,
+# incremented by the selection (Group 4) and the delivery core (Group 5).
+# Every closed child starts at zero so the first event of a rare outcome is
+# visible to increase(); the vocabularies and their meaning live in
+# src/observability/metric_dimensions.py.  Kept above the billing
+# instruments: ``provider`` here is the WhatsApp channel, and
+# scripts/verify-asaas-observability.py scans the billing block (from
+# BILLING_OPERATION_RECEIPTS_TOTAL to the end) for identity label words.
+AGENT_MEDIA_SELECTION_TOTAL = precreate_closed_children(
+    Counter(
+        "neurostack_agent_media_selection_total",
+        "Agent media selections of the turns that offered candidates, by outcome",
+        ["outcome"],
+    )
+)
+AGENT_MEDIA_DELIVERY_TOTAL = precreate_closed_children(
+    Counter(
+        "neurostack_agent_media_delivery_total",
+        "Agent media deliveries by WhatsApp provider and outcome",
+        ["provider", "outcome"],
+    )
 )
 
 # ASAAS billing webhook and readback (Group 3).  Labels are closed technical

@@ -36,7 +36,7 @@ Antes de definir `APPCONFIG_ENABLED=true` em produção, o gate de ativação ex
 evidência sanitizada e somente leitura da revision ativa da task definition, do
 Agent marcado como essential e healthy, da imagem/versão implantada, do acesso
 IAM ao data plane, dos IDs exatos de application/environment/profile e do
-readback bem-sucedido das duas flags. Qualquer evidência ausente ou divergente
+readback bem-sucedido de todas as flags. Qualquer evidência ausente ou divergente
 mantém `APPCONFIG_ENABLED=false`.
 
 Quando ligado em produção, `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` e
@@ -52,13 +52,15 @@ descrito nesta seção; `sdk` lê o AppConfig Data de dentro do processo, com um
 refresher em background por processo (`APPCONFIG_ORIGIN` e `APPCONFIG_TOKEN`
 não são usados). Produção usa `sdk` a partir do passo L7: a task de produção tem apenas os
 containers `app` e `otel`, então não há Agent para `agent` consultar. Hoje
-nenhum nome `APPCONFIG_*` está definido e as duas flags ficam fechadas por
+nenhum nome `APPCONFIG_*` está definido e todas as flags ficam fechadas por
 ausência. Detalhes
 em `docs/runbooks/asaas-deployment.md`, seção "AppConfig and opening financial
 egress (follow-up F2)".
 
-Somente `financial_egress_enabled` e `uazapi_egress_enabled` são aceitas, como
-decisões independentes no formato `{nome_da_flag: {enabled: boolean}}`. Com `agent`, a
+Somente `financial_egress_enabled`, `uazapi_egress_enabled` e
+`agent_media_send_enabled` (envio de arquivos da Central de Mídias pelo agente)
+são aceitas, como decisões independentes no formato
+`{nome_da_flag: {enabled: boolean}}`. Com `agent`, a
 aplicação não mantém cache, refresher ou lifecycle próprios: cada consulta
 observa o snapshot atual do agente. Configuração incompleta, agente
 indisponível, timeout, resposta inválida ou flag ausente resultam em `false` e

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   Download,
   FileAudio,
   FileImage,
@@ -52,6 +53,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { CreditAllocationNotice } from "@/components/plan-usage-summary";
 import { useAuth } from "@/context/auth";
 import { useI18n } from "@/context/i18n";
+import { getIntentLabel } from "@/lib/intent-presentation";
 import type { TranslationKey } from "@/locales/en";
 
 type MediaCategory = "video" | "audio" | "pdf" | "image";
@@ -66,8 +68,38 @@ interface MediaAsset {
   size_bytes: number;
   usage_trigger: string | null;
   auto_suggest: boolean;
+  // The intents whose turns may send this file, in the API's canonical order.
+  trigger_intents: string[];
   created_at: string;
   updated_at: string;
+}
+
+type CategoryByteLimits = Record<MediaCategory, number>;
+
+// GET /v1/media-assets/bindable-intents, per clinic. "loading" and "error"
+// promise nothing: no delivery rule, no client-side size check.
+interface BindableState {
+  scope: string;
+  status: "loading" | "ready" | "error";
+  intents: string[];
+  deliveryEnabled: boolean;
+  maxBytes: CategoryByteLimits | null;
+  // The canonical MIME types the clinic's channel sends (Z-API: no OGG or
+  // M4A). Optional in the contract: null when the API does not publish it,
+  // sends null or sends something malformed, and then no format alert is
+  // shown.
+  sendableMimeTypes: string[] | null;
+}
+
+function loadingBindable(scope: string): BindableState {
+  return {
+    scope,
+    status: "loading",
+    intents: [],
+    deliveryEnabled: false,
+    maxBytes: null,
+    sendableMimeTypes: null,
+  };
 }
 
 interface MediaListResponse {
@@ -100,6 +132,7 @@ interface EditState {
   usageTrigger: string;
   usageTriggerIsNull: boolean;
   autoSuggest: boolean;
+  triggerIntents: string[];
 }
 
 interface DeleteState {
@@ -138,20 +171,20 @@ const CATEGORY_HELP_KEY: Record<MediaCategory, TranslationKey> = {
   pdf: "media_file_help_pdf",
 };
 
+// The same help with the API's limit in {limit}; the key above is the
+// fallback while max_bytes_by_category is not read.
+const CATEGORY_HELP_LIMITS_KEY: Record<MediaCategory, TranslationKey> = {
+  image: "media_file_help_image_limits",
+  video: "media_file_help_video_limits",
+  audio: "media_file_help_audio_limits",
+  pdf: "media_file_help_pdf_limits",
+};
+
 const CATEGORY_TOO_LARGE_KEY: Record<MediaCategory, TranslationKey> = {
   image: "media_file_too_large_image",
   video: "media_file_too_large_video",
   audio: "media_file_too_large_audio",
   pdf: "media_file_too_large_pdf",
-};
-
-// Mirrors MEDIA_CATEGORY_MAX_BYTES in src/services/media_assets.py. The server
-// is authoritative; this only spares the user a long upload that ends in 413.
-const MAX_BYTES_BY_CATEGORY: Record<MediaCategory, number> = {
-  image: 5_000_000,
-  pdf: 20_000_000,
-  audio: 16_000_000,
-  video: 16_000_000,
 };
 
 interface MediaFormat {
@@ -182,6 +215,7 @@ const UPLOAD_ERROR_KEY: Record<string, TranslationKey> = {
   media_type_unsupported: "media_upload_error_format",
   media_type_mismatch: "media_upload_error_format",
   media_signature_invalid: "media_upload_error_format",
+  media_audio_not_mono: "media_upload_error_not_mono",
   media_storage_cap_exceeded: "media_upload_error_storage_full",
   credit_pending: "media_upload_error_credits",
   credit_category_exhausted: "media_upload_error_credits",
@@ -306,6 +340,87 @@ function matchesFilters(asset: MediaAsset, filters: ListFilters) {
   );
 }
 
+// Reads the bindable-intents body strictly: anything off-contract in the
+// fields that drive the binding, the promise or the size block is treated as
+// a failed read, so the page falls back to promising nothing. The optional,
+// alert-only sendable_mime_types never takes the rest of the body down.
+function parseBindable(
+  body: unknown,
+): Omit<BindableState, "scope" | "status"> | null {
+  if (!body || typeof body !== "object") return null;
+  const {
+    intents,
+    delivery_enabled,
+    max_bytes_by_category,
+    sendable_mime_types,
+  } = body as {
+    intents?: unknown;
+    delivery_enabled?: unknown;
+    max_bytes_by_category?: unknown;
+    sendable_mime_types?: unknown;
+  };
+  if (
+    !Array.isArray(intents) ||
+    !intents.every((intent) => typeof intent === "string") ||
+    typeof delivery_enabled !== "boolean" ||
+    !max_bytes_by_category ||
+    typeof max_bytes_by_category !== "object"
+  ) {
+    return null;
+  }
+  const limits = max_bytes_by_category as Record<string, unknown>;
+  const maxBytes = {} as CategoryByteLimits;
+  for (const category of MEDIA_CATEGORIES) {
+    const limit = limits[category];
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0)
+      return null;
+    maxBytes[category] = limit;
+  }
+  // Absent, null or malformed all read as "not published": no format alert.
+  const sendableMimeTypes =
+    Array.isArray(sendable_mime_types) &&
+    sendable_mime_types.every((mime) => typeof mime === "string")
+      ? (sendable_mime_types as string[])
+      : null;
+  return {
+    intents: intents as string[],
+    deliveryEnabled: delivery_enabled,
+    maxBytes,
+    sendableMimeTypes,
+  };
+}
+
+// The bound intents in the API's canonical order, without any the allowlist
+// no longer carries (the server would refuse them with a 422).
+function canonicalIntents(selected: readonly string[], allowed: readonly string[]) {
+  return allowed.filter((intent) => selected.includes(intent));
+}
+
+function toggleIntent(selected: readonly string[], intent: string, on: boolean) {
+  return on
+    ? [...selected.filter((item) => item !== intent), intent]
+    : selected.filter((item) => item !== intent);
+}
+
+// split/join, not replace: a file name or label must never be read as a
+// replacement pattern.
+function fill(template: string, values: Record<string, string>) {
+  return Object.entries(values).reduce(
+    (text, [key, value]) => text.split(`{${key}}`).join(value),
+    template,
+  );
+}
+
+function formatMegabyteAmount(bytes: number, locale: string) {
+  return new Intl.NumberFormat(locale === "pt" ? "pt-BR" : "en-US", {
+    maximumFractionDigits: 1,
+  }).format(bytes / 1_000_000);
+}
+
+function formatMegabytes(bytes: number, locale: string) {
+  return `${formatMegabyteAmount(bytes, locale)} MB`;
+}
+
 async function uploadErrorKey(response: Response): Promise<TranslationKey> {
   try {
     const body = (await response.json()) as { detail?: { code?: string } };
@@ -380,6 +495,124 @@ function AutoSuggestSection({
   );
 }
 
+// "Quando enviar": one checkbox per bindable intent, in the API's order and
+// labelled like every other intent in the product.
+function TriggerIntentsField({
+  id,
+  bindable,
+  selected,
+  onChange,
+  disabled,
+  onRetry,
+  compact = false,
+}: {
+  id: string;
+  bindable: BindableState;
+  selected: readonly string[];
+  onChange: (selected: string[]) => void;
+  disabled: boolean;
+  onRetry: () => void;
+  // Inside the 512 px edit dialog: never more than two columns, because the
+  // breakpoints follow the window, not the dialog.
+  compact?: boolean;
+}) {
+  const { t } = useI18n();
+  return (
+    <fieldset className="space-y-1.5" aria-describedby={`${id}-help`}>
+      <legend className="text-sm font-medium leading-none">
+        {t("media_trigger_intents_label")}
+      </legend>
+      <p id={`${id}-help`} className="pt-1 text-xs text-muted-foreground">
+        {t("media_trigger_intents_help")}
+      </p>
+      {bindable.status === "loading" ? (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          {t("media_trigger_intents_loading")}
+        </p>
+      ) : bindable.status === "error" ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm text-destructive">
+            {t("media_trigger_intents_error")}
+          </p>
+          <Button type="button" size="sm" variant="outline" onClick={onRetry}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            {t("media_retry")}
+          </Button>
+        </div>
+      ) : (
+        <div
+          className={`grid gap-2 sm:grid-cols-2 ${compact ? "" : "lg:grid-cols-3"}`}
+        >
+          {bindable.intents.map((intent) => (
+            <label
+              key={intent}
+              className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
+            >
+              <input
+                type="checkbox"
+                checked={selected.includes(intent)}
+                onChange={(event) =>
+                  onChange(toggleIntent(selected, intent, event.target.checked))
+                }
+                disabled={disabled}
+              />
+              {getIntentLabel(intent, t)}
+            </label>
+          ))}
+        </div>
+      )}
+    </fieldset>
+  );
+}
+
+// amber-700 on the light card and amber-400 on the dark one both clear WCAG
+// AA (4.5:1) at 12 px; amber-600 measured 3.2:1.
+function MediaWarning({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span>{children}</span>
+    </p>
+  );
+}
+
+// The one line under the automatic-suggestion card that says what really
+// happens. Nothing is said while the read is loading; a failed read says it
+// could not be checked, never that sending is off; the rule shows only while
+// the switch is on, because with it off the file is never sent.
+function DeliveryNotice({
+  bindable,
+  autoSuggest,
+  testId,
+}: {
+  bindable: BindableState;
+  autoSuggest: boolean;
+  testId: string;
+}) {
+  const { t } = useI18n();
+  if (bindable.status === "loading") return null;
+  let text: string | null;
+  if (bindable.status === "error") {
+    text = t("media_delivery_unknown");
+  } else if (!bindable.deliveryEnabled) {
+    text = t("media_delivery_inactive");
+  } else {
+    text = autoSuggest
+      ? fill(t("media_delivery_rule"), {
+          when: t("media_trigger_intents_label"),
+          trigger: t("media_usage_trigger_label"),
+        })
+      : null;
+  }
+  if (text === null) return null;
+  return (
+    <p className="text-sm text-muted-foreground" data-testid={testId}>
+      {text}
+    </p>
+  );
+}
+
 export default function Midias() {
   const {
     clinicId,
@@ -429,6 +662,11 @@ export default function Midias() {
   const [fileName, setFileName] = useState("");
   const [usageTrigger, setUsageTrigger] = useState("");
   const [autoSuggest, setAutoSuggest] = useState(false);
+  const [triggerIntents, setTriggerIntents] = useState<string[]>([]);
+  const [bindableVersion, setBindableVersion] = useState(0);
+  const [bindable, setBindable] = useState<BindableState>(() =>
+    loadingBindable(scope),
+  );
   const [uploadingScope, setUploadingScope] = useState<string | null>(null);
   const [editState, setEditState] = useState<EditState | null>(null);
   const [deleteState, setDeleteState] = useState<DeleteState | null>(null);
@@ -443,7 +681,11 @@ export default function Midias() {
     success: boolean;
     messageKey?: TranslationKey;
   } | null>(null);
-  const [fileError, setFileError] = useState<TranslationKey | null>(null);
+  // limitBytes fills the {limit} of a too-large message with the API's value.
+  const [fileError, setFileError] = useState<{
+    key: TranslationKey;
+    limitBytes?: number;
+  } | null>(null);
 
   function abortAll(controllers: Set<AbortController>) {
     for (const controller of controllers) controller.abort();
@@ -493,6 +735,7 @@ export default function Midias() {
     autoNameRef.current = "";
     setUsageTrigger("");
     setAutoSuggest(false);
+    setTriggerIntents([]);
     setFileError(null);
     setUploadingScope(null);
     setEditState(null);
@@ -501,6 +744,35 @@ export default function Midias() {
     setFeedback(null);
     return () => abortAll(mutations);
   }, [scope]);
+
+  // What the clinic may bind a file to, whether the agent sends it today and
+  // the per-category limits; read again for every clinic.
+  useEffect(() => {
+    const loading = loadingBindable(scope);
+    setBindable(loading);
+    if (!canManage) return;
+    const controller = new AbortController();
+    void fetch(mediaUrl("/bindable-intents"), {
+      headers: { Authorization: `Bearer ${authToken()}` },
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`media-bindable-${response.status}`);
+        const parsed = parseBindable(await response.json());
+        if (!parsed) throw new Error("media-bindable-shape");
+        return parsed;
+      })
+      .then((parsed) => {
+        if (controller.signal.aborted) return;
+        setBindable({ scope, status: "ready", ...parsed });
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setBindable({ ...loading, status: "error" });
+      });
+    return () => controller.abort();
+    // bindableVersion intentionally replays the read for Retry.
+  }, [canManage, scope, bindableVersion]);
 
   // The first page for the current clinic and filters. Changing a filter only
   // replaces the list; it never aborts an upload, edit or delete.
@@ -589,6 +861,79 @@ export default function Midias() {
           loading: canManage,
         };
   const filtersActive = Boolean(categoryFilter || appliedName);
+  const currentBindable =
+    bindable.scope === scope ? bindable : loadingBindable(scope);
+  const categoryLimits =
+    currentBindable.status === "ready" ? currentBindable.maxBytes : null;
+  const retryBindable = () => setBindableVersion((version) => version + 1);
+  const tooLargeText = (category: MediaCategory) =>
+    categoryLimits
+      ? fill(t("media_alert_too_large"), {
+          limit: formatMegabytes(categoryLimits[category], locale),
+        })
+      : null;
+  const megabytes = (bytes: number) => formatMegabytes(bytes, locale);
+  // "5 MB para imagem, 20 MB para PDF, 16 MB para áudio ou vídeo", from the
+  // API's limits; audio and video share a phrase only while they are equal.
+  const limitsSummary = (limits: CategoryByteLimits) =>
+    limits.audio === limits.video
+      ? fill(t("media_limits_summary"), {
+          image: megabytes(limits.image),
+          pdf: megabytes(limits.pdf),
+          audio_video: megabytes(limits.audio),
+        })
+      : fill(t("media_limits_summary_split"), {
+          image: megabytes(limits.image),
+          pdf: megabytes(limits.pdf),
+          audio: megabytes(limits.audio),
+          video: megabytes(limits.video),
+        });
+  // Each text keeps today's fixed wording while the limits are not read.
+  const supportedFormatsText = (() => {
+    if (!categoryLimits) return t("media_supported_formats");
+    const values = MEDIA_CATEGORIES.map((category) => categoryLimits[category]);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    return fill(t("media_supported_formats_limits"), {
+      range:
+        min === max
+          ? megabytes(max)
+          : fill(t("media_limits_range"), {
+              min: formatMegabyteAmount(min, locale),
+              max: megabytes(max),
+            }),
+    });
+  })();
+  const fileHelpText = (category: MediaCategory | "") => {
+    if (!categoryLimits)
+      return t(category ? CATEGORY_HELP_KEY[category] : "media_file_help");
+    return category
+      ? fill(t(CATEGORY_HELP_LIMITS_KEY[category]), {
+          limit: megabytes(categoryLimits[category]),
+        })
+      : fill(t("media_file_help_limits"), {
+          limits: limitsSummary(categoryLimits),
+        });
+  };
+  const feedbackErrorText = (key: TranslationKey) =>
+    key === "media_upload_error_size" && categoryLimits
+      ? fill(t("media_upload_error_size_limits"), {
+          limits: limitsSummary(categoryLimits),
+        })
+      : t(key);
+  const isTooLarge = (target: MediaAsset) =>
+    categoryLimits !== null &&
+    target.size_bytes > categoryLimits[target.category];
+  // Only while sending is active: when it is not, the inactive notice already
+  // says nothing is sent, whatever the format.
+  const isUnsendableFormat = (mime: string) =>
+    currentBindable.status === "ready" &&
+    currentBindable.deliveryEnabled &&
+    currentBindable.sendableMimeTypes !== null &&
+    !currentBindable.sendableMimeTypes.includes(mime);
+  const noSubjectText = fill(t("media_alert_no_subject"), {
+    when: t("media_trigger_intents_label"),
+  });
   const currentEdit = editState?.scope === scope ? editState : null;
   const currentDelete = deleteState?.scope === scope ? deleteState : null;
   const currentBusy = busyAsset?.scope === scope ? busyAsset : null;
@@ -682,10 +1027,11 @@ export default function Midias() {
   function rejectFile(
     event: React.ChangeEvent<HTMLInputElement>,
     key: TranslationKey,
+    limitBytes?: number,
   ) {
     event.target.value = "";
     setFile(null);
-    setFileError(key);
+    setFileError({ key, limitBytes });
   }
 
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
@@ -705,8 +1051,11 @@ export default function Midias() {
       rejectFile(event, "media_file_wrong_type");
       return;
     }
-    if (selected.size > MAX_BYTES_BY_CATEGORY[format.category]) {
-      rejectFile(event, CATEGORY_TOO_LARGE_KEY[format.category]);
+    // The limits come from the API (max_bytes_by_category). Until they are
+    // read, or when the read failed, the server's 413 is the only check.
+    const limit = categoryLimits?.[format.category];
+    if (limit !== undefined && selected.size > limit) {
+      rejectFile(event, CATEGORY_TOO_LARGE_KEY[format.category], limit);
       return;
     }
     setFileError(null);
@@ -751,6 +1100,16 @@ export default function Midias() {
     form.append("original_filename", uploadNames.original_filename);
     if (usageTrigger !== "") form.append("usage_trigger", usageTrigger);
     form.append("auto_suggest", autoSuggest ? "true" : "false");
+    // One part per bound intent: the API reads trigger_intents as a repeated
+    // field, never as one joined value.
+    if (currentBindable.status === "ready") {
+      for (const intent of canonicalIntents(
+        triggerIntents,
+        currentBindable.intents,
+      )) {
+        form.append("trigger_intents", intent);
+      }
+    }
     setUploadingScope(requestScope);
     setFeedback(null);
     try {
@@ -791,6 +1150,7 @@ export default function Midias() {
       autoNameRef.current = "";
       setUsageTrigger("");
       setAutoSuggest(false);
+      setTriggerIntents([]);
       setFeedback({ scope: requestScope, kind: "upload", success: true });
     } catch (error) {
       if (
@@ -820,6 +1180,7 @@ export default function Midias() {
       usageTrigger: asset.usage_trigger ?? "",
       usageTriggerIsNull: asset.usage_trigger === null,
       autoSuggest: asset.auto_suggest,
+      triggerIntents: [...asset.trigger_intents],
     });
   }
 
@@ -855,6 +1216,16 @@ export default function Midias() {
             ? null
             : currentEdit.usageTrigger,
           auto_suggest: currentEdit.autoSuggest,
+          // The whole list replaces the bound intents. Without the allowlist
+          // the field is left out, so a failed read never unbinds anything.
+          ...(currentBindable.status === "ready"
+            ? {
+                trigger_intents: canonicalIntents(
+                  currentEdit.triggerIntents,
+                  currentBindable.intents,
+                ),
+              }
+            : {}),
         }),
         signal: controller.signal,
       });
@@ -1035,7 +1406,9 @@ export default function Midias() {
             </p>
           </div>
         </div>
-        <Badge variant="outline">{t("media_supported_formats")}</Badge>
+        <Badge variant="outline" className="whitespace-normal">
+          {supportedFormatsText}
+        </Badge>
       </div>
 
       {/* Credits (Group 6): the clinic's builder's media allocation, read
@@ -1069,11 +1442,16 @@ export default function Midias() {
                 disabled={isUploading}
               />
               <p className="text-xs text-muted-foreground">
-                {t(fileType ? CATEGORY_HELP_KEY[fileType] : "media_file_help")}
+                {fileHelpText(fileType)}
               </p>
               {fileError && (
                 <p className="text-sm text-destructive" role="alert">
-                  {t(fileError)}
+                  {fill(t(fileError.key), {
+                    limit:
+                      fileError.limitBytes === undefined
+                        ? ""
+                        : formatMegabytes(fileError.limitBytes, locale),
+                  })}
                 </p>
               )}
             </div>
@@ -1126,6 +1504,15 @@ export default function Midias() {
               </div>
             </div>
 
+            <TriggerIntentsField
+              id="media-trigger-intents"
+              bindable={currentBindable}
+              selected={triggerIntents}
+              onChange={setTriggerIntents}
+              disabled={isUploading}
+              onRetry={retryBindable}
+            />
+
             <div className="space-y-1.5">
               <Label htmlFor="media-usage-trigger">
                 {t("media_usage_trigger_label")}
@@ -1146,6 +1533,29 @@ export default function Midias() {
               onCheckedChange={setAutoSuggest}
               disabled={isUploading}
             />
+            <DeliveryNotice
+              bindable={currentBindable}
+              autoSuggest={autoSuggest}
+              testId="media-delivery-notice"
+            />
+            {/* Polite live region, rendered (and in the accessibility tree)
+                before its warnings so a screen reader announces them as the
+                switch or the file changes. Never hide it while empty: a
+                region that appears with its content is often not announced.
+                Empty, it has no height and its margin collapses into the
+                form's gap, so it adds no space. */}
+            <div
+              className="space-y-1"
+              aria-live="polite"
+              data-testid="media-upload-warnings"
+            >
+              {autoSuggest && triggerIntents.length === 0 && (
+                <MediaWarning>{noSubjectText}</MediaWarning>
+              )}
+              {fileFormat && isUnsendableFormat(fileFormat.mime) && (
+                <MediaWarning>{t("media_alert_format_not_sent")}</MediaWarning>
+              )}
+            </div>
 
             <div className="flex justify-end">
               <Button type="submit" disabled={!canUpload}>
@@ -1170,12 +1580,12 @@ export default function Midias() {
           }`}
           role={currentFeedback.success ? "status" : "alert"}
         >
-          {t(
-            currentFeedback.success
-              ? `media_${currentFeedback.kind}_success`
-              : (currentFeedback.messageKey ??
-                  `media_${currentFeedback.kind}_error`),
-          )}
+          {currentFeedback.success
+            ? t(`media_${currentFeedback.kind}_success`)
+            : feedbackErrorText(
+                currentFeedback.messageKey ??
+                  `media_${currentFeedback.kind}_error`,
+              )}
         </div>
       )}
 
@@ -1281,6 +1691,10 @@ export default function Midias() {
                       asset.mime_type,
                       asset.original_filename,
                     );
+                    const noSubject =
+                      asset.auto_suggest && asset.trigger_intents.length === 0;
+                    const tooLarge = isTooLarge(asset);
+                    const unsendable = isUnsendableFormat(asset.mime_type);
                     return (
                       <TableRow
                         key={asset.id}
@@ -1301,6 +1715,23 @@ export default function Midias() {
                               <p className="mt-0.5 text-xs text-muted-foreground sm:hidden">
                                 {typeLabel} · {format}
                               </p>
+                              {(noSubject || tooLarge || unsendable) && (
+                                <div className="mt-1 space-y-0.5">
+                                  {noSubject && (
+                                    <MediaWarning>{noSubjectText}</MediaWarning>
+                                  )}
+                                  {tooLarge && (
+                                    <MediaWarning>
+                                      {tooLargeText(asset.category)}
+                                    </MediaWarning>
+                                  )}
+                                  {unsendable && (
+                                    <MediaWarning>
+                                      {t("media_alert_format_not_sent")}
+                                    </MediaWarning>
+                                  )}
+                                </div>
+                              )}
                             </div>
                           </div>
                         </TableCell>
@@ -1393,7 +1824,9 @@ export default function Midias() {
           if (!open && currentBusy?.kind !== "edit") setEditState(null);
         }}
       >
-        <DialogContent>
+        {/* The dialog is fixed and centred and Radix locks the page scroll,
+            so it scrolls itself once it is taller than the viewport. */}
+        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{t("media_edit_title")}</DialogTitle>
             <DialogDescription>{t("media_edit_description")}</DialogDescription>
@@ -1439,6 +1872,29 @@ export default function Midias() {
                   />
                 </div>
               </div>
+              {isTooLarge(currentEdit.asset) && (
+                <MediaWarning>
+                  {tooLargeText(currentEdit.asset.category)}
+                </MediaWarning>
+              )}
+              {isUnsendableFormat(currentEdit.asset.mime_type) && (
+                <MediaWarning>{t("media_alert_format_not_sent")}</MediaWarning>
+              )}
+              <TriggerIntentsField
+                id="media-edit-trigger-intents"
+                bindable={currentBindable}
+                selected={currentEdit.triggerIntents}
+                onChange={(selected) =>
+                  setEditState((current) =>
+                    current?.scope === scope
+                      ? { ...current, triggerIntents: selected }
+                      : current,
+                  )
+                }
+                disabled={currentBusy?.kind === "edit"}
+                onRetry={retryBindable}
+                compact
+              />
               <div className="space-y-1.5">
                 <Label htmlFor="media-edit-usage-trigger">
                   {t("media_usage_trigger_label")}
@@ -1495,6 +1951,18 @@ export default function Midias() {
                 }
                 disabled={currentBusy?.kind === "edit"}
               />
+              <DeliveryNotice
+                bindable={currentBindable}
+                autoSuggest={currentEdit.autoSuggest}
+                testId="media-edit-delivery-notice"
+              />
+              {/* Mounted while empty, as the upload form's region above. */}
+              <div aria-live="polite" data-testid="media-edit-warnings">
+                {currentEdit.autoSuggest &&
+                  currentEdit.triggerIntents.length === 0 && (
+                    <MediaWarning>{noSubjectText}</MediaWarning>
+                  )}
+              </div>
               <DialogFooter>
                 <Button
                   type="button"

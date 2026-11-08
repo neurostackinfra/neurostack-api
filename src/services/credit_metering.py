@@ -134,7 +134,13 @@ age (OD-2); only the provider call is under the send timeout, and the
 bookkeeping after it is shielded and bounded (OD-5).
 :class:`CreditResponsePublisher` only recovers the crash windows, at most
 once per row; :func:`run_retention_sweeper` erases expired payloads config
-on or off (OD-3).  The Meta and Z-API file handoff is one enforced
+on or off (OD-3).  A stored reply whose turn chose a Central de Mídias file
+carries its ``media_id`` (envio-midia-agente Group 6): once the text is
+delivered and marked, the sender starts the file's delivery as a task of its
+own (:meth:`ReplySender.start_media`), never inside the publisher's serial
+tick nor under the send timeout or the lease, and a failure of the file
+never changes the text's row; a recovered row's file is deduplicated by the
+24-hour claim.  The Meta and Z-API file handoff is one enforced
 transaction (:func:`run_meta_file_handoff`).  Uazapi and Evolution (``unknown``) never
 reach any of this.
 """
@@ -150,7 +156,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -185,6 +191,10 @@ from src.services.credit_switch import (
     request_credit_switch,
     run_credit_worker_tick,
 )
+
+if TYPE_CHECKING:
+    # Types only: ``reply_media`` imports this module.
+    from src.services.reply_media import PermitPool
 
 logger = get_logger(__name__)
 
@@ -2034,6 +2044,22 @@ class ReplySender(Protocol):
         """Main's bookkeeping after an accepted send (the echo id tracked and
         stored, the conversation marked unread on a handoff)."""
 
+    def start_media(
+        self,
+        prepared: Any,
+        *,
+        media_id: UUID,
+        tenant_id: UUID,
+        session_factory: Callable[[], AsyncSession],
+        agent_sends: "PermitPool",
+    ) -> None:
+        """Start the delivery of the reply's file (envio-midia-agente) as a
+        task of its own and return at once: the channel from ``prepared``
+        (in memory -- the row's phone is already erased), the echo
+        bookkeeping, the process's one ``agent_sends`` pool.  Called only
+        after the text was delivered and marked, for a payload with a
+        ``media_id``."""
+
 
 @dataclass(frozen=True)
 class WebhookEnforcement:
@@ -2700,6 +2726,88 @@ async def _finish_delivered(
     return _Delivery("delivered")
 
 
+def _reply_media_id(claim: OutboxClaim) -> UUID | None:
+    """The file the stored reply's turn chose (envio-midia-agente), or
+    ``None``: no ``media_id``, or one that is not a UUID (logged)."""
+
+    raw = claim.payload.get("media_id")
+    if raw is None:
+        return None
+    try:
+        return UUID(str(raw))
+    except ValueError:
+        logger.warning(
+            PUBLISHER_LOG,
+            alert="credit_response_media",
+            reason="media_id_unusable",
+            outbox_id=str(claim.id),
+        )
+        return None
+
+
+def _start_reply_media(
+    sender: ReplySender,
+    prepared: Any,
+    claim: OutboxClaim,
+    factory: Callable[[], AsyncSession],
+    agent_sends: "PermitPool | None",
+) -> None:
+    """The step after :func:`_finish_delivered` (envio-midia-agente Group 6):
+    the reply's file, if its turn chose one, STARTED -- never awaited -- so
+    it never runs under the send timeout, the lease or the publisher's
+    serial tick; synchronous and never raises, and it never touches the
+    text's row (a failure of the file leaves it as the mark left it)."""
+
+    media_id = _reply_media_id(claim)
+    if media_id is None:
+        return
+    if agent_sends is None:
+        logger.warning(
+            PUBLISHER_LOG,
+            alert="credit_response_media",
+            reason="no_agent_sends_pool",
+            outbox_id=str(claim.id),
+        )
+        return
+    try:
+        sender.start_media(
+            prepared,
+            media_id=media_id,
+            tenant_id=claim.tenant_id,
+            session_factory=factory,
+            agent_sends=agent_sends,
+        )
+    except Exception as error:
+        logger.warning(
+            PUBLISHER_LOG,
+            alert="credit_response_media",
+            reason="media_not_started",
+            outbox_id=str(claim.id),
+            error_type=type(error).__name__,
+        )
+
+
+async def _finish_then_media(
+    sender: ReplySender,
+    prepared: Any,
+    sent: Any,
+    claim: OutboxClaim,
+    factory: Callable[[], AsyncSession],
+    agent_sends: "PermitPool | None",
+) -> _Delivery:
+    """:func:`_finish_delivered` -- the bookkeeping, then the ``delivered``
+    mark -- and only then the reply's file (:func:`_start_reply_media`).
+    ``_finish_delivered`` always answers ``delivered`` (the provider
+    accepted the text), the mark moved, lost or fenced: the file starts in
+    all three (owner-accepted, G6 Q3); a later recovery of a row whose mark
+    was lost resends the text and its file is ``deduplicated`` by the
+    24-hour claim."""
+
+    delivery = await _finish_delivered(sender, prepared, sent, claim, factory)
+    _start_reply_media(sender, prepared, claim, factory, agent_sends)
+    return delivery
+
+
 async def _prepare_claimed(
     claim: OutboxClaim,
     sender: ReplySender,
@@ -2765,6 +2873,7 @@ async def _deliver_claimed(
     claim: OutboxClaim,
     sender: ReplySender,
     factory: Callable[[], AsyncSession],
+    agent_sends: "PermitPool | None" = None,
 ) -> _Delivery:
     """One send of a claimed (``sending``) row, inline or recovered.
 
@@ -2775,7 +2884,9 @@ async def _deliver_claimed(
     timeout -- an UNCERTAIN result -- turns the row ``failed`` at once with
     its PII erased and is never resent (OD-1).  Once the provider returned
     the reply IS delivered: the bookkeeping and the ``delivered`` mark run
-    shielded from a cancellation of the caller.
+    shielded from a cancellation of the caller, then the start of the
+    reply's file, if any (:func:`_finish_then_media`, with ``agent_sends``,
+    the process's one pool).
     """
 
     try:
@@ -2798,7 +2909,7 @@ async def _deliver_claimed(
         failed = await _mark_failed(factory, claim, "send_failed")
         return _Delivery(failed.outcome, reason="send_failed", error=str(error))
     finish = asyncio.ensure_future(
-        _finish_delivered(sender, prepared, sent, claim, factory)
+        _finish_then_media(sender, prepared, sent, claim, factory, agent_sends)
     )
     return await asyncio.shield(finish)
 
@@ -2808,13 +2919,15 @@ async def deliver_reply_inline(
     *,
     sender: ReplySender,
     session_factory: Callable[[], AsyncSession] | None = None,
+    agent_sends: "PermitPool | None" = None,
 ) -> InlineDelivery:
     """Right after the final commit (H4, LOW-2): claim the row ``pending ->
     sending`` with ``RETURNING`` -- no row means the publisher took it (or
     the row is gone with its tenant), so nothing is sent here -- then one
     send (:func:`_deliver_claimed`): ``delivered``, or ``failed`` at once
     with its PII erased, like main's lost reply (OD-1).  Runs in sessions of
-    its own: the route's transaction already ended."""
+    its own: the route's transaction already ended.  ``agent_sends`` (the
+    process's one pool) lets a delivered reply start its file."""
 
     factory = session_factory or _session_factory()
     try:
@@ -2835,7 +2948,7 @@ async def deliver_reply_inline(
             PUBLISHER_LOG, reason="inline_not_claimed", outbox_id=str(outbox_id)
         )
         return InlineDelivery("not_claimed")
-    delivery = await _deliver_claimed(claim, sender, factory)
+    delivery = await _deliver_claimed(claim, sender, factory, agent_sends)
     if delivery.outcome == "delivered":
         return InlineDelivery("delivered")
     return InlineDelivery("failed", reason=delivery.reason, error=delivery.error)
@@ -2879,9 +2992,13 @@ class CreditResponsePublisher:
         session_factory: Callable[[], AsyncSession] | None = None,
         poll_seconds: float = PUBLISHER_POLL_SECONDS,
         batch: int = PUBLISHER_BATCH,
+        agent_sends: "PermitPool | None" = None,
     ) -> None:
         self._sender = sender
         self._factory = session_factory
+        # The process's one ``agent_sends`` pool (the inline webhooks' too),
+        # for the files of the rows it delivers (envio-midia-agente).
+        self._agent_sends = agent_sends
         self.poll_seconds = poll_seconds
         self.batch = batch
 
@@ -2944,22 +3061,31 @@ class CreditResponsePublisher:
             # send is uncertain, never repeated.
             delivery = await _mark_failed(factory, claim, "resend_refused")
         else:
-            delivery = await _deliver_claimed(claim, self._sender, factory)
+            delivery = await _deliver_claimed(
+                claim, self._sender, factory, self._agent_sends
+            )
         return delivery.outcome
 
 
 def start_credit_response_publisher(
-    sender: ReplySender, source: Settings | None = None
+    sender: ReplySender,
+    source: Settings | None = None,
+    *,
+    agent_sends: "PermitPool | None" = None,
 ) -> asyncio.Task[None] | None:
     """Start the publisher in the lifespan, only when the configuration is
     on (no task with ``credit_hot_path_enabled`` off, like the switch
-    refresher); every row still re-reads the effective switch first."""
+    refresher); every row still re-reads the effective switch first.
+    ``agent_sends`` is the process's one pool of agent media sends -- the
+    same object the inline webhooks use, so a recovered row's file and an
+    inline turn's are deduplicated in flight (envio-midia-agente G6)."""
 
     configured = settings if source is None else source
     if configured.credit_hot_path_enabled is not True:
         return None
     return asyncio.create_task(
-        CreditResponsePublisher(sender).run(), name="credit-response-publisher"
+        CreditResponsePublisher(sender, agent_sends=agent_sends).run(),
+        name="credit-response-publisher",
     )
 
 
