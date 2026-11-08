@@ -11,6 +11,7 @@ import {
   Pencil,
   RefreshCw,
   Search,
+  Sparkles,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -334,6 +335,50 @@ function categoryIcon(category: MediaCategory) {
 
 const SELECT_CLASS =
   "h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
+
+function AutoSuggestSection({
+  id,
+  checked,
+  onCheckedChange,
+  disabled,
+}: {
+  id: string;
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+  disabled: boolean;
+}) {
+  const { t } = useI18n();
+  return (
+    <section className="space-y-2" aria-labelledby={`${id}-title`}>
+      <h3
+        id={`${id}-title`}
+        className="flex items-center gap-2 text-sm font-semibold text-foreground"
+      >
+        <Sparkles className="h-4 w-4 shrink-0 text-sky-500" aria-hidden />
+        {t("media_auto_suggest_label")}
+      </h3>
+      <p className="text-sm text-muted-foreground">
+        {t("media_auto_suggest_description")}
+      </p>
+      <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/30 px-4 py-3">
+        <div className="space-y-0.5">
+          <Label htmlFor={id} className="text-sm font-medium">
+            {t("media_auto_suggest_label")}
+          </Label>
+          <p className="text-sm text-muted-foreground">
+            {t("media_auto_suggest_help")}
+          </p>
+        </div>
+        <Switch
+          id={id}
+          checked={checked}
+          onCheckedChange={onCheckedChange}
+          disabled={disabled}
+        />
+      </div>
+    </section>
+  );
+}
 
 export default function Midias() {
   const {
@@ -1095,22 +1140,12 @@ export default function Midias() {
               />
             </div>
 
-            <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
-              <div>
-                <Label htmlFor="media-auto-suggest">
-                  {t("media_auto_suggest_label")}
-                </Label>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  {t("media_auto_suggest_help")}
-                </p>
-              </div>
-              <Switch
-                id="media-auto-suggest"
-                checked={autoSuggest}
-                onCheckedChange={setAutoSuggest}
-                disabled={isUploading}
-              />
-            </div>
+            <AutoSuggestSection
+              id="media-auto-suggest"
+              checked={autoSuggest}
+              onCheckedChange={setAutoSuggest}
+              disabled={isUploading}
+            />
 
             <div className="flex justify-end">
               <Button type="submit" disabled={!canUpload}>
@@ -1448,23 +1483,18 @@ export default function Midias() {
                   {t("media_no_usage_trigger")}
                 </label>
               </div>
-              <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
-                <Label htmlFor="media-edit-auto-suggest">
-                  {t("media_auto_suggest_label")}
-                </Label>
-                <Switch
-                  id="media-edit-auto-suggest"
-                  checked={currentEdit.autoSuggest}
-                  onCheckedChange={(checked) =>
-                    setEditState((current) =>
-                      current?.scope === scope
-                        ? { ...current, autoSuggest: checked }
-                        : current,
-                    )
-                  }
-                  disabled={currentBusy?.kind === "edit"}
-                />
-              </div>
+              <AutoSuggestSection
+                id="media-edit-auto-suggest"
+                checked={currentEdit.autoSuggest}
+                onCheckedChange={(checked) =>
+                  setEditState((current) =>
+                    current?.scope === scope
+                      ? { ...current, autoSuggest: checked }
+                      : current,
+                  )
+                }
+                disabled={currentBusy?.kind === "edit"}
+              />
               <DialogFooter>
                 <Button
                   type="button"

@@ -228,7 +228,7 @@ describe("<Midias /> catalog operations", () => {
       target: { value: "Na primeira conversa" },
     });
     fireEvent.click(
-      screen.getByRole("switch", { name: "Automatic suggestion" }),
+      screen.getByRole("switch", { name: "AI Automatic Suggestion" }),
     );
     const uploadButton = screen.getByRole("button", { name: "Upload media" });
     expect(uploadButton).toBeEnabled();
@@ -373,7 +373,7 @@ describe("<Midias /> catalog operations", () => {
         target: { value: "Quando o paciente pedir" },
       });
       fireEvent.click(
-        within(dialog).getByRole("switch", { name: "Automatic suggestion" }),
+        within(dialog).getByRole("switch", { name: "AI Automatic Suggestion" }),
       );
       fireEvent.click(
         within(dialog).getByRole("button", { name: "Save changes" }),
@@ -1513,6 +1513,28 @@ describe("<Midias /> role and locale guards", () => {
     );
     expect(screen.getByLabelText("Buscar nome")).toBeInTheDocument();
     expect(screen.getByText("Biblioteca de mídias")).toBeInTheDocument();
+
+    const autoSuggest = screen.getByRole("region", {
+      name: "Sugestão Automática por IA",
+    });
+    expect(
+      within(autoSuggest).getByText(
+        "Configure para que a IA sugira o envio deste arquivo automaticamente quando detectar a intenção correta do paciente.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(autoSuggest).getByText(
+        "A IA analisa o contexto e envia o ativo no momento de maior impacto",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(autoSuggest).getByRole("switch", {
+        name: "Sugestão Automática por IA",
+      }),
+    ).not.toBeChecked();
+    expect(
+      screen.queryByText(/Apenas um marcador de catálogo/),
+    ).not.toBeInTheDocument();
   });
 });
 
