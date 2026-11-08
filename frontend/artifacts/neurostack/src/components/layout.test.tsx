@@ -669,6 +669,36 @@ describe("<Layout /> inactive queue navigation", () => {
   });
 });
 
+describe("<Layout /> chat simulator navigation", () => {
+  it("hides the chat simulator from builders", async () => {
+    renderLayout();
+    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+    expect(
+      screen.queryByTestId("nav-link-chat-simulator"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("nav-link-dashboard")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["super_admin", "admin@example.com", "", "super-clinic-1"],
+    ["clinic_admin", "clinic-admin@example.com", "clinic-admin-clinic", "clinic-admin-clinic"],
+  ] as const)(
+    "shows the chat simulator to %s",
+    async (role, email, clinicId, viewingClinicId) => {
+      setRole(role);
+      mocks.auth.email = email;
+      mocks.auth.clinicId = clinicId;
+      mocks.auth.viewingClinicId = viewingClinicId;
+
+      renderLayout();
+
+      const link = await screen.findByTestId("nav-link-chat-simulator");
+      expect(link.closest("a")).toHaveAttribute("href", "/");
+    },
+  );
+});
+
 describe("<Layout /> RLHF audit navigation", () => {
   it("renders /rlhf-audit as a regular nav item (no version badge) for super_admin", async () => {
     setRole("super_admin");

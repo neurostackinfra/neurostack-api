@@ -50,6 +50,18 @@ function VoiceAiRedirect() {
   return null;
 }
 
+/**
+ * Builders have no chat simulator: `/` sends them to their own panel, the
+ * same landing the login redirect uses.
+ */
+function BuilderHomeRedirect() {
+  const [, setLocation] = useLocation();
+  useEffect(() => {
+    setLocation("/builder", { replace: true });
+  }, [setLocation]);
+  return null;
+}
+
 function Router() {
   const { isAuthenticated, isSuperAdmin, isInvestor, leadSubmitted } = useAuth();
 
@@ -76,7 +88,7 @@ function AuthenticatedRouter() {
   return (
     <Layout>
       <Switch>
-        <Route path="/" component={Chat} />
+        <Route path="/" component={isBuilder ? BuilderHomeRedirect : Chat} />
         <Route path="/dashboard" component={Dashboard} />
         <Route path="/traces" component={TracesList} />
         <Route path="/traces/:id" component={TraceDetail} />

@@ -665,10 +665,10 @@ export default function BuilderPanel() {
     navigate("/config");
   }
 
-  // Navigate to clinic panel (simulator)
+  // Navigate to clinic panel (dashboard — builders have no chat simulator)
   function handleAccessClinicPanel(clinicTenantId: string) {
     setViewingClinicId(clinicTenantId);
-    navigate("/");
+    navigate("/dashboard");
   }
 
   // Navigate to clinic from alert

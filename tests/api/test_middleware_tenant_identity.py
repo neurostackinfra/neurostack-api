@@ -27,7 +27,12 @@ class _AuthenticatedTenant:
         await self.app(scope, receive, send)
 
 
-def _event_app(tenant_id: UUID, *, with_rate_limit: bool = False) -> FastAPI:
+def _event_app(
+    tenant_id: UUID,
+    *,
+    with_rate_limit: bool = False,
+    tenant: TenantContext | None = None,
+) -> FastAPI:
     app = FastAPI()
 
     @app.post("/v1/events")
@@ -43,7 +48,7 @@ def _event_app(tenant_id: UUID, *, with_rate_limit: bool = False) -> FastAPI:
     app.add_middleware(TenantIdentityMiddleware)
     app.add_middleware(
         _AuthenticatedTenant,
-        tenant=TenantContext(tenant_id=tenant_id, api_key="not-a-real-key"),
+        tenant=tenant or TenantContext(tenant_id=tenant_id, api_key="not-a-real-key"),
     )
     return app
 
@@ -72,6 +77,110 @@ async def test_event_missing_or_same_assertion_preserves_bytes_and_identity(
 
     assert response.status_code == 200
     assert response.json() == {"raw": raw.decode(), "tenant_id": str(tenant_id)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tenant_factory", "passes"),
+    [
+        (
+            lambda t: TenantContext(
+                tenant_id=t,
+                user_id=uuid4(),
+                role="super_admin",
+                authentication_mode="jwt",
+            ),
+            True,
+        ),
+        (lambda t: TenantContext(tenant_id=t, api_key="k", role="super_admin"), False),
+        (
+            lambda t: TenantContext(
+                tenant_id=t,
+                api_key="k",
+                user_id=uuid4(),
+                role="super_admin",
+                authentication_mode="jwt",
+            ),
+            False,
+        ),
+        (
+            lambda t: TenantContext(
+                tenant_id=t, role="super_admin", authentication_mode="jwt"
+            ),
+            False,
+        ),
+        (
+            lambda t: TenantContext(
+                tenant_id=t, role="super_admin", authentication_mode="meta_hmac"
+            ),
+            False,
+        ),
+        (
+            lambda t: TenantContext(
+                tenant_id=t,
+                user_id=uuid4(),
+                role="builder",
+                builder_id=uuid4(),
+                authentication_mode="jwt",
+            ),
+            False,
+        ),
+        (
+            lambda t: TenantContext(
+                tenant_id=t,
+                user_id=uuid4(),
+                role="clinic_admin",
+                authentication_mode="jwt",
+            ),
+            False,
+        ),
+    ],
+    ids=[
+        "super-admin-jwt",
+        "api-key-claiming-super-admin",
+        "jwt-with-api-key",
+        "jwt-without-user",
+        "meta-claiming-super-admin",
+        "builder-jwt",
+        "clinic-admin-jwt",
+    ],
+)
+async def test_event_foreign_assertion_passes_only_for_super_admin_jwt(
+    tenant_factory: Any,
+    passes: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The simulator's clinic selection: the route resolves it, nobody else's."""
+
+    tenant_id, selected = uuid4(), uuid4()
+    audit = MagicMock()
+    monkeypatch.setattr(
+        "src.api.middleware.tenant_identity._audit_logger.warning", audit
+    )
+    raw = json.dumps(
+        {"tenant_id": str(selected), "session_id": str(uuid4()), "payload": {}},
+        separators=(",", ":"),
+    ).encode()
+
+    async with AsyncClient(
+        transport=ASGITransport(
+            app=_event_app(tenant_id, tenant=tenant_factory(tenant_id))
+        ),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/events", content=raw, headers={"content-type": "application/json"}
+        )
+
+    if passes:
+        assert response.status_code == 200
+        # Bytes reach the route untouched; the authenticated identity is kept.
+        assert response.json() == {"raw": raw.decode(), "tenant_id": str(tenant_id)}
+        audit.assert_not_called()
+    else:
+        assert response.status_code == 403
+        assert response.json()["error"] == "tenant_identity_mismatch"
+        audit.assert_called_once()
 
 
 @pytest.mark.asyncio
