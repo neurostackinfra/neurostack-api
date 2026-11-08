@@ -13,8 +13,18 @@ from collections import OrderedDict as _OrderedDict
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Final, Optional, cast, overload
+from datetime import datetime, timedelta, timezone
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Final,
+    Literal,
+    Optional,
+    cast,
+    get_args,
+    overload,
+)
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -69,12 +79,13 @@ from src.services.credit_metering import (
     uazapi_ingress,
     zapi_ingress,
 )
-from src.services.egress_policy import EgressDisabledError
+from src.services.egress_policy import EgressDisabledError, require_uazapi_egress
 from src.services.event_service import get_event_service
 from src.services.handoff_service import (
     dispatch_committed_handoff_webhooks,
     record_handoff_post_commit_dispatch_failure,
 )
+from src.services.media_assets import MEDIA_IMAGE_MAX_BYTES
 from src.services.meta_service import (
     download_meta_media_audio,
     extract_meta_message_id,
@@ -82,7 +93,12 @@ from src.services.meta_service import (
     send_meta_cloud_audio,
     send_meta_cloud_text,
 )
-from src.services.safe_egress import UnsafeEgressError, safe_download_audio
+from src.services.safe_egress import (
+    IMAGE_MIME_ALLOWLIST,
+    UnsafeEgressError,
+    safe_download_audio,
+    safe_download_image,
+)
 from src.services.tts_service import synthesize_speech
 from src.services.uazapi_service import (
     UazapiMediaDownloadError,
@@ -156,6 +172,74 @@ _STT_TEMPORARY_FAILURE_MSG_EN = (
     "I got your voice message! 🎙️ I couldn't listen to it right now. Could "
     "you type what you need? That way I can help you without delay. 😊"
 )
+
+# ── Image description chain (whatsapp-image-understanding) ──
+#
+# Byte cap of an image the agent may describe (Decision 12): the same cap the
+# credit system applies to media images. Above it the image never reaches the
+# multimodal provider and, when the channel declares the size, is never even
+# downloaded.
+IMAGE_MAX_BYTES: Final = MEDIA_IMAGE_MAX_BYTES
+
+# Reasons returned by ``_describe_image_chain``. The empty string means "a
+# description was produced and composed"; the two non-empty values both send
+# the patient down the file-acknowledgement flow (Decision 3), and are kept
+# distinct so a handler can tell "nothing configured" from "it failed now".
+IMAGE_CHAIN_OK = ""
+IMAGE_CHAIN_NO_CAPABILITY = "no_capability"
+IMAGE_CHAIN_FAILED = "description_failed"
+
+# ``outcome`` of the ``image_description_attempt`` event. The chain emits the
+# outcomes it decides itself; handlers emit the ones decided before the chain
+# runs (``view_once``, a declared ``too_large``/``unsupported_mime``,
+# ``download_failed``).
+ImageDescriptionOutcome = Literal[
+    "described",
+    "no_capability",
+    "too_large",
+    "unsupported_mime",
+    "view_once",
+    "download_failed",
+    "provider_failed",
+    "no_content",
+]
+IMAGE_DESCRIPTION_OUTCOMES: frozenset[str] = frozenset(
+    get_args(ImageDescriptionOutcome)
+)
+
+# Adapter error code -> event outcome; every other failure is
+# ``provider_failed``.
+_IMAGE_ERROR_OUTCOMES: dict[str, ImageDescriptionOutcome] = {
+    "no_image_content": "no_content",
+    "unsupported_image_mime": "unsupported_mime",
+}
+
+# ``safe_download_image`` error code -> event outcome, for the handlers that
+# download before the chain runs; every other code (``unsafe_api_url``,
+# ``redirect_forbidden``, ``image_download_failed``, unknown) is
+# ``download_failed``.
+_IMAGE_DOWNLOAD_ERROR_OUTCOMES: dict[str, ImageDescriptionOutcome] = {
+    "image_too_large": "too_large",
+    "unsupported_image_mime": "unsupported_mime",
+}
+
+
+def _image_download_outcome(code: str) -> ImageDescriptionOutcome:
+    """Map a ``safe_download_image`` error code to its event outcome."""
+
+    return _IMAGE_DOWNLOAD_ERROR_OUTCOMES.get(code, "download_failed")
+
+
+# What a loggable MIME looks like (``type/subtype``, RFC 6838 characters,
+# bounded). The MIME comes from the patient's payload, so anything else is
+# logged as ``invalid`` rather than echoed into the log line.
+_IMAGE_EVENT_MIME_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$"
+)
+
+# Decision 10: how the description enters the pipeline, per agent language.
+_IMAGE_DESCRIPTION_LABEL_PT = "Imagem enviada pelo paciente"
+_IMAGE_DESCRIPTION_LABEL_EN = "Image sent by the patient"
 
 logger = logging.getLogger(__name__)
 
@@ -2131,6 +2215,201 @@ def _stt_fallback_message(failure_reason: str, agent_language: str) -> str:
     )
 
 
+def _image_event_mime(mime: Optional[str]) -> Optional[str]:
+    """The MIME as logged: normalized, or ``invalid`` when not MIME-shaped."""
+    normalized = (mime or "").split(";", 1)[0].strip().lower()
+    if not normalized:
+        return None
+    if _IMAGE_EVENT_MIME_PATTERN.fullmatch(normalized) is None:
+        return "invalid"
+    return normalized
+
+
+def _emit_image_description_attempt(
+    *,
+    channel: str,
+    outcome: ImageDescriptionOutcome,
+    mime: Optional[str],
+    size_bytes: Optional[int],
+    latency_ms: Optional[int],
+) -> None:
+    """Emit the structured ``image_description_attempt`` event (one per image).
+
+    ``channel`` is the channel token (``uazapi``, ``zapi`` or ``meta``);
+    ``outcome`` is one of :data:`IMAGE_DESCRIPTION_OUTCOMES`; ``size_bytes``
+    and ``latency_ms`` are ``None`` when unknown (no download, no provider
+    call). The signature has no slot for the image bytes or the description:
+    neither ever reaches a log record. The fields are in the message (the
+    production formatter prints only the message) and in ``extra``.
+    """
+    if outcome not in IMAGE_DESCRIPTION_OUTCOMES:
+        logger.error(
+            "image_description_attempt dropped: unknown outcome channel=%s",
+            channel,
+        )
+        return
+    logged_mime = _image_event_mime(mime)
+    logger.info(
+        "image_description_attempt channel=%s outcome=%s mime=%s "
+        "size_bytes=%s latency_ms=%s",
+        channel,
+        outcome,
+        logged_mime,
+        size_bytes,
+        latency_ms,
+        extra={
+            "event": "image_description_attempt",
+            "channel": channel,
+            "outcome": outcome,
+            "mime": logged_mime,
+            "size_bytes": size_bytes,
+            "latency_ms": latency_ms,
+        },
+    )
+
+
+def _compose_image_message(
+    caption: Optional[str],
+    description: str,
+    agent_language: str,
+) -> str:
+    """Decision 10: the patient's caption, then the bracketed description.
+
+    ``"<caption>\\n\\n[Imagem enviada pelo paciente: <description>]"``; just
+    the bracketed line without a caption; ``[Image sent by the patient: ...]``
+    when the agent language is ``en``. The main LLM can thus tell what the
+    patient wrote from what was seen, and the context survives later turns.
+    """
+    label = (
+        _IMAGE_DESCRIPTION_LABEL_EN
+        if agent_language == "en"
+        else _IMAGE_DESCRIPTION_LABEL_PT
+    )
+    marker = f"[{label}: {description.strip()}]"
+    cleaned_caption = (caption or "").strip()
+    if cleaned_caption:
+        return f"{cleaned_caption}\n\n{marker}"
+    return marker
+
+
+async def _multimodal_describe_image(
+    image_bytes: bytes,
+    mime_type: str,
+    creds: dict[str, Any],
+    agent_language: str,
+) -> str:
+    """The provider call of the image chain: the tenant's OpenRouter bundle."""
+    from src.services.multimodal_service import describe_image_multimodal
+
+    return await describe_image_multimodal(
+        api_key=str(creds.get("multimodal_api_key") or ""),
+        image_bytes=image_bytes,
+        mimetype=mime_type,
+        model=str(creds.get("multimodal_model_name") or ""),
+        base_url=str(creds.get("multimodal_api_url") or ""),
+        agent_language=agent_language,
+    )
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int(round((_time.monotonic() - started) * 1000)))
+
+
+async def _describe_image_chain(
+    image_bytes: Optional[bytes],
+    credentials: dict[str, Any],
+    *,
+    mime_type: str,
+    caption: Optional[str],
+    agent_language: str,
+    channel: str,
+) -> tuple[str, str]:
+    """Describe a patient image. Returns ``(composed_text, reason)``.
+
+    ``reason`` is :data:`IMAGE_CHAIN_OK` (the empty string) exactly when
+    ``composed_text`` is usable: the caption plus the bracketed description
+    (:func:`_compose_image_message`). Otherwise the text is empty and the
+    reason is :data:`IMAGE_CHAIN_NO_CAPABILITY` (the tenant's multimodal
+    bundle is not operational — no provider call) or
+    :data:`IMAGE_CHAIN_FAILED`.
+
+    Mirrors ``_transcribe_audio_chain``, with one rung: capability is
+    ``_multimodal_operational`` (the OpenRouter bundle). Before any call the
+    chain also refuses missing bytes (``download_failed``), an image above
+    :data:`IMAGE_MAX_BYTES` (``too_large``) and a MIME outside the allowlist
+    (``unsupported_mime``), so no handler can send those to the provider. An
+    empty description or one carrying ``IMAGE_NO_CONTENT_MARKER`` is a
+    failure, never a message.
+
+    Emits exactly one ``image_description_attempt`` event (with ``channel``)
+    for the outcome it decides. ``channel`` is the channel token
+    (``uazapi``, ``zapi`` or ``meta``).
+    """
+    from src.services.multimodal_service import (
+        IMAGE_NO_CONTENT_MARKER,
+        MultimodalImageError,
+    )
+
+    mime = (mime_type or "").split(";", 1)[0].strip().lower()
+    size_bytes = len(image_bytes) if image_bytes is not None else None
+
+    def emit(outcome: ImageDescriptionOutcome, latency_ms: Optional[int]) -> None:
+        _emit_image_description_attempt(
+            channel=channel,
+            outcome=outcome,
+            mime=mime,
+            size_bytes=size_bytes,
+            latency_ms=latency_ms,
+        )
+
+    if not _multimodal_operational(credentials):
+        emit("no_capability", None)
+        return "", IMAGE_CHAIN_NO_CAPABILITY
+    if not image_bytes:
+        logger.warning("%s image description chain reached with no bytes", channel)
+        emit("download_failed", None)
+        return "", IMAGE_CHAIN_FAILED
+    if len(image_bytes) > IMAGE_MAX_BYTES:
+        emit("too_large", None)
+        return "", IMAGE_CHAIN_FAILED
+    if mime not in IMAGE_MIME_ALLOWLIST:
+        emit("unsupported_mime", None)
+        return "", IMAGE_CHAIN_FAILED
+
+    started = _time.monotonic()
+    try:
+        description = await _multimodal_describe_image(
+            image_bytes, mime, credentials, agent_language
+        )
+    except MultimodalImageError as exc:
+        # Expected provider outcomes: the stable code is the whole story.
+        logger.warning(
+            "%s image description failed at the multimodal provider code=%s",
+            channel,
+            exc.code,
+        )
+        emit(
+            _IMAGE_ERROR_OUTCOMES.get(exc.code, "provider_failed"), _elapsed_ms(started)
+        )
+        return "", IMAGE_CHAIN_FAILED
+    except Exception as exc:
+        logger.exception(
+            "%s image description failed at the multimodal provider — %s",
+            channel,
+            type(exc).__name__,
+        )
+        emit("provider_failed", _elapsed_ms(started))
+        return "", IMAGE_CHAIN_FAILED
+
+    latency_ms = _elapsed_ms(started)
+    cleaned = (description or "").strip()
+    if not cleaned or IMAGE_NO_CONTENT_MARKER in cleaned:
+        emit("no_content", latency_ms)
+        return "", IMAGE_CHAIN_FAILED
+    emit("described", latency_ms)
+    return _compose_image_message(caption, cleaned, agent_language), IMAGE_CHAIN_OK
+
+
 async def _send_zapi_stt_fallback(
     *,
     tenant_id: UUID,
@@ -2272,6 +2551,217 @@ async def _send_uazapi_stt_fallback(
 
 
 # ── Z-API webhook endpoint ──────────────────────────────────────────
+
+# Patient files on Z-API (whatsapp-image-understanding Group 3). Z-API names
+# each media by its own key; the field names are the "Ao receber" return
+# examples of the Z-API docs (``tests/fixtures/zapi/media-payloads.json``),
+# not verified on a real payload.
+ZapiFileKind = Literal["image", "document", "video"]
+_ZAPI_FILE_KINDS: tuple[ZapiFileKind, ...] = ("image", "document", "video")
+
+
+def _zapi_patient_file_kind(body: Mapping[str, Any]) -> Optional[ZapiFileKind]:
+    """The file kind of a Z-API message, or ``None`` when it carries no file.
+
+    A media object under ``image``, ``document`` or ``video`` -- one without
+    a URL included: it is acknowledged, never silenced (Decision 12). A
+    sticker is never a file and keeps the ``non-text`` exit. Neither is
+    media in a group or a channel (owner decision 2026-11-07, as on Uazapi):
+    ``isGroup`` or ``isNewsletter`` true, or -- defensively -- a ``phone``
+    ending in ``-group`` (the docs' group form, ``"<id>-group"``); it keeps
+    the ``non-text`` exit too. ``fromMe``, text and audio are the caller's
+    to exclude.
+    """
+    if body.get("sticker"):
+        return None
+    if body.get("isGroup") is True or body.get("isNewsletter") is True:
+        return None
+    if str(body.get("phone") or "").strip().endswith("-group"):
+        return None
+    for kind in _ZAPI_FILE_KINDS:
+        if isinstance(body.get(kind), Mapping):
+            return kind
+    return None
+
+
+def _zapi_sent_message_id(send_result: Mapping[str, Any]) -> str:
+    """The outbound id of a Z-API send, read like the AI reply's."""
+    return str(send_result.get("messageId") or send_result.get("zapiMessageId") or "")
+
+
+async def _describe_zapi_image(
+    image: Mapping[str, Any],
+    credentials: dict[str, Any],
+    *,
+    agent_language: str,
+) -> str:
+    """Download and describe one Z-API patient image (Decisions 9-13).
+
+    Returns the Decision 10 message (``image.caption`` plus the bracketed
+    description) when the image was described, and ``""`` when it goes down
+    the file flow.
+
+    Order: capability, view-once (``image.viewOnce is True``: neither
+    downloaded nor described), the URL (``imageUrl``, else ``url``, read like
+    the audio's; none is ``download_failed``), the declared ``mimeType``,
+    then ``safe_download_image`` -- whose ``declared_mime`` covers a CDN that
+    answers ``application/octet-stream`` -- and :func:`_describe_image_chain`
+    on the effective MIME. Without capability nothing is downloaded and the
+    chain itself reports ``no_capability``. The refusals decided here emit
+    their own ``image_description_attempt`` with ``size_bytes=None`` (Z-API
+    declares no size); after a download the chain emits the rest, so each
+    image emits exactly one event.
+
+    Nothing is claimed here (Decision 9): the replay claim at the top of
+    ``zapi_webhook`` already covers the message. Logs carry a stable error
+    code or an exception type, never the media URL.
+    """
+    caption_value = image.get("caption")
+    caption = caption_value if isinstance(caption_value, str) else None
+    declared_mime = str(image.get("mimeType") or "")
+    image_bytes: Optional[bytes] = None
+    effective_mime = declared_mime
+
+    if _multimodal_operational(credentials):
+        refused: Optional[ImageDescriptionOutcome] = None
+        image_url = str(image.get("imageUrl") or image.get("url") or "").strip()
+        normalized_mime = declared_mime.split(";", 1)[0].strip().lower()
+        if image.get("viewOnce") is True:
+            refused = "view_once"
+        elif not image_url:
+            logger.warning("Z-API image without a URL")
+            refused = "download_failed"
+        elif normalized_mime and normalized_mime not in IMAGE_MIME_ALLOWLIST:
+            refused = "unsupported_mime"
+        else:
+            try:
+                download = await safe_download_image(
+                    image_url,
+                    max_bytes=IMAGE_MAX_BYTES,
+                    declared_mime=declared_mime or None,
+                )
+            except UnsafeEgressError as exc:
+                logger.warning("Z-API image download failed code=%s", exc.code)
+                refused = _image_download_outcome(exc.code)
+            except Exception as exc:
+                logger.warning("Z-API image download failed — %s", type(exc).__name__)
+                refused = "download_failed"
+            else:
+                image_bytes = download.content
+                effective_mime = download.mime_type
+        if refused is not None:
+            _emit_image_description_attempt(
+                channel="zapi",
+                outcome=refused,
+                mime=declared_mime,
+                size_bytes=None,
+                latency_ms=None,
+            )
+            return ""
+
+    composed, _reason = await _describe_image_chain(
+        image_bytes,
+        credentials,
+        mime_type=effective_mime,
+        caption=caption,
+        agent_language=agent_language,
+        channel="zapi",
+    )
+    return composed
+
+
+async def _send_zapi_file_ack(
+    *,
+    session_id: UUID,
+    phone: str,
+    z_inst: str,
+    z_tok: str,
+    z_ct: str,
+    agent_language: str,
+    file_kind: ZapiFileKind,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    """Acknowledge a file the agent does not analyse (Decisions 3, 4, 7, 17, 18).
+
+    Free: no claim and no effect in any credit world; a handoff only ever
+    comes from the forward-on-request path. No acknowledgement while a
+    pending review is active. Otherwise the owner's copy goes out through
+    ``send_text_message``; its outbound id is tracked and stored like the AI
+    reply's -- Z-API echoes the bot's own sends back as ``fromMe``, and an
+    untracked echo would pause the session -- and only then is the pending
+    review written and committed: a failed send leaves nothing pending.
+    """
+    if not await _file_ack_needed(session_id, db):
+        logger.info(
+            "Z-API file ack suppressed for %s (type=%s): review pending",
+            phone,
+            file_kind,
+        )
+        return {"ok": True, "replied": False, "action": "file_ack_suppressed"}
+    if not z_inst or not z_tok:
+        logger.warning("Z-API credentials missing for file ack to %s", phone)
+        return {"ok": True, "replied": False, "reason": "no_credentials"}
+    try:
+        send_result = await send_text_message(
+            z_inst,
+            z_tok,
+            phone,
+            _build_meta_file_ack_message(agent_language),
+            client_token=z_ct,
+        )
+    except Exception as exc:
+        # ``send_text_message`` strips the token-bearing URL from HTTP errors.
+        logger.warning("Z-API file ack send failed for %s — %s", phone, exc)
+        return {"ok": True, "replied": False, "reason": "send_failed"}
+    _track_sent_message(send_result)
+    ack_mid = _zapi_sent_message_id(send_result)
+    if ack_mid:
+        await _store_ai_msg_id_to_db(session_id, ack_mid, db)
+    await _meta_set_pending_file_review(session_id, db)
+    await db.commit()
+    logger.info("Z-API file ack sent to %s (type=%s)", phone, file_kind)
+    return {"ok": True, "replied": True, "action": "file_ack"}
+
+
+async def _send_zapi_file_forwarded(
+    *,
+    session_id: UUID,
+    phone: str,
+    z_inst: str,
+    z_tok: str,
+    z_ct: str,
+    agent_language: str,
+    db: AsyncSession,
+) -> None:
+    """Confirm a forward-on-request handoff to the patient (Decision 17).
+
+    The handoff is already committed; like Meta, a confirmation that cannot
+    go out is logged and the route still answers ``file_handoff``. A sent
+    confirmation is tracked and stored like the AI reply, so its echo is an
+    ``ai_echo``.
+    """
+    if not z_inst or not z_tok:
+        logger.warning(
+            "Z-API credentials missing for file-forward confirmation to %s", phone
+        )
+        return
+    message = (
+        _FILE_FORWARDED_MSG_EN if agent_language == "en" else _FILE_FORWARDED_MSG_PT
+    )
+    try:
+        send_result = await send_text_message(
+            z_inst, z_tok, phone, message, client_token=z_ct
+        )
+    except Exception as exc:
+        logger.warning(
+            "Z-API file-forward confirmation send failed for %s — %s", phone, exc
+        )
+        return
+    _track_sent_message(send_result)
+    forward_mid = _zapi_sent_message_id(send_result)
+    if forward_mid:
+        await _store_ai_msg_id_to_db(session_id, forward_mid, db)
+    await db.commit()
 
 
 @router.post(
@@ -2471,6 +2961,17 @@ async def _process_zapi_authenticated_body(
     # replying by text.
     staff_audio = bool(audio_obj) and not message_text and is_from_me
 
+    # A patient image, document or video (whatsapp-image-understanding,
+    # Decisions 3, 8). It is the only media let through the ``non-text`` and
+    # ``empty`` guards below, and it is described or acknowledged at the
+    # insertion point after the LGPD notice. A sticker and the clinic's own
+    # media (``fromMe``) are never files: they keep today's exits and never
+    # reach ``_handle_clinic_message``, where a staff image would read as a
+    # human takeover and pause the AI.
+    patient_file_kind: Optional[ZapiFileKind] = (
+        None if is_from_me or text_obj or audio_obj else _zapi_patient_file_kind(body)
+    )
+
     # Handle audio/voice messages.
     # ``not is_from_me`` sits in the block condition — not merely above the
     # download — so no branch inside the block (download, STT, handoff, reply)
@@ -2603,13 +3104,15 @@ async def _process_zapi_authenticated_body(
                     failure_reason=chain_failure,
                 )
 
-    if not text_obj and not audio_obj:
+    if not text_obj and not audio_obj and patient_file_kind is None:
         return {"ok": True, "skipped": "non-text"}
-    # ``staff_audio`` is the one case allowed past the empty-text guard: the
+    # ``staff_audio`` is one case allowed past the empty-text guard: the
     # audio was deliberately left untranscribed, and the fromMe block below
     # routes it to _handle_clinic_message with empty text — empty text cannot
-    # match the trigger phrase, so it falls through to human takeover.
-    if not message_text and not staff_audio:
+    # match the trigger phrase, so it falls through to human takeover. A
+    # patient file is the other: it has no text of its own (a caption is the
+    # file's, never the patient's message) and never takes the fromMe block.
+    if not message_text and not staff_audio and patient_file_kind is None:
         return {"ok": True, "skipped": "empty"}
 
     # ── fromMe=true: check if AI-sent echo or real clinic message ──
@@ -2737,6 +3240,81 @@ async def _process_zapi_authenticated_body(
                 db=db,
                 send=_send_zapi_privacy,
             )
+
+    # ── patient files (whatsapp-image-understanding, Decisions 3, 4, 7-14) ──
+    # Here, after the AI-off and pause gates, the credit pre-check, the
+    # session and the LGPD notice: nothing below runs with the AI off or a
+    # paused session, and a new session's notice already went out. No claim
+    # of its own: the replay claim at the top of ``zapi_webhook`` covers it.
+    agent_lang = _get_agent_language(clinic_config)
+    if patient_file_kind is None:
+        # A textual message (text, or audio transcribed above) resolves an
+        # active pending review. A file's caption never does: files never
+        # take this branch. An expired or legacy flag counts as absent.
+        if await _pending_file_review_active(session_id, db):
+            if _detect_forward_intent(message_text):
+                # Credit-metered like Meta (Decision 7): with the pre-check's
+                # enforcement, one transaction in ``run_meta_file_handoff``
+                # (claim ``zapi``, handoff, debit); without it, the Group 3a
+                # writer on the Z-API ingress.
+                skipped = await _meta_file_handoff(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    from_phone=phone,
+                    note="file_pending_review",
+                    context=context,
+                    db=db,
+                    metering=(
+                        None
+                        if request is None or enforcement is not None
+                        else zapi_ingress(request, body=body, context=context)
+                    ),
+                    enforcement=enforcement,
+                    clear_pending_review=True,
+                )
+                if skipped is not None:
+                    return skipped
+                forward_creds = await _tenant_creds()
+                await _send_zapi_file_forwarded(
+                    session_id=session_id,
+                    phone=phone,
+                    z_inst=str(forward_creds.get("zapi_instance_id") or "").strip(),
+                    z_tok=str(forward_creds.get("zapi_token") or "").strip(),
+                    z_ct=str(forward_creds.get("zapi_client_token") or "").strip(),
+                    agent_language=agent_lang,
+                    db=db,
+                )
+                return {"ok": True, "replied": True, "action": "file_handoff"}
+            # Not a forward: the patient is telling what they need.
+            await _meta_clear_pending_file_review(session_id, db)
+            await db.commit()
+    else:
+        file_creds = await _tenant_creds()
+        image_text = ""
+        if patient_file_kind == "image":
+            image_obj = body.get("image")
+            image_text = await _describe_zapi_image(
+                image_obj if isinstance(image_obj, Mapping) else {},
+                file_creds,
+                agent_language=agent_lang,
+            )
+        if not image_text:
+            return await _send_zapi_file_ack(
+                session_id=session_id,
+                phone=phone,
+                z_inst=str(file_creds.get("zapi_instance_id") or "").strip(),
+                z_tok=str(file_creds.get("zapi_token") or "").strip(),
+                z_ct=str(file_creds.get("zapi_client_token") or "").strip(),
+                agent_language=agent_lang,
+                file_kind=patient_file_kind,
+                db=db,
+            )
+        # Described: the caption plus the description is the patient's
+        # message (Decision 10), billed like any turn by the pipeline below.
+        # An active pending review stays as it is (Decision 14); the next
+        # textual message resolves it.
+        message_text = image_text
+
     _event_metadata: dict[str, Any] = {
         "phone": phone,
         "senderName": sender_name,
@@ -3135,6 +3713,265 @@ async def evolution_webhook(
     return {"ok": True, "replied": True}
 
 
+# ── Uazapi patient files (whatsapp-image-understanding) ─────────────
+
+# The file kinds a patient message can take on Uazapi. An image is described
+# when it can be; a document, a video and an image that is not described get
+# the file acknowledgement (Decision 3).
+UazapiFileKind = Literal["image", "document", "video"]
+
+# ``messageType`` names per kind, compared lowercased. Only ``ImageMessage``
+# is proven by a captured payload (``media-payload.json``); the document and
+# video names are not, so ``type``/``mediaType`` are accepted as well.
+_UAZAPI_IMAGE_MESSAGE_TYPES = frozenset({"imagemessage"})
+_UAZAPI_DOCUMENT_MESSAGE_TYPES = frozenset(
+    {"documentmessage", "documentwithcaptionmessage"}
+)
+_UAZAPI_VIDEO_MESSAGE_TYPES = frozenset({"videomessage"})
+
+
+def _uazapi_is_view_once(msg: Mapping[str, Any]) -> bool:
+    """Decision 13: ``content.viewOnce == true`` or a ``*ViewOnce*`` type.
+
+    Neither signal is verified against a real Uazapi payload, so both count.
+    """
+    content = msg.get("content")
+    if isinstance(content, Mapping) and content.get("viewOnce") is True:
+        return True
+    return "viewonce" in str(msg.get("messageType") or "").lower()
+
+
+def _uazapi_file_kind(msg: Mapping[str, Any]) -> Optional[UazapiFileKind]:
+    """The file kind of a Uazapi message, or ``None`` when it is no file.
+
+    Case-insensitive over ``type``, ``mediaType`` and ``messageType``. A
+    sticker is never a file (it keeps the ``non-text`` exit). Audio is the
+    caller's to exclude: it has its own path. A view-once message of no
+    recognised kind still takes the image path, which refuses it before any
+    download and acknowledges it (Decision 13), so it never ends in silence.
+    """
+    kinds = {
+        str(msg.get("type") or "").strip().lower(),
+        str(msg.get("mediaType") or "").strip().lower(),
+    }
+    message_type = str(msg.get("messageType") or "").strip().lower()
+    if "sticker" in kinds or message_type == "stickermessage":
+        return None
+    if "image" in kinds or message_type in _UAZAPI_IMAGE_MESSAGE_TYPES:
+        return "image"
+    if "document" in kinds or message_type in _UAZAPI_DOCUMENT_MESSAGE_TYPES:
+        return "document"
+    if "video" in kinds or message_type in _UAZAPI_VIDEO_MESSAGE_TYPES:
+        return "video"
+    if _uazapi_is_view_once(msg):
+        return "image"
+    return None
+
+
+def _uazapi_declared_size(value: Any) -> Optional[int]:
+    """``content.fileLength`` as a byte count; ``None`` when not a count."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _uazapi_image_caption(msg: Mapping[str, Any]) -> Optional[str]:
+    """Decision 10: ``content.caption``, falling back to ``message.text``."""
+    content = msg.get("content")
+    if isinstance(content, Mapping):
+        caption = content.get("caption")
+        if isinstance(caption, str) and caption.strip():
+            return caption
+    return _extract_uazapi_text_value(msg.get("text"))
+
+
+def _uazapi_egress_retry_response() -> JSONResponse:
+    """The retryable 503 of a closed Uazapi egress, answered before any claim."""
+    return JSONResponse(
+        status_code=503,
+        content={"ok": False, "error": "uazapi_egress_disabled", "retryable": True},
+    )
+
+
+async def _describe_uazapi_image(
+    msg: Mapping[str, Any],
+    credentials: dict[str, Any],
+    *,
+    msg_id: str,
+    claim: Callable[[], Optional[dict[str, Any]]],
+    agent_language: str,
+) -> tuple[str, Response | dict[str, Any] | None]:
+    """Gate, download, claim and describe one patient image (Decisions 9-13).
+
+    Returns ``(composed_text, answer)``. A non-``None`` ``answer`` is returned
+    by the route as is: the retryable 503 when the egress closes during the
+    download (nothing claimed), or ``duplicate_message`` on a redelivery.
+    Otherwise ``composed_text`` is the Decision 10 message when the image was
+    described, and ``""`` when it goes down the file flow.
+
+    Order: capability, view-once, declared ``fileLength``/``mimetype``,
+    download, claim, :func:`_describe_image_chain`. Without capability nothing
+    is downloaded and the chain itself reports ``no_capability``. The refusals
+    decided here (view-once, a declared size or MIME off the limits, a failed
+    download) emit their own ``image_description_attempt``; after a download
+    the chain re-checks size and MIME on the effective MIME (downloaded, else
+    declared) and emits the rest, so each image emits exactly one event.
+    Pre-chain refusals report the declared ``content.fileLength`` as
+    ``size_bytes`` (``None`` when absent or not a count).
+    """
+    content_value = msg.get("content")
+    content: Mapping[str, Any] = (
+        content_value if isinstance(content_value, Mapping) else {}
+    )
+    declared_mime = str(content.get("mimetype") or "")
+    declared_size = _uazapi_declared_size(content.get("fileLength"))
+    image_bytes: Optional[bytes] = None
+    effective_mime = declared_mime
+
+    if _multimodal_operational(credentials):
+        refused: Optional[ImageDescriptionOutcome] = None
+        normalized_mime = declared_mime.split(";", 1)[0].strip().lower()
+        if _uazapi_is_view_once(msg):
+            refused = "view_once"
+        elif declared_size is not None and declared_size > IMAGE_MAX_BYTES:
+            refused = "too_large"
+        elif normalized_mime and normalized_mime not in IMAGE_MIME_ALLOWLIST:
+            refused = "unsupported_mime"
+        else:
+            try:
+                image_bytes, downloaded_mime = await download_uazapi_media(
+                    str(credentials.get("uazapi_api_url") or "").strip(),
+                    str(credentials.get("uazapi_token") or "").strip(),
+                    msg_id,
+                )
+            except EgressDisabledError:
+                return "", _uazapi_egress_retry_response()
+            except UazapiMediaDownloadError as exc:
+                logger.warning("Uazapi image download failed for %s — %s", msg_id, exc)
+                refused = "download_failed"
+            else:
+                effective_mime = downloaded_mime or declared_mime
+        if refused is not None:
+            duplicate = claim()
+            if duplicate is not None:
+                return "", duplicate
+            _emit_image_description_attempt(
+                channel="uazapi",
+                outcome=refused,
+                mime=declared_mime,
+                size_bytes=declared_size,
+                latency_ms=None,
+            )
+            return "", None
+
+    duplicate = claim()
+    if duplicate is not None:
+        return "", duplicate
+    composed, _reason = await _describe_image_chain(
+        image_bytes,
+        credentials,
+        mime_type=effective_mime,
+        caption=_uazapi_image_caption(msg),
+        agent_language=agent_language,
+        channel="uazapi",
+    )
+    return composed, None
+
+
+async def _send_uazapi_file_ack(
+    *,
+    session_id: UUID,
+    phone: str,
+    u_url: str,
+    u_token: str,
+    agent_language: str,
+    file_kind: UazapiFileKind,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    """Acknowledge a file the agent does not analyse (Decisions 3, 4, 17, 18).
+
+    No acknowledgement while a pending review is active. Otherwise the
+    owner's copy goes out, the outbound id is tracked like the AI reply's (so
+    its ``fromMe`` echo is an ``ai_echo``), and only then is the pending review
+    written and committed: a failed send leaves nothing pending.
+    """
+    if not await _file_ack_needed(session_id, db):
+        logger.info(
+            "Uazapi file ack suppressed for %s (type=%s): review pending",
+            phone,
+            file_kind,
+        )
+        return {"ok": True, "replied": False, "action": "file_ack_suppressed"}
+    if not u_url or not u_token:
+        logger.warning("Uazapi credentials missing for file ack to %s", phone)
+        return {"ok": True, "replied": False, "reason": "no_credentials"}
+    try:
+        send_result = await send_uazapi_text(
+            u_url, u_token, phone, _build_meta_file_ack_message(agent_language)
+        )
+    except EgressDisabledError:
+        return {"ok": True, "replied": False, "reason": "uazapi_egress_disabled"}
+    except Exception:
+        logger.exception("Uazapi file ack send failed for %s", phone)
+        return {"ok": True, "replied": False, "reason": "send_failed"}
+    ack_mid = _extract_normalised_send_id(send_result)
+    if ack_mid:
+        _track_sent_message({"messageid": ack_mid})
+        await _store_ai_msg_id_to_db(session_id, ack_mid, db)
+    else:
+        _track_sent_message(send_result)
+    await _meta_set_pending_file_review(session_id, db)
+    await db.commit()
+    logger.info("Uazapi file ack sent to %s (type=%s)", phone, file_kind)
+    return {"ok": True, "replied": True, "action": "file_ack"}
+
+
+async def _send_uazapi_file_forwarded(
+    *,
+    session_id: UUID,
+    phone: str,
+    u_url: str,
+    u_token: str,
+    agent_language: str,
+    db: AsyncSession,
+) -> None:
+    """Confirm a forward-on-request handoff to the patient (Decision 17).
+
+    The handoff is already committed; like Meta, a confirmation that cannot
+    go out is logged and the route still answers ``file_handoff``.
+    """
+    if not u_url or not u_token:
+        logger.warning(
+            "Uazapi credentials missing for file-forward confirmation to %s", phone
+        )
+        return
+    message = (
+        _FILE_FORWARDED_MSG_EN if agent_language == "en" else _FILE_FORWARDED_MSG_PT
+    )
+    try:
+        send_result = await send_uazapi_text(u_url, u_token, phone, message)
+    except EgressDisabledError:
+        logger.warning(
+            "Uazapi file-forward confirmation to %s suppressed: egress disabled",
+            phone,
+        )
+        return
+    except Exception:
+        logger.exception("Uazapi file-forward confirmation send failed for %s", phone)
+        return
+    forward_mid = _extract_normalised_send_id(send_result)
+    if forward_mid:
+        _track_sent_message({"messageid": forward_mid})
+        await _store_ai_msg_id_to_db(session_id, forward_mid, db)
+    else:
+        _track_sent_message(send_result)
+    await db.commit()
+
+
 # ── Uazapi webhook endpoint ─────────────────────────────────────────
 
 
@@ -3254,6 +4091,10 @@ async def uazapi_webhook(
         or media_type in {"audio", "Audio", "ptt"}
         or bool(msg.get("ptt"))
     )
+    # Patient files (whatsapp-image-understanding, Decision 3): an image,
+    # document or video from the patient takes the file path at the insertion
+    # point below. Staff media, audio and stickers keep their own paths.
+    patient_file_kind = None if is_from_me or is_audio_media else _uazapi_file_kind(msg)
 
     # ── resolve tenant from instance_name ──
     tenant_id = await _resolve_tenant_by_credential(
@@ -3281,15 +4122,19 @@ async def uazapi_webhook(
     #     transcribes it below (STT → multimodal → text reroute chain shared
     #     with Z-API and Meta). Without this carve-out patient audio would be
     #     silently dropped as ``non-text``.
+    #   * ``patient_file_kind`` — a patient image, document or video
+    #     (whatsapp-image-understanding). It is described or acknowledged at
+    #     the insertion point after the LGPD notice; a caption-less file has
+    #     no text, so the second gate lets it through as well.
     #
-    # Any other media (image, video, document, sticker) still exits as
-    # ``non-text`` — Z-API reference, not Meta's file-ack path (out of scope
-    # for this wish).
+    # Any other media (sticker, staff image/document/video, unknown kinds)
+    # still exits as ``non-text``.
     audio_is_transcribable = is_audio_media and not is_from_me
     if (
         is_media_message
         and not (is_from_me and is_audio_media)
         and not audio_is_transcribable
+        and patient_file_kind is None
     ):
         logger.info(
             "Uazapi webhook: skipping non-text msg_type=%s mediaType=%s",
@@ -3302,6 +4147,7 @@ async def uazapi_webhook(
         message_text is None
         and not (is_from_me and is_audio_media)
         and not audio_is_transcribable
+        and patient_file_kind is None
     ):
         logger.info(
             "Uazapi webhook: skipping non-text missing textual content type=%s mediaType=%s",
@@ -3315,10 +4161,13 @@ async def uazapi_webhook(
     # same echo is barred here — the id-based echo layers below consume
     # on match, so without this ordering the second delivery would slip
     # past them and pause the session. The claim is ``SET NX EX`` with a
-    # 31-day retention: claim-and-hold, not consume.
+    # 31-day retention: claim-and-hold, not consume. Patient audio and a
+    # patient image (Decision 9) claim later, after their download; a
+    # document or video is claimed here.
     if (
         msg_id
         and not audio_is_transcribable
+        and patient_file_kind != "image"
         and not _claim_incoming_message("uazapi", tenant_id, msg_id)
     ):
         logger.info(
@@ -3368,8 +4217,9 @@ async def uazapi_webhook(
             _raw_creds_memo = await _load_tenant_credentials(tenant_id, db)
         return _raw_creds_memo
 
-    def _claim_audio_message() -> dict[str, Any] | None:
-        """Claim audio only after any required provider download succeeds."""
+    def _claim_deferred_message() -> dict[str, Any] | None:
+        """Claim patient audio or a patient image (both skip the top-level
+        claim) only after any required provider download succeeds."""
 
         if msg_id and not _claim_incoming_message("uazapi", tenant_id, msg_id):
             return {"ok": True, "skipped": "duplicate_message"}
@@ -3392,7 +4242,7 @@ async def uazapi_webhook(
         # This gate is deliberate — some providers have no runtime adapter
         # and must not attempt download / transcription / reroute.
         if stt_provider in UNSUPPORTED_STT_PROVIDERS:
-            duplicate = _claim_audio_message()
+            duplicate = _claim_deferred_message()
             if duplicate is not None:
                 return duplicate
             return _stt_skip_envelope(stt_provider)
@@ -3407,7 +4257,7 @@ async def uazapi_webhook(
             audio_seconds = int(content_obj.get("seconds") or 0)
         audio_max_seconds = int(creds.get("audio_max_seconds") or 60)
         if audio_seconds > audio_max_seconds:
-            duplicate = _claim_audio_message()
+            duplicate = _claim_deferred_message()
             if duplicate is not None:
                 return duplicate
             if u_url and u_token:
@@ -3463,7 +4313,7 @@ async def uazapi_webhook(
                     },
                 )
             except UazapiMediaDownloadError as exc:
-                duplicate = _claim_audio_message()
+                duplicate = _claim_deferred_message()
                 if duplicate is not None:
                     return duplicate
                 # Media never materialised — Uazapi's download endpoint
@@ -3476,7 +4326,7 @@ async def uazapi_webhook(
                     exc,
                 )
                 return {"ok": True, "skipped": "audio_download_failed"}
-            duplicate = _claim_audio_message()
+            duplicate = _claim_deferred_message()
             if duplicate is not None:
                 return duplicate
             if downloaded_mime:
@@ -3487,7 +4337,7 @@ async def uazapi_webhook(
                 effective_mime,
             )
         else:
-            duplicate = _claim_audio_message()
+            duplicate = _claim_deferred_message()
             if duplicate is not None:
                 return duplicate
 
@@ -3533,6 +4383,16 @@ async def uazapi_webhook(
     if pause_result:
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
+
+    # ── patient image: egress gate before the session (Decision 9) ──
+    # The image has no claim yet, so a closed egress answers the retryable
+    # 503 here, before ``is_new`` is consumed: the redelivery still finds a
+    # new session and sends its LGPD notice.
+    if patient_file_kind == "image":
+        try:
+            await require_uazapi_egress()
+        except EgressDisabledError:
+            return _uazapi_egress_retry_response()
 
     # ── get or create a session for this phone ──
     session_id, is_new = await _get_or_create_session(tenant_id, from_phone, db)
@@ -3583,6 +4443,68 @@ async def uazapi_webhook(
                 )
             except EgressDisabledError:
                 egress_suppressed = True
+
+    # ── patient files (whatsapp-image-understanding, Decisions 3, 4, 8-14) ──
+    # Here, after the AI-off and pause gates, the session and the LGPD
+    # notice: nothing below runs for a paused session or with the AI off.
+    agent_lang = _get_agent_language(clinic_config)
+    if patient_file_kind is None:
+        # A textual message (plain text, or audio transcribed above) resolves
+        # an active pending review. A file's caption never does: files never
+        # take this branch. An expired or legacy flag counts as absent.
+        if await _pending_file_review_active(session_id, db):
+            if _detect_forward_intent(message_text or ""):
+                skipped = await _meta_file_handoff(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    from_phone=from_phone,
+                    note="file_pending_review",
+                    context=context,
+                    db=db,
+                    metering=uazapi_ingress(request, message=msg, context=context),
+                    enforcement=None,
+                    clear_pending_review=True,
+                )
+                if skipped is not None:
+                    return skipped
+                await _send_uazapi_file_forwarded(
+                    session_id=session_id,
+                    phone=from_phone,
+                    u_url=u_url,
+                    u_token=u_token,
+                    agent_language=agent_lang,
+                    db=db,
+                )
+                return {"ok": True, "replied": True, "action": "file_handoff"}
+            # Not a forward: the patient is telling what they need.
+            await _meta_clear_pending_file_review(session_id, db)
+            await db.commit()
+    else:
+        image_text = ""
+        if patient_file_kind == "image":
+            image_text, answer = await _describe_uazapi_image(
+                msg,
+                creds,
+                msg_id=msg_id,
+                claim=_claim_deferred_message,
+                agent_language=agent_lang,
+            )
+            if answer is not None:
+                return answer
+        if not image_text:
+            return await _send_uazapi_file_ack(
+                session_id=session_id,
+                phone=from_phone,
+                u_url=u_url,
+                u_token=u_token,
+                agent_language=agent_lang,
+                file_kind=patient_file_kind,
+                db=db,
+            )
+        # Described: the composed caption + description is the patient's
+        # message (Decision 10). An active pending review stays as it is
+        # (Decision 14); the next textual message resolves it.
+        message_text = image_text
 
     assert message_text is not None
     event_request = CanonicalEventRequest(
@@ -3719,10 +4641,12 @@ def _track_meta_sent_message(send_result: dict[str, Any]) -> None:
 # Message types that route through the audio-transcription path (Whisper)
 _META_AUDIO_TYPES = frozenset({"audio", "voice"})
 
-# Message types that trigger the "file received" acknowledgement flow.
-# By design we never download or analyse the contents (see WISH.md: risk of
-# opining on a sensitive document like a medical exam without clinical
-# context is unsafe by default).
+# Message types that take the file path. Documents, videos and stickers are
+# never downloaded or analysed (risk of opining on a sensitive document like
+# a medical exam without clinical context); they always get the "file
+# received" acknowledgement. An ``image`` is described when the tenant's
+# OpenRouter bundle is operational and, in every other outcome, gets that same
+# acknowledgement (whatsapp-image-understanding, Decision 5).
 _META_FILE_TYPES = frozenset({"image", "document", "video", "sticker"})
 
 # Rough Opus voice-note bitrate. Meta's webhook + media resolve endpoint do
@@ -3751,21 +4675,28 @@ _META_FORWARD_KEYWORDS: tuple[str, ...] = (
     "send it",
 )
 
+# The owner's file acknowledgement, identical on every channel
+# (whatsapp-image-understanding, Decision 6). Never personalised.
 _FILE_ACK_MSG_PT = (
-    "Olá{name_suffix}! Percebi que você enviou um arquivo. No momento, não "
-    "consigo acessar nem analisar o conteúdo por aqui. Você prefere me "
-    "descrever como posso ajudar? Pode escrever ou enviar um áudio, se "
-    "for mais fácil. Ou prefere que eu encaminhe o arquivo para a nossa "
-    "equipe avaliar e retornar para você?"
+    "Recebi seu arquivo! Mas, no momento, não consigo acessar o conteúdo por "
+    "aqui.\n\nVocê poderia me contar um pouco mais sobre o arquivo e o que "
+    "precisa? Assim, consigo entender melhor a situação e tentar te orientar."
+    "\n\nSe preferir, também posso encaminhar seu caso para nossa equipe "
+    "avaliar com mais detalhes."
 )
 
 _FILE_ACK_MSG_EN = (
-    "Hi{name_suffix}! I noticed you sent a file. Right now I can't access "
-    "or analyze its contents here. Would you rather describe how I can "
-    "help? You can type or send a voice message, whichever is easier. Or "
-    "would you like me to forward the file to our team so they can review "
-    "and get back to you?"
+    "I received your file! But right now I can't access its contents here."
+    "\n\nCould you tell me a bit more about the file and what you need? That "
+    "way I can better understand the situation and try to help.\n\nIf you "
+    "prefer, I can also forward your case to our team to review in more "
+    "detail."
 )
+
+# How long a ``pending_file_review`` stays active after the acknowledgement
+# (Decision 4). Covers a burst of files and a patient who answers later;
+# past it the flag counts as absent everywhere.
+FILE_REVIEW_WINDOW: Final = timedelta(hours=2)
 
 _AUDIO_TOO_LONG_MSG_PT = (
     "Recebi seu áudio! 🎙️ Como ele é mais longo, vou encaminhar para a "
@@ -3788,17 +4719,15 @@ _FILE_FORWARDED_MSG_EN = (
 )
 
 
-def _build_meta_file_ack_message(lead_name: str, agent_language: str) -> str:
-    """Fixed acknowledgement when a patient sends a file/attachment via Meta.
+def _build_meta_file_ack_message(agent_language: str) -> str:
+    """The fixed acknowledgement for a file the agent does not analyse.
 
-    Personalises with the lead's first name when we already know it (from
-    ``cognitive_state.slots.lead_name``). Never analyses or opines about the
-    file's content — offers two options: describe the need in text/audio,
-    or forward the file to the human team.
+    The owner's copy of Decision 6 in the agent's language, never
+    personalised. Never analyses or opines about the file's content — offers
+    two options: tell more about the file and the need, or forward the case
+    to the human team.
     """
-    suffix = f", {lead_name.split()[0]}" if lead_name and lead_name.strip() else ""
-    template = _FILE_ACK_MSG_EN if agent_language == "en" else _FILE_ACK_MSG_PT
-    return template.format(name_suffix=suffix)
+    return _FILE_ACK_MSG_EN if agent_language == "en" else _FILE_ACK_MSG_PT
 
 
 def _detect_forward_intent(text: str) -> bool:
@@ -3815,11 +4744,27 @@ def _detect_forward_intent(text: str) -> bool:
     return any(kw in normalized for kw in _META_FORWARD_KEYWORDS)
 
 
+def _utc(moment: Optional[datetime]) -> datetime:
+    """``moment`` (default: now) as an aware UTC datetime; naive means UTC."""
+    if moment is None:
+        return datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
 async def _meta_set_pending_file_review(
     session_id: UUID,
     db: AsyncSession,
+    *,
+    now: Optional[datetime] = None,
 ) -> None:
     """Mark the session as awaiting a decision on a received file/attachment.
+
+    Writes ``pending_file_review = true`` and ``pending_file_review_at`` (UTC
+    ISO 8601, ``now`` by default) into ``session_metadata``, overwriting both
+    (Decision 4): the review is active only inside
+    :data:`FILE_REVIEW_WINDOW` from that timestamp.
 
     Uses the SQLAlchemy ORM (load → mutate → flush) so the same code works
     on PostgreSQL in production and SQLite in tests without dialect-specific
@@ -3833,15 +4778,48 @@ async def _meta_set_pending_file_review(
         return
     meta = dict(sess.session_metadata or {})
     meta["pending_file_review"] = True
+    meta["pending_file_review_at"] = _utc(now).isoformat()
     sess.session_metadata = meta
     await db.flush()
 
 
-async def _meta_get_pending_file_review(
+def _pending_file_review_fresh(meta: Any, now: datetime) -> bool:
+    """Decision 4's predicate over one ``session_metadata`` value.
+
+    True only for ``pending_file_review is True`` with a timezone-aware ISO
+    ``pending_file_review_at`` that is not in the future and younger than
+    :data:`FILE_REVIEW_WINDOW`. A flag without timestamp (rows written before
+    the window existed), any malformed value and an expired review are all
+    absent.
+    """
+    if not isinstance(meta, Mapping) or meta.get("pending_file_review") is not True:
+        return False
+    raw = meta.get("pending_file_review_at")
+    if not isinstance(raw, str):
+        return False
+    try:
+        set_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if set_at.tzinfo is None:
+        return False
+    age = now - set_at
+    return timedelta(0) <= age < FILE_REVIEW_WINDOW
+
+
+async def _pending_file_review_active(
     session_id: UUID,
     db: AsyncSession,
+    *,
+    now: Optional[datetime] = None,
 ) -> bool:
-    """Check whether the session is awaiting a decision on a received file."""
+    """Whether the session has an *active* pending file review (Decision 4).
+
+    Read-only: an expired, legacy (no timestamp) or malformed flag is
+    reported as absent and left untouched — the next
+    ``_meta_set_pending_file_review`` overwrites it, the next resolution
+    clears it.
+    """
     from src.models.session import Session as SessionModel
 
     result = await db.execute(
@@ -3849,15 +4827,28 @@ async def _meta_get_pending_file_review(
             SessionModel.id == session_id,
         )
     )
-    meta = result.scalars().first() or {}
-    return bool(meta.get("pending_file_review"))
+    return _pending_file_review_fresh(result.scalars().first(), _utc(now))
+
+
+async def _file_ack_needed(
+    session_id: UUID,
+    db: AsyncSession,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Whether a new file must receive the acknowledgement: no active review.
+
+    While a review is active, a new file does not resend the acknowledgement
+    on any channel (Decision 4).
+    """
+    return not await _pending_file_review_active(session_id, db, now=now)
 
 
 async def _meta_clear_pending_file_review(
     session_id: UUID,
     db: AsyncSession,
 ) -> None:
-    """Clear the pending-file-review flag on the session."""
+    """Clear the pending file review: both ``pending_file_review`` keys."""
     from src.models.session import Session as SessionModel
 
     result = await db.execute(select(SessionModel).where(SessionModel.id == session_id))
@@ -3865,25 +4856,12 @@ async def _meta_clear_pending_file_review(
     if not sess:
         return
     meta = dict(sess.session_metadata or {})
-    if "pending_file_review" in meta:
-        del meta["pending_file_review"]
+    keys = ("pending_file_review", "pending_file_review_at")
+    if any(key in meta for key in keys):
+        for key in keys:
+            meta.pop(key, None)
         sess.session_metadata = meta
         await db.flush()
-
-
-async def _meta_load_lead_name(session_id: UUID, db: AsyncSession) -> str:
-    """Read ``cognitive_state.slots.lead_name`` from a session, or "" if unset."""
-    from src.models.session import Session as SessionModel
-
-    result = await db.execute(
-        select(SessionModel.cognitive_state).where(
-            SessionModel.id == session_id,
-        )
-    )
-    cs = result.scalars().first() or {}
-    slots = cs.get("slots") or {}
-    name = slots.get("lead_name")
-    return str(name) if name else ""
 
 
 async def _meta_initiate_file_handoff(
@@ -4010,6 +4988,173 @@ async def _meta_file_handoff(
                 exc, owner="adapter", tenant_id=tenant_id, session_id=session_id
             )
     return None if outcome.answer is None else dict(outcome.answer)
+
+
+async def _describe_meta_image(
+    image: Mapping[str, Any],
+    credentials: dict[str, Any],
+    *,
+    access_token: str,
+    agent_language: str,
+) -> str:
+    """Resolve, download and describe one Meta patient image (Decisions 5, 9-12).
+
+    Returns the Decision 10 message (``image.caption`` plus the bracketed
+    description) when the image was described, and ``""`` when it goes down
+    the file branch (Decision 5).
+
+    Order: capability, ``resolve_meta_media``, the declared ``file_size`` /
+    ``mime_type`` (the resolve's, else the webhook's ``image.mime_type``),
+    ``safe_download_image`` with the tenant's Bearer token, then
+    :func:`_describe_image_chain` on the effective MIME. Without capability
+    nothing is resolved or downloaded and the chain itself reports
+    ``no_capability``. The refusals decided here (no token or a failed
+    resolve, a declared size or MIME off the limits, a failed download) emit
+    their own ``image_description_attempt``, with the declared ``file_size``
+    as ``size_bytes`` (``None`` when absent); after a download the chain
+    emits the rest, so each image emits exactly one event.
+
+    Nothing is claimed here (Decision 9): Meta's replay claim at the top of
+    the route already covers the message. Logs carry the media id and a
+    stable error code or exception type, never the token or the signed URL.
+    """
+    caption_value = image.get("caption")
+    caption = caption_value if isinstance(caption_value, str) else None
+    payload_mime = str(image.get("mime_type") or "")
+    image_bytes: Optional[bytes] = None
+    effective_mime = payload_mime
+
+    if _multimodal_operational(credentials):
+        media_id = str(image.get("id") or "").strip()
+        declared_mime = payload_mime
+        declared_size: Optional[int] = None
+        media_url = ""
+        if media_id and access_token:
+            try:
+                media_info = await resolve_meta_media(media_id, access_token)
+            except Exception as exc:
+                logger.warning(
+                    "Meta image media resolve failed for %s — %s",
+                    media_id,
+                    type(exc).__name__,
+                )
+            else:
+                media_url = str(media_info.get("url") or "")
+                declared_mime = str(media_info.get("mime_type") or "") or payload_mime
+                declared_size = _uazapi_declared_size(media_info.get("file_size"))
+        refused: Optional[ImageDescriptionOutcome] = None
+        normalized_mime = declared_mime.split(";", 1)[0].strip().lower()
+        if not media_url:
+            refused = "download_failed"
+        elif declared_size is not None and declared_size > IMAGE_MAX_BYTES:
+            refused = "too_large"
+        elif normalized_mime and normalized_mime not in IMAGE_MIME_ALLOWLIST:
+            refused = "unsupported_mime"
+        else:
+            try:
+                download = await safe_download_image(
+                    media_url,
+                    max_bytes=IMAGE_MAX_BYTES,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    declared_mime=declared_mime or None,
+                )
+            except UnsafeEgressError as exc:
+                logger.warning(
+                    "Meta image download failed for %s code=%s", media_id, exc.code
+                )
+                refused = _image_download_outcome(exc.code)
+            except Exception as exc:
+                logger.warning(
+                    "Meta image download failed for %s — %s",
+                    media_id,
+                    type(exc).__name__,
+                )
+                refused = "download_failed"
+            else:
+                image_bytes = download.content
+                effective_mime = download.mime_type
+        if refused is not None:
+            _emit_image_description_attempt(
+                channel="meta",
+                outcome=refused,
+                mime=declared_mime,
+                size_bytes=declared_size,
+                latency_ms=None,
+            )
+            return ""
+
+    composed, _reason = await _describe_image_chain(
+        image_bytes,
+        credentials,
+        mime_type=effective_mime,
+        caption=caption,
+        agent_language=agent_language,
+        channel="meta",
+    )
+    return composed
+
+
+async def _send_meta_file_ack(
+    *,
+    tenant_id: UUID,
+    session_id: UUID,
+    phone: str,
+    meta_pnid: str,
+    meta_token: str,
+    agent_language: str,
+    msg_type: str,
+    send_privacy_notice: Callable[[], Awaitable[None]],
+    db: AsyncSession,
+) -> dict[str, Any]:
+    """Meta's file branch: acknowledge a file the agent does not analyse.
+
+    A document, video or sticker, or an image that was not described
+    (Decision 5). Free: no claim and no debit; a handoff only ever comes from
+    the forward-on-request path. No acknowledgement while a pending review is
+    active (Decision 4). Otherwise the LGPD notice of a new session (once per
+    request, ``send_privacy_notice``), then the owner's copy; its outbound id
+    is tracked and stored like the AI reply's, and only then is the pending
+    review written and committed (Decision 17): a failed send leaves nothing
+    pending.
+    """
+    if not await _file_ack_needed(session_id, db):
+        logger.info(
+            "Meta file ack suppressed for %s (type=%s): review pending",
+            phone,
+            msg_type,
+        )
+        return {"ok": True, "replied": False, "action": "file_ack_suppressed"}
+    if not meta_pnid or not meta_token:
+        logger.warning("Meta credentials missing for file ack tenant %s", tenant_id)
+        return {"ok": True, "replied": False, "reason": "no_credentials"}
+
+    # The file path returns before the route's shared notice, so a file-first
+    # session sends its LGPD notice here, ahead of the ack.
+    await send_privacy_notice()
+
+    try:
+        send_result = await send_meta_cloud_text(
+            meta_pnid,
+            meta_token,
+            phone,
+            _build_meta_file_ack_message(agent_language),
+        )
+        _track_meta_sent_message(send_result)
+        ack_mid = extract_meta_message_id(send_result)
+        if ack_mid:
+            await _store_ai_msg_id_to_db(session_id, ack_mid, db)
+        await _meta_set_pending_file_review(session_id, db)
+        await db.commit()
+        logger.info("Meta file ack sent to %s (type=%s)", phone, msg_type)
+    except Exception as exc:
+        logger.exception("Meta file ack send failed for %s — %s", phone, exc)
+        return {
+            "ok": True,
+            "replied": False,
+            "reason": "send_failed",
+            "error": str(exc),
+        }
+    return {"ok": True, "replied": True, "action": "file_ack"}
 
 
 @router.get(
@@ -4383,12 +5528,20 @@ async def meta_webhook(
             agent_lang = _get_agent_language(clinic_config)
 
             # LGPD privacy notice for a new session. Called by the text/audio
-            # path right before the pipeline and by the file path right before
-            # the fixed ack, so a patient whose first message is an attachment
-            # still receives it on that first (and only ``is_new``) turn.
+            # path right before the pipeline, by the file path right before
+            # the fixed ack and by the image path right before the description,
+            # so a patient whose first message is an attachment still receives
+            # it on that first (and only ``is_new``) turn. ``privacy_sent``
+            # makes it once per request whichever caller comes first: an image
+            # sends it before its description, and then either the ack or the
+            # pipeline would call it again (Decision 8).
+            privacy_sent = False
+
             async def _send_meta_privacy_notice() -> None:
-                if not (is_new and meta_pnid and meta_token):
+                nonlocal privacy_sent
+                if privacy_sent or not (is_new and meta_pnid and meta_token):
                     return
+                privacy_sent = True
                 lgpd_cfg = (clinic_config or {}).get("lgpd") or {}
 
                 async def _send_meta_privacy(msg: str) -> dict[str, Any]:
@@ -4421,11 +5574,22 @@ async def meta_webhook(
             #   • ``audio`` / ``voice`` — resolve media_id, cap by size to
             #     protect the STT budget, then transcribe via Whisper and
             #     fall through to the normal text pipeline.
-            #   • ``image`` / ``document`` / ``video`` / ``sticker`` — never
-            #     download the payload (safety: we won't opine on a medical
-            #     document without clinical context). Send the fixed
-            #     acknowledgement and flag the session so the next reply can
-            #     branch into a real handoff or a normal description.
+            #   • ``image`` with the tenant's OpenRouter bundle operational
+            #     (whatsapp-image-understanding, Decision 5) — resolved,
+            #     checked against the declared size and MIME, downloaded and
+            #     described; the caption plus the description falls through
+            #     to the pipeline as the patient's message, billed like any
+            #     turn. An active pending review stays untouched and the
+            #     caption is never read as a forward request (Decision 14).
+            #   • any image not described, ``document``, ``video``,
+            #     ``sticker`` — never analysed (safety: we won't opine on a
+            #     medical document without clinical context). Send the fixed
+            #     acknowledgement, free (no claim, no debit), unless a review
+            #     is already active (Decision 4), and flag the session so the
+            #     next text reply can branch into a real handoff or a normal
+            #     description.
+            #   • ``unsupported`` — how Meta delivers a view-once photo, among
+            #     other types — keeps the silent non-text skip (Decision 13).
             message_text: str = ""
 
             if msg_type == "text":
@@ -4433,10 +5597,13 @@ async def meta_webhook(
                 if not message_text:
                     return {"ok": True, "skipped": "empty"}
 
-                # If a previous file/attachment set pending_file_review, this
-                # text is the patient's choice: forward to the team, or
-                # describe their need.
-                if await _meta_get_pending_file_review(session_id, db):
+                # If a previous file/attachment set an *active* pending review
+                # (Decision 4), this text is the patient's choice: forward to
+                # the team, or describe their need. Only text resolves it on
+                # Meta (Decision 3); an expired or legacy flag counts as
+                # absent, so the text continues the pipeline without forward
+                # matching.
+                if await _pending_file_review_active(session_id, db):
                     if _detect_forward_intent(message_text):
                         skipped = await _meta_file_handoff(
                             tenant_id=tenant_id,
@@ -4620,58 +5787,36 @@ async def meta_webhook(
                 # Falls through to the shared text pipeline below.
 
             elif msg_type in _META_FILE_TYPES:
-                # File/attachment: never download, never analyse. Send the
-                # fixed acknowledgement and mark the session as awaiting the
-                # patient's choice (describe vs forward).
-                lead_name = await _meta_load_lead_name(session_id, db)
-                ack_msg = _build_meta_file_ack_message(lead_name, agent_lang)
-
-                if not meta_pnid or not meta_token:
-                    logger.warning(
-                        "Meta credentials missing for file ack tenant %s",
-                        tenant_id,
+                if msg_type == "image":
+                    # Decision 8: a new session's LGPD notice goes out before
+                    # the description, and so before the ack should the image
+                    # fall back to the file branch.
+                    await _send_meta_privacy_notice()
+                    image_obj = msg.get("image")
+                    message_text = await _describe_meta_image(
+                        image_obj if isinstance(image_obj, Mapping) else {},
+                        creds,
+                        access_token=meta_token,
+                        agent_language=agent_lang,
                     )
-                    return {"ok": True, "replied": False, "reason": "no_credentials"}
-
-                # The file path returns before the shared notice below, so a
-                # file-first session sends its LGPD notice here, ahead of the ack.
-                await _send_meta_privacy_notice()
-
-                try:
-                    send_result = await send_meta_cloud_text(
-                        meta_pnid,
-                        meta_token,
-                        from_phone,
-                        ack_msg,
+                if not message_text:
+                    # Decision 5: every file that is not a described image
+                    # gets the fixed acknowledgement, free, and the session
+                    # awaits the patient's choice (describe vs forward).
+                    return await _send_meta_file_ack(
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        phone=from_phone,
+                        meta_pnid=meta_pnid,
+                        meta_token=meta_token,
+                        agent_language=agent_lang,
+                        msg_type=msg_type,
+                        send_privacy_notice=_send_meta_privacy_notice,
+                        db=db,
                     )
-                    _track_meta_sent_message(send_result)
-                    _ack_mid = extract_meta_message_id(send_result)
-                    if _ack_mid:
-                        await _store_ai_msg_id_to_db(session_id, _ack_mid, db)
-                    await _meta_set_pending_file_review(session_id, db)
-                    await db.commit()
-                    logger.info(
-                        "Meta file ack sent to %s (type=%s)",
-                        from_phone,
-                        msg_type,
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "Meta file ack send failed for %s — %s",
-                        from_phone,
-                        exc,
-                    )
-                    return {
-                        "ok": True,
-                        "replied": False,
-                        "reason": "send_failed",
-                        "error": str(exc),
-                    }
-                return {
-                    "ok": True,
-                    "replied": True,
-                    "action": "file_ack",
-                }
+                # Described (Decision 10): the patient's message for the
+                # pipeline below. An active pending review stays as it is
+                # (Decision 14); the next text message resolves it.
 
             else:
                 # Unknown message type (contacts, location, reactions…) —

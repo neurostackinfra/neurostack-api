@@ -28,6 +28,7 @@ import functools
 import hashlib
 import inspect
 import json
+import logging
 import secrets
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -2163,11 +2164,18 @@ def test_the_writer_runs_only_at_the_governed_decision_points() -> None:
     # Group 3b-2: both Meta file handoff call sites (forward-on-request and
     # audio_too_long) go through one decision helper; its main branch is the
     # writer's only call, its enforced branch the handoff in ``db``.
+    # whatsapp-image-understanding G2 adds Uazapi's forward-on-request, which
+    # takes the observational branch (no enforcement on Uazapi); G3 adds
+    # Z-API's, enforced like Meta's when the pre-check says so.
     [handoff_writer] = webhook_calls["record_meta_file_handoff"]
     assert _enclosing(webhook, handoff_writer) == "_meta_file_handoff"
     decision_sites = webhook_calls["_meta_file_handoff"]
-    assert len(decision_sites) == 2
-    assert {_enclosing(webhook, c) for c in decision_sites} == {"meta_webhook"}
+    assert len(decision_sites) == 4
+    assert {_enclosing(webhook, c) for c in decision_sites} == {
+        "meta_webhook",
+        "uazapi_webhook",
+        "_process_zapi_authenticated_body",
+    }
     initiated = webhook_calls["_meta_initiate_file_handoff"]
     assert sorted(_enclosing(webhook, c) for c in initiated) == [
         "_meta_file_handoff",
@@ -3295,6 +3303,543 @@ def test_a_failure_inside_the_file_handoff_transaction_leaves_nothing(
     ] == []
     assert _claims(client) == [] and _all_rows(client, CreditEffect) == []
     assert _ledger(client) == {}
+
+
+# whatsapp-image-understanding Group 4: on Meta a described image is an
+# ordinary turn (Decision 7), billed by the pipeline like a transcribed audio;
+# an image that is not described takes the free file ack (Decision 5).
+
+_IMAGE_JPEG = b"\xff\xd8\xff\xe0metering-image"
+_IMAGE_DESCRIPTION = "Foto de uma receita com o texto Dipirona 500 mg."
+_OPENROUTER_BUNDLE = {
+    "multimodal_provider": "openrouter",
+    "multimodal_api_url": "https://openrouter.ai/api/v1",
+    "multimodal_api_key": "sk-metering-multimodal",
+    "multimodal_model_name": "google/gemini-2.5-flash",
+}
+
+
+def _meta_image(
+    message_id: str, phone: str, caption: str | None = None
+) -> dict[str, Any]:
+    image: dict[str, Any] = {
+        "id": f"media-{message_id}",
+        "mime_type": "image/jpeg",
+        "sha256": "sha",
+    }
+    if caption is not None:
+        image["caption"] = caption
+    return {
+        "from": phone,
+        "id": message_id,
+        "timestamp": "1711900000",
+        "type": "image",
+        "image": image,
+    }
+
+
+@dataclass
+class _ImageBoundaries:
+    media: dict[str, Any]
+    download_error: Exception | None = None
+    description: str | Exception = _IMAGE_DESCRIPTION
+    downloads: int = 0
+    descriptions: int = 0
+
+
+@pytest.fixture
+def image_boundaries(monkeypatch: pytest.MonkeyPatch) -> _ImageBoundaries:
+    """Meta's media resolve and download and the image adapter, faked at
+    their module slots; nothing leaves the process."""
+
+    from src.services import multimodal_service
+    from src.services.safe_egress import SafeDownload
+
+    boundaries = _ImageBoundaries(
+        media={
+            "url": "https://media.invalid/image.jpg",
+            "mime_type": "image/jpeg",
+            "file_size": len(_IMAGE_JPEG),
+        }
+    )
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return dict(boundaries.media)
+
+    async def download(*_args: Any, **_kwargs: Any) -> Any:
+        boundaries.downloads += 1
+        if boundaries.download_error is not None:
+            raise boundaries.download_error
+        return SafeDownload(content=_IMAGE_JPEG, mime_type="image/jpeg")
+
+    async def describe(**_kwargs: Any) -> str:
+        boundaries.descriptions += 1
+        if isinstance(boundaries.description, Exception):
+            raise boundaries.description
+        return boundaries.description
+
+    monkeypatch.setattr(webhook, "resolve_meta_media", resolve)
+    monkeypatch.setattr(webhook, "safe_download_image", download)
+    monkeypatch.setattr(multimodal_service, "describe_image_multimodal", describe)
+    return boundaries
+
+
+def _message_in_contents(client: Any) -> list[Any]:
+    return [
+        (row.event_data or {}).get("content")
+        for row in _all_rows(client, EventRow)
+        if row.event_type == "message.in"
+    ]
+
+
+def _image_outcomes(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.outcome
+        for record in caplog.records
+        if getattr(record, "event", None) == "image_description_attempt"
+    ]
+
+
+def test_an_enforced_meta_image_is_described_and_charged_as_an_ordinary_turn(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    image_boundaries: _ImageBoundaries,
+) -> None:
+    world, phone = enforced, "5511900009101"
+    client._submit(_set_credentials(world.meta_tenant, **_OPENROUTER_BUNDLE))
+    message = _meta_image("wamid.image-1", phone, caption="Olha a receita")
+    assert _meta(client, world, message).json() == {"ok": True, "replied": True}
+    assert (image_boundaries.downloads, image_boundaries.descriptions) == (1, 1)
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "meta",
+        "enforced",
+        "wamid.image-1",
+    )
+    assert claim.payload_sha256 == provider_message_sha256(message)
+    effect_id = trace_effect_id(world.meta_tenant, claim.interaction_id)
+    assert [(e.effect_id, e.effect_kind) for e in _all_rows(client, CreditEffect)] == [
+        (effect_id, "trace")
+    ]
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # one turn, like a text
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "delivered" and "phone" not in outbox.payload
+    assert _sends(providers, "send_meta_cloud_text", phone) == [_LLM_REPLY]
+    assert _message_in_contents(client) == [
+        f"Olha a receita\n\n[Imagem enviada pelo paciente: {_IMAGE_DESCRIPTION}]"
+    ]
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert "pending_file_review" not in (session.session_metadata or {})
+    assert _all_rows(client, HandoffRecord) == []
+
+
+def test_an_observed_meta_image_records_one_production_trace_like_a_text(
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    image_boundaries: _ImageBoundaries,
+) -> None:
+    client._submit(_set_credentials(world.meta_tenant, **_OPENROUTER_BUNDLE))
+    message = _meta_image("wamid.image-observed", "5511900009102")
+    assert _meta(client, world, message).json() == {"ok": True, "replied": True}
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode) == ("meta", "observational")
+    effect = _only_effect(client)
+    assert effect.trace_id == claim.interaction_id
+    assert (effect.origin, effect.authenticated, effect.would_debit_mc) == (
+        "production",
+        True,
+        1_000,
+    )
+
+
+@pytest.mark.parametrize("mode", ["observational", "enforced"])
+@pytest.mark.parametrize(
+    ("reason", "outcome"),
+    [
+        ("no_capability", "no_capability"),
+        ("declared_too_large", "too_large"),
+        ("declared_bad_mime", "unsupported_mime"),
+        ("download_failed", "download_failed"),
+        ("provider_failed", "provider_failed"),
+        ("no_content", "no_content"),
+    ],
+)
+def test_a_meta_image_that_is_not_described_gets_the_free_ack(
+    request: pytest.FixtureRequest,
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    image_boundaries: _ImageBoundaries,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    reason: str,
+    outcome: str,
+) -> None:
+    from src.services.multimodal_service import (
+        IMAGE_NO_CONTENT_MARKER,
+        MultimodalImageError,
+    )
+    from src.services.safe_egress import UnsafeEgressError
+
+    if mode == "enforced":
+        request.getfixturevalue("enforced")
+    if reason != "no_capability":
+        client._submit(_set_credentials(world.meta_tenant, **_OPENROUTER_BUNDLE))
+    if reason == "declared_too_large":
+        image_boundaries.media["file_size"] = 5_000_001
+    elif reason == "declared_bad_mime":
+        image_boundaries.media["mime_type"] = "image/gif"
+    elif reason == "download_failed":
+        image_boundaries.download_error = UnsafeEgressError("image_download_failed")
+    elif reason == "provider_failed":
+        image_boundaries.description = MultimodalImageError("provider_http_error")
+    elif reason == "no_content":
+        image_boundaries.description = IMAGE_NO_CONTENT_MARKER
+    caplog.set_level(logging.INFO, logger="src.api.routes.webhook")
+    phone = "5511900009201"
+    response = _meta(client, world, _meta_image(f"wamid.image-{reason}", phone))
+    assert response.json() == {"ok": True, "replied": True, "action": "file_ack"}
+    assert _effects(client) == [] and _claims(client) == []  # the ack is free
+    assert _all_rows(client, CreditEffect) == [] and _ledger(client) == {}
+    assert _image_outcomes(caplog) == [outcome]
+    assert _sends(providers, "send_meta_cloud_text", phone) == [
+        webhook._FILE_ACK_MSG_PT
+    ]
+    assert _message_in_contents(client) == []  # never reached the pipeline
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert session.session_metadata["pending_file_review"] is True
+
+
+# whatsapp-image-understanding Group 3: on Z-API a described image is an
+# ordinary turn (Decision 7) and the file ack is free in both worlds; the
+# forward on request is ``run_meta_file_handoff`` with the Z-API pre-check's
+# enforcement -- the claim is ``(tenant, 'zapi', messageId)``.
+
+
+def _zapi_image(
+    world: World, message_id: str, phone: str, caption: str = ""
+) -> dict[str, Any]:
+    return {
+        "instanceId": world.zapi_instance,
+        "messageId": message_id,
+        "phone": phone,
+        "fromMe": False,
+        "senderName": "Paciente",
+        "image": {
+            "mimeType": "image/jpeg",
+            "imageUrl": "https://media.invalid/zapi-image.jpeg",
+            "caption": caption,
+            "viewOnce": False,
+        },
+    }
+
+
+def _zapi_document(world: World, message_id: str, phone: str) -> dict[str, Any]:
+    return {
+        "instanceId": world.zapi_instance,
+        "messageId": message_id,
+        "phone": phone,
+        "fromMe": False,
+        "senderName": "Paciente",
+        "document": {
+            "documentUrl": "https://media.invalid/zapi-exam.pdf",
+            "mimeType": "application/pdf",
+            "fileName": "exame.pdf",
+        },
+    }
+
+
+async def _reopen_file_review(tenant_id: UUID, phone: str) -> None:
+    """An active pending review on the patient's session, set now."""
+
+    database = get_db_session()
+    try:
+        async with database.begin():
+            [session] = (
+                await database.execute(
+                    select(Session).where(
+                        Session.tenant_id == tenant_id, Session.user_id == phone
+                    )
+                )
+            ).scalars()
+            session.session_metadata = {
+                **(session.session_metadata or {}),
+                "pending_file_review": True,
+                "pending_file_review_at": datetime.now(timezone.utc).isoformat(),
+            }
+    finally:
+        await database.close()
+
+
+@pytest.fixture
+def file_handoff_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Any, Any]]:
+    """Every ``run_meta_file_handoff`` call, with its enforcement and outcome
+    (the route resolves the module attribute)."""
+
+    seen: list[tuple[Any, Any]] = []
+    original = credit_metering.run_meta_file_handoff
+
+    async def spy(db: Any, enforcement: Any, **kwargs: Any) -> Any:
+        outcome = await original(db, enforcement, **kwargs)
+        seen.append((enforcement, outcome))
+        return outcome
+
+    monkeypatch.setattr(credit_metering, "run_meta_file_handoff", spy)
+    return seen
+
+
+def test_an_enforced_zapi_image_is_described_and_charged_as_an_ordinary_turn(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    image_boundaries: _ImageBoundaries,
+) -> None:
+    world, phone = enforced, "5511900009301"
+    client._submit(_set_credentials(world.zapi_tenant, **_OPENROUTER_BUNDLE))
+    body = _zapi_image(world, "zapi-image-1", phone, caption="Olha a receita")
+    assert _zapi(client, world, body).json() == {"ok": True, "replied": True}
+    assert (image_boundaries.downloads, image_boundaries.descriptions) == (1, 1)
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "enforced",
+        "zapi-image-1",
+    )
+    assert claim.payload_sha256 == zapi_payload_sha256(body)
+    effect_id = trace_effect_id(world.zapi_tenant, claim.interaction_id)
+    assert [(e.effect_id, e.effect_kind) for e in _all_rows(client, CreditEffect)] == [
+        (effect_id, "trace")
+    ]
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # one turn, like a text
+    [outbox] = _all_rows(client, CreditResponseOutbox)
+    assert outbox.state == "delivered" and "phone" not in outbox.payload
+    texts = _sends(providers, "send_text_message", phone)
+    assert len(texts) == 2 and texts[1] == _LLM_REPLY  # the LGPD notice first
+    assert _message_in_contents(client) == [
+        f"Olha a receita\n\n[Imagem enviada pelo paciente: {_IMAGE_DESCRIPTION}]"
+    ]
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert "pending_file_review" not in (session.session_metadata or {})
+    assert _all_rows(client, HandoffRecord) == []
+    assert _effects(client) == []  # the observational writer stood down
+
+
+def test_an_observed_zapi_image_records_one_production_trace_like_a_text(
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    image_boundaries: _ImageBoundaries,
+) -> None:
+    client._submit(_set_credentials(world.zapi_tenant, **_OPENROUTER_BUNDLE))
+    body = _zapi_image(world, "zapi-image-observed", "5511900009302")
+    assert _zapi(client, world, body).json() == {"ok": True, "replied": True}
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode) == ("zapi", "observational")
+    effect = _only_effect(client)
+    assert effect.trace_id == claim.interaction_id
+    assert (effect.origin, effect.authenticated, effect.would_debit_mc) == (
+        "production",
+        True,
+        1_000,
+    )
+    assert _all_rows(client, CreditEffect) == []
+
+
+@pytest.mark.parametrize("mode", ["observational", "enforced"])
+@pytest.mark.parametrize(
+    "case", ["document", "image_no_capability", "image_download_failed"]
+)
+def test_a_zapi_file_ack_writes_no_claim_and_no_effect(
+    request: pytest.FixtureRequest,
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    image_boundaries: _ImageBoundaries,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    case: str,
+) -> None:
+    from src.services.safe_egress import UnsafeEgressError
+
+    if mode == "enforced":
+        request.getfixturevalue("enforced")
+    phone = "5511900009401"
+    if case == "document":
+        body = _zapi_document(world, f"zapi-ack-{case}", phone)
+    else:
+        if case == "image_download_failed":
+            client._submit(_set_credentials(world.zapi_tenant, **_OPENROUTER_BUNDLE))
+            image_boundaries.download_error = UnsafeEgressError("image_download_failed")
+        body = _zapi_image(world, f"zapi-ack-{case}", phone)
+    caplog.set_level(logging.INFO, logger="src.api.routes.webhook")
+    response = _zapi(client, world, body)
+    assert response.json() == {"ok": True, "replied": True, "action": "file_ack"}
+    assert _effects(client) == [] and _claims(client) == []  # the ack is free
+    assert _all_rows(client, CreditEffect) == [] and _ledger(client) == {}
+    assert _all_rows(client, CreditResponseOutbox) == []
+    expected = {
+        "document": [],
+        "image_no_capability": ["no_capability"],
+        "image_download_failed": ["download_failed"],
+    }[case]
+    assert _image_outcomes(caplog) == expected
+    texts = _sends(providers, "send_text_message", phone)
+    assert len(texts) == 2 and texts[1] == webhook._FILE_ACK_MSG_PT  # after LGPD
+    assert _message_in_contents(client) == []  # never reached the pipeline
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert session.session_metadata["pending_file_review"] is True
+
+
+def test_the_enforced_zapi_file_handoff_commits_claim_handoff_debit_and_link(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    redis_forgets: None,
+    file_handoff_outcomes: list[tuple[Any, Any]],
+) -> None:
+    world, phone = enforced, "5511900009501"
+    ack = _zapi(client, world, _zapi_document(world, "zapi-document-1", phone))
+    assert ack.json() == {"ok": True, "replied": True, "action": "file_ack"}
+    assert _claims(client) == [] and _all_rows(client, CreditEffect) == []  # free
+    forward = _zapi_body(
+        world, "zapi-forward-1", phone=phone, text="Pode encaminhar para a equipe"
+    )
+    assert _zapi(client, world, forward).json() == {
+        "ok": True,
+        "replied": True,
+        "action": "file_handoff",
+    }
+    # The route took the enforced file handoff with the Z-API enforcement.
+    [(enforcement, outcome)] = file_handoff_outcomes
+    assert (enforcement.source, enforcement.provider_message_id) == (
+        "zapi",
+        "zapi-forward-1",
+    )
+    assert outcome.answer is None and outcome.handoff is not None
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "enforced",
+        "zapi-forward-1",
+    )
+    assert claim.principal_id == f"zapi:{world.zapi_tenant}"
+    assert claim.payload_sha256 == zapi_payload_sha256(forward)
+    assert claim.session_version is not None
+    effect_id = trace_effect_id(world.zapi_tenant, claim.interaction_id)
+    [record] = _all_rows(client, HandoffRecord)
+    assert record.id == outcome.handoff.id
+    assert record.context["credit_effect_id"] == effect_id
+    assert record.context.get("key_info")  # merged, not replaced
+    assert [(e.effect_id, e.effect_kind) for e in _all_rows(client, CreditEffect)] == [
+        (effect_id, "trace")
+    ]
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # one trace
+    assert outcome.charge is not None and outcome.charge.effect_id == effect_id
+    assert announced == [record.id]  # after the commit, once
+    texts = _sends(providers, "send_text_message", phone)
+    assert texts[-1] == webhook._FILE_FORWARDED_MSG_PT
+    assert _all_rows(client, CreditResponseOutbox) == []  # sent as on Meta
+    assert _effects(client) == []  # the observational writer stood down
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert "pending_file_review" not in (session.session_metadata or {})
+    assert session.is_paused is False  # Decision 19
+    # A redelivery while a review is active again (the replay store forgot):
+    # the claim conflicts INSIDE the file handoff transaction and rolls back.
+    client._submit(_reopen_file_review(world.zapi_tenant, phone))
+    assert _zapi(client, world, forward).json() == {
+        "ok": True,
+        "skipped": "duplicate_message",
+    }
+    assert len(file_handoff_outcomes) == 2
+    assert file_handoff_outcomes[-1][1].answer == credit_metering.DUPLICATE_MESSAGE_SKIP
+    assert file_handoff_outcomes[-1][1].handoff is None
+    assert len(_all_rows(client, HandoffRecord)) == 1  # no second handoff
+    assert len(_claims(client)) == 1
+    assert _ledger(client) == {"debt": TRACE_COST_MC}  # nor a second debit
+    assert announced == [record.id]
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert session.session_metadata.get("pending_file_review") is True  # untouched
+    assert _sends(providers, "send_text_message", phone) == texts  # nothing sent
+
+
+def test_a_hold_seen_in_the_zapi_file_handoff_transaction_hands_nothing_off(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, phone = enforced, "5511900009502"
+    ack = _zapi(client, world, _zapi_document(world, "zapi-document-held", phone))
+    assert ack.json()["action"] == "file_ack"
+    seen: list[UUID] = []
+
+    async def late(_self: Any, builder_id: UUID) -> bool:
+        seen.append(builder_id)
+        return len(seen) > 1  # free at the pre-check, held in the transaction
+
+    monkeypatch.setattr(CreditRepository, "quarantine_hold", late)
+    forward = _zapi_body(
+        world, "zapi-forward-held", phone=phone, text="Pode encaminhar"
+    )
+    assert _zapi(client, world, forward).json() == {
+        "ok": True,
+        "skipped": "credit_pending",
+    }
+    assert _all_rows(client, HandoffRecord) == [] and announced == []
+    assert _claims(client) == [] and _all_rows(client, CreditEffect) == []
+    texts = _sends(providers, "send_text_message", phone)
+    assert webhook._FILE_FORWARDED_MSG_PT not in texts
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert session.session_metadata.get("pending_file_review") is True  # untouched
+
+
+def test_an_observed_zapi_forward_records_one_production_trace(
+    client: Any,
+    world: World,
+    providers: Providers,
+    force_switch: Any,
+    file_handoffs: list[dict[str, Any]],
+) -> None:
+    phone = "5511900009601"
+    ack = _zapi(client, world, _zapi_document(world, "zapi-document-observed", phone))
+    assert ack.json()["action"] == "file_ack"
+    assert _effects(client) == [] and _claims(client) == []  # the ack is free
+    forward = _zapi_body(
+        world, "zapi-forward-observed", phone=phone, text="Pode encaminhar"
+    )
+    assert _zapi(client, world, forward).json() == {
+        "ok": True,
+        "replied": True,
+        "action": "file_handoff",
+    }
+    [call] = file_handoffs
+    assert call["note"] == "file_pending_review"
+    assert call["context"].origin is InteractionOrigin.PRODUCTION
+    [claim] = _claims(client)
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "observational",
+        "zapi-forward-observed",
+    )
+    assert claim.interaction_id == call["id"]  # anchored on the handoff
+    effect = _only_effect(client)
+    assert effect.trace_id == call["id"]
+    assert (effect.origin, effect.authenticated, effect.would_debit_mc) == (
+        "production",
+        True,
+        1_000,
+    )
+    assert _all_rows(client, CreditEffect) == []
 
 
 @pytest.mark.parametrize("source", ["uazapi", "evolution"])

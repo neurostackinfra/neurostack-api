@@ -2699,6 +2699,159 @@ async def test_an_enforced_meta_file_handoff_commits_atomically_on_postgres(
     assert all("credit_effect_id" not in d.text for d in details)
 
 
+async def _reopen_zapi_file_review(
+    direct: AsyncEngine, tenant_id: UUID, phone: str
+) -> None:
+    """An active pending file review on the patient's session, set now."""
+
+    async with direct.begin() as connection:
+        updated = await connection.execute(
+            text(
+                "UPDATE sessions SET metadata = metadata || jsonb_build_object("
+                "'pending_file_review', true, 'pending_file_review_at', "
+                "CAST(:at AS text)) WHERE tenant_id = :t AND user_id = :p"
+            ),
+            {"t": tenant_id, "p": phone, "at": datetime.now(timezone.utc).isoformat()},
+        )
+        assert updated.rowcount == 1
+
+
+async def _zapi_file_review(direct: AsyncEngine, tenant_id: UUID, phone: str) -> Any:
+    async with direct.connect() as connection:
+        return (
+            await connection.execute(
+                text(
+                    "SELECT metadata -> 'pending_file_review' FROM sessions "
+                    "WHERE tenant_id = :t AND user_id = :p"
+                ),
+                {"t": tenant_id, "p": phone},
+            )
+        ).scalar_one()
+
+
+async def test_an_enforced_zapi_file_handoff_commits_atomically_on_postgres(
+    enforced_pg: _PG,
+    enforced_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """whatsapp-image-understanding Group 3: the Z-API forward on request is
+    Meta's enforced file handoff with the claim ``zapi``.  The file ack
+    before it writes nothing; claim, handoff (record and
+    ``handoff.request``), debit and the ``credit_effect_id`` link commit
+    together; the creation webhook leaves only after that commit; a
+    redelivery while a review is active again (Redis down) conflicts inside
+    the transaction -- ``duplicate_message``, no second handoff nor debit,
+    the review untouched --; a fault after the handoff insert leaves
+    nothing."""
+
+    from src.api.routes import webhook
+    from src.services.handoff_service import HandoffService
+
+    committed_at_dispatch: list[tuple[int, int]] = []
+    tenants: list[UUID] = []
+
+    async def announce(_self: Any, handoff: Any, *_args: Any) -> tuple[bool, None]:
+        # Seen from another connection: the record AND its charge committed.
+        async with enforced_direct.connect() as connection:
+            committed_at_dispatch.append(
+                tuple(  # type: ignore[arg-type]
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT (SELECT count(*) FROM handoff_records WHERE "
+                                "id = :h AND context ? 'credit_effect_id'), (SELECT "
+                                "count(*) FROM credit_effects WHERE tenant_id = :t)"
+                            ),
+                            {"h": handoff.id, "t": tenants[0]},
+                        )
+                    ).one()
+                )
+            )
+        return False, None
+
+    monkeypatch.setattr(HandoffService, "_dispatch_creation_webhook", announce)
+    phone = "5511900009211"
+    async with _running_app(enforced_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        tenant = UUID(world.zapi_tenant)
+        tenants.append(tenant)
+        path = f"/v1/webhook/zapi/{world.zapi_token}"
+        document = {
+            "instanceId": world.zapi_instance,
+            "messageId": "pg-zapi-document",
+            "phone": phone,
+            "fromMe": False,
+            "document": {
+                "documentUrl": "https://media.invalid/pg-exam.pdf",
+                "mimeType": "application/pdf",
+                "fileName": "exame.pdf",
+            },
+        }
+
+        def forward(message_id: str) -> dict[str, Any]:
+            return {
+                "instanceId": world.zapi_instance,
+                "messageId": message_id,
+                "phone": phone,
+                "fromMe": False,
+                "text": {"message": "Pode encaminhar para a equipe"},
+            }
+
+        answers = []
+        async with asyncio.timeout(_TURN_SECONDS):
+            answers.append(await client.post(path, json=document))
+            after_ack = await _webhook_rows(enforced_direct, tenant)
+            review_after_ack = await _zapi_file_review(enforced_direct, tenant, phone)
+            answers.append(await client.post(path, json=forward("pg-zapi-forward")))
+            review_after_forward = await _zapi_file_review(
+                enforced_direct, tenant, phone
+            )
+            await _reopen_zapi_file_review(enforced_direct, tenant, phone)
+            answers.append(await client.post(path, json=forward("pg-zapi-forward")))
+            before_fault = await _webhook_rows(enforced_direct, tenant)
+
+            async def fault(_self: Any, **_kwargs: Any) -> bool:
+                raise RuntimeError("injected after the handoff insert")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(CreditRepository, "link_handoff_credit_effect", fault)
+                with pytest.raises(RuntimeError, match="after the handoff insert"):
+                    await client.post(path, json=forward("pg-zapi-broken"))
+            seen = await _webhook_rows(enforced_direct, tenant)
+            review_at_end = await _zapi_file_review(enforced_direct, tenant, phone)
+        texts = _sent_to(webhook.send_text_message, phone)
+    assert [a.json() for a in answers] == [
+        {"ok": True, "replied": True, "action": "file_ack"},
+        {"ok": True, "replied": True, "action": "file_handoff"},
+        {"ok": True, "skipped": "duplicate_message"},
+    ]
+    # The ack is free: no claim, no effect, no debit.
+    assert (after_ack.claims, after_ack.effects, after_ack.entries) == ([], [], {})
+    assert review_after_ack is True
+    assert review_after_forward is None  # cleared in the handoff's transaction
+    assert seen == before_fault  # the fault left nothing durable
+    assert review_at_end is True  # the redelivery and the fault rolled back
+    [claim] = seen.claims
+    assert (claim.source, claim.mode, claim.provider_message_id) == (
+        "zapi",
+        "enforced",
+        "pg-zapi-forward",
+    )
+    assert claim.session_version is not None
+    effect = _wtrace(tenant, claim)
+    assert seen.effects == [(effect, "trace")]
+    assert seen.entries == {"debt": 1_000}  # one trace, charged once
+    [(_handoff_id, context)] = seen.handoffs
+    assert context["credit_effect_id"] == effect
+    assert context.get("key_info")  # merged, not replaced
+    assert seen.handoff_requests == 1
+    assert seen.outbox == []  # the confirmation is sent as on Meta
+    assert committed_at_dispatch == [(1, 1)]
+    assert texts.count(webhook._FILE_ACK_MSG_PT) == 1
+    assert texts.count(webhook._FILE_FORWARDED_MSG_PT) == 1
+
+
 # -- the response outbox: publishers, the inline claim and the sweep -------
 
 

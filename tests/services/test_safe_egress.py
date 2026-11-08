@@ -11,6 +11,7 @@ MIME allowlist and byte cap, and secret-free error paths.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import socket
 from typing import Any
 
@@ -22,6 +23,7 @@ from src.services.safe_egress import (
     CUSTOM_PUBLIC_PROVIDERS,
     DEFAULT_MAX_AUDIO_BYTES,
     GEMINI_API_BASE_URL,
+    IMAGE_MIME_ALLOWLIST,
     LLM_DROPOUT_HOSTS,
     LLM_GEMINI_HOSTS,
     LLM_OPENAI_HOSTS,
@@ -39,6 +41,7 @@ from src.services.safe_egress import (
     TTS_OPENAI_HOSTS,
     ZAPI_ALLOWED_HOSTS,
     ParsedUrl,
+    ProviderPolicy,
     UnsafeEgressError,
     ValidatedRequest,
     build_safe_async_client,
@@ -49,7 +52,9 @@ from src.services.safe_egress import (
     resolve_public_ips,
     safe_async_client,
     safe_download_audio,
+    safe_download_image,
     validate_audio_mime,
+    validate_image_mime,
     validate_url,
 )
 
@@ -507,7 +512,14 @@ class TestProviderPolicies:
                 )
 
     def test_custom_public_kinds_have_no_allowlist(self) -> None:
-        for name in ("llm_outros", "stt_outros", "evolution", "uazapi", "audio_url"):
+        for name in (
+            "llm_outros",
+            "stt_outros",
+            "evolution",
+            "uazapi",
+            "audio_url",
+            "image_url",
+        ):
             assert PROVIDER_POLICIES[name].allowed_hosts is None
 
     def test_no_config_only_provider_registered(self) -> None:
@@ -527,7 +539,7 @@ class TestProviderPolicies:
     def test_custom_public_providers_set_matches_policy(self) -> None:
         for name in CUSTOM_PUBLIC_PROVIDERS:
             # every value in the "custom public" tag maps into a real policy
-            resolved_names = {"outros", "evolution", "uazapi", "audio_url"}
+            resolved_names = {"outros", "evolution", "uazapi", "audio_url", "image_url"}
             assert name in resolved_names
 
 
@@ -928,6 +940,360 @@ class TestSafeDownloadAudio:
                 assert SECRET not in payload
 
         asyncio.run(_go())
+
+
+# ---------------------------------------------------------------------------
+# Image MIME validator + safe_download_image (whatsapp-image-understanding D12)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateImageMime:
+    def test_allowlist_is_exactly_decision_12(self) -> None:
+        assert IMAGE_MIME_ALLOWLIST == frozenset(
+            {"image/jpeg", "image/png", "image/webp"}
+        )
+
+    @pytest.mark.parametrize(
+        ("content_type", "effective"),
+        [
+            ("image/jpeg", "image/jpeg"),
+            ("image/png", "image/png"),
+            ("image/webp", "image/webp"),
+            ("IMAGE/JPEG", "image/jpeg"),
+            ("image/png; charset=binary", "image/png"),
+        ],
+    )
+    def test_accepts_the_allowlist(self, content_type: str, effective: str) -> None:
+        assert validate_image_mime(content_type) == effective
+
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            None,
+            "",
+            "image/gif",
+            "image/heic",
+            "image/jpg",
+            "image/svg+xml",
+            "text/html",
+            "audio/ogg",
+            "application/pdf",
+        ],
+    )
+    def test_rejects_everything_else(self, content_type: str | None) -> None:
+        with pytest.raises(UnsafeEgressError) as excinfo:
+            validate_image_mime(content_type, declared_mime="image/jpeg")
+        assert excinfo.value.code == "unsupported_image_mime"
+
+    @pytest.mark.parametrize(
+        ("declared", "effective"),
+        [
+            ("image/jpeg", "image/jpeg"),
+            ("IMAGE/WEBP", "image/webp"),
+            ("image/png; foo=bar", "image/png"),
+        ],
+    )
+    def test_octet_stream_takes_an_allowlisted_declared_mime(
+        self, declared: str, effective: str
+    ) -> None:
+        assert (
+            validate_image_mime("application/octet-stream", declared_mime=declared)
+            == effective
+        )
+
+    @pytest.mark.parametrize("declared", [None, "", "image/gif", "application/pdf"])
+    def test_octet_stream_without_an_allowlisted_declared_mime_is_rejected(
+        self, declared: str | None
+    ) -> None:
+        with pytest.raises(UnsafeEgressError) as excinfo:
+            validate_image_mime("application/octet-stream", declared_mime=declared)
+        assert excinfo.value.code == "unsupported_image_mime"
+
+    def test_server_mime_wins_over_a_declared_one(self) -> None:
+        assert validate_image_mime("image/png", declared_mime="image/jpeg") == (
+            "image/png"
+        )
+
+
+class TestImageUrlPolicy:
+    def test_image_url_is_custom_public_like_audio_url(self) -> None:
+        assert "image_url" in CUSTOM_PUBLIC_PROVIDERS
+        assert PROVIDER_POLICIES["image_url"] == ProviderPolicy(
+            kind="image_url", allowed_hosts=None
+        )
+
+    def test_image_url_still_runs_the_public_ip_filter(self) -> None:
+        with pytest.raises(UnsafeEgressError) as excinfo:
+            validate_url(
+                "https://cdn.example/x.jpg",
+                kind="image_url",
+                resolver=make_resolver("10.0.0.5"),
+            )
+        assert excinfo.value.code == "unsafe_api_url"
+
+
+class TestSafeDownloadImage:
+    URL = "https://cdn.example/media/photo"
+
+    def _resolver(self):
+        return make_resolver("93.184.216.34")
+
+    def _download(self, handler: Any, **kwargs: Any) -> Any:
+        transport = httpx.MockTransport(handler)
+        kwargs.setdefault("max_bytes", 1_000)
+        return asyncio.run(
+            safe_download_image(
+                self.URL,
+                resolver=self._resolver(),
+                transport=transport,
+                **kwargs,
+            )
+        )
+
+    def _refused(self, handler: Any, **kwargs: Any) -> str:
+        with pytest.raises(UnsafeEgressError) as excinfo:
+            self._download(handler, **kwargs)
+        return excinfo.value.code
+
+    def test_happy_path(self) -> None:
+        body = b"\xff\xd8\xff" + b"\x00" * 100
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "image/jpeg",
+                    "Content-Length": str(len(body)),
+                },
+                content=body,
+            )
+
+        result = self._download(handler, headers={"Authorization": "Bearer t"})
+        assert result.content == body
+        assert result.mime_type == "image/jpeg"
+        assert seen[0].method == "GET"
+        assert seen[0].headers["Host"] == "cdn.example"
+        assert seen[0].headers["Authorization"] == "Bearer t"
+
+    def test_validates_under_the_image_url_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``image_url`` and ``audio_url`` are identical today, so pin the
+        # kind by behaviour: narrow only ``image_url`` to an allowlist that
+        # excludes the test host and the download must be refused.
+        monkeypatch.setitem(
+            PROVIDER_POLICIES,  # type: ignore[arg-type]
+            "image_url",
+            ProviderPolicy(
+                kind="image_url", allowed_hosts=frozenset({"other.example"})
+            ),
+        )
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, headers={"Content-Type": "image/jpeg"})
+
+        assert self._refused(handler) == "unsafe_api_url"
+        assert seen == []
+
+    def test_max_bytes_is_required(self) -> None:
+        parameter = inspect.signature(safe_download_image).parameters["max_bytes"]
+        assert parameter.default is inspect.Parameter.empty
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_rejects_bad_mime(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, headers={"Content-Type": "text/html"}, content=b"<html/>"
+            )
+
+        assert self._refused(handler) == "unsupported_image_mime"
+
+    def test_rejects_missing_mime(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"\xff\xd8\xff")
+
+        assert self._refused(handler, declared_mime="image/jpeg") == (
+            "unsupported_image_mime"
+        )
+
+    def test_octet_stream_with_declared_mime_is_accepted(self) -> None:
+        body = b"RIFF\x00\x00WEBP"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/octet-stream"},
+                content=body,
+            )
+
+        result = self._download(handler, declared_mime="image/webp")
+        assert result.content == body
+        assert result.mime_type == "image/webp"
+
+    @pytest.mark.parametrize("declared", [None, "image/gif"])
+    def test_octet_stream_without_declared_mime_is_rejected(
+        self, declared: str | None
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/octet-stream"},
+                content=b"\xff\xd8\xff",
+            )
+
+        assert self._refused(handler, declared_mime=declared) == (
+            "unsupported_image_mime"
+        )
+
+    def test_rejects_over_content_length_before_reading_the_body(self) -> None:
+        streamed: list[bytes] = []
+
+        class _Body(httpx.AsyncByteStream):
+            async def __aiter__(self):  # type: ignore[override]
+                streamed.append(b"chunk")
+                yield b"\x00" * 10
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png", "Content-Length": "1001"},
+                stream=_Body(),
+            )
+
+        assert self._refused(handler, max_bytes=1_000) == "image_too_large"
+        assert streamed == []
+
+    def test_content_length_exactly_at_the_cap_is_accepted(self) -> None:
+        body = b"\x89PNG" + b"\x00" * 996
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png", "Content-Length": "1000"},
+                content=body,
+            )
+
+        assert self._download(handler, max_bytes=1_000).content == body
+
+    def test_streaming_overflow_rejected(self) -> None:
+        # No Content-Length header, but the streamed body exceeds max_bytes.
+        class _Body(httpx.AsyncByteStream):
+            async def __aiter__(self):  # type: ignore[override]
+                for _ in range(5):
+                    yield b"a" * 300
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, headers={"Content-Type": "image/jpeg"}, stream=_Body()
+            )
+
+        assert self._refused(handler, max_bytes=1_000) == "image_too_large"
+
+    def test_lying_content_length_is_caught_while_streaming(self) -> None:
+        class _Body(httpx.AsyncByteStream):
+            async def __aiter__(self):  # type: ignore[override]
+                yield b"a" * 2_000
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/jpeg", "Content-Length": "10"},
+                stream=_Body(),
+            )
+
+        assert self._refused(handler, max_bytes=1_000) == "image_too_large"
+
+    def test_non_numeric_content_length_is_too_large(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/jpeg", "Content-Length": "lots"},
+                content=b"",
+            )
+
+        assert self._refused(handler) == "image_too_large"
+
+    def test_empty_body_is_a_download_failure(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"Content-Type": "image/jpeg"})
+
+        assert self._refused(handler) == "image_download_failed"
+
+    @pytest.mark.parametrize("status", [400, 403, 404, 500, 503])
+    def test_http_error_becomes_image_download_failed(self, status: int) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, content=b"nope")
+
+        assert self._refused(handler) == "image_download_failed"
+
+    @pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.ConnectError])
+    def test_transport_error_becomes_image_download_failed(
+        self, error: type[httpx.TransportError]
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise error("boom", request=request)
+
+        assert self._refused(handler) == "image_download_failed"
+
+    @pytest.mark.parametrize("status", [301, 302, 307, 308])
+    def test_redirect_is_forbidden(self, status: int) -> None:
+        followed: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            followed.append(str(request.url))
+            return httpx.Response(
+                status, headers={"Location": "https://169.254.169.254/latest"}
+            )
+
+        assert self._refused(handler) == "redirect_forbidden"
+        assert len(followed) == 1  # the Location was never requested
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://cdn.example/photo.jpg",
+            "https://localhost/photo.jpg",
+            "https://user:pw@cdn.example/photo.jpg",
+            "https://cdn.example:8443/photo.jpg",
+            "https://10.0.0.1/photo.jpg",
+        ],
+    )
+    def test_unsafe_url_is_refused_before_any_request(self, url: str) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, headers={"Content-Type": "image/jpeg"})
+
+        async def _go() -> None:
+            await safe_download_image(
+                url,
+                max_bytes=1_000,
+                resolver=self._resolver(),
+                transport=httpx.MockTransport(handler),
+            )
+
+        with pytest.raises(UnsafeEgressError) as excinfo:
+            asyncio.run(_go())
+        assert excinfo.value.code == "unsafe_api_url"
+        assert seen == []
+
+    def test_secret_absent_from_error(self) -> None:
+        secret = "EAAG-SUPER-SECRET-META-TOKEN"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, headers={"Content-Type": "text/html"}, content=b"<html/>"
+            )
+
+        with pytest.raises(UnsafeEgressError) as excinfo:
+            self._download(handler, headers={"Authorization": f"Bearer {secret}"})
+        exc = excinfo.value
+        assert secret not in repr(exc) + str(exc) + repr(exc.context)
 
 
 # ---------------------------------------------------------------------------
