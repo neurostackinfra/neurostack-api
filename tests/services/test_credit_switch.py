@@ -219,6 +219,41 @@ def test_schema_verdict_matrix(
     assert (reading.effective, reading.reason) == (effective, reason)
 
 
+def test_revision_045_under_the_bridge_image_chain_is_on() -> None:
+    """Window 045 (envio-midia-agente, the media bridge, with 043 and 044)
+    runs only after the image containing 045 serves: on this repository's own
+    chain, a database at 045 keeps the credit switch on (the minimum stays
+    042)."""
+
+    chain = load_image_migration_chain()
+    assert chain[chain.index(CREDIT_SCHEMA_MIN_REVISION) :] == (
+        "042",
+        "043",
+        "044",
+        "045",
+    )
+    reading = evaluate_schema_revision(("045",), chain, CREDIT_SCHEMA_MIN_REVISION)
+    assert (reading.effective, reading.reason) == (True, "schema_ready")
+
+
+@pytest.mark.parametrize("last", ["042", "043", "044"])
+def test_revision_045_under_an_image_chain_cut_before_045_is_off(last: str) -> None:
+    """The bridge image rolled back to the revision it replaced after the
+    window: that image's chain ends before 045 (at 042, or at 043 or 044 if
+    it already carried the media widenings), so the switch turns off."""
+
+    chain = load_image_migration_chain()
+    before_bridge = chain[: chain.index(last) + 1]
+    assert before_bridge[-1] == last and "045" not in before_bridge
+    reading = evaluate_schema_revision(
+        ("045",), before_bridge, CREDIT_SCHEMA_MIN_REVISION
+    )
+    assert (reading.effective, reading.reason) == (
+        False,
+        "revision_outside_image_chain",
+    )
+
+
 def test_a_minimum_outside_the_image_chain_is_off() -> None:
     reading = evaluate_schema_revision(("038",), ("001", "038"), "042")
     assert reading == CreditSwitchReading(False, "revision_outside_image_chain", "038")

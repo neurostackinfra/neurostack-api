@@ -1,9 +1,11 @@
-"""Four production migration windows, each applying exactly its own revision.
+"""Five production migration windows, each applying exactly its own revision.
 
-``035`` (migrations 033-035), ``036``, ``037`` and ``042`` (migrations
-038-042, asaas-rollout-opening live step L3) are separate manifest steps,
-each run only on its own explicit owner instruction, 036 before 037, after a
-fresh SELECT showing zero legacy rows, and 042 after 037. The window table of
+``035`` (migrations 033-035), ``036``, ``037``, ``042`` (migrations
+038-042, asaas-rollout-opening live step L3) and ``045`` (migrations 043-045:
+the media category/MIME invariant widened for audio/ogg and audio/mp4, then
+the media bridge of envio-midia-agente) are separate manifest steps, each run only on its own
+explicit owner instruction, 036 before 037, after a fresh SELECT showing zero
+legacy rows, 042 after 037 and 045 after 042. The window table of
 ``scripts/asaas_migration_window.py`` is the single source: one constant per
 window, each baking ``alembic upgrade <window>``. ``alembic upgrade head`` in
 any artifact that describes a production window would apply every later
@@ -83,6 +85,11 @@ RUNBOOK_WINDOW_SECTIONS = {
         "subcommands are `scripts/asaas_migration_window.py --window 042`",
         r"^\*\*Rollback \(window 042\)\.\*\*",
     ),
+    "045": (
+        "Order (each step stops on any divergence and returns to the owner; the\n"
+        "subcommands are `scripts/asaas_migration_window.py --window 045`",
+        r"^### Rollback$",
+    ),
 }
 
 
@@ -113,11 +120,12 @@ def test_no_production_migration_artifact_says_upgrade_head() -> None:
 
 
 def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
-    assert list(windows.WINDOWS) == ["035", "036", "037", "042"]
+    assert list(windows.WINDOWS) == ["035", "036", "037", "042", "045"]
     assert windows.WINDOWS["035"] is windows.WINDOW_035
     assert windows.WINDOWS["036"] is windows.WINDOW_036
     assert windows.WINDOWS["037"] is windows.WINDOW_037
     assert windows.WINDOWS["042"] is windows.WINDOW_042
+    assert windows.WINDOWS["045"] is windows.WINDOW_045
     assert wiring.MIGRATION_WINDOWS is windows.WINDOWS
     for name, window in windows.WINDOWS.items():
         assert window.command == ("alembic", "upgrade", name)
@@ -127,12 +135,14 @@ def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
         ("035", "036"),
         ("036", "037"),
         ("037", "042"),
+        ("042", "045"),
     ]
     assert [w.snapshot_pattern for w in windows.WINDOWS.values()] == [
         "pre-033-035-<date>",
         "pre-036-<date>",
         "pre-037-<date>",
         "pre-038-042-<date>",
+        "pre-043-045-<date>",
     ]
 
 
@@ -150,7 +160,7 @@ def test_runbook_migrations_gate_pins_035_and_reads_back_alembic_version() -> No
         assert phrase in flat, phrase
 
 
-@pytest.mark.parametrize("name", ["036", "037", "042"])
+@pytest.mark.parametrize("name", ["036", "037", "042", "045"])
 def test_runbook_gate_of_the_later_windows_pins_their_own_revision(name: str) -> None:
     window = windows.WINDOWS[name]
     flat = " ".join(_runbook_window(name).split())
@@ -174,6 +184,14 @@ def test_runbook_gate_of_the_later_windows_pins_their_own_revision(name: str) ->
     elif name == "042":
         assert "`alembic_version` == `037`, read as the application role" in flat
         assert "five upgrade lines `037 -> 038`" in flat
+    elif name == "045":
+        assert "`alembic_version` == `042`, read as the application role" in flat
+        assert "every count `0` with `alembic_version` == `042`" in flat
+        assert (
+            "exactly the three upgrade lines `042 -> 043`, `043 -> 044` and"
+            " `044 -> 045`" in flat
+        )
+        assert "and both privilege rows `true`" in flat
     else:
         assert "never the application role" in flat and "eleven `ok`" in flat
 
@@ -233,7 +251,7 @@ def test_deploy_vps_pin_is_the_first_window() -> None:
         assert wiring._UNPINNED_UPGRADE.search(text) is None, name
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045"])
 def test_each_window_text_names_only_its_own_revision(name: str) -> None:
     window = windows.WINDOWS[name]
     texts = {
@@ -678,7 +696,7 @@ def test_runbook_migration_sections_record_036_and_037_as_applied() -> None:
     # The image smoke names the head of main, which is the tree's own head.
     flat = " ".join(raw.split())
     head = _alembic_head()
-    assert head == "044"
+    assert head == "045"
     assert flat.count("on `main` today") == flat.count(f"`{head}` on `main` today")
     assert flat.count(f"`{head}` on `main` today") == 2
 
@@ -820,3 +838,110 @@ def test_the_state_section_does_not_claim_formal_post_read_verification() -> Non
         "hook's `verify-result`",
     ):
         assert claim not in caveat_free, claim
+
+
+def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
+    """Migration 045 ships in a bridge release, and its window also applies
+    043 and 044 (no windows of their own): its section gives the production
+    order (the 16 -> 17 re-pin, bridge image, window, the 17 -> 18 re-pin,
+    behaviour release, flag), the known OGG gap between the bridge deploy
+    and the window, that the one-transaction window briefly blocks writes
+    (lock_timeout per lock wait, not per statement), and the rollbacks
+    before and after the window, in both runbooks: the behaviour release
+    back to the bridge keeps the credit switch on; the bridge back to the
+    revision it replaced turns it off after the window; the schema only by a
+    restore."""
+
+    raw = _text(RUNBOOK)
+    section = " ".join(_section(raw, "## Migration 045: ", r"^## ").split())
+    order = [
+        "0. Re-pin the manifest's rollback target from 16 to the serving"
+        " revision 17",
+        "1. Deploy the bridge image",
+        "2. Run window `045`",
+        "3. Re-pin the rollback target from 17 to the bridge revision 18",
+        "4. Only then merge and deploy the behaviour release (PR-B)",
+        "5. Open the behaviour release's flag.",
+    ]
+    positions = [section.index(step) for step in order]
+    assert positions == sorted(positions)
+    assert "4. Open the behaviour release's flag." not in section
+    assert "The owner confirms it before this release is merged" not in section
+    for phrase in (
+        "**Window `045` also applies `043` and `044`.**",
+        "neither has a window of its own, so production stays at `042` until"
+        " this window runs `042 -> 043 -> 044 -> 045` in one run",
+        "**the bridge image maps neither object in the ORM**",
+        "`revision_outside_image_chain`, and the switch turns **off**",
+        "**The owner confirmed revision 17 on 2026-11-07**",
+        "`service_not_on_target`",
+        "`rollback_target_not_repinned_before_image_bump`",
+        "**The window briefly blocks writes.**",
+        "`alembic/env.py` does not set `transaction_per_migration`, so the"
+        " whole run is **one transaction**",
+        "`043` takes `ACCESS EXCLUSIVE` on `media_assets`",
+        "takes `SHARE ROW EXCLUSIVE` on `tenants`, then on `sessions`",
+        "bounds each lock **wait**, not a statement or the run",
+        "Worst case, `media_assets` is unreadable and unwritable for about 15 s",
+        "SQLSTATE `55P03` (lock timeout) or `40P01` (deadlock) means nothing"
+        " changed: the one transaction rolled back, `043` and `044` with `045`",
+        "the window can be retried",
+        "**Known gap between steps 1 and 2: `audio/ogg` and `audio/mp4` uploads"
+        " fail.**",
+        "**503 `media_storage_unavailable`**, nothing stored",
+        "Run it **right after** step 1",
+        "**The gap comes from the current `main`, not from the bridge**",
+        "**Every deploy of the current `main` to production before window `045`"
+        " runs has it**, a hotfix deployed before this bridge release included;"
+        " window `045` (`042 -> 043 -> 044 -> 045`) is what closes it.",
+        "**Steps 1 and 2 are approved together**",
+        "`media mime check not at 042` is `0` only when",
+        "`has_table_privilege` with a list (`'SELECT,INSERT,UPDATE,DELETE'`)"
+        " is true when **any** of them is held",
+        "`read_privilege_not_held:<check>`",
+        "The post-read does not read the media check again",
+    ):
+        assert phrase in section, phrase
+    # The superseded per-statement wording.
+    assert "at most `lock_timeout` (5 s) per statement" not in section
+    rollback = " ".join(_section(raw, "### Rollback\n", r"^## ").split())
+    for phrase in (
+        "**Before the window (after step 1, before step 2): the bridge image"
+        " back to revision 17.**",
+        "It is also the escape hatch for the OGG/M4A gap",
+        "returning to revision 17 closes the gap, because its image"
+        " (`build-20261104-fbda835a`) predates #184",
+        "**The behaviour release back to the bridge image: safe.**",
+        "the credit switch stays **on**",
+        "It is the rollback target once step 3 above re-pins the target from 17"
+        " to the bridge revision 18, before PR-B deploys.",
+        "**The bridge image back to the rollback target (revision 17) after the"
+        " window.**",
+        "reads `revision_outside_image_chain` and stays **off**",
+        "`044`'s and `043`'s fail (SQLSTATE `23514`, nothing changed) while an"
+        " `audio/mp4` or `audio/ogg` asset exists",
+        "As after windows `036`, `037` and `042`, the schema goes back only by"
+        " restoring the snapshot (`pre-043-045-<date>`, taken at `042`, so it"
+        " undoes `043` and `044` too)",
+    ):
+        assert phrase in rollback, phrase
+    text = " ".join(_text(ROLLBACK_RUNBOOK).split())
+    for phrase in (
+        "## Migration 045: the media bridge release and the behaviour release",
+        "together with `043` and `044`",
+        "Before the window (the bridge image serving on `042`)",
+        "It also closes the OGG/M4A upload gap",
+        "return to revision 17, whose image (`build-20261104-fbda835a`)"
+        " predates #184 and never offers OGG or M4A",
+        "**The behaviour release back to the bridge image is safe.**",
+        "the credit switch stays **on**",
+        "the target is re-pinned from 17 to 18 after the window and before"
+        " PR-B deploys",
+        "takes the serving image out of the chain.**",
+        "its credit switch reads `revision_outside_image_chain` and stays **off**",
+        "**The migrations come back only by a restore** of the window's snapshot"
+        " (`pre-043-045-<date>`, taken at `042`, so it undoes `043` and `044`"
+        " too), as after windows `036`, `037` and `042`",
+        "`044`'s and `043`'s fail while an `audio/mp4` or `audio/ogg` asset" " exists",
+    ):
+        assert phrase in text, phrase

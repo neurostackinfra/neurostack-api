@@ -201,7 +201,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "044"
+    assert version == "045"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 

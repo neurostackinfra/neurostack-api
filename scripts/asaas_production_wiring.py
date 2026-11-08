@@ -9,7 +9,8 @@ JSON diff: what would change, what is already compliant and what blocks.
 live D3 source revision, with secrets as ARN references only, the otel image
 pinned by digest and ``ManagedBy=manual``. ``check`` runs the existing rollout
 evidence validators against that request. ``render-migrations-taskdef
---window 035|036|037|042 --purpose migrate|read`` (both required, no default)
+--window 035|036|037|042|045 --purpose migrate|read`` (both required, no
+default)
 prints a new ``neurostack-staging-migrations`` revision that bakes exactly
 that window's ``alembic upgrade <window>`` (``migrate``) or, for window 037
 only, its SELECT-only readback program run as the migration role (``read``);
@@ -331,14 +332,17 @@ ADDED_ENVIRONMENT: dict[str, tuple[str, str]] = {
 ADDED_SECRETS = tuple(row[0] for row in SECRET_REFERENCES)
 FORBIDDEN_NAME_PREFIXES = ("ABACATEPAY_", "APPCONFIG_")
 FORBIDDEN_NAMES = frozenset({"SPA_ENABLED", "SPA_DIST_DIR"})
-# Four production migration windows, each its own separately approved step:
+# Five production migration windows, each its own separately approved step:
 # the window table of scripts/asaas_migration_window.py is the single source
 # (command, alembic_version before and after, snapshot name, readback, image
 # prerequisite). Each window bakes exactly ``alembic upgrade <window>``, never
 # the head, so 036 and 037 only ever run on their own owner instruction, 036
 # before 037, after a fresh SELECT showing zero legacy rows, and 042 (the
 # credit schema, 038 to 042 in one window) only after the image containing
-# 042 serves (asaas-rollout-opening, live steps L2 then L3).
+# 042 serves (asaas-rollout-opening, live steps L2 then L3), and 045 (the
+# media bridge of envio-midia-agente, with 043 and 044, the media
+# category/MIME invariant widened for audio/ogg and audio/mp4, in one window)
+# only after the bridge image serves.
 MIGRATION_WINDOWS = migration_window.WINDOWS
 STEPS: tuple[tuple[str, str], ...] = (
     ("secret_access_stack", "d3_apply"),
@@ -352,6 +356,7 @@ STEPS: tuple[tuple[str, str], ...] = (
     (migration_window.WINDOW_036.manifest_step, "separate_approval"),
     (migration_window.WINDOW_037.manifest_step, "separate_approval"),
     (migration_window.WINDOW_042.manifest_step, "separate_approval"),
+    (migration_window.WINDOW_045.manifest_step, "separate_approval"),
     ("rollout_transitions", "separate_approval"),
 )
 # What each window leaves to a later window (printed by plan).
@@ -371,11 +376,15 @@ MIGRATIONS_EXCLUDED: Mapping[str, str] = {
         "instruction after the image containing 042 serves"
     ),
     "042": (
-        "043 and 044 (the media category/MIME invariant widened for audio/ogg, "
-        "then for audio/mp4) and later: 043 and 044 are written and have no "
-        "window yet, so production stays at 042; they need their own window in "
-        "the table, authored once the image containing 044 serves and its "
-        "rollback target revision exists"
+        "043, 044 and 045 (the media category/MIME invariant widened for "
+        "audio/ogg, then for audio/mp4, and the media bridge of "
+        "envio-midia-agente): their own window (migrations_043_045), on its "
+        "own explicit owner instruction after the bridge image containing 045 "
+        "serves"
+    ),
+    "045": (
+        "046 and later: none is written; a later revision needs its own "
+        "window in the table"
     ),
 }
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)

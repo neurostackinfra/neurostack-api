@@ -1,4 +1,5 @@
-"""Production migration windows 035, 036, 037 and 042: pure planner, renderer, verifier.
+"""Production migration windows 035, 036, 037, 042 and 045: pure planner, renderer,
+verifier.
 
 Every test runs on recorded readback files built here; nothing reaches AWS or
 a database. The Alembic and read-program output the verifiers classify is
@@ -6,7 +7,8 @@ real: ``tests/fixtures/asaas_migration_window/*.json`` holds what the
 alembic CLI and the rendered read program printed against disposable
 PostgreSQL 16 (success per window, 55000 refusals, a 55P03 lock timeout, a
 40P01 deadlock and an unpinned ``upgrade head``; window 042's runs, from 036 to
-042, captured on 2026-10-31).
+042, captured on 2026-10-31; window 045's, from 042 to 045, captured on
+2026-11-07).
 """
 
 from __future__ import annotations
@@ -50,6 +52,17 @@ SERVICE_TD_11 = TD_PREFIX + "neurostack-staging-app:11"
 # L2a's revision 12: the same revision on the E7b image, the worker on.
 SERVICE_TD_12 = TD_PREFIX + "neurostack-staging-app:12"
 SERVICE_TD_13 = TD_PREFIX + "neurostack-staging-app:13"
+# Window 045 (envio-midia-agente, the media bridge release): the service runs
+# the bridge revision 18 (revision 17 with the app image alone moved to the
+# bridge image containing 045; BRIDGE_IMAGE stands for it), and the rollback
+# target is revision 17, the revision serving on 2026-11-07 (read on ECS),
+# on its own image, the worker on.
+SERVICE_TD_17 = TD_PREFIX + "neurostack-staging-app:17"
+SERVICE_TD_18 = TD_PREFIX + "neurostack-staging-app:18"
+REVISION_17_IMAGE = (
+    f"{REGISTRY}/neurostack-staging@sha256:"
+    "8010699afadac09e2966385725437c9ede9b53ca945ebcb2b3b9b3ad294889bf"
+)
 WORKER_ON = [{"name": "BILLING_FACT_WORKER_ENABLED", "value": "true"}]
 MIGRATIONS_TD = {
     "035": TD_PREFIX + "neurostack-staging-migrations:4",
@@ -57,6 +70,7 @@ MIGRATIONS_TD = {
     "037": TD_PREFIX + "neurostack-staging-migrations:6",
     # After window 037's read revision (:7).
     "042": TD_PREFIX + "neurostack-staging-migrations:8",
+    "045": TD_PREFIX + "neurostack-staging-migrations:9",
 }
 READ_TD = TD_PREFIX + "neurostack-staging-consulta:26"
 # Window 037's dedicated read revision (planner --purpose read).
@@ -100,6 +114,7 @@ SNAPSHOT_ID = {
     "036": "pre-036-2026-10-22",
     "037": "pre-037-2026-10-22",
     "042": "pre-038-042-2026-10-22",
+    "045": "pre-043-045-2026-10-22",
 }
 UPGRADE_HEAD = re.compile(r"upgrade\s+heads?\b", re.IGNORECASE)
 # Built by concatenation so repository secret scanners never see a literal.
@@ -126,12 +141,14 @@ GOOD_PRE_READ = {
     "036": "pre_036_at_035",
     "037": "pre_037_at_036_migration_role",
     "042": "pre_042_at_037",
+    "045": "pre_045_at_042",
 }
 GOOD_POST_READ = {
     "035": "post_035_at_035",
     "036": "post_036_at_036",
     "037": "post_037_at_037",
     "042": "post_042_at_042",
+    "045": "post_045_at_045",
 }
 
 
@@ -344,9 +361,11 @@ class World:
         self.reads: dict[str, dict[str, Any]] = {}
         self.records: dict[str, dict[str, Any]] = {}
         self.captured_at = CAPTURED_PLAN
-        self.service_td = {"035": SERVICE_TD_8, "042": SERVICE_TD_13}.get(
-            window, SERVICE_TD_10
-        )
+        self.service_td = {
+            "035": SERVICE_TD_8,
+            "042": SERVICE_TD_13,
+            "045": SERVICE_TD_18,
+        }.get(window, SERVICE_TD_10)
         self.migrations_td = MIGRATIONS_TD[window]
         self.snapshot_id = SNAPSHOT_ID[window]
         service_image = OLD_IMAGE if window == "035" else BRIDGE_IMAGE
@@ -388,7 +407,7 @@ class World:
             _app_definition(
                 self.service_td,
                 service_image,
-                environment=WORKER_ON if window == "042" else None,
+                environment=WORKER_ON if window in ("042", "045") else None,
             ),
         )
         if window == "042":
@@ -398,6 +417,16 @@ class World:
                 "DescribeTaskDefinition",
                 mw.describe_task_definition_request(SERVICE_TD_12),
                 _app_definition(SERVICE_TD_12, E7B_IMAGE, environment=WORKER_ON),
+            )
+        if window == "045":
+            # The rollback target: the bridge revision 18 but for the app image.
+            self.put(
+                "ecs",
+                "DescribeTaskDefinition",
+                mw.describe_task_definition_request(SERVICE_TD_17),
+                _app_definition(
+                    SERVICE_TD_17, REVISION_17_IMAGE, environment=WORKER_ON
+                ),
             )
         if window == "035":
             self.put(
@@ -790,12 +819,13 @@ def pinned_manifest(tmp_path: Path, revision: int) -> Path:
 
 def window_manifest(tmp_path: Path, name: str) -> Path:
     """A manifest pinned at the window's own rollback target (10 for 036 and
-    037, 12 for 042; 035 reads none).
+    037, 12 for 042, 17 for 045; 035 reads none).
 
     The reviewed manifest moved past 10 (Group 5b: 10 to 11, then 12 and 13
     by the live chain), so 036 and 037, already run in production, are
     planned here against a test manifest at 10, and 042 against one at 12
-    (live step L2c); the tests of the reviewed manifest itself pass it
+    (live step L2c), and 045 against one at 17 (the revision the bridge
+    image replaces); the tests of the reviewed manifest itself pass it
     explicitly.
     """
 
@@ -946,11 +976,12 @@ def _rows_changed(lines: list[str], index: int, values: list[Any]) -> list[str]:
 
 
 def test_one_constant_per_window_and_nothing_else() -> None:
-    assert list(mw.WINDOWS) == ["035", "036", "037", "042"]
+    assert list(mw.WINDOWS) == ["035", "036", "037", "042", "045"]
     assert mw.WINDOWS["035"] is mw.WINDOW_035
     assert mw.WINDOWS["036"] is mw.WINDOW_036
     assert mw.WINDOWS["037"] is mw.WINDOW_037
     assert mw.WINDOWS["042"] is mw.WINDOW_042
+    assert mw.WINDOWS["045"] is mw.WINDOW_045
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     constructed = [
         node
@@ -959,7 +990,7 @@ def test_one_constant_per_window_and_nothing_else() -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "MigrationWindow"
     ]
-    assert len(constructed) == 4
+    assert len(constructed) == 5
     with pytest.raises(TypeError):
         mw.WINDOWS["038"] = mw.WINDOW_037  # type: ignore[index]
 
@@ -1039,6 +1070,24 @@ def test_one_constant_per_window_and_nothing_else() -> None:
                 "post_read": "S27",
             },
         ),
+        (
+            "045",
+            "042",
+            "045",
+            ("042", "043", "044", "045"),
+            "pre-043-045-",
+            "scripts/migration_043_045_preflight.sql",
+            "zero_counts",
+            "app",
+            {
+                "register": "S28",
+                "snapshot": "S28",
+                "pre_read": "S29",
+                "run": "S29",
+                "verify": "S30",
+                "post_read": "S30",
+            },
+        ),
     ],
 )
 def test_each_window_pins_its_command_versions_snapshot_readback_and_steps(
@@ -1077,6 +1126,9 @@ def test_each_window_pins_its_command_versions_snapshot_readback_and_steps(
             "036": 10,
             "037": 10,
             "042": 12,
+            # The revision serving on 2026-11-07; the owner confirmed it on
+            # 2026-11-07.
+            "045": 17,
         }[name]
     )
     assert (ROOT / sql).is_file()
@@ -1099,7 +1151,13 @@ def test_the_pinned_window_is_035_and_no_subcommand_defaults_a_window() -> None:
         assert len(windows) == 1, name
         assert windows[0].required is True, name
         assert windows[0].default is None, name
-        assert tuple(windows[0].choices) == ("035", "036", "037", "042"), name
+        assert tuple(windows[0].choices) == (
+            "035",
+            "036",
+            "037",
+            "042",
+            "045",
+        ), name
 
 
 def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
@@ -1123,24 +1181,23 @@ def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
     assert declared["040"] == "039"
     assert declared["041"] == "040"
     assert declared["042"] == "041"
-    # 043 (the media category/MIME invariant widened for audio/ogg) and 044
-    # (the same invariant widened for audio/mp4) are written and deliberately
-    # have NO window: their rollback target is the revision serving before
-    # their own image, which does not exist until that image deploys, and the
-    # reviewed manifest is pinned to the serving revision 16 (#183), so a
-    # window naming 16 today would arm itself with no re-pin. Production
-    # therefore stays at 042 until a window carrying 043 and 044 is authored.
+    # 043 (the media category/MIME invariant widened for audio/ogg, #184) and
+    # 044 (the same invariant widened for audio/mp4, M4A) have no window of
+    # their own: window 045 (the media bridge of envio-midia-agente, Group 1)
+    # applies them with 045, the last written revision, in one run from 042
+    # (owner decision 2026-11-07), so production moves from 042 to 045 at once.
     assert declared["043"] == "042"
     assert declared["044"] == "043"
-    # 044 is the only revision chained off 043.
+    assert declared["045"] == "044"
+    # One linear chain: 044 is the only revision chained off 043, 045 the only
+    # one off 044, and the window carries all three.
     assert [rev for rev, down in declared.items() if down == "043"] == ["044"]
-    chained = {rev for row in mw.WINDOWS.values() for rev in row.chain}
-    assert "043" not in chained
-    assert "044" not in chained
-    # No later revision can exist unseen: a 045 would need its own window, or
+    assert [rev for rev, down in declared.items() if down == "044"] == ["045"]
+    assert {"043", "044", "045"} <= set(mw.WINDOW_045.chain)
+    # No later revision can exist unseen: a 046 would need its own window, or
     # its own entry here saying why it has none.
-    assert "045" not in declared
-    assert not [rev for rev, down in declared.items() if down == "044"]
+    assert "046" not in declared
+    assert not [rev for rev, down in declared.items() if down == "045"]
 
 
 @pytest.mark.parametrize(
@@ -1195,6 +1252,68 @@ def test_an_inconsistent_042_row_cannot_load(
     monkeypatch.setattr(mw, "WINDOWS", dict(mw.WINDOWS) | {"042": broken})
     with pytest.raises(mw.WindowError, match="window_table"):
         mw._assert_window_table()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        # The service on the bridge image, a rollback target to check.
+        ("image_rule", mw.IMAGE_RULE_BRIDGE),
+        ("rollback_target_revision", None),
+        # The start state is exactly 042, the end of the window before it.
+        ("before", "041"),
+        ("chain", ("041", "042", "043", "044", "045")),
+        # 043 and 044 are in the window: no revision of the chain skipped.
+        ("chain", ("042", "045")),
+        ("chain", ("042", "043", "045")),
+        ("chain", ("045",)),
+        ("command", ("alembic", "upgrade", "head")),
+        ("command", ("alembic", "upgrade", "042")),
+        ("command", ("alembic", "upgrade", "044")),
+        # The snapshot names the span the window applies, 043 to 045.
+        ("snapshot_prefix", "pre-045-"),
+        ("snapshot_prefix", "pre-042-045-"),
+        ("snapshot_prefix", "pre-044-045-"),
+        ("started_by", "neurostack-migration-window-042"),
+    ],
+)
+def test_an_inconsistent_045_row_cannot_load(
+    field: str, value: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = dataclasses.replace(mw.WINDOW_045, **{field: value})
+    monkeypatch.setattr(mw, "WINDOWS", dict(mw.WINDOWS) | {"045": broken})
+    with pytest.raises(mw.WindowError, match="window_table"):
+        mw._assert_window_table()
+
+
+def test_the_045_post_read_is_its_own_sql_and_rule() -> None:
+    """Window 042's post-read reads the revision only; 045's has its own SQL
+    and rule: the revision and the application role's privileges on what the
+    migration adds (the migrations carry no GRANT)."""
+
+    assert mw.WINDOW_042.post_read.sql_file is None
+    assert mw.WINDOW_042.post_read.rule == mw.RULE_VERSION_ONLY
+    post = mw.WINDOW_045.post_read
+    assert post.sql_file == "scripts/migration_043_045_post_read.sql"
+    assert post.rule == mw.RULE_PRIVILEGES_HELD == "privileges_held"
+    assert post.role == mw.READ_ROLE_APP
+    assert (
+        post.checks
+        == mw.PRIVILEGES_045
+        == (
+            "dml on public.media_deliveries",
+            "dml on public.media_assets.trigger_intents",
+        )
+    )
+    assert (
+        mw.WINDOW_045.pre_read.checks
+        == mw.PREFLIGHT_045
+        == (
+            "045 tables present",
+            "045 columns present",
+            "media mime check not at 042",
+        )
+    )
 
 
 def test_a_default_or_extra_window_cannot_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1335,18 +1454,20 @@ def test_windows_subcommand_prints_the_table(
     code, out, err = run_cli(["windows"], capsys)
     assert code == 0, err
     rows = json.loads(out)["windows"]
-    assert [row["window"] for row in rows] == ["035", "036", "037", "042"]
+    assert [row["window"] for row in rows] == ["035", "036", "037", "042", "045"]
     assert [row["command"] for row in rows] == [
         ["alembic", "upgrade", "035"],
         ["alembic", "upgrade", "036"],
         ["alembic", "upgrade", "037"],
         ["alembic", "upgrade", "042"],
+        ["alembic", "upgrade", "045"],
     ]
     assert [row["snapshot_name_pattern"] for row in rows] == [
         "pre-033-035-<date>",
         "pre-036-<date>",
         "pre-037-<date>",
         "pre-038-042-<date>",
+        "pre-043-045-<date>",
     ]
     assert rows[3]["upgrades"] == [
         "037 -> 038",
@@ -1356,11 +1477,24 @@ def test_windows_subcommand_prints_the_table(
         "041 -> 042",
     ]
     assert rows[3]["image_prerequisite"] == mw.IMAGE_RULE_DEPLOYED
+    assert rows[4]["upgrades"] == ["042 -> 043", "043 -> 044", "044 -> 045"]
+    assert rows[4]["image_prerequisite"] == mw.IMAGE_RULE_DEPLOYED
+    assert rows[4]["post_read"] == {
+        "sql_file": "scripts/migration_043_045_post_read.sql",
+        "rule": "privileges_held",
+        "checks": [
+            "dml on public.media_deliveries",
+            "dml on public.media_assets.trigger_intents",
+        ],
+        "role": "app",
+        "expected_alembic_version": "045",
+    }
     assert [row["rollback_target_must_be_revision"] for row in rows] == [
         None,
         10,
         10,
         12,
+        17,
     ]
     assert UPGRADE_HEAD.search(out) is None
 
@@ -1370,7 +1504,7 @@ def test_windows_subcommand_prints_the_table(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 def test_plan_is_ready_for_each_window(window: str, tmp_path: Path) -> None:
     world = ready_world(tmp_path, window)
     document = plan(world, tmp_path)
@@ -1415,10 +1549,23 @@ def _blocks(world: World, tmp_path: Path, **kwargs: Any) -> list[str]:
     return list(document["blocks"])
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 def test_plan_refuses_a_wrong_before_version(window: str, tmp_path: Path) -> None:
-    # 038, 041 and 042: window 042 partly or wholly applied already.
-    for version in ("032", "035", "036", "037", "034", "038", "041", "042"):
+    # 038, 041 and 042: window 042 partly or wholly applied already; 043,
+    # 044 and 045: window 045 partly or wholly applied already.
+    for version in (
+        "032",
+        "035",
+        "036",
+        "037",
+        "034",
+        "038",
+        "041",
+        "042",
+        "043",
+        "044",
+        "045",
+    ):
         if version == mw.WINDOWS[window].before:
             continue
         world = World(window)
@@ -1612,7 +1759,7 @@ def test_single_flight_listings_use_the_documented_filters() -> None:
     }
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 @pytest.mark.parametrize("which", [0, 1])
 def test_plan_refuses_an_image_digest_mismatch_on_one_task(
     window: str, which: int, tmp_path: Path
@@ -1714,7 +1861,7 @@ def test_plan_refuses_an_old_task_still_stopping(tmp_path: Path) -> None:
     assert plan(world, tmp_path)["status"] == "ready"
 
 
-@pytest.mark.parametrize("window", ["036", "037", "042"])
+@pytest.mark.parametrize("window", ["036", "037", "042", "045"])
 def test_036_and_037_need_the_deployed_image_in_the_migrations_revision(
     window: str, tmp_path: Path
 ) -> None:
@@ -1742,7 +1889,7 @@ def test_036_and_037_need_the_deployed_image_in_the_migrations_revision(
     assert "service_task_image_digest_mismatch" in blocks
 
 
-@pytest.mark.parametrize("window", ["036", "037", "042"])
+@pytest.mark.parametrize("window", ["036", "037", "042", "045"])
 def test_036_and_037_refuse_a_service_image_by_tag(window: str, tmp_path: Path) -> None:
     world = ready_world(tmp_path, window)
     world.put(
@@ -1924,7 +2071,7 @@ def test_plan_refuses_without_a_recorded_pre_read(tmp_path: Path) -> None:
     assert "pre_read_not_recorded" in document["blocks"]
 
 
-@pytest.mark.parametrize("window", ["036", "037", "042"])
+@pytest.mark.parametrize("window", ["036", "037", "042", "045"])
 def test_036_037_and_042_refuse_a_rollback_target_not_repinned(
     window: str, tmp_path: Path
 ) -> None:
@@ -1936,9 +2083,10 @@ def test_036_037_and_042_refuse_a_rollback_target_not_repinned(
         blocks = _blocks(world, tmp_path, manifest=manifest)
         assert "rollback_target_not_repinned" in blocks
     # Any other pin than the window's own: 036 and 037 require 10, 042
-    # requires 12 (never 10, 11 or a later one).
+    # requires 12 (never 10, 11 or a later one), 045 requires 17 (never the
+    # reviewed 16 nor the bridge revision 18 it serves).
     own = mw.WINDOWS[window].rollback_target_revision
-    for revision in (10, 11, 12, 13, 14):
+    for revision in (10, 11, 12, 13, 14, 16, 17, 18):
         if revision == own:
             continue
         blocks = _blocks(world, tmp_path, manifest=pinned_manifest(tmp_path, revision))
@@ -1969,7 +2117,7 @@ def test_the_reviewed_manifest_is_pinned_to_revision_16() -> None:
     }
 
 
-@pytest.mark.parametrize("window", ["036", "037", "042"])
+@pytest.mark.parametrize("window", ["036", "037", "042", "045"])
 def test_without_a_manifest_the_tool_reads_the_reviewed_one(
     window: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2380,6 +2528,125 @@ def test_042_refuses_before_l2b_serves(tmp_path: Path) -> None:
     )
 
 
+def test_045_accepts_the_revision_17_by_number_and_by_content(
+    tmp_path: Path,
+) -> None:
+    """The media bridge window: the service runs the bridge revision 18 (the
+    image containing 045), the manifest pins revision 17 (the revision the
+    bridge image replaces): ACTIVE by digest, the worker 'true' exactly
+    once, revision 18 but for the app image."""
+
+    world = ready_world(tmp_path, "045")
+    document = plan(world, tmp_path)
+    assert document["status"] == "ready", document["blocks"]
+    assert document["manifest"] == {
+        "rollback_target_revision": 17,
+        "rollback_target_change_to_service_revision": "app_image",
+    }
+    for check in (
+        "rollback_target_repinned",
+        "rollback_target_revision_active_digest_pinned",
+        "rollback_target_worker_flag_true",
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+        "migrations_image_is_the_deployed_image",
+    ):
+        assert check in document["checks"], check
+    assert document["service_task_definition_arn"] == SERVICE_TD_18
+
+
+def _set_target_17_app(world: World, **changes: Any) -> None:
+    response = copy.deepcopy(
+        world.response(
+            "ecs",
+            "DescribeTaskDefinition",
+            mw.describe_task_definition_request(SERVICE_TD_17),
+        )
+    )
+    for container in response["taskDefinition"]["containerDefinitions"]:
+        if container["name"] == "app":
+            container.update(changes)
+            for key, value in list(container.items()):
+                if value is None:
+                    del container[key]
+    world.put(
+        "ecs",
+        "DescribeTaskDefinition",
+        mw.describe_task_definition_request(SERVICE_TD_17),
+        response,
+    )
+
+
+TARGET_17_REFUSALS: dict[str, tuple[dict[str, Any], str]] = {
+    "worker_false": (
+        {"environment": WORKER_OFF},
+        "rollback_target_worker_flag_true",
+    ),
+    "worker_missing": ({"environment": None}, "rollback_target_worker_flag_true"),
+    # The bridge image itself: not the revision the bridge image replaced.
+    "same_image_as_the_service": (
+        {"image": BRIDGE_IMAGE},
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+    # Another image AND another row: two kinds, not the image alone.
+    "image_and_a_row": (
+        {"environment": [*WORKER_ON, {"name": "LOG_FORMAT", "value": "json"}]},
+        "rollback_target_is_the_revision_the_service_revision_replaced",
+    ),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(TARGET_17_REFUSALS))
+def test_045_refuses_a_target_17_that_is_not_the_revision_the_bridge_replaced(
+    refusal: str, tmp_path: Path
+) -> None:
+    world = ready_world(tmp_path, "045")
+    assert plan(world, tmp_path)["status"] == "ready"
+    changes, check = TARGET_17_REFUSALS[refusal]
+    _set_target_17_app(world, **changes)
+    document = plan(world, tmp_path)
+    assert document["status"] == "blocked"
+    assert "rollback_target_not_repinned" in document["blocks"]
+    assert check not in document["checks"]
+    assert "rollback_target_repinned" in document["checks"]
+    assert "rollback_target_revision_active_digest_pinned" in document["checks"]
+
+
+def test_045_refuses_before_the_bridge_image_serves(tmp_path: Path) -> None:
+    """The service still on revision 17 and its own image (the bridge image
+    not deployed): the window never runs, by the image rule (the credit
+    switch would read 045 outside the serving image's chain) and by the
+    rollback target's content."""
+
+    world = ready_world(tmp_path, "045")
+    world.service_td = SERVICE_TD_17
+    world.put(
+        "ecs",
+        "DescribeServices",
+        mw.describe_services_request(),
+        _service(SERVICE_TD_17),
+    )
+    world.put(
+        "ecs",
+        "DescribeTasks",
+        mw.describe_tasks_request(SERVICE_TASKS),
+        {
+            "tasks": [
+                _running_task(arn, SERVICE_TD_17, REVISION_17_IMAGE.split("@", 1)[1])
+                for arn in SERVICE_TASKS
+            ],
+            "failures": [],
+        },
+    )
+    document = plan(world, tmp_path)
+    assert document["status"] == "blocked"
+    assert "migrations_image_differs_from_deployed_image" in document["blocks"]
+    assert "rollback_target_not_repinned" in document["blocks"]
+    assert (
+        "rollback_target_is_the_revision_the_service_revision_replaced"
+        not in document["checks"]
+    )
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -2528,7 +2795,7 @@ LIVE_ACCEPTED_RUN_TASK_KEYS = {
 }
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 def test_render_run_task_prints_the_exact_request(window: str, tmp_path: Path) -> None:
     world = ready_world(tmp_path, window)
     request = render_run(world, tmp_path)
@@ -2723,7 +2990,7 @@ def test_render_run_task_refuses_unless_plan_is_ready(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 @pytest.mark.parametrize("phase", ["pre", "post"])
 def test_read_request_is_the_read_program_on_the_right_family(
     window: str, phase: str, tmp_path: Path
@@ -3128,7 +3395,7 @@ def _assert_printable(document: dict[str, Any]) -> None:
     assert FORBIDDEN_IN_OUTPUT.search(json.dumps(document)) is None
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 def test_the_window_success_log_is_applied(window: str, tmp_path: Path) -> None:
     world = completed(tmp_path, window)
     result = verify(world, tmp_path)
@@ -3218,6 +3485,8 @@ def test_the_unpinned_head_run_is_schema_beyond_the_window(tmp_path: Path) -> No
         ("036", "success_037"),
         ("036", "success_035"),
         ("037", "success_036"),
+        ("042", "success_045"),
+        ("045", "success_042"),
     ],
 )
 def test_another_windows_upgrade_lines_are_refused(
@@ -3701,7 +3970,7 @@ def test_verify_result_cli_exit_codes(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 def test_the_real_pre_and_post_reads_verify(window: str, tmp_path: Path) -> None:
     world = World(window)
     world.record_read(tmp_path, "pre")
@@ -3924,6 +4193,137 @@ def test_the_042_success_log_is_exactly_the_five_upgrades(tmp_path: Path) -> Non
         assert result["outcome"] == "MIGRATION_WINDOW_STOPPED", window
 
 
+# Window 045 (envio-midia-agente, the media bridge, with 043 and 044): the
+# start state is exactly 042, with neither the table nor the column 045 adds
+# and the media category/MIME check exactly 042's (043 and 044 rewrite it);
+# after the run the application role must hold every privilege the behaviour
+# release needs on what 045 adds. Real runs of the rendered program on
+# PostgreSQL 16 (2026-11-07).
+def test_the_045_pre_read_refuses_a_start_state_other_than_042(
+    tmp_path: Path,
+) -> None:
+    golden = READS["pre_045_at_045"]
+    world = World("045")
+    world.record_read(tmp_path, "pre", golden["lines"], exit_code=golden["exit_code"])
+    result = verify_read(world, tmp_path, "pre")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["alembic_version"] == ["045"]
+    assert result["reasons"] == [
+        "read_alembic_version_mismatch",
+        "read_count_not_zero:045_tables_present",
+        "read_count_not_zero:045_columns_present",
+        "read_count_not_zero:media_mime_check_not_at_042",
+    ]
+    assert [row["count"] for row in result["rows"]] == [1, 1, 1]
+    _assert_printable(result)
+    assert "pre_read_not_ok" in _blocks(world, tmp_path)
+
+
+@pytest.mark.parametrize("index", range(3))
+def test_any_nonzero_count_stops_the_045_preflight(index: int, tmp_path: Path) -> None:
+    lines = READS["pre_045_at_042"]["lines"]
+    name = mw.PREFLIGHT_045[index]
+    world = World("045")
+    world.record_read(tmp_path, "pre", _rows_changed(lines, index, [name, 1]))
+    result = verify_read(world, tmp_path, "pre")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["reasons"] == [f"read_count_not_zero:{mw._slug(name)}"]
+
+
+def test_the_045_post_read_at_042_means_nothing_was_applied(tmp_path: Path) -> None:
+    """At 042 neither object exists: the read does not fail (each is looked
+    up by OID, so the privilege reads NULL), the revision says nothing was
+    applied, and NULL is never held."""
+
+    golden = READS["post_045_at_042"]
+    world = World("045")
+    world.record_read(tmp_path, "post", golden["lines"])
+    result = verify_read(world, tmp_path, "post")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["reasons"] == [
+        "post_read_version_is_before_nothing_applied",
+        "read_privilege_not_held:dml_on_public_media_deliveries",
+        "read_privilege_not_held:dml_on_public_media_assets_trigger_intents",
+    ]
+    _assert_printable(result)
+
+
+def test_the_045_post_read_stops_when_the_application_role_lacks_dml(
+    tmp_path: Path,
+) -> None:
+    """The migration applied, but the role's default privileges grant
+    SELECT alone: the window stops before the behaviour release."""
+
+    golden = READS["post_045_privileges_red"]
+    world = World("045")
+    world.record_read(tmp_path, "post", golden["lines"])
+    result = verify_read(world, tmp_path, "post")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert result["alembic_version"] == ["045"]
+    assert result["reasons"] == [
+        "read_privilege_not_held:dml_on_public_media_deliveries",
+        "read_privilege_not_held:dml_on_public_media_assets_trigger_intents",
+    ]
+    assert result["rows"] == [
+        {"object": "dml on public.media_deliveries", "held": False},
+        {"object": "dml on public.media_assets.trigger_intents", "held": False},
+    ]
+    _assert_printable(result)
+
+
+@pytest.mark.parametrize(
+    "index,values,reason",
+    [
+        (0, ["dml on public.media_deliveries", None], "read_privilege_not_held"),
+        (0, ["dml on public.media_deliveries", "true"], "read_privilege_not_held"),
+        (
+            1,
+            ["dml on public.media_assets.trigger_intents", 1],
+            "read_privilege_not_held",
+        ),
+        (0, ["dml on public.media_assets", True], "read_checks_mismatch"),
+        (1, ["dml on public.media_deliveries", True], "read_checks_mismatch"),
+    ],
+)
+def test_only_the_boolean_true_is_a_held_privilege(
+    index: int, values: list[Any], reason: str, tmp_path: Path
+) -> None:
+    lines = READS["post_045_at_045"]["lines"]
+    world = World("045")
+    world.record_read(tmp_path, "post", _rows_changed(lines, index, values))
+    result = verify_read(world, tmp_path, "post")
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED"
+    assert any(r.startswith(reason) for r in result["reasons"]), result["reasons"]
+
+
+def test_the_045_success_log_is_exactly_the_three_upgrades(tmp_path: Path) -> None:
+    """043 (audio/ogg) and 044 (audio/mp4) have no window: window 045 applies
+    them with 045, and its log is exactly those three upgrade lines."""
+
+    lines = ALEMBIC["success_045"]["lines"]
+    upgrades = [line for line in lines if "Running upgrade" in line]
+    assert upgrades == [
+        "INFO  [alembic.runtime.migration] Running upgrade 042 -> 043, allow"
+        " audio/ogg in the media asset category/MIME invariant",
+        "INFO  [alembic.runtime.migration] Running upgrade 043 -> 044, allow"
+        " audio/mp4 (M4A) in the media asset category/MIME invariant",
+        "INFO  [alembic.runtime.migration] Running upgrade 044 -> 045, media"
+        " trigger intents and session media deliveries",
+    ]
+    result = verify(completed(tmp_path, "045"), tmp_path)
+    assert result["outcome"] == "applied", result["reasons"]
+    # 043 and 044 without 045 (the last line missing) past the log grace
+    # period is not applied: the window stopped part-way.
+    world = completed(tmp_path, "045", list(lines[:-1]))
+    assert lines[-1] == upgrades[-1]
+    result = verify(world, tmp_path)
+    assert result["outcome"] == "MIGRATION_WINDOW_STOPPED", result["reasons"]
+    assert "upgrade_lines_mismatch" in result["reasons"]
+    for window in ("036", "037", "042"):
+        result = verify(completed(tmp_path, window, list(lines)), tmp_path)
+        assert result["outcome"] == "MIGRATION_WINDOW_STOPPED", window
+
+
 def _line(seq: int, kind: str, **values: Any) -> str:
     return json.dumps(
         {
@@ -4066,7 +4466,7 @@ def _snapshot_args(world: World, tmp_path: Path) -> list[str]:
     return args[:index] + args[index + 2 :] + world.manifest_args(tmp_path)
 
 
-@pytest.mark.parametrize("window", ["035", "036", "037", "042"])
+@pytest.mark.parametrize("window", ["035", "036", "037", "042", "045"])
 def test_snapshot_requests_name_the_window_and_carry_no_tags(
     window: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4394,6 +4794,7 @@ def test_script_runs_standalone_without_repository_on_the_path(tmp_path: Path) -
         "036",
         "037",
         "042",
+        "045",
     ]
     # The real clock judges the fixture's capture (2026-10-22): the plan runs
     # standalone (manifest read through the planner) and refuses on freshness
@@ -4503,8 +4904,13 @@ def test_the_042_preflight_file_is_the_runbook_query() -> None:
     assert block == _sql_without_comments("scripts/migration_038_042_preflight.sql")
 
 
+def test_the_045_preflight_file_is_the_runbook_query() -> None:
+    block = _runbook_block("## Migration 045: ")
+    assert block == _sql_without_comments("scripts/migration_043_045_preflight.sql")
+
+
 def _migration_constants(revision: str) -> dict[str, Any]:
-    """CREATED_TABLES / CREATED_FUNCTIONS of one migration, read by AST (the
+    """CREATED_TABLES / CREATED_FUNCTIONS / ADDED_COLUMNS of one migration, read by AST (the
     module imports ``alembic.op``, which only exists inside a run)."""
 
     (path,) = (ROOT / "alembic" / "versions").glob(f"*_{revision}_*.py")
@@ -4514,7 +4920,8 @@ def _migration_constants(revision: str) -> dict[str, Any]:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("CREATED_TABLES", "CREATED_FUNCTIONS")
+            and node.targets[0].id
+            in ("CREATED_TABLES", "CREATED_FUNCTIONS", "ADDED_COLUMNS")
         ):
             found[node.targets[0].id] = ast.literal_eval(node.value)
     return found
@@ -4550,6 +4957,127 @@ def test_the_042_preflight_counts_exactly_what_038_to_042_create() -> None:
     assert sql.count("to_regprocedure(signature) IS NOT NULL") == 3
 
 
+def _invariant_pairs(text: str) -> dict[str, set[str]]:
+    """The (category, MIME types) pairs of a media category/MIME invariant, in
+    source form or as pg_get_constraintdef prints it: a quoted token without a
+    slash is a category, the ones with a slash after it are its types."""
+
+    pairs: dict[str, set[str]] = {}
+    category = None
+    for token in re.findall(r"'([^']*)'", text):
+        if "/" not in token:
+            category = token
+            pairs[category] = set()
+        else:
+            assert category is not None, token
+            pairs[category].add(token)
+    return pairs
+
+
+def _invariant_043_restores_on_downgrade() -> str:
+    """The invariant migration 043's downgrade writes back (042's), built from
+    043's own ``_invariant`` template and ``_AUDIO_MPEG_ONLY`` clause."""
+
+    (path,) = (ROOT / "alembic" / "versions").glob("*_043_*.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+    }
+    (template,) = [
+        node
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef) and function.name == "_invariant"
+        for node in ast.walk(function)
+        if isinstance(node, ast.JoinedStr)
+    ]
+    parts = []
+    for value in template.values:
+        if isinstance(value, ast.Constant):
+            parts.append(str(value.value))
+        else:
+            assert isinstance(value, ast.FormattedValue)
+            parts.append(str(constants["_AUDIO_MPEG_ONLY"]))
+    return "".join(parts)
+
+
+def test_the_045_preflight_counts_exactly_what_045_adds_and_the_042_check() -> None:
+    """The table 045 creates and the column it adds, schema-qualified, each in
+    its own row, and the media category/MIME check 043 and 044 rewrite,
+    compared with 042's exactly; none more."""
+
+    sql = _sql_without_comments("scripts/migration_043_045_preflight.sql")
+    constants = _migration_constants("045")
+    assert set(constants) == {"CREATED_TABLES", "ADDED_COLUMNS"}
+    tables, columns, check = sql.strip().split("\nUNION ALL ")
+    assert tables.startswith("SELECT '045 tables present' AS check_name")
+    assert re.findall(r"'(public\.[a-z_]+)'", tables) == [
+        f"public.{table}" for table in constants["CREATED_TABLES"]
+    ]
+    assert tables.count("to_regclass(relation) IS NOT NULL") == 1
+    assert columns.startswith("SELECT '045 columns present'")
+    assert re.findall(r"\('(public\.[a-z_]+)', '([a-z_]+)'\)", columns) == [
+        (f"public.{table}", column) for table, column in constants["ADDED_COLUMNS"]
+    ]
+    assert "attnum > 0 AND NOT attribute.attisdropped" in columns
+    # 1 - count(*): 0 only for the one validated CHECK of that name on
+    # public.media_assets whose printed definition is 042's.
+    assert check.startswith("SELECT 'media mime check not at 042', 1 - count(*) ")
+    for clause in (
+        "FROM pg_catalog.pg_constraint AS con",
+        "con.conrelid = to_regclass('public.media_assets')",
+        "con.conname = 'ck_media_assets_category_mime'",
+        "con.contype = 'c'",
+        "AND con.convalidated AND",
+    ):
+        assert clause in check, clause
+    head, literal = check.split("pg_catalog.pg_get_constraintdef(con.oid) = ", 1)
+    assert literal.startswith("'CHECK (") and literal.endswith("';")
+    definition = literal[1:-2].replace("''", "'")
+    assert "'" not in literal[1:-2].replace("''", "")
+    # The definition is the invariant 043's downgrade restores: video/mp4,
+    # audio/mpeg alone, application/pdf, image/jpeg and image/png.
+    assert (
+        _invariant_pairs(definition)
+        == _invariant_pairs(_invariant_043_restores_on_downgrade())
+        == {
+            "video": {"video/mp4"},
+            "audio": {"audio/mpeg"},
+            "pdf": {"application/pdf"},
+            "image": {"image/jpeg", "image/png"},
+        }
+    )
+    assert tuple(re.findall(r"SELECT '([0-9a-z ]+)'", sql)) == mw.PREFLIGHT_045
+
+
+def test_the_045_post_read_asks_each_privilege_on_its_own() -> None:
+    """has_table_privilege with a list ('SELECT,INSERT,...') is true when ANY
+    privilege is held: the post-read calls it once per privilege, joined with
+    AND, and looks each object up by OID (a missing one reads NULL)."""
+
+    sql = _sql_without_comments("scripts/migration_043_045_post_read.sql")
+    table_row, column_row = sql.strip().split("\nUNION ALL ")
+    assert re.findall(
+        r"has_table_privilege\(current_user, to_regclass\('public\.media_deliveries'\),"
+        r" '([A-Z]+)'\)",
+        table_row,
+    ) == ["SELECT", "INSERT", "UPDATE", "DELETE"]
+    assert table_row.count(") AND has_table_privilege(") == 3
+    assert re.findall(
+        r"has_column_privilege\(current_user, to_regclass\('public\.media_assets'\),"
+        r" column_number, '([A-Z]+)'\)",
+        column_row,
+    ) == ["SELECT", "INSERT", "UPDATE"]
+    assert column_row.count(") AND has_column_privilege(") == 2
+    assert "attribute.attname = 'trigger_intents'" in column_row
+    assert not re.search(r"'[A-Z]+,[A-Z]", sql)
+    assert "current_user" in sql and "session_user" not in sql
+
+
 def test_the_035_zero_reads_file_is_the_runbook_query() -> None:
     block = _runbook_block(
         "The zero reads are `scripts/migration_033_035_zero_reads.sql`"
@@ -4569,6 +5097,8 @@ def test_the_035_zero_reads_file_is_the_runbook_query() -> None:
         mw.WINDOW_037.pre_read,
         mw.WINDOW_037.post_read,
         mw.WINDOW_042.pre_read,
+        mw.WINDOW_045.pre_read,
+        mw.WINDOW_045.post_read,
     ],
 )
 def test_each_read_file_names_exactly_the_checks_the_verifier_expects(
@@ -4580,6 +5110,8 @@ def test_each_read_file_names_exactly_the_checks_the_verifier_expects(
         assert tuple(names) == spec.checks
     elif spec.rule == mw.RULE_RELATIONS_GONE:
         assert sorted(re.findall(r"'(public\.[a-z_]+)'", sql)) == list(spec.checks)
+    elif spec.rule == mw.RULE_PRIVILEGES_HELD:
+        assert tuple(re.findall(r"SELECT '(dml on [a-z_.]+)'", sql)) == spec.checks
     else:
         assert tuple(re.findall(r"SELECT '([a-z_ 0-9]+)'", sql)) == spec.checks
 
@@ -4604,7 +5136,7 @@ def _statement_text(sql: str) -> str:
 
 @pytest.mark.parametrize(
     "window,phase",
-    [(w, p) for w in ("035", "036", "037", "042") for p in ("pre", "post")],
+    [(w, p) for w in ("035", "036", "037", "042", "045") for p in ("pre", "post")],
 )
 def test_every_decoded_payload_is_one_select_only_statement(
     window: str, phase: str
@@ -4674,9 +5206,9 @@ def test_the_runbook_window_table_is_the_module_table() -> None:
     rows = [
         line
         for line in section.splitlines()
-        if re.match(r"^\| `0(?:3[567]|42)` \|", line)
+        if re.match(r"^\| `0(?:3[567]|4[25])` \|", line)
     ]
-    assert len(rows) == 4
+    assert len(rows) == 5
     for row, window in zip(rows, mw.WINDOWS.values()):
         cells = [cell.strip() for cell in row.strip("|").split("|")]
         labels = [label for _phase, label in window.plan_steps]

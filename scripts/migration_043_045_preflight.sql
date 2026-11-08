@@ -1,0 +1,33 @@
+-- SELECT-only preflight before migration window 045 (migrations 043-045).
+--
+-- scripts/asaas_migration_window.py (render-pre-read --window 045) runs it in
+-- a read task, as the application role, inside a REPEATABLE READ, READ ONLY
+-- transaction that is always rolled back, right before the window; the same
+-- task reads alembic_version, which must be 042.  The window applies 043 and
+-- 044 (the media category/MIME invariant widened for audio/ogg, then
+-- audio/mp4; neither has a window of its own) and 045 (the media bridge), so
+-- the start state is the 042 schema exactly where they touch it, and every
+-- count must be 0, or stop and return to the owner:
+--
+-- * '045 tables present' counts the tables 045 creates (CREATED_TABLES) that
+--   already exist, '045 columns present' the columns it adds (ADDED_COLUMNS)
+--   that already exist;
+-- * 'media mime check not at 042' is 0 only when public.media_assets has the
+--   validated CHECK ck_media_assets_category_mime whose definition, as
+--   pg_get_constraintdef prints it on PostgreSQL 16 (production runs RDS
+--   PostgreSQL 16), is 042's byte for byte, and 1 otherwise.  043 and 044
+--   drop and re-create that constraint, each wider than the one before, so
+--   no row the 042 constraint admits can stop them; but a missing constraint
+--   fails 043's DROP (42704), and a drifted one is silently replaced, or,
+--   admitting a row 043's does not, fails its validation (23514).
+--
+-- The rows count catalog objects, not table rows, so row-level security
+-- cannot hide one.  Every name is schema-qualified.
+-- docs/runbooks/asaas-deployment.md ("Migration 045") shows this query byte
+-- for byte below these comment lines; tests/scripts/test_asaas_migration_window.py
+-- keeps the two equal and every list equal to the migration's constants, and
+-- tests/integration/test_media_bridge_migration_postgres.py reads 0 with it
+-- at 042 and 1 once the constraint is not 042's.
+SELECT '045 tables present' AS check_name, count(*) AS found FROM unnest(ARRAY['public.media_deliveries']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '045 columns present', count(*) FROM (VALUES ('public.media_assets', 'trigger_intents')) AS added(relation, name) JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = to_regclass(added.relation) AND attribute.attname = added.name WHERE attribute.attnum > 0 AND NOT attribute.attisdropped
+UNION ALL SELECT 'media mime check not at 042', 1 - count(*) FROM pg_catalog.pg_constraint AS con WHERE con.conrelid = to_regclass('public.media_assets') AND con.conname = 'ck_media_assets_category_mime' AND con.contype = 'c' AND con.convalidated AND pg_catalog.pg_get_constraintdef(con.oid) = 'CHECK (((((category)::text = ''video''::text) AND ((mime_type)::text = ''video/mp4''::text)) OR (((category)::text = ''audio''::text) AND ((mime_type)::text = ''audio/mpeg''::text)) OR (((category)::text = ''pdf''::text) AND ((mime_type)::text = ''application/pdf''::text)) OR (((category)::text = ''image''::text) AND ((mime_type)::text = ANY ((ARRAY[''image/jpeg''::character varying, ''image/png''::character varying])::text[])))))';

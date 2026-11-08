@@ -907,7 +907,7 @@ restored guards refuse what they refused.
 
 ## Migration windows: the run tooling
 
-Four production migration windows, each its own manifest step and each run
+Five production migration windows, each its own manifest step and each run
 only on its own explicit owner instruction, in this order. The window table
 of `scripts/asaas_migration_window.py` (`WINDOWS`) is the only source: the
 planner validates the manifest steps against it and renders each window's
@@ -919,6 +919,7 @@ migrations revision from it.
 | `036` | `migrations_036` | S20-S22 | `alembic upgrade 036` | `035`, `036` | `pre-036-<date>` | `scripts/migration_036_preflight.sql`, application role | every service task runs the image containing 036 by digest, and the migrations revision carries that same image; `rollback_target` re-pinned to revision 10, `ACTIVE` (by number) |
 | `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 10, `ACTIVE` (by number) |
 | `042` | `migrations_038_042` | S25-S27 | `alembic upgrade 042` | `037`, `042` | `pre-038-042-<date>` | `scripts/migration_038_042_preflight.sql`, application role | as for 036, with the image containing 042 (live step L2b of asaas-rollout-opening), carried by the migrate revision; `rollback_target` revision 12 (L2a's, re-pinned in L2c), `ACTIVE`, and by content: the worker `'true'` exactly once, and the service revision (L2b's) differing from it in the app image alone |
+| `045` | `migrations_043_045` | S28-S30 | `alembic upgrade 045` | `042`, `045` | `pre-043-045-<date>` | `scripts/migration_043_045_preflight.sql`, application role | as for 042, with the media bridge image containing 045 (envio-midia-agente Group 1; the window also applies 043 and 044, the media category/MIME invariant widened for `audio/ogg` and `audio/mp4`, which have no window of their own), carried by the migrate revision; `rollback_target` revision 17 (the revision the bridge image replaces), `ACTIVE`, and by the same content: the worker `'true'` exactly once, and the service revision (the bridge revision) differing from it in the app image alone |
 
 History: windows `036` and `037` actually ran with `rollback_target`
 revision 9; the requirement of revision 10 in the table applies to any later
@@ -926,12 +927,16 @@ use of the tooling. Since the re-pin from 10 to 11 (asaas-rollout-opening
 Group 5b) the reviewed manifest satisfies neither: production is at `037`,
 so they could run again only after a snapshot restore, planned with a
 manifest at 10 (a fact, not a pending item). Window `042` requires revision
-12 by number and by content (below), never the number alone.
+12 by number and by content (below), never the number alone, and window
+`045` revision 17 the same way ("Migration 045" below).
 
 After the run every window reads back `alembic_version` as the application
 role; it must be exactly the window's "after" (window `037` also reads
-`scripts/migration_037_post_read.sql`: the four legacy tables gone). Window
-`042` is described in "Window 042: migrations 038-042" below.
+`scripts/migration_037_post_read.sql`: the four legacy tables gone; window
+`045` also reads `scripts/migration_043_045_post_read.sql`: the application
+role's privileges on what 045 adds). Window `042` is described in "Window
+042: migrations 038-042" below, window `045` (migrations 043-045) in
+"Migration 045" after it.
 `windows` prints this table.
 
 There is **no default window**: every subcommand of the tool, and the
@@ -984,7 +989,10 @@ reads run on, is a spelling backstop, not the guarantee.
   ECS allows). The revision to use is `neurostack-staging-consulta:28`
   (below). Their SQL is row counts and the revision read: no ownership
   or privilege check, so the application role answers them as the migration
-  would (reproduced on PostgreSQL 16 in the T8 capture). Dropping the
+  would (reproduced on PostgreSQL 16 in the T8 capture). The one exception
+  is window `045`'s post-read, a privilege check on purpose: it asks about
+  the reading role itself, the application role the behaviour release runs
+  as, so that role is the one that must answer it. Dropping the
   override there would start the family's own baked command, so that
   command, its entry point and its environment must not mention the
   migration tool: `plan-pre-read`, `plan-post-read`, `verify-*-read` and
@@ -1058,13 +1066,13 @@ every freshness window is judged against the system clock.
 
 ```bash
 tool=scripts/asaas_migration_window.py
-args=(--window "$W"                                   # 035, 036, 037 or 042: the owner's order
+args=(--window "$W"                                   # 035, 036, 037, 042 or 045: the owner's order
       --readback-file "$workdir/window-readback.json"
       --service-task-definition "$SERVICE_TD"         # the revision the service runs
       --migrations-task-definition "$MIGRATIONS_TD"   # registered for this window (> :3)
       --read-task-definition "$READ_TD"               # neurostack-staging-consulta:28
       --snapshot-id "$SNAPSHOT_ID")                   # printed by render-snapshot-requests
-# window 037 only (required there, refused for 035, 036 and 042):
+# window 037 only (required there, refused for 035, 036, 042 and 045):
 args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read revision
 ```
 
@@ -1072,14 +1080,14 @@ args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read 
 `plan-*` and `plan` list the reads still missing as `next_requests`, with
 status `incomplete`: send them, record the responses, run them again):
 
-| Phase | Plan step (035 / 036 / 037 / 042) | Subcommands, in order | Done when |
+| Phase | Plan step (035 / 036 / 037 / 042 / 045) | Subcommands, in order | Done when |
 |---|---|---|---|
-| register | S10 / S20 / S23 / S25 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
-| snapshot | S11 / S20 / S23 / S25 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
-| pre-read | S12 / S21 / S24 / S26 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
-| run | S12 / S21 / S24 / S26 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
-| verify | S13 / S22 / S24 / S27 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
-| post-read | S13 / S22 / S24 / S27 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" |
+| register | S10 / S20 / S23 / S25 / S28 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
+| snapshot | S11 / S20 / S23 / S25 / S28 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
+| pre-read | S12 / S21 / S24 / S26 / S29 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
+| run | S12 / S21 / S24 / S26 / S29 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
+| verify | S13 / S22 / S24 / S27 / S30 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
+| post-read | S13 / S22 / S24 / S27 / S30 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" (and, for `037` and `045`, every row of its post-read file passes) |
 
 **Snapshot order.** `plan-snapshot` runs, and exits 0, **before**
 `CreateDBSnapshot` is sent: it is the check that the deploy state allows
@@ -1120,7 +1128,9 @@ table's `plan_steps`, printed by `windows`). They map the S1-S24 plan of
 the plan's own step texts are not in this repository, so the mapping is
 inferred, and a label whose step differs is renamed here and in the window
 table together. Window `042`'s S25-S27 continue that numbering for live step
-L3 of asaas-rollout-opening and map no step of the 2026-10-19 plan.
+L3 of asaas-rollout-opening and map no step of the 2026-10-19 plan; window
+`045`'s S28-S30 continue it for the media bridge window of
+envio-midia-agente.
 
 **Same-day snapshot retry: a known limitation.** The snapshot name is
 `pre-<span>-<date>` (owner decision 2026-10-19 b) and has no second slot for
@@ -1138,7 +1148,7 @@ pending, Fargate, private awsvpc; `ListTasks` of the service listing exactly
 `desiredCount` tasks, each `RUNNING` on `$SERVICE_TD` with the `app`
 container on the expected image digest, and no task told to stop still
 running (`desiredStatus` `STOPPED` listing all `STOPPED`); the expected digest
-is, for 036, 037 and 042, the migrations revision's image, which must equal the
+is, for 036, 037, 042 and 045, the migrations revision's image, which must equal the
 service revision's `app` image exactly, and for 035 the service revision's
 own image (a tag resolved through `ecr:DescribeImages`); the migrations
 revision of this window: family `neurostack-staging-migrations`, revision
@@ -1157,7 +1167,9 @@ content, exactly one `BILLING_FACT_WORKER_ENABLED` row in revision 12, `'true'`
 differing from revision 12 in the app image alone, the planner's
 `reviewed_change`, both read the same way, without `TAGS`
 (`rollback_target_is_the_revision_the_service_revision_replaced`), else
-`rollback_target_not_repinned`; for 037 the read revision (baked readback,
+`rollback_target_not_repinned`; for 045 revision 17, by number and by the
+same content (the service revision being the bridge revision, the one
+running the image containing 045); for 037 the read revision (baked readback,
 no mention of the migration tool, same image as the migrate revision) and the
 migrate revision never swapped; the recorded pre-read verified `read_ok`,
 stopped within the last 15 minutes and created at or after the snapshot; no
@@ -1390,6 +1402,257 @@ not a way back once the credit system writes; restoring the snapshot is an owner
 of last resort, because it loses every write made after it. SQLSTATE
 `55P03`, `40P01` or `55000` means nothing changed: report and stop.
 
+## Migration 045: media trigger intents and deliveries (the media bridge release)
+
+Migration `045` (envio-midia-agente, Group 1) is the schema of the agent's
+media delivery, shipped in a release of its own, the **bridge release**
+(PR-A), before the behaviour release (PR-B) that uses it. It only adds:
+
+- the column `media_assets.trigger_intents`, `TEXT[] NOT NULL DEFAULT '{}'`:
+  every existing row reads the empty list, and an insert that does not name
+  the column gets it too (the default is a constant, so PostgreSQL does not
+  rewrite the table);
+- the table `media_deliveries` (`id`, `tenant_id`, `session_id`, `media_id`,
+  `last_sent_at`), with `UNIQUE (session_id, media_id)` and three foreign
+  keys `ON DELETE CASCADE`: deleting a tenant (`tenants`), a session
+  (`sessions`) or a media asset (`media_assets`) deletes its rows
+  (`tenant_id` and `media_id` are indexed for those cascades).
+
+**Window `045` also applies `043` and `044`.** Migration `043` widens the
+media category/MIME invariant `ck_media_assets_category_mime` for
+`audio/ogg` (#184) and `044` for `audio/mp4` (M4A); neither has a window of
+its own, so production stays at `042` until this window runs `042 -> 043 ->
+044 -> 045` in one run. Each drops the constraint and re-creates it wider,
+with no backfill; every row the `042` constraint admits is admitted after
+them, so no existing row can stop them. That holds only while the constraint
+really is `042`'s, which is why the preflight reads it.
+
+**The window briefly blocks writes.** `alembic/env.py` does not set
+`transaction_per_migration`, so the whole run is **one transaction**, and
+every lock it takes is held until its commit:
+
+1. `043` takes `ACCESS EXCLUSIVE` on `media_assets` (from then on every read
+   and write of `media_assets` waits) and validates its new CHECK by
+   scanning the table; `044` scans it again under the same lock.
+2. `045` adds the column under that same lock (a catalog change only).
+3. `045`'s `CREATE TABLE media_deliveries` takes `SHARE ROW EXCLUSIVE` on
+   `tenants`, then on `sessions` (it conflicts with every `INSERT`, `UPDATE`
+   and `DELETE` on them; reads still run), still holding the lock on
+   `media_assets`.
+
+`lock_timeout` (5 s, `SET LOCAL` by each of `043`, `044` and `045`) bounds each
+lock **wait**, not a statement or the run: the run gives up after 5 s
+waiting for any one lock, but the waits add up. Worst case, `media_assets`
+is unreadable and unwritable for about 15 s (three waits of up to 5 s: on
+`media_assets` itself, during which new readers already queue behind the
+request, then on `tenants`, then on `sessions`) plus the two scans and the
+DDL, and writes to `tenants` and `sessions` wait from the window's request
+for their lock to the commit; normally the whole run takes well under a
+second. SQLSTATE `55P03` (lock timeout) or `40P01` (deadlock) means nothing
+changed: the one transaction rolled back, `043` and `044` with `045`, and the
+revision stays `042`. Report it, and the window can be retried from the
+pre-read on the owner's instruction.
+
+It alters no ASAAS or credit object, and **the bridge image maps neither
+object in the ORM**: nothing under `src/` names `trigger_intents` or
+`media_deliveries`.
+
+**Why a bridge release.** Three constraints meet here:
+
+1. The window tool requires, for every window after the first, the image
+   containing the migration on every service task (`IMAGE_RULE_DEPLOYED`).
+2. The credit switch reads `alembic_version` against the serving image's own
+   migration chain: a database at `045` under an image whose chain ends
+   before `045` is `revision_outside_image_chain`, and the switch turns
+   **off**. So the image that contains `045` serves before the window runs.
+3. An image whose ORM maps `trigger_intents` fails every `SELECT` of
+   `media_assets` on a schema still at `042`.
+
+The bridge image contains `045` and maps nothing, so it runs on `042` (before
+the window) and on `045` (after it), and the credit switch stays on through
+the window. The behaviour release maps both objects, so it is **merged** into
+`main`, not only deployed, after the window: an image built from a `main`
+that carries the mapping before the window (a hotfix, a live step of another
+wish) would have no safe deploy.
+
+**Production order** (each step on its own owner approval, except steps 1
+and 2, approved together; see "Known gap" below):
+
+0. Re-pin the manifest's rollback target from 16 to the serving revision 17,
+   by its own manifest PR, before any image change (the planner's image gate
+   requires the target to be the revision an image change replaces;
+   "Re-pinning the rollback target along the live chain").
+1. Deploy the bridge image: one revision with the app image alone moved
+   (revision 18, from 17).
+2. Run window `045` (below), on that image, with the rollback target 17.
+   Run it **right after** step 1 (see "Known gap" below).
+3. Re-pin the rollback target from 17 to the bridge revision 18, by its own
+   manifest PR, once window `045` is verified and the bridge revision serves.
+   The planner's image gate requires the service to run the target before
+   any image change (`service_not_on_target`), so with the target still 17
+   PR-B's deploy is blocked (`rollback_target_not_repinned_before_image_bump`);
+   after this step the way back from PR-B is the bridge revision, which keeps
+   the credit switch on.
+4. Only then merge and deploy the behaviour release (PR-B), rebased on the
+   `main` that contains this release, with proof of ancestry.
+5. Open the behaviour release's flag.
+
+**Known gap between steps 1 and 2: `audio/ogg` and `audio/mp4` uploads
+fail.** The bridge image is built from a `main` that contains #184 and M4A,
+whose upload route accepts `audio/ogg` and `audio/mp4`, while the schema is
+still at `042`, whose `ck_media_assets_category_mime` admits only
+`audio/mpeg` for audio. Until the window runs, a valid OGG-Opus or M4A
+upload passes every check of the image, then its `INSERT` violates the
+constraint (SQLSTATE `23514`), and the route maps that `IntegrityError` like
+any database error: **503 `media_storage_unavailable`**, nothing stored, the
+transaction rolled back (reproduced on PostgreSQL 16 with the real upload
+route: both 503 at `042`, both created at `045`). The code says
+"unavailable", so a client may retry; it succeeds only once the window has
+run. **The gap comes from the current `main`, not from the bridge**: #184
+(`3051496f`) added `audio/ogg` and #194 (`b39eb270`) added `audio/mp4`, both
+with their migration (`043`, `044`) and no window of their own, and the
+bridge adds no upload path. **Every deploy of the current `main` to
+production before window `045` runs has it**, a hotfix deployed before this
+bridge release included; window `045` (`042 -> 043 -> 044 -> 045`) is what
+closes it. Production today is not affected: the service runs revision 17
+(image `build-20261104-fbda835a`), which does not contain #184. Following
+this order, the gap lasts only from the bridge deploy to the window's
+commit, so the remedy is the order itself: run the window right after the
+bridge deploy is stable, and keep the gap short. **Steps 1 and 2 are
+approved together**, in one "vai" from the owner, and run back to back;
+never approve step 1 alone and leave it
+standing. If the window cannot run right after the deploy, close the gap by
+returning the service to revision 17 (the image without #184 and #194, and
+the rollback target after step 0): before the window that is an ordinary
+image rollback, the schema still at `042` and the credit switch **on**
+("Rollback" below).
+
+**Preconditions.** Window `042` applied and verified. The bridge image
+deployed and running on every service task, by digest, and carried by the
+window's migrations revision (`migrations_image_differs_from_deployed_image`,
+`service_task_image_digest_mismatch` otherwise). `rollback_target` revision
+17 with no pending re-pin, `ACTIVE`, by digest, and, by content, exactly one
+`BILLING_FACT_WORKER_ENABLED` row in it, `'true'`, and the service revision
+(the bridge revision) differing from it in the app image alone
+(`rollback_target_not_repinned` otherwise). Revision 17 is the revision
+serving on 2026-11-07 (read on ECS: `ACTIVE`, the worker, the credit switch
+and the transport `'true'` and the AppConfig group, differing from revision
+16 in the app image alone). **The owner confirmed revision 17 on
+2026-11-07**; a later serving revision moves the window's
+`rollback_target_revision` with it, in the same reviewed way.
+
+**Preflight (SELECT only, immediately before the run)**, as the application
+role on the read family: `scripts/migration_043_045_preflight.sql`, byte
+for byte below (its comment lines aside). The same task reads
+`alembic_version`, which must be `042`. Every count must be `0`, or stop and
+return to the owner:
+
+- `045 tables present` counts the tables `045` creates (`CREATED_TABLES`)
+  that already exist, and `045 columns present` the columns it adds
+  (`ADDED_COLUMNS`);
+- `media mime check not at 042` is `0` only when `media_assets` has the
+  validated CHECK `ck_media_assets_category_mime` whose definition, as
+  `pg_get_constraintdef` prints it on PostgreSQL 16 (production runs RDS
+  PostgreSQL 16), is `042`'s byte for byte, and `1` otherwise. `043` and
+  `044` are widenings, so no row can stop them, but a missing constraint
+  fails `043`'s `DROP` (SQLSTATE `42704`), and a drifted one is silently
+  replaced, or, if it admits a row `043`'s does not, fails `043`'s
+  validation (SQLSTATE `23514`): either would surface as an unexpected
+  failure or an unseen change in the run, so the preflight stops first.
+
+The real runs on PostgreSQL 16
+(`tests/fixtures/asaas_migration_window/read_runs.json`): at `042` every
+count `0` (`read_ok`); at `045` the revision and every count stop it.
+
+```sql
+SELECT '045 tables present' AS check_name, count(*) AS found FROM unnest(ARRAY['public.media_deliveries']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '045 columns present', count(*) FROM (VALUES ('public.media_assets', 'trigger_intents')) AS added(relation, name) JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = to_regclass(added.relation) AND attribute.attname = added.name WHERE attribute.attnum > 0 AND NOT attribute.attisdropped
+UNION ALL SELECT 'media mime check not at 042', 1 - count(*) FROM pg_catalog.pg_constraint AS con WHERE con.conrelid = to_regclass('public.media_assets') AND con.conname = 'ck_media_assets_category_mime' AND con.contype = 'c' AND con.convalidated AND pg_catalog.pg_get_constraintdef(con.oid) = 'CHECK (((((category)::text = ''video''::text) AND ((mime_type)::text = ''video/mp4''::text)) OR (((category)::text = ''audio''::text) AND ((mime_type)::text = ''audio/mpeg''::text)) OR (((category)::text = ''pdf''::text) AND ((mime_type)::text = ''application/pdf''::text)) OR (((category)::text = ''image''::text) AND ((mime_type)::text = ANY ((ARRAY[''image/jpeg''::character varying, ''image/png''::character varying])::text[])))))';
+```
+
+**Post-read: the privileges the behaviour release needs.** The migrations
+carry no `GRANT`: the application role reaches a new table only through the
+migration role's default privileges, and a new column through its grants on
+the table (the migration role and the DML application role are different
+roles; see "Preflight readback" in "Migration 037"). So, after the run, the
+post-read `scripts/migration_043_045_post_read.sql`, as the application
+role on the read family, reads `alembic_version` (`045`) and one row per
+object, `true` only when that role holds every privilege the behaviour
+release needs on it: `SELECT`, `INSERT`, `UPDATE` and `DELETE` on
+`media_deliveries` (`dml on public.media_deliveries`), and `SELECT`,
+`INSERT` and `UPDATE` on `media_assets.trigger_intents` (`dml on
+public.media_assets.trigger_intents`). Each privilege is asked on its own
+and joined with `AND`, because `has_table_privilege` with a list
+(`'SELECT,INSERT,UPDATE,DELETE'`) is true when **any** of them is held. A
+row that is not `true` is `read_privilege_not_held:<check>` and stops the
+window before the behaviour release; the remedy (a grant, or default
+privileges on the migration role) is an owner decision. The real runs: at
+`045` with the DML role both rows `true` (`verified`); with default
+privileges granting `SELECT` alone both `false`; at `042` both `NULL` (each
+object is looked up by OID, so the read does not fail) with
+`post_read_version_is_before_nothing_applied`. This is the post-read the
+owner confirms before the behaviour release is merged.
+
+The post-read does not read the media check again: `alembic_version` reads
+`045` only once the one transaction that also ran `043` and `044` committed,
+and `verify-result` already requires exactly their three upgrade lines in
+the run's log. That `audio/ogg` and `audio/mp4` are admitted after the
+window is what those two facts prove together.
+
+Order (each step stops on any divergence and returns to the owner; the
+subcommands are `scripts/asaas_migration_window.py --window 045`, with the
+arguments of "Files" above and no `--migrations-read-task-definition`):
+
+1. Register the window's migrations revision with `render-migrations-taskdef
+   --window 045 --purpose migrate` (the deployed bridge image digest, the
+   command baked to exactly `alembic upgrade 045`).
+2. `plan-snapshot`, then `render-snapshot-requests`: the manual RDS snapshot
+   named `pre-043-045-<date>`, `available` and recent.
+3. `plan-pre-read`, `render-pre-read`, `verify-pre-read`: `read_ok`, every
+   count `0` with `alembic_version` == `042`, read as the application role.
+4. `plan`, then `render-run-task`, and the RunTask exactly as printed.
+5. `render-verify-reads --target migration`, then `verify-result`:
+   `applied`, exactly the three upgrade lines `042 -> 043`, `043 -> 044` and
+   `044 -> 045` (the real run is in
+   `tests/fixtures/asaas_migration_window/alembic_runs.json`, `success_045`).
+6. `plan-post-read`, `render-post-read`, `verify-post-read`. **Verify**
+   `alembic_version` == `045` and both privilege rows `true`;
+   `post_read_version_is_before_nothing_applied` means it still reads `042`.
+
+### Rollback
+
+None from the window; SQLSTATE `55P03`, `40P01` or `55000` means nothing
+changed: report and stop.
+
+- **Before the window (after step 1, before step 2): the bridge image back
+  to revision 17.** An ordinary image rollback: the schema did not change,
+  `042` is in both images' chains, and the credit switch stays **on**. It is
+  also the escape hatch for the OGG/M4A gap ("Known gap" above): if the
+  window cannot run promptly after the bridge deploy, returning to revision
+  17 closes the gap, because its image (`build-20261104-fbda835a`) predates
+  #184 and never offers `audio/ogg` or `audio/mp4`.
+- **The behaviour release back to the bridge image: safe.** The bridge image
+  contains `045` too, so the chain keeps the revision and the credit switch
+  stays **on**; it maps neither object, so the rows the behaviour release
+  wrote stay, unread. It is the rollback target once step 3 above re-pins
+  the target from 17 to the bridge revision 18, before PR-B deploys.
+- **The bridge image back to the rollback target (revision 17) after the
+  window.** Only while the bridge serves and the target is still 17 (before
+  step 3). The schema stays valid for it (the column has a default, the
+  table is unused, the media check only admits more), but its image's chain
+  ends before `045`: the credit switch reads `revision_outside_image_chain`
+  and stays **off** until an image containing `045` serves again. It is the
+  way back from an image failure, not a free one; prefer going forward to
+  the bridge image. After step 3 the target is the bridge revision itself.
+- **The schema.** The downgrades are not a production way back: `045`'s
+  refuses (SQLSTATE `55000`, nothing changed) while `media_deliveries` holds
+  a row or a media asset has trigger intents, and `044`'s and `043`'s fail
+  (SQLSTATE `23514`, nothing changed) while an `audio/mp4` or `audio/ogg`
+  asset exists. As after windows `036`, `037` and `042`, the schema goes
+  back only by restoring the snapshot (`pre-043-045-<date>`, taken at
+  `042`, so it undoes `043` and `044` too), an owner decision of last resort
+  that loses every write made after it.
+
 ## Post-deploy rollout readback
 
 The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one
@@ -1410,28 +1673,32 @@ task, one JSON line per result), the read family contract of
 `neurostack-staging-consulta:28` (application role), the RunTask hardening,
 the log reader, the exposure scan and the output guard. The program carries
 the labels window `<W>`, phase `rollout` (the window tool recognizes these
-two pairs, and only them, as a read program besides the windows' own).
+three pairs, and only them, as a read program besides the windows' own).
 
-**Two windows, chosen explicitly.** Every subcommand requires `--window`,
+**Three windows, chosen explicitly.** Every subcommand requires `--window`,
 given once and with no default: `037` while the production schema is at
 `037` (before window `042`, live step L3 of asaas-rollout-opening), `042`
-after it. The window is the program's label and the revision the read must
-see; nothing else differs (the SQL, the payload digest, the table and the
-judge are the same). The readback file carries no window (the window is
+after it while the schema is at `042`, and `045` once window `045` (the
+media bridge release, "Migration 045") has run; that window also applies
+`043` and `044`, which have no window and so no readback of their own. The window is the program's
+label and the revision the read must see; nothing else differs (the SQL,
+the payload digest, the table and the judge are the same). The readback file carries no window (the window is
 `--window`'s; a file with a `window` key is `readback_file_shape_invalid`).
-A RunTask or a task rendered for one window never verifies as the other: the
+A RunTask or a task rendered for one window never verifies as another: the
 recorded RunTask, the task's command, the program's window label and the
 revision stop it (`read_request_not_rendered_by_this_tool`,
 `read_task_command_mismatch`, `read_begin_mismatch`), and the program of one
-window on the other window's schema stops on the revision alone
-(`read_alembic_version_mismatch`): the 038 to 042 window changes none of the
-facts it reads. `readback_window_mismatch` guards the Python API (a
-readback loaded for one window passed with the context of the other); from
+window on another window's schema stops on the revision alone
+(`read_alembic_version_mismatch`): neither the 038 to 042 window nor window
+`045` (with `043` and `044`) changes any of the facts it reads (after window `045`, `--window 042`
+stops there, so name `045`). `readback_window_mismatch` guards the Python
+API (a readback loaded for one window passed with the context of another);
+from
 the command line it cannot fire.
 
 **What it reads** (`scripts/asaas_rollout_readback.sql`, verbatim in the
-program): `alembic_version`, which must be exactly the chosen window (`037`
-or `042`), and one row per
+program): `alembic_version`, which must be exactly the chosen window (`037`,
+`042` or `045`), and one row per
 fact, `check_name`, `subject`, `value`. `verify` requires exactly this
 table of 25 rows (4 + 4 + 4 + 10 + 3), no row missing, none added or
 repeated. Rows are judged by `check_name` and `subject`, so their order is
@@ -1476,7 +1743,7 @@ that no transition to `canary_allowlist` or `general` ever happened; the
 ```bash
 tool=scripts/asaas_rollout_readback.py
 workdir="$(mktemp -d)" && chmod 700 "$workdir"; umask 077
-args=(--window "$W"                                   # 037 before window 042, 042 after it
+args=(--window "$W"                                   # 037 before window 042, 042 after it, 045 after window 045
       --readback-file "$workdir/rollout-readback.json"
       --service-task-definition "$SERVICE_TD"            # the revision serving now (see below)
       --read-task-definition arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-consulta:28)
@@ -1494,7 +1761,9 @@ be serving when the read runs: for `--window 037`, the revision serving at
 the time (`neurostack-staging-app:11`, the final deploy of 2026-10-25,
 before L2a; the L2a or L2b revision until L3); for `--window 042`, which
 runs only after L2a and L2b, the revision L2b registered and the service
-serves. With `:11` once the service runs a later revision, `plan` blocks on
+serves; for `--window 045`, which runs only after window `045`, the
+revision serving then: the bridge revision (18), or the behaviour release's
+revision once PR-B is deployed (the read itself is the same on both). With `:11` once the service runs a later revision, `plan` blocks on
 the service check (`service_task_definition_mismatch`); the verdict names
 it. Running the three commands in
 sequence before the RunTask is sent is harmless: the tool itself sends
@@ -1590,13 +1859,15 @@ program at 036, at 037, with row-level security on `billing_rollout_control`
 and on `billing_checkout_sessions`, with one row opened to `general`; and,
 captured on 2026-10-31, window `042`'s program at 037 and at 042 and window
 `037`'s at 042; window `037`'s program at 037 printed the earlier capture
-again, byte for byte); the server log of those captures shows each read
+again, byte for byte; and, captured on 2026-11-07, window `045`'s program
+at 042 and at 045 and window `042`'s at 045; window `042`'s program at 042
+printed the earlier capture again, byte for byte); the server log of those captures shows each read
 session running only `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, the
 `SET LOCAL` settings, the two SELECTs and `ROLLBACK`.
 `tests/integration/test_rollout_readback_postgres.py`, in the
 release-candidate PostgreSQL suites CI runs
 (`asaas_release_candidate_postgres_suites`), migrates a fresh database to
-036, 037 and 042 and runs both windows' programs as the superuser and as a
+036, 037, 042 and 045 and runs every window's program as the superuser and as a
 throwaway non-superuser login role at each (each passes only on its own
 revision; row-level security is not bypassed for the non-superuser).
 
@@ -1635,7 +1906,7 @@ python scripts/asaas_production_wiring.py check          --params "$params"
 python scripts/asaas_production_wiring.py render-migrations-taskdef --window 035 --purpose migrate --params "$params"
 ```
 
-`render-migrations-taskdef` requires `--window` (`035`, `036`, `037` or `042`) and
+`render-migrations-taskdef` requires `--window` (`035`, `036`, `037`, `042` or `045`) and
 `--purpose` (`migrate`, or `read` for window `037` only); neither has a
 default. `migrate` bakes exactly the window's own upgrade; `read` bakes
 window `037`'s SELECT-only readback program on the same image, roles and
@@ -3726,8 +3997,8 @@ poetry run python scripts/production_image_smoke.py --expected-head <head of the
 ```
 
 `--expected-head` is the head of the migrations CONTAINED in the image, that
-is of `alembic/versions` in the checkout being built: `044` on `main` today
-(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041, enforcement 042, the media `audio/ogg` widening 043 and the media `audio/mp4` widening 044 are merged). It is not the production
+is of `alembic/versions` in the checkout being built: `045` on `main` today
+(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041, enforcement 042, the media `audio/ogg` widening 043, the media `audio/mp4` widening 044 and the media bridge 045 are merged). It is not the production
 migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
 checked offline as `032:035` whatever the image's head is.
 
@@ -3757,7 +4028,7 @@ signer factories build their clients (no KMS call);
 `billing_fact_bundle_digest()` and the consumer pin both return the pinned
 digest; `alembic heads` prints
 exactly one line, `<expected head> (head)`, the head of the migrations in
-the image given with `--expected-head` (`044` on `main` today);
+the image given with `--expected-head` (`045` on `main` today);
 `/app/spa/index.html` exists; and `alembic upgrade
 032:035 --sql` emits the production migration window, which stays `032:035`
 whatever the image's head, as one transaction. The window

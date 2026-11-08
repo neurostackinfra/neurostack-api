@@ -1,5 +1,5 @@
 {
- "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app). Window 042's runs (pre_042_at_036, pre_042_at_037, post_042_at_037, success_042, pre_042_at_042, post_042_at_042) were captured on 2026-10-31 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 036, then 037, then 042 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT through default privileges set before the migrations); the server statement log showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK.",
+ "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app). Window 042's runs (pre_042_at_036, pre_042_at_037, post_042_at_037, success_042, pre_042_at_042, post_042_at_042) were captured on 2026-10-31 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 036, then 037, then 042 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT through default privileges set before the migrations); the server statement log showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK. Window 045's runs (pre_045_at_042, post_045_at_042, success_045, pre_045_at_045, post_045_at_045, post_045_privileges_red) were captured on 2026-11-07 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 042, then to 045 in one run (043, 044 and 045) by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT, INSERT, UPDATE and DELETE through default privileges set before the migrations, the DML application role); post_045_privileges_red in a second database where those default privileges grant SELECT only; the server statement log (log_statement='all' for neurostack_app in those two databases only) showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK.",
  "runs": {
   "deadlock_036": {
    "exit_code": 1,
@@ -1110,6 +1110,16 @@
     "INFO  [alembic.runtime.migration] Running upgrade 039 -> 040, Additive credit object-copy registry and durable workers (Group 4b).",
     "INFO  [alembic.runtime.migration] Running upgrade 040 -> 041, credit lifecycle, legal hold, purge fence and operational roles",
     "INFO  [alembic.runtime.migration] Running upgrade 041 -> 042, credit enforcement cutoff acceptances"
+   ]
+  },
+  "success_045": {
+   "exit_code": 0,
+   "lines": [
+    "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.",
+    "INFO  [alembic.runtime.migration] Will assume transactional DDL.",
+    "INFO  [alembic.runtime.migration] Running upgrade 042 -> 043, allow audio/ogg in the media asset category/MIME invariant",
+    "INFO  [alembic.runtime.migration] Running upgrade 043 -> 044, allow audio/mp4 (M4A) in the media asset category/MIME invariant",
+    "INFO  [alembic.runtime.migration] Running upgrade 044 -> 045, media trigger intents and session media deliveries"
    ]
   }
  }
