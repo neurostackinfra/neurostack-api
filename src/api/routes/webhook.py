@@ -3502,6 +3502,50 @@ async def _process_zapi_authenticated_body(
 # ── Evolution API webhook endpoint ───────────────────────────────────
 
 
+# The id Baileys generates on the socket (``generateMessageIDV2``), identical
+# at every Baileys Evolution pins. Phone-typed ids are Android 32-hex or iOS
+# ``3A...`` and never match.
+_EVOLUTION_SOCKET_MESSAGE_ID = re.compile(r"3EB0[0-9A-F]{18}")
+
+
+def _is_evolution_call_auto_reply(data: dict[str, Any]) -> bool:
+    """Whether a ``fromMe`` upsert is Evolution's own call auto-reply.
+
+    When a call arrives and the instance has ``msgCall`` set, Evolution sends
+    that text and re-emits the send as ``messages.upsert`` (2.2.0 to
+    2.4.0-rc2; 2.3.7 ``whatsapp.baileys.service.ts:1890-1896``). The message
+    is generated on the socket, so it carries Baileys' ``PENDING`` status
+    (forwarded as ``data.status == "PENDING"``) and a socket id
+    (``3EB0`` + 18 uppercase hex). Both must hold.
+
+    A message decoded from the wire (typed on another device of the clinic's
+    number) is stamped ``SERVER_ACK`` by Baileys. Evolution's socket runs
+    with ``emitOwnEvents: false`` and posts its API sends as
+    ``send.message``, so the re-emit is the only ``PENDING`` ``fromMe``
+    upsert it produces, with two known exceptions:
+
+    * Placeholder resend: when a message fails to decrypt, the phone's
+      resend answer is re-emitted with a status the phone wrote, which
+      Baileys does not normalise (rc.9 ``process-message.ts:339-358``). The id
+      check closes this for phone-typed staff messages; a message from a
+      web-based companion linked to the number (WhatsApp Web, or a
+      Baileys-based CRM or another Evolution instance), whose id has the
+      socket shape, could still be skipped.
+    * A receipt merged into the still-buffered upsert overwrites ``PENDING``
+      (rc.9 ``event-buffer.ts:444``). The check then misses and the message
+      takes over, which is today's behaviour and harmless.
+
+    Anything else, including a missing status or id, is staff, as before.
+    """
+    if data.get("status") != "PENDING":
+        return False
+    key = data.get("key")
+    message_id = key.get("id") if isinstance(key, dict) else None
+    return isinstance(message_id, str) and bool(
+        _EVOLUTION_SOCKET_MESSAGE_ID.fullmatch(message_id)
+    )
+
+
 @router.post(
     "/evolution",
     summary="Evolution API Webhook",
@@ -3605,6 +3649,10 @@ async def evolution_webhook(
         # Fast path: in-memory + Redis check (same worker, Redis available)
         if webhook_msg_id and _is_ai_sent_message(webhook_msg_id):
             return {"ok": True, "skipped": "ai_echo"}
+        # The instance's own call auto-reply is not staff typing: without
+        # this it would pause the AI (no expiry under the default config).
+        if _is_evolution_call_auto_reply(data):
+            return {"ok": True, "skipped": "call_auto_reply"}
         # Pass message_id for DB-backed cross-worker dedup inside _handle_clinic_message
         result = await _handle_clinic_message(
             tenant_id, phone, message_text, db, message_id=webhook_msg_id

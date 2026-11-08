@@ -1306,3 +1306,306 @@ class TestEvolutionInteractionOrigin:
         assert [row.id for row in rows] == [context.interaction_event_id]
         assert rows[0].interaction_origin == "unknown"
         assert rows[0].event_metadata == {"paused_capture": True}
+
+
+# ============================================
+# Call auto-reply (``msgCall``) must not read as a human takeover
+# ============================================
+#
+# Evolution 2.2.0 to 2.4.0-rc2 answer a call with the instance's ``msgCall``
+# text and then re-emit that send as ``messages.upsert`` with ``type:
+# "notify"`` (2.3.7 ``whatsapp.baileys.service.ts:1890-1896``). The message
+# is generated on this socket, so Baileys stamps it ``status: PENDING``
+# (Baileys 7.0.0-rc.9 ``src/Utils/messages.ts:702``) and Evolution's
+# ``prepareMessage`` maps that to the string ``"PENDING"`` (2.3.7 L4663 with
+# ``src/utils/renderStatus.ts``). Its id is Baileys' socket id, ``3EB0`` + 18
+# uppercase hex (``src/Utils/generics.ts:178-195``). A message typed on
+# another device of the clinic's number is decoded from the wire, and Baileys
+# stamps every decoded ``fromMe`` message ``SERVER_ACK``
+# (``src/Utils/decode-wa-message.ts:215-216``). The one exception is the
+# placeholder resend (``src/Utils/process-message.ts:339-358``), which keeps a
+# status the phone wrote, so the skip also requires the socket id shape.
+# The payloads below copy each shape field by field.
+
+
+def _evolution_call_auto_reply_payload(
+    *, instance_name: str, phone: str, text_body: str, message_id: str
+) -> dict:
+    """The ``messages.upsert`` Evolution 2.3.7 posts for its ``msgCall`` reply.
+
+    ``data`` is ``prepareMessage(msg)`` of the ``sendMessage`` result:
+    ``key`` is Baileys' generated key (``3EB0`` + 18 hex, ``fromMe`` true,
+    no participant for a 1:1 chat), ``pushName`` falls back to ``"Você"``
+    because a generated message has none, ``status`` is ``"PENDING"``, the
+    ``extendedTextMessage`` is folded into ``conversation`` and ``source`` is
+    ``getDevice(key.id)``. The envelope is ``webhook.controller.ts:93-102``.
+    """
+    return {
+        "event": "messages.upsert",
+        "instance": instance_name,
+        "data": {
+            "key": {
+                "remoteJid": f"{phone}@s.whatsapp.net",
+                "fromMe": True,
+                "id": message_id,
+            },
+            "pushName": "Você",
+            "status": "PENDING",
+            "message": {"conversation": text_body},
+            "messageType": "conversation",
+            "messageTimestamp": 1762617600,
+            "instanceId": str(uuid4()),
+            "source": "web",
+        },
+        "destination": "https://api.example.com/v1/webhook/evolution",
+        "date_time": "2026-11-08T13:00:00.000Z",
+        "sender": "5511900000999@s.whatsapp.net",
+        "server_url": "https://evolution.example.com",
+        "apikey": "evk_instance_token",
+    }
+
+
+def _evolution_staff_payload(
+    *,
+    instance_name: str,
+    phone: str,
+    text_body: str,
+    message_id: str,
+    push_name: str = "Clínica Teste",
+    source: str = "android",
+    status: str | None = "SERVER_ACK",
+) -> dict:
+    """The ``messages.upsert`` for a message staff typed on another device.
+
+    The default is the clinic's phone (Android, 32 hex id). ``status=None``
+    drops the field, the shape of a minimal or older payload.
+    """
+    data: dict[str, Any] = {
+        "key": {
+            "remoteJid": f"{phone}@s.whatsapp.net",
+            "fromMe": True,
+            "id": message_id,
+        },
+        "pushName": push_name,
+        "message": {"conversation": text_body},
+        "messageType": "conversation",
+        "messageTimestamp": 1762617600,
+        "instanceId": str(uuid4()),
+        "source": source,
+    }
+    if status is not None:
+        data["status"] = status
+    return {
+        "event": "messages.upsert",
+        "instance": instance_name,
+        "data": data,
+        "sender": "5511900000999@s.whatsapp.net",
+    }
+
+
+def _create_active_session(client: TestClient, tenant_id: UUID, phone: str) -> UUID:
+    """Create the phone's active, unpaused session through the webhook helper."""
+    from src.api.routes.webhook import _get_or_create_session
+    from src.repositories.database import get_db_session
+
+    async def _run() -> UUID:
+        db = get_db_session()
+        try:
+            session_id, _ = await _get_or_create_session(tenant_id, phone, db)
+            await db.commit()
+            return session_id
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _session_pause_state(
+    client: TestClient, session_id: UUID
+) -> tuple[bool, datetime | None]:
+    """``(is_paused, paused_until)`` of a session, read in a new DB session."""
+    from sqlalchemy import select
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> tuple[bool, datetime | None]:
+        db = get_db_session()
+        try:
+            row = (
+                await db.execute(
+                    select(SessionRow.is_paused, SessionRow.paused_until).where(
+                        SessionRow.id == session_id
+                    )
+                )
+            ).one()
+            return bool(row[0]), row[1]
+        finally:
+            await db.close()
+
+    return client._submit(_run())  # type: ignore[attr-defined]
+
+
+_MSG_CALL_TEXT = "Não atendemos ligações por aqui. Por favor, envie sua mensagem."
+
+
+class TestEvolutionCallAutoReply:
+    """A patient's call must not pause the AI through the ``msgCall`` echo."""
+
+    def test_call_auto_reply_does_not_pause_active_session(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000600"
+        session_id = _create_active_session(client, tenant_id, phone)
+        payload = _evolution_call_auto_reply_payload(
+            instance_name=instance,
+            phone=phone,
+            text_body=_MSG_CALL_TEXT,
+            message_id="3EB0A1B2C3D4E5F6A7B8C9",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "call_auto_reply"}
+        assert _session_pause_state(client, session_id) == (False, None)
+
+    def test_staff_message_from_phone_still_pauses(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000601"
+        session_id = _create_active_session(client, tenant_id, phone)
+        payload = _evolution_staff_payload(
+            instance_name=instance,
+            phone=phone,
+            text_body="Oi, aqui é a Ana da recepção, vou te ajudar.",
+            message_id="A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "action": "human_takeover"}
+        assert _session_pause_state(client, session_id) == (True, None)
+
+    @pytest.mark.parametrize(
+        ("push_name", "source", "status", "text_body"),
+        [
+            # WhatsApp Web on the clinic's number: same id shape, ``source``,
+            # fallback ``pushName`` and text as the auto-reply; only
+            # ``status`` tells them apart.
+            ("Você", "web", "SERVER_ACK", _MSG_CALL_TEXT),
+            # No ``status`` at all: never read as an auto-reply.
+            ("Clínica Teste", "android", None, _MSG_CALL_TEXT),
+            # The word in the text is not the status field.
+            (
+                "Clínica Teste",
+                "android",
+                "SERVER_ACK",
+                "Seu pedido aparece como PENDING no sistema, já verifico.",
+            ),
+        ],
+        ids=["whatsapp_web_server_ack", "status_absent", "status_word_in_text"],
+    )
+    def test_staff_message_resembling_auto_reply_still_pauses(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        push_name: str,
+        source: str,
+        status: str | None,
+        text_body: str,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000602"
+        session_id = _create_active_session(client, tenant_id, phone)
+        payload = _evolution_staff_payload(
+            instance_name=instance,
+            phone=phone,
+            text_body=text_body,
+            message_id="3EB0F1E2D3C4B5A6978877",
+            push_name=push_name,
+            source=source,
+            status=status,
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "action": "human_takeover"}
+        assert _session_pause_state(client, session_id) == (True, None)
+
+    @pytest.mark.parametrize(
+        "message_id",
+        [
+            "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",  # Android, 32 hex
+            "3A1B2C3D4E5F6A7B8C9D",  # iOS, ``3A`` + 18
+        ],
+        ids=["android_id", "ios_id"],
+    )
+    def test_pending_staff_message_with_phone_id_still_pauses(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        message_id: str,
+    ) -> None:
+        """A placeholder resend can carry the phone's ``PENDING``; it pauses."""
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000603"
+        session_id = _create_active_session(client, tenant_id, phone)
+        payload = _evolution_staff_payload(
+            instance_name=instance,
+            phone=phone,
+            text_body="Oi, aqui é a Ana da recepção, vou te ajudar.",
+            message_id=message_id,
+            status="PENDING",
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "action": "human_takeover"}
+        assert _session_pause_state(client, session_id) == (True, None)
+
+    @pytest.mark.parametrize(
+        "message_id",
+        [
+            "BAE5F1E2D3C4B5A6",  # older Baileys id format
+            "3eb0a1b2c3d4e5f6a7b8c9",  # lowercase
+            "3EB0A1B2C3D4E5F6A7B8C9D0E1",  # ``3EB0`` prefix, 22 hex after it
+            "3EB0A1B2C3D4E5F6A7B8",  # ``3EB0`` prefix, 16 hex after it
+        ],
+        ids=["legacy_bae5", "lowercase", "too_long", "too_short"],
+    )
+    def test_auto_reply_shape_without_socket_id_is_not_skipped(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        message_id: str,
+    ) -> None:
+        instance = f"evo_{uuid4().hex[:8]}"
+        _seed_evolution_credentials(client, tenant_id, instance)
+        phone = "5511900000604"
+        session_id = _create_active_session(client, tenant_id, phone)
+        payload = _evolution_call_auto_reply_payload(
+            instance_name=instance,
+            phone=phone,
+            text_body=_MSG_CALL_TEXT,
+            message_id=message_id,
+        )
+
+        resp = client.post(WEBHOOK_PATH, json=payload)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "action": "human_takeover"}
+        assert _session_pause_state(client, session_id) == (True, None)
