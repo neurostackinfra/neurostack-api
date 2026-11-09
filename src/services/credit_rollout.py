@@ -107,6 +107,11 @@ ORPHAN_CLOSURE_BATCH: Final = 500
 # ``run_credit_orphan_reconciliation_once`` when another process holds the
 # pass lock (distinct from a clean pass, which returns 0).
 ORPHAN_PASS_SKIPPED: Final = -1
+# Sources whose observational claims are cut off as unknown traffic.  A
+# verified Uazapi callback (an enforced envelope-token match) is still counted
+# here on purpose: the ``uazapi-credit-enforcement`` follow-up, which adds the
+# enforced Uazapi adapter, is what changes this label; until then the L10 guard
+# keeps arming refused anyway.
 UNKNOWN_INGRESS_SOURCES: Final = frozenset({"uazapi", "evolution"})
 # Non-terminal ASAAS subscription statuses (``ck_billing_subscriptions_status``
 # of ``src/models/billing.py``; terminal are ``inactive`` and ``cancelled``).
@@ -277,6 +282,28 @@ class DeletionClosurePreview:
 
 class CreditEnforcementRejected(RuntimeError):
     """The server-side preflight did not establish a safe enforcement point."""
+
+
+def uazapi_enforced_credit_adapter_available() -> bool:
+    """The L10 guard: whether a Uazapi turn can be charged once armed.
+
+    Always ``False``.  A Uazapi callback whose envelope token the route
+    verified is metered as an authenticated production turn
+    (uazapi-webhook-auth), but no enforced adapter charges or blocks it: its
+    webhook never calls the pre-check nor the enforced sender.  Arming now
+    would therefore leave that traffic served for free, so
+    :meth:`CreditRolloutService.arm_enforcement` refuses unconditionally and
+    ``python -m src.ops.credit_enforcement status`` says so beforehand.
+
+    It reads no environment variable, configuration, flag or database row on
+    purpose: nothing an operator can set lifts it, and the refusal is not a
+    cutoff finding ``accept_cutoff`` could accept.  Only the follow-up wish
+    ``uazapi-credit-enforcement`` removes this guard, with this predicate.
+    Tests that prove a successful arm replace it through an explicit fixture;
+    no production code path does.
+    """
+
+    return False
 
 
 class CreditRolloutService:
@@ -1568,6 +1595,11 @@ class CreditRolloutService:
         Readiness and the cutoff report are evaluated at the database clock,
         never at ``at``.  Tests control the instant by patching
         ``CreditRepository.database_now``.
+
+        Until the follow-up wish ``uazapi-credit-enforcement`` lands, every
+        call that passes the clock checks is refused by the L10 guard
+        (:func:`uazapi_enforced_credit_adapter_available`) before the first
+        write, whatever the readiness, the orphans and the cutoff say.
         """
 
         if (at is not None and at.tzinfo is None) or not set_by:
@@ -1596,6 +1628,11 @@ class CreditRolloutService:
             raise CreditEnforcementRejected(
                 "credit_enforcement_at cannot be future-dated past the database clock"
             )
+        # L10 guard (uazapi-webhook-auth): refused before anything is written
+        # (the orphan closures below are this transaction's first write).
+        # Only the follow-up wish ``uazapi-credit-enforcement`` removes this.
+        if not uazapi_enforced_credit_adapter_available():
+            raise CreditEnforcementRejected("uazapi has no enforced credit adapter")
         if (await self.reconcile_orphans()).open_count:
             raise CreditEnforcementRejected(
                 "credit orphan reconciliation is incomplete"
@@ -1871,4 +1908,5 @@ __all__ = [
     "run_credit_orphan_reconciliation_worker",
     "start_credit_orphan_reconciliation_worker",
     "stop_credit_orphan_reconciliation_worker",
+    "uazapi_enforced_credit_adapter_available",
 ]

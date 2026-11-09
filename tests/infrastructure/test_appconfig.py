@@ -282,6 +282,7 @@ async def test_disabled_incomplete_and_unknown_flags_make_zero_http_requests() -
         "financial_egress_enabled",
         "uazapi_egress_enabled",
         "agent_media_send_enabled",
+        "uazapi_webhook_auth_enforced",
     }
     assert creations == []
 
@@ -1279,3 +1280,83 @@ async def test_the_media_flag_alone_opens_nothing_else_and_logs_its_change() -> 
         if entry["event"] == "appconfig_egress_flags_changed"
     ]
     assert events == [(False, False, True), (False, False, False)]
+
+
+# ---------------------------------------------------------------------------
+# uazapi-webhook-auth: uazapi_webhook_auth_enforced.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        ({"uazapi_webhook_auth_enforced": {"enabled": True}}, True),
+        ({"uazapi_webhook_auth_enforced": {"enabled": False}}, False),
+        # Absent, while every other flag is open: shadow.
+        (
+            {
+                "financial_egress_enabled": {"enabled": True},
+                "uazapi_egress_enabled": {"enabled": True},
+                "agent_media_send_enabled": {"enabled": True},
+            },
+            False,
+        ),
+        ({"uazapi_webhook_auth_enforced": {"enabled": "true"}}, False),
+        ({"uazapi_webhook_auth_enforced": True}, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_client_reads_the_uazapi_auth_flag_only_when_exactly_true(
+    document: dict[str, Any], expected: bool
+) -> None:
+    client = AppConfigClient(
+        _settings(),
+        client_factory=_factory(lambda _: httpx.Response(200, json=document), []),
+    )
+
+    assert await client.is_enabled("uazapi_webhook_auth_enforced") is expected
+
+
+@pytest.mark.asyncio
+async def test_the_uazapi_auth_flag_is_in_the_per_worker_transition_log() -> None:
+    """Each worker logs the flag on its own transitions, so the operator can
+    verify every process enforces (or not) after a deployment; opening it
+    opens nothing else."""
+
+    from structlog.testing import capture_logs
+
+    fake = _FakeAppConfigData(
+        [
+            _flags(uazapi_webhook_auth_enforced=True),
+            _flags(uazapi_webhook_auth_enforced=False),
+            RuntimeError("appconfig down"),
+        ]
+    )
+    reader = _data_reader(fake)
+
+    with capture_logs() as logs:
+        assert await reader.refresh_now() is True
+        assert await reader.is_enabled("uazapi_webhook_auth_enforced") is True
+        for other in sorted(SUPPORTED_FLAGS - {"uazapi_webhook_auth_enforced"}):
+            assert await reader.is_enabled(other) is False
+        # Only this flag changes: still a transition worth one line.
+        assert await reader.refresh_now() is True
+        assert await reader.is_enabled("uazapi_webhook_auth_enforced") is False
+        assert await reader.refresh_now() is False
+
+    events = [
+        (
+            entry["poll_ok"],
+            entry["financial_egress_enabled"],
+            entry["uazapi_egress_enabled"],
+            entry["agent_media_send_enabled"],
+            entry["uazapi_webhook_auth_enforced"],
+        )
+        for entry in logs
+        if entry["event"] == "appconfig_egress_flags_changed"
+    ]
+    assert events == [
+        (True, False, False, False, True),
+        (True, False, False, False, False),
+        (False, False, False, False, False),
+    ]

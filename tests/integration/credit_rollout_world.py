@@ -22,8 +22,10 @@ from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import text
 
+from src.services import credit_rollout
 from src.services.billing_outbox import PRODUCER
 from src.services.credit_ledger import start_of_civil_day
 from tests.integration import test_billing_fact_worker_postgres as worker_suite
@@ -31,6 +33,24 @@ from tests.integration.test_billing_fact_worker_postgres import _Harness
 
 template = worker_suite.template
 clean = worker_suite.clean
+
+
+@pytest.fixture
+def uazapi_enforced_credit_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lift the L10 guard for a proof that ``arm_enforcement`` gets past it.
+
+    uazapi-webhook-auth: ``arm_enforcement`` refuses unconditionally while
+    ``uazapi_enforced_credit_adapter_available()`` is ``False`` (always, in
+    production code).  A proof of a successful arm -- or of a refusal that
+    comes after the guard -- requests this fixture explicitly; every other
+    proof meets the guard as production does.  Only the follow-up wish
+    ``uazapi-credit-enforcement`` removes the guard itself.
+    """
+
+    monkeypatch.setattr(
+        credit_rollout, "uazapi_enforced_credit_adapter_available", lambda: True
+    )
+
 
 SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 SHA = "a" * 64

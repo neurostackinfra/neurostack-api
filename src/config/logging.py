@@ -1,14 +1,207 @@
 """
 NeuroStack API - Logging Configuration
 Structured logging using structlog
+
+Every standard-logging line is exactly one physical line: the root stdout
+handler and uvicorn's own handlers escape the line-breaking characters of the
+fully formatted record (``_SINGLE_LINE_ESCAPES``), so a body value or a
+traceback can never start a new CloudWatch event.  With ``LOG_FORMAT=console``
+(development only) ESC (``\x1b``) is left as it is, so the console renderer's
+ANSI colours keep working; ESC cannot break a line.  JSON mode (production)
+escapes the full table.
+
+Every rendered line is also at most ``MAX_LINE_BYTES`` (15000) bytes of UTF-8:
+the Fargate log shim cuts a line at 16 KiB and awslogs sends each piece as its
+own event, so a longer line would let a body value start an event.  A longer
+record keeps its first ``HEAD_BYTES`` (8000) and its last ``TAIL_BYTES``
+(6000) bytes, cut on character boundaries before escaping (an escape is never
+split), joined by ``...[N chars elided]...`` where N is the number of
+characters of the formatted record, before escaping, that were dropped.  A
+line under the cap is unchanged by the cap (structlog JSON stays
+byte-identical); one over it is no longer valid JSON.  The work per record is
+bounded by the cap, whatever the record's size.
 """
 
 import logging
 import sys
-from typing import Any, Optional
+from typing import Any, Final, Optional
 
 import structlog
 from structlog.types import Processor
+
+# What makes a log line break or hide: every C0 control and DEL, plus the
+# Unicode line separators (NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR).  The
+# awslogs driver starts a new CloudWatch event at every newline, so one raw
+# ``\n`` in a body value would forge a whole line.  Backslashes are left as
+# they are: a line without these characters renders byte-identical.
+_SINGLE_LINE_ESCAPES: Final[dict[int, str]] = {
+    **{code: f"\\x{code:02x}" for code in (*range(0x20), 0x7F)},
+    ord("\r"): "\\r",
+    ord("\n"): "\\n",
+    ord("\t"): "\\t",
+    **{code: f"\\u{code:04x}" for code in (0x85, 0x2028, 0x2029)},
+    # Lone surrogates (the JSON decoder lets them through): UTF-8 cannot
+    # encode them, so the stream write would fail and logging would print a
+    # multi-line ``--- Logging error ---`` block instead of the record.
+    **{code: f"\\u{code:04x}" for code in range(0xD800, 0xE000)},
+}
+
+
+# Console mode (development): the same table but ESC, for ANSI colours.
+_CONSOLE_SINGLE_LINE_ESCAPES: Final[dict[int, str]] = {
+    code: escaped for code, escaped in _SINGLE_LINE_ESCAPES.items() if code != 0x1B
+}
+# uvicorn's own loggers, whose handlers do not propagate to the root.
+_UVICORN_LOGGERS: Final = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+# The rendered line's bound (UTF-8 bytes, newline excluded), safely under the
+# 16384-byte piece the Fargate log shim cuts a longer line into.
+MAX_LINE_BYTES: Final = 15000
+# What an elided record keeps: at most this many bytes, escaped, of its start
+# and of its end (the end keeps a traceback's exception line).
+HEAD_BYTES: Final = 8000
+TAIL_BYTES: Final = 6000
+_ELISION_MARKER: Final = "...[{elided} chars elided]..."
+
+
+def _translate(text: str, table: dict[int, str]) -> str:
+    """The one place a record's text is escaped (bounded by the callers)."""
+
+    return text.translate(table)
+
+
+def _plain(text: str) -> bool:
+    """Printable ASCII: nothing to escape, one byte per character."""
+
+    return text.isascii() and text.isprintable()
+
+
+def _escape(text: str, table: dict[int, str]) -> str:
+    return text if _plain(text) else _translate(text, table)
+
+
+def _escaped_bytes(char: str, table: dict[int, str]) -> int:
+    escaped = table.get(ord(char))
+    if escaped is not None:
+        return len(escaped)
+    code = ord(char)
+    return 1 if code < 0x80 else 2 if code < 0x800 else 3 if code < 0x10000 else 4
+
+
+def _fitting_chars(text: str, budget: int, table: dict[int, str]) -> int:
+    """How many leading characters of *text* fit, escaped, in *budget* bytes.
+
+    *text* is a slice of at most *budget* characters (every character takes
+    at least one byte), so this is bounded by the cap.
+    """
+
+    if _plain(text):
+        return min(len(text), budget)
+    used = 0
+    for count, char in enumerate(text):
+        used += _escaped_bytes(char, table)
+        if used > budget:
+            return count
+    return len(text)
+
+
+def _single_line(text: str, *, keep_ansi: bool = False) -> str:
+    """*text* escaped onto one line of at most ``MAX_LINE_BYTES`` bytes."""
+
+    table = _CONSOLE_SINGLE_LINE_ESCAPES if keep_ansi else _SINGLE_LINE_ESCAPES
+    if len(text) <= MAX_LINE_BYTES:
+        if _plain(text):
+            return text  # the fast path: nothing to escape, under the cap
+        escaped = _translate(text, table)
+        if len(escaped.encode("utf-8", "surrogatepass")) <= MAX_LINE_BYTES:
+            return escaped
+    # Over the cap: keep a head and a tail, cut on raw characters (never
+    # inside a multi-byte character or an escape), then escape only those.
+    head = _fitting_chars(text[:HEAD_BYTES], HEAD_BYTES, table)
+    rest = len(text) - head
+    tail_window = text[len(text) - min(rest, TAIL_BYTES) :][::-1]
+    tail = _fitting_chars(tail_window, TAIL_BYTES, table)
+    elided = len(text) - head - tail
+    return (
+        _escape(text[:head], table)
+        + _ELISION_MARKER.format(elided=elided)
+        + _escape(text[len(text) - tail :], table)
+    )
+
+
+def _unformattable(record: logging.LogRecord) -> str:
+    try:
+        fallback = (
+            f"unformattable log record: logger={record.name!r} "
+            f"msg={record.msg!r} args={record.args!r}"
+        )
+        return _single_line(fallback)
+    except Exception:
+        return "unformattable log record"
+
+
+class SingleLineFormatter(logging.Formatter):
+    """``logging.Formatter`` whose every record is exactly one physical line.
+
+    The fully formatted record (message, ``exc_text`` and ``stack_info``) has
+    its line-breaking characters escaped (``_SINGLE_LINE_ESCAPES``): a
+    traceback becomes one line with ``\\n`` escapes, and a body value cannot
+    start a forged line.  ``keep_ansi`` (console mode) leaves ESC.  Never
+    raises.
+    """
+
+    def __init__(self, fmt: Optional[str] = None, *, keep_ansi: bool = False):
+        super().__init__(fmt)
+        self.keep_ansi = keep_ansi
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            return _single_line(super().format(record), keep_ansi=self.keep_ansi)
+        except Exception:
+            return _unformattable(record)
+
+
+class SingleLineDelegatingFormatter(logging.Formatter):
+    """Another handler's formatter, kept as it is, then made one line.
+
+    Wraps uvicorn's own formatters (``DefaultFormatter`` keeps its look):
+    ``format`` calls the wrapped one and escapes its result like
+    ``SingleLineFormatter``.  Never raises.
+    """
+
+    def __init__(self, inner: logging.Formatter, *, keep_ansi: bool = False):
+        super().__init__()
+        self.inner = inner
+        self.keep_ansi = keep_ansi
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            return _single_line(self.inner.format(record), keep_ansi=self.keep_ansi)
+        except Exception:
+            return _unformattable(record)
+
+
+def _single_line_uvicorn_handlers(*, keep_ansi: bool) -> None:
+    """Wrap the formatter of every handler uvicorn's loggers have now; once.
+
+    The uvicorn CLI configures its logging (``Config.configure_logging``,
+    again in each worker process) before it imports the application, which
+    runs ``configure_logging``: these handlers exist by then.
+    """
+
+    for name in _UVICORN_LOGGERS:
+        for handler in logging.getLogger(name).handlers:
+            current = handler.formatter
+            if isinstance(
+                current, (SingleLineDelegatingFormatter, SingleLineFormatter)
+            ):
+                continue
+            handler.setFormatter(
+                SingleLineDelegatingFormatter(
+                    current or logging.Formatter(), keep_ansi=keep_ansi
+                )
+            )
 
 
 def configure_logging() -> None:
@@ -51,12 +244,22 @@ def configure_logging() -> None:
         cache_logger_on_first_use=True,
     )
 
-    # Configure standard logging
+    # Configure standard logging.  ``basicConfig`` does nothing when the root
+    # logger already has handlers; when it creates the stdout handler, that
+    # handler renders every record as one physical line.
+    root = logging.getLogger()
+    adds_handler = not root.handlers
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
         level=getattr(logging, settings.log_level),
     )
+    keep_ansi = settings.log_format != "json"
+    if adds_handler:
+        for handler in root.handlers:
+            handler.setFormatter(
+                SingleLineFormatter("%(message)s", keep_ansi=keep_ansi)
+            )
 
     # Reduce noise from third-party libraries.
     #
@@ -75,6 +278,7 @@ def configure_logging() -> None:
     access_logger.propagate = False
     for handler in list(access_logger.handlers):
         access_logger.removeHandler(handler)
+    _single_line_uvicorn_handlers(keep_ansi=keep_ansi)
     logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

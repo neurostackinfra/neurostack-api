@@ -22,7 +22,11 @@ Subcommands.
     The switch verdict, the ``credit_enforcement_state`` row, readiness, the
     open orphans by class, what ``arm``'s own first step (closing the
     effects of deleted tenants) would write and leave open, and the cutoff
-    digest with its finding and acceptance counts.
+    digest with its finding and acceptance counts.  While the L10 guard
+    holds (``uazapi_enforced_credit_adapter_available``), ``status`` carries
+    the reason ``uazapi_enforced_credit_adapter_missing`` and
+    ``ready_after_arm_closures`` is false: ``arm`` is refused with that
+    reason (``refused``) whatever the readiness, and no acceptance clears it.
 ``report`` (read-only)
     The tenant cutoff report at the database clock: its digest and each
     finding ``(tenant_id, builder_id, reason)``, with whether an acceptance
@@ -104,6 +108,7 @@ try:
     from src.models.credit import ENFORCEMENT_STATE_ID, CreditEnforcementState
     from src.models.credit_enforcement import CreditCutoffAcceptance
     from src.repositories.credit import CreditRepository
+    from src.services import credit_rollout
     from src.services.credit_rollout import (
         CreditEnforcementRejected,
         CreditRolloutService,
@@ -151,6 +156,9 @@ CUTOFF_REASON_CODES: Final = frozenset(
         "unknown_unauthenticated_traffic",
     }
 )
+# The L10 guard's reason (uazapi-webhook-auth): ``arm`` refuses with it and
+# ``status`` reports it.  Never a cutoff reason code.
+UAZAPI_ADAPTER_REASON: Final = "uazapi_enforced_credit_adapter_missing"
 # Every ``CreditEnforcementRejected`` message of ``credit_rollout`` (pinned by
 # the same suite), as a closed reason.
 REJECTION_REASONS: Final[Mapping[str, str]] = MappingProxyType(
@@ -176,6 +184,10 @@ REJECTION_REASONS: Final[Mapping[str, str]] = MappingProxyType(
         "cutoff acceptance author is not an active super_admin": (
             "author_not_active_super_admin"
         ),
+        # The L10 guard (uazapi-webhook-auth): unconditional and never a
+        # cutoff reason, so no acceptance clears it.  Only the follow-up wish
+        # ``uazapi-credit-enforcement`` removes it.
+        "uazapi has no enforced credit adapter": UAZAPI_ADAPTER_REASON,
     }
 )
 REASONS: Final = frozenset(
@@ -194,6 +206,7 @@ REASONS: Final = frozenset(
         "cutoff_unaccepted",
         "clock_refused",
         "already_armed",
+        UAZAPI_ADAPTER_REASON,
         "refused_unclassified",
         "readback_mismatch",
         "unexpected",
@@ -476,9 +489,14 @@ async def _status(sessions: SessionFactory, switch: dict[str, object]) -> RunRes
             accepted = await _accepted_findings(session, report.digest)
         finally:
             await session.rollback()
+    # The L10 guard ``arm`` meets first (read through the module, as
+    # ``arm_enforcement`` reads it): while it holds, ``arm`` is refused
+    # whatever the readiness says, so ``status`` never reports it ready.
+    guard_open = credit_rollout.uazapi_enforced_credit_adapter_available() is True
     return RunResult(
         command="status",
         verdict="ok",
+        reasons=() if guard_open else (UAZAPI_ADAPTER_REASON,),
         switch=switch,
         database_now=_iso(now),
         enforcement=enforcement.document(),
@@ -495,7 +513,7 @@ async def _status(sessions: SessionFactory, switch: dict[str, object]) -> RunRes
             # transaction, and then evaluates readiness: what it would see.
             "deletion_closures_arm_writes": preview.closures_to_write,
             "orphans_after_arm_closures": _orphans_document(preview.orphans_after),
-            "ready_after_arm_closures": preview.readiness_after.ready,
+            "ready_after_arm_closures": preview.readiness_after.ready and guard_open,
         },
         cutoff=_cutoff_document(report, accepted, with_findings=False),
     )

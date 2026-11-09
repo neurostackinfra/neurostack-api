@@ -5,7 +5,10 @@ builder from ``tenants.builder_id`` as re-read from the database:
 
 * exact strings -- ``user:{sub}``, ``api_key:{tenant}``, ``zapi:{tenant}``,
   ``meta:{tenant}``, ``uazapi:{tenant}``, ``evolution:{tenant}``;
-* Uazapi and Evolution are ``authenticated=False`` (routed by instance name);
+* Uazapi and Evolution are ``authenticated=False`` (routed by instance name),
+  except a Uazapi identity the route built ``inbound_verified`` (its envelope
+  token matched the stored instance token): authenticated, same principal;
+  ``inbound_verified`` is refused for every other kind;
 * a tenant with ``builder_id`` NULL is standalone; a JWT ``builder_id`` claim
   is never an input; a tenant read of another tenant is refused;
 * the mapping from ``main``'s ``TenantContext`` refuses inconsistent contexts
@@ -135,6 +138,97 @@ def test_unsound_identities_are_refused(
     with pytest.raises((TypeError, ValueError)):
         AuthenticatedIdentity(kind=kind, tenant_id=tenant_id, subject=subject)
     assert credit_identity(kind, tenant_id, subject) is None
+
+
+# ---------------------------------------------------------------------------
+# uazapi-webhook-auth (option C): ``inbound_verified``, Uazapi only.
+# ---------------------------------------------------------------------------
+
+
+def test_a_verified_uazapi_identity_is_authenticated_with_the_same_principal() -> None:
+    verified = credit_identity("uazapi", TENANT, inbound_verified=True)
+    unverified = credit_identity("uazapi", TENANT)
+    assert verified is not None and unverified is not None
+    assert (verified.inbound_verified, unverified.inbound_verified) == (True, False)
+    tenant = TenantBuilder(TENANT, BUILDER, True)
+
+    principal = derive_credit_principal(verified, tenant)
+    assert principal == CreditPrincipal(
+        principal_id=f"uazapi:{TENANT}",
+        kind="uazapi",
+        tenant_id=TENANT,
+        builder_id=BUILDER,
+        authenticated=True,
+    )
+    # Only ``authenticated`` differs: the same principal, so the same claim
+    # key ``(tenant_id, "uazapi", messageid)``.
+    assert derive_credit_principal(unverified, tenant) == CreditPrincipal(
+        principal_id=f"uazapi:{TENANT}",
+        kind="uazapi",
+        tenant_id=TENANT,
+        builder_id=BUILDER,
+        authenticated=False,
+    )
+    # The kind is not lifted: Uazapi stays an unauthenticated kind by itself.
+    from src.services import credit_principal
+
+    assert "uazapi" in credit_principal._UNAUTHENTICATED_KINDS
+    assert credit_principal._INBOUND_VERIFIABLE_KINDS == {"uazapi"}
+
+
+@pytest.mark.parametrize("kind", sorted(CREDIT_INGRESS_KINDS - {"uazapi"}))
+def test_inbound_verified_is_refused_for_every_other_kind(kind: str) -> None:
+    subject = SUBJECT if kind == "jwt" else None
+    with pytest.raises(ValueError, match="cannot be inbound-verified"):
+        AuthenticatedIdentity(
+            kind=kind,  # type: ignore[arg-type]
+            tenant_id=TENANT,
+            subject=subject,
+            inbound_verified=True,
+        )
+    assert credit_identity(kind, TENANT, subject, inbound_verified=True) is None
+    # The default stays sound for every kind.
+    assert credit_identity(kind, TENANT, subject) is not None
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", None, "yes"])
+def test_inbound_verified_must_be_a_bool(value: object) -> None:
+    with pytest.raises(TypeError, match="inbound_verified must be a bool"):
+        AuthenticatedIdentity(
+            kind="uazapi",
+            tenant_id=TENANT,
+            inbound_verified=value,  # type: ignore[arg-type]
+        )
+    assert credit_identity("uazapi", TENANT, inbound_verified=value) is None
+
+
+@pytest.mark.parametrize("kind", ["evolution", "meta"])
+def test_a_forged_verified_field_on_another_kind_never_authenticates(
+    kind: str,
+) -> None:
+    """Even past ``__post_init__`` (``object.__setattr__`` on the frozen
+    instance), the derivation lifts only a Uazapi identity."""
+
+    identity = credit_identity(kind, TENANT)
+    assert identity is not None
+    object.__setattr__(identity, "inbound_verified", True)
+    principal = derive_credit_principal(identity, TenantBuilder(TENANT, None, True))
+    assert principal.authenticated is (kind == "meta")
+
+
+def test_the_default_identity_equals_the_one_main_built_before() -> None:
+    """``inbound_verified`` defaults to ``False``: every identity built
+    without it compares equal to the same identity built with it false."""
+
+    for kind in sorted(CREDIT_INGRESS_KINDS):
+        identity = _identity(kind)
+        assert identity.inbound_verified is False
+        assert identity == AuthenticatedIdentity(
+            kind=kind,  # type: ignore[arg-type]
+            tenant_id=TENANT,
+            subject=identity.subject,
+            inbound_verified=False,
+        )
 
 
 # ---------------------------------------------------------------------------

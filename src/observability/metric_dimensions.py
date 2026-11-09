@@ -12,7 +12,7 @@ import itertools
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, TypeVar
+from typing import Any, Final, Literal, Mapping, TypeVar, get_args
 
 from prometheus_client import CollectorRegistry
 from prometheus_client import Counter as PrometheusCounter
@@ -222,6 +222,44 @@ _BILLING_TOPUP_DIRECTION = _enum("enable", "disable")
 _AGENT_MEDIA_SELECTION_OUTCOME = _enum(
     "selected", "none", "invalid_marker", "dropped", "candidates_capped"
 )
+# uazapi-webhook-auth: one increment per Uazapi callback that reached the
+# envelope-token check.  ``mode`` is the ``uazapi_webhook_auth_enforced``
+# reading of that request (``shadow`` measures only, ``enforce`` refuses
+# every result but ``match`` with 401); ``result`` is the closed outcome:
+#   match                -- exactly one row of the instance has a non-empty
+#                           stored token equal to the envelope token;
+#   mismatch             -- a token was presented and a row has a stored
+#                           token, but none is equal;
+#   token_missing        -- no usable envelope token (absent, not a string,
+#                           or empty after strip);
+#   token_not_configured -- no row of the instance has a stored token;
+#   unknown_instance     -- no row has this instance name;
+#   ambiguous_instance   -- two or more rows of the instance match;
+#   check_error          -- the instance query failed in shadow, and the
+#                           callback was routed as before (enforced, that
+#                           failure is a 500 and is not counted, so the
+#                           ``enforce`` child stays at zero).
+# No instance, tenant or token label: those go to the
+# ``uazapi_webhook_auth`` log line (never a token or a derivative of it).
+# These Literals are the ONE vocabulary: the Uazapi route imports them.
+UazapiWebhookAuthMode = Literal["shadow", "enforce"]
+UazapiWebhookAuthResult = Literal[
+    "match",
+    "mismatch",
+    "token_missing",
+    "token_not_configured",
+    "unknown_instance",
+    "ambiguous_instance",
+    "check_error",
+]
+UAZAPI_WEBHOOK_AUTH_MODES: Final[frozenset[str]] = frozenset(
+    get_args(UazapiWebhookAuthMode)
+)
+UAZAPI_WEBHOOK_AUTH_RESULTS: Final[frozenset[str]] = frozenset(
+    get_args(UazapiWebhookAuthResult)
+)
+_UAZAPI_WEBHOOK_AUTH_MODE = _enum(*get_args(UazapiWebhookAuthMode))
+_UAZAPI_WEBHOOK_AUTH_RESULT = _enum(*get_args(UazapiWebhookAuthResult))
 # The WhatsApp provider that carried (or would carry) the file: the delivery
 # providers' ONE vocabulary (``api_credentials.MediaDeliveryProvider``, also
 # the selection's and the delivery's), never a copy of it.
@@ -619,6 +657,11 @@ METRIC_DIMENSION_CONTRACTS: Mapping[str, MetricDimensionContract] = MappingProxy
         "neurostack_agent_media_delivery": _contract(
             provider=_AGENT_MEDIA_PROVIDER,
             outcome=_AGENT_MEDIA_DELIVERY_OUTCOME,
+        ),
+        # uazapi-webhook-auth: ``neurostack_uazapi_webhook_auth_total``.
+        "neurostack_uazapi_webhook_auth": _contract(
+            mode=_UAZAPI_WEBHOOK_AUTH_MODE,
+            result=_UAZAPI_WEBHOOK_AUTH_RESULT,
         ),
         # neurostack-core opt-in collector
         "neurostack_srm_decisions": _contract(

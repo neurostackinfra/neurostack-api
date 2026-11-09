@@ -267,6 +267,18 @@ AGENT_MEDIA_DELIVERY_TOTAL = precreate_closed_children(
     )
 )
 
+# uazapi-webhook-auth: the Uazapi webhook's envelope-token check, by the mode
+# that request read and its closed result (vocabularies in
+# src/observability/metric_dimensions.py).  Every child is pre-created so the
+# first mismatch is visible to increase().  No instance label.
+UAZAPI_WEBHOOK_AUTH_TOTAL = precreate_closed_children(
+    Counter(
+        "neurostack_uazapi_webhook_auth_total",
+        "Uazapi webhook envelope-token checks by mode and result",
+        ["mode", "result"],
+    )
+)
+
 # ASAAS billing webhook and readback (Group 3).  Labels are closed technical
 # vocabularies only; builder, payment, subscription and event identities stay
 # out of Prometheus.  Alert rules (Group 5) fire on ``neurostack_billing_alerts``.

@@ -12,14 +12,17 @@ Inputs come from ``main`` as it is:
 * the ORIGIN of a decision is ``context.origin`` of the single
   :class:`~src.interaction_context.ResolvedInteractionContext` the ingress
   built (never ``events.interaction_origin`` as stored, never a second
-  classifier): API key and Meta (``classify_interaction_origin``) and Z-API
-  (its adapter) are ``production``; the panel JWT is ``simulator``; Uazapi,
-  Evolution, a JWT outside the allowlist and callers without proof are
-  ``unknown``;
+  classifier): API key and Meta (``classify_interaction_origin``), Z-API
+  (its adapter) and a Uazapi callback whose envelope token the route verified
+  against the stored instance token are ``production``; the panel JWT is
+  ``simulator``; any other Uazapi callback, Evolution, a JWT outside the
+  allowlist and callers without proof are ``unknown``;
 * ``authenticated`` and ``principal_id`` come from
   :func:`~src.services.credit_principal.derive_credit_principal` over the
-  identity ``main``'s auth proved (Uazapi/Evolution: ``authenticated=False``)
-  and the tenant's builder re-read in the database;
+  identity ``main``'s auth proved (a verified Uazapi callback:
+  ``inbound_verified=True``, authenticated; any other Uazapi callback and
+  Evolution: ``authenticated=False``) and the tenant's builder re-read in the
+  database;
 * the anchor of a decision (M3) is the ``interaction_id`` of its ingress
   claim or, without a claim, the public ``event_id`` of the response (the
   ``srm.decision`` row) -- never ``context.interaction_event_id``, which is a
@@ -141,8 +144,9 @@ own (:meth:`ReplySender.start_media`), never inside the publisher's serial
 tick nor under the send timeout or the lease, and a failure of the file
 never changes the text's row; a recovered row's file is deduplicated by the
 24-hour claim.  The Meta and Z-API file handoff is one enforced
-transaction (:func:`run_meta_file_handoff`).  Uazapi and Evolution (``unknown``) never
-reach any of this.
+transaction (:func:`run_meta_file_handoff`).  Uazapi and Evolution never reach
+any of this: Evolution is ``unknown``, and Uazapi has no enforced adapter yet
+(a verified Uazapi turn is metered as authenticated, observationally only).
 """
 
 from __future__ import annotations
@@ -517,15 +521,23 @@ def uazapi_ingress(
     *,
     message: Mapping[str, Any],
     context: ResolvedInteractionContext,
+    inbound_verified: bool = False,
 ) -> ObservationalIngress | None:
-    """Uazapi: routed by instance name only (``authenticated=False``),
-    ``message.messageid`` falling back to ``message.id``."""
+    """Uazapi: ``inbound_verified`` when the route verified the envelope
+    token against the stored instance token (``authenticated=True``), else
+    routed by instance name only (``authenticated=False``); the same
+    ``principal_id`` and ``message.messageid`` (falling back to
+    ``message.id``) either way."""
 
     return _ingress(
         request,
         source="uazapi",
         context=context,
-        identity=lambda: credit_identity("uazapi", context.effective_tenant_id),
+        identity=lambda: credit_identity(
+            "uazapi",
+            context.effective_tenant_id,
+            inbound_verified=inbound_verified,
+        ),
         payload_sha256=lambda: provider_message_sha256(message),
         provider_message_id=str(message.get("messageid") or message.get("id") or ""),
     )
@@ -2108,8 +2120,8 @@ async def precheck_webhook(
     the enforcement set: then :class:`CreditEnforcementUnavailable` (D1) and
     the webhook answers 503 -- which in practice drops the message: main's
     replay claim (Redis, before this pre-check) is already spent, so the
-    provider's retry answers ``duplicate_message``.  Uazapi and Evolution
-    never call this.
+    provider's retry answers ``duplicate_message``.  Uazapi (no enforced
+    adapter yet, even for a verified callback) and Evolution never call this.
     """
 
     global _enforcement_seen

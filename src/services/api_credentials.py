@@ -863,18 +863,23 @@ def _whatsapp_readiness(credentials: Mapping[str, Any]) -> str:
     return "active" if fields and _complete(credentials, fields) else "incomplete"
 
 
-# The WhatsApp providers whose inbound webhook proves its caller, so their
-# turns are ``InteractionOrigin.PRODUCTION``: Meta by the X-Hub-Signature-256
-# HMAC over ``meta_app_secret`` (``TenantIdentityMiddleware`` publishes the
-# ``meta_hmac`` context the webhook classifies), Z-API by the capability URL
-# whose digest is ``zapi_inbound_token_digest`` (``zapi_webhook``).  Uazapi and
-# Evolution are routed by instance name only: their webhooks classify
-# ``UNKNOWN`` (the credit principal's ``_UNAUTHENTICATED_KINDS``).  The
-# cloud-readiness wish plugs its provider gate in here when it authenticates
-# them; nothing else decides media delivery readiness.
+# The WhatsApp providers whose inbound webhook always proves its caller, so
+# their turns are ``InteractionOrigin.PRODUCTION``: Meta by the
+# X-Hub-Signature-256 HMAC over ``meta_app_secret``
+# (``TenantIdentityMiddleware`` publishes the ``meta_hmac`` context the webhook
+# classifies), Z-API by the capability URL whose digest is
+# ``zapi_inbound_token_digest`` (``zapi_webhook``).  Evolution is routed by
+# instance name only: its webhook classifies ``UNKNOWN`` (the credit
+# principal's ``_UNAUTHENTICATED_KINDS``).
 _PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS: frozenset[str] = frozenset(
     {"meta_cloud", "zapi"}
 )
+# The WhatsApp providers whose webhook proves its caller only per request: a
+# Uazapi callback is ``PRODUCTION`` when its envelope token equals the stored
+# instance token and that check is enforced (the credit principal's
+# ``_INBOUND_VERIFIABLE_KINDS``); otherwise it is ``UNKNOWN``.  Nothing else
+# decides media delivery readiness.
+_VERIFIED_ORIGIN_WHATSAPP_PROVIDERS: frozenset[str] = frozenset({"uazapi"})
 
 
 # The WhatsApp providers that can carry an agent media reply, by the names of
@@ -912,7 +917,12 @@ def media_delivery_provider(whatsapp_provider: object) -> MediaDeliveryProvider 
     return MEDIA_DELIVERY_PROVIDER_BY_WHATSAPP_PROVIDER.get(whatsapp_provider)
 
 
-def media_delivery_provider_ready(credentials: Mapping[str, Any]) -> bool:
+def media_delivery_provider_ready(
+    credentials: Mapping[str, Any],
+    *,
+    uazapi_auth_enforced: bool,
+    uazapi_egress_enabled: bool,
+) -> bool:
     """Whether the clinic's WhatsApp provider can carry agent media today.
 
     The single point behind ``delivery_enabled`` (envio-midia-agente
@@ -921,17 +931,24 @@ def media_delivery_provider_ready(credentials: Mapping[str, Any]) -> bool:
     credentials panel shows: Meta needs its phone number id, permanent token
     and ``meta_app_secret`` (without the secret it is ``signature_pending``
     and the webhook answers 401); Z-API needs its instance, token and
-    ``zapi_inbound_token_digest``.  Uazapi and Evolution are never ready
-    here.  Pure; anything that is not a mapping is not ready.
+    ``zapi_inbound_token_digest``.  Uazapi needs its URL, instance and token,
+    and is ready only while its webhook authentication is enforced
+    (``uazapi_auth_enforced``: its verified turns are production) AND its
+    egress is open (``uazapi_egress_enabled``: the file can be sent).
+    Evolution is never ready here.  Pure and sync: the caller reads both
+    flags; anything that is not a mapping, or a flag that is not exactly
+    ``True``, is not ready.
     """
 
     if not isinstance(credentials, Mapping):
         return False
     provider = credentials.get("whatsapp_provider")
-    if (
-        not isinstance(provider, str)
-        or provider not in _PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS
-    ):
+    if not isinstance(provider, str):
+        return False
+    if provider in _VERIFIED_ORIGIN_WHATSAPP_PROVIDERS:
+        if uazapi_auth_enforced is not True or uazapi_egress_enabled is not True:
+            return False
+    elif provider not in _PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS:
         return False
     return _whatsapp_readiness(credentials) == "active"
 

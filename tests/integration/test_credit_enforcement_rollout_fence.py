@@ -101,13 +101,14 @@ from tests.integration.credit_rollout_world import (
     set_subscription_status,
     subscribed_builder,
     template,
+    uazapi_enforced_credit_adapter,
 )
 from tests.integration.test_billing_fact_worker_postgres import _Harness
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.integration
 
-__all__ = ["clean", "template"]
+__all__ = ["clean", "template", "uazapi_enforced_credit_adapter"]
 
 NOW = datetime.now(timezone.utc)
 TODAY = civil_today(NOW)
@@ -222,6 +223,7 @@ async def _two_bound_candidates(harness: _Harness) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_clean_world_arms_exactly_once(clean: _Harness) -> None:
     await subscribed_builder(clean)
     async with clean.sessions() as session:
@@ -260,6 +262,7 @@ async def test_a_future_timestamp_is_refused_and_writes_nothing(
     assert await _state_rows(clean) == (0, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_far_future_timestamp_does_not_pass_vacuously(
     clean: _Harness,
 ) -> None:
@@ -278,6 +281,7 @@ async def test_a_far_future_timestamp_does_not_pass_vacuously(
     assert await _state_rows(clean) == (0, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_the_gate_is_evaluated_at_the_database_clock(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -319,6 +323,7 @@ async def test_a_past_timestamp_is_refused_and_writes_nothing(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_an_open_orphan_refuses(clean: _Harness) -> None:
     world = await subscribed_builder(clean)
     # An enforced decision whose trace effect was never written.
@@ -340,6 +345,7 @@ async def test_an_open_orphan_refuses(clean: _Harness) -> None:
     await _refused(clean, "orphan reconciliation is incomplete")
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_readiness_false_refuses(clean: _Harness) -> None:
     await subscribed_builder(clean)
     await execute(
@@ -351,6 +357,7 @@ async def test_readiness_false_refuses(clean: _Harness) -> None:
     await _refused(clean, "readiness is incomplete")
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_consumer_lag_refuses_even_though_requests_are_served(
     clean: _Harness,
 ) -> None:
@@ -358,6 +365,7 @@ async def test_consumer_lag_refuses_even_though_requests_are_served(
     await _refused(clean, "readiness is incomplete")
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize(
     "status", ["readback_required", "non_billable_pending_readback"]
 )
@@ -375,6 +383,7 @@ async def test_an_ambiguous_open_subscription_with_a_current_cycle_refuses(
     await _refused(clean, "readiness is incomplete")
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize(
     "status",
     ["active", "active_linked", "readback_required", "non_billable_pending_readback"],
@@ -420,6 +429,7 @@ async def test_a_terminal_subscription_is_outside_the_readback(
     assert readback.complete
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_two_candidate_cycles_refuse(clean: _Harness) -> None:
     world = await subscribed_builder(clean)
     await make_cycle(
@@ -432,6 +442,7 @@ async def test_two_candidate_cycles_refuse(clean: _Harness) -> None:
     await _refused(clean, "readiness is incomplete")
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_an_unaccepted_cutoff_refuses(clean: _Harness) -> None:
     await subscribed_builder(clean)
     standalone = await make_tenant(clean, None)
@@ -445,6 +456,7 @@ async def test_an_unaccepted_cutoff_refuses(clean: _Harness) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_digest_other_than_the_evaluated_report_refuses(
     clean: _Harness,
 ) -> None:
@@ -460,6 +472,7 @@ async def test_a_digest_other_than_the_evaluated_report_refuses(
     assert await _state_rows(clean) == (0, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_an_accepted_report_that_changed_since_review_refuses(
     clean: _Harness,
 ) -> None:
@@ -556,6 +569,7 @@ async def test_a_malformed_confirmed_digest_is_refused_before_the_lock(
     assert await _state_rows(clean) == (0, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_well_formed_wrong_digest_is_refused_inside_the_transaction(
     clean: _Harness,
 ) -> None:
@@ -648,6 +662,7 @@ async def test_accept_cutoff_stamps_the_database_clock(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_acceptance_counts_only_for_its_tenant_and_digest(
     clean: _Harness,
 ) -> None:
@@ -922,6 +937,7 @@ async def test_a_topup_only_tenant_is_covered_only_by_a_live_reconciled_lot(
     assert _findings(await _cutoff(clean)) == expected
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_after_an_accepted_cutoff_each_tenant_follows_its_normal_rule(
     clean: _Harness,
 ) -> None:
@@ -1054,6 +1070,7 @@ async def _settle(*tasks: asyncio.Task[object]) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_change_committed_before_the_gate_is_seen(clean: _Harness) -> None:
     """The writer holds the lock with the change uncommitted; the gate blocks
     on it (seen in pg_stat_activity) and its reread sees the committed
@@ -1090,6 +1107,7 @@ async def test_a_change_committed_before_the_gate_is_seen(clean: _Harness) -> No
     assert await _state_rows(clean) == (0, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_change_after_the_gate_waits_and_is_captured_by_id(
     clean: _Harness,
 ) -> None:

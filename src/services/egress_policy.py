@@ -1,4 +1,10 @@
-"""Fail-closed domain gates for provider egress."""
+"""Fail-closed domain gates for provider egress, and the flag questions.
+
+A gate (``require_*``) raises :class:`EgressDisabledError` unless its flag is
+effective.  A question (``agent_media_send_enabled``,
+``uazapi_webhook_auth_enforced``, ``uazapi_egress_open``) answers ``False``
+for any doubt and never raises (only cancellation propagates).
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,12 @@ EgressFlag = Literal[
     "financial_egress_enabled",
     "uazapi_egress_enabled",
     "agent_media_send_enabled",
+]
+# The flags read as questions (``False`` for any doubt, never raising).
+QuestionFlag = Literal[
+    "agent_media_send_enabled",
+    "uazapi_egress_enabled",
+    "uazapi_webhook_auth_enforced",
 ]
 EgressDisabledCode = Literal[
     "financial_egress_disabled",
@@ -63,8 +75,25 @@ class EgressPolicy:
         cancellation propagates.
         """
 
+        return await self._question("agent_media_send_enabled")
+
+    async def uazapi_webhook_auth_enforced(self) -> bool:
+        """Whether the Uazapi webhook refuses an unverified callback now.
+
+        ``False`` for any doubt is the shadow mode (measure only): here
+        "fail-closed" means *no* enforcement, never a refused delivery.
+        """
+
+        return await self._question("uazapi_webhook_auth_enforced")
+
+    async def uazapi_egress_open(self) -> bool:
+        """``uazapi_egress_enabled`` as a question; ``False`` for any doubt."""
+
+        return await self._question("uazapi_egress_enabled")
+
+    async def _question(self, flag_name: QuestionFlag) -> bool:
         try:
-            enabled = await self._flag_reader.is_enabled("agent_media_send_enabled")
+            enabled = await self._flag_reader.is_enabled(flag_name)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -158,6 +187,49 @@ async def agent_media_send_enabled() -> bool:
 
     try:
         return await _current_policy().agent_media_send_enabled()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def uazapi_webhook_auth_enforced() -> bool:
+    """Read ``uazapi_webhook_auth_enforced`` once; never raises (shadow).
+
+    ``True`` only when the selected reader answers the flag unambiguously
+    ``{"enabled": true}``: absent, false, not a boolean, AppConfig disabled
+    or unconfigured, the Agent unreachable, a stale or failed SDK poll, or a
+    reader that cannot even be built all read ``False`` -- the Uazapi webhook
+    then only measures its check (shadow) and serves as before.  Read once
+    per Uazapi callback, before its first database statement.  Only
+    cancellation propagates.
+
+    With AppConfig disabled no reader is consulted at all: both readers
+    answer ``False`` there anyway, and a process without AppConfig (local
+    development, the suites) keeps exactly the flag reads it had before this
+    check existed.
+    """
+
+    if settings.appconfig_enabled is not True:
+        return False
+    try:
+        return await _current_policy().uazapi_webhook_auth_enforced()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def uazapi_egress_open() -> bool:
+    """Read ``uazapi_egress_enabled`` once as a question; never raises.
+
+    For a readiness answer (the Central de Mídias promise), not a gate: an
+    outbound Uazapi call still goes through :func:`require_uazapi_egress`.
+    Only cancellation propagates.
+    """
+
+    try:
+        return await _current_policy().uazapi_egress_open()
     except asyncio.CancelledError:
         raise
     except Exception:

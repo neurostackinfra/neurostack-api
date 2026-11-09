@@ -67,12 +67,13 @@ from tests.integration.credit_rollout_world import (
     scalar,
     subscribed_builder,
     template,
+    uazapi_enforced_credit_adapter,
 )
 from tests.integration.test_billing_fact_worker_postgres import _Harness
 
 pytestmark = pytest.mark.integration
 
-__all__ = ["clean", "template"]
+__all__ = ["clean", "template", "uazapi_enforced_credit_adapter"]
 
 DIGEST = "c" * 64
 
@@ -467,6 +468,7 @@ async def test_deleted_tenant_effect_gets_an_idempotent_digest_closure(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_the_periodic_pass_keeps_has_alert_until_the_orphan_closes(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -786,6 +788,7 @@ async def _old_effect(
     )
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize(
     "kind",
     [
@@ -849,6 +852,7 @@ async def test_an_orphan_older_than_the_window_is_found_by_arm_full_scan(
         await session.rollback()
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_the_periodic_pass_skips_while_another_process_holds_the_lock(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -915,6 +919,7 @@ async def _full_has_alert(harness: _Harness) -> bool:
     return readiness.has_alert
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_deleted_tenants_old_effect_is_closed_by_the_periodic_pass(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1003,6 +1008,7 @@ async def test_deletion_closures_are_batched_across_passes(clean: _Harness) -> N
     assert written == [2, 4, 5, 5]
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_an_old_orphan_keeps_the_gauge_up_until_a_full_sweep_sees_it_closed(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1061,6 +1067,7 @@ async def test_an_outbox_row_naming_another_tenants_effect_is_open(
         assert report.orphan_outbox == 1 and report.open_count == 1
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_new_orphan_raises_the_gauge_between_full_sweeps(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1104,6 +1111,7 @@ async def test_no_closure_is_written_for_a_live_tenants_effects(
     assert await _closures(clean, world.builder_id) == 0
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_the_worker_caps_closures_at_the_batch_per_pass(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1129,6 +1137,7 @@ async def test_the_worker_caps_closures_at_the_batch_per_pass(
     assert written == [2, 4, 5]
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_minute_ticks_sweep_the_full_history_at_0_and_900_seconds(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1160,6 +1169,7 @@ class _Warnings:
         self.fields.append(fields)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize("remembered", [0, 5])
 async def test_a_failing_full_sweep_never_freezes_the_gauge(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch, remembered: int
@@ -1204,6 +1214,7 @@ async def test_a_failing_full_sweep_never_freezes_the_gauge(
     assert await _closures(clean, world.builder_id) == 1  # committed anyway
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize("remembered", [0, 5])
 async def test_the_window_count_is_published_even_if_the_pass_then_fails(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch, remembered: int
@@ -1235,6 +1246,7 @@ async def test_the_window_count_is_published_even_if_the_pass_then_fails(
     assert _orphan_gauge() == max(1, remembered)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_cancelled_full_sweep_is_not_swallowed(
     clean: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

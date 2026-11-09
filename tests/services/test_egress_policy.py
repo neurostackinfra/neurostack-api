@@ -454,3 +454,122 @@ async def test_media_helper_agent_source_reads_the_agent_each_time(
 
     assert await egress_policy.agent_media_send_enabled() is enabled
     assert len(requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# uazapi-webhook-auth: two more questions that never raise.  "Fail-closed"
+# for ``uazapi_webhook_auth_enforced`` means NO enforcement (shadow).
+# ---------------------------------------------------------------------------
+
+_QUESTIONS = [
+    ("uazapi_webhook_auth_enforced", "uazapi_webhook_auth_enforced"),
+    ("uazapi_egress_open", "uazapi_egress_enabled"),
+]
+
+
+@pytest.mark.parametrize(("question", "flag"), _QUESTIONS)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(True, True), (False, False), ("true", False), (1, False), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_uazapi_questions_are_true_only_for_an_exact_true(
+    question: str, flag: str, value: object, expected: bool
+) -> None:
+    reader = _ValueFlagReader(value)
+    policy = EgressPolicy(reader)  # type: ignore[arg-type]
+
+    assert await getattr(policy, question)() is expected
+    assert reader.calls == [flag]
+
+
+@pytest.mark.parametrize(("question", "_flag"), _QUESTIONS)
+@pytest.mark.parametrize(
+    "error", [RuntimeError("agent down"), OSError("reset"), ValueError("bad")]
+)
+@pytest.mark.asyncio
+async def test_uazapi_questions_read_closed_when_the_reader_fails(
+    monkeypatch: pytest.MonkeyPatch, question: str, _flag: str, error: Exception
+) -> None:
+    assert await getattr(EgressPolicy(_FailingFlagReader(error)), question)() is False
+    # The module helpers too, and even when no reader can be built.
+    _configure(monkeypatch, source="agent", enabled=True)
+    monkeypatch.setattr(
+        egress_policy, "_flag_reader", lambda: _FailingFlagReader(error)
+    )
+    assert await getattr(egress_policy, question)() is False
+
+    def unavailable() -> None:
+        raise RuntimeError("reader unavailable")
+
+    monkeypatch.setattr(egress_policy, "_flag_reader", unavailable)
+    assert await getattr(egress_policy, question)() is False
+
+
+@pytest.mark.parametrize(("question", "_flag"), _QUESTIONS)
+@pytest.mark.asyncio
+async def test_uazapi_questions_propagate_cancellation(
+    monkeypatch: pytest.MonkeyPatch, question: str, _flag: str
+) -> None:
+    cancelled = _FailingFlagReader(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await getattr(EgressPolicy(cancelled), question)()
+    _configure(monkeypatch, source="agent", enabled=True)
+    monkeypatch.setattr(egress_policy, "_flag_reader", lambda: cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await getattr(egress_policy, question)()
+
+
+@pytest.mark.asyncio
+async def test_the_auth_mode_without_appconfig_is_shadow_without_any_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, source="sdk", enabled=False)
+
+    def no_reader() -> None:
+        pytest.fail("no reader is consulted with AppConfig disabled")
+
+    monkeypatch.setattr(egress_policy, "_flag_reader", no_reader)
+
+    assert await egress_policy.uazapi_webhook_auth_enforced() is False
+
+
+@pytest.mark.parametrize(
+    "case", ["open", "closed", "absent", "invalid", "stale", "error", "never_read"]
+)
+@pytest.mark.asyncio
+async def test_the_auth_mode_sdk_source_is_enforce_only_when_open_and_fresh(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    _configure(monkeypatch, source="sdk", enabled=True)
+    _no_agent_http(monkeypatch)
+    flag = "uazapi_webhook_auth_enforced"
+    others = {
+        "financial_egress_enabled": True,
+        "uazapi_egress_enabled": True,
+        "agent_media_send_enabled": True,
+    }
+    documents = {
+        "open": _flags(**{flag: True}),
+        "closed": _flags(**{flag: False}, **others),
+        "absent": _flags(**others),
+        "invalid": _flags(**{flag: "true"}, **others),
+        "stale": _flags(**{flag: True}),
+        "error": _flags(**{flag: True}),
+        "never_read": _flags(**{flag: True}),
+    }
+    clock = _Clock()
+    fake = _FakeAppConfigData([documents[case], RuntimeError("appconfig down")])
+    reader = _install_reader(monkeypatch, fake, clock)
+    if case != "never_read":
+        assert await reader.refresh_now() is True
+    if case == "stale":
+        clock.now += 3 * reader.poll_interval
+    if case == "error":
+        assert await reader.refresh_now() is False
+
+    assert await egress_policy.uazapi_webhook_auth_enforced() is (case == "open")
+    # The egress question reads its own flag only.
+    assert await egress_policy.uazapi_egress_open() is (
+        case in {"closed", "absent", "invalid"}
+    )

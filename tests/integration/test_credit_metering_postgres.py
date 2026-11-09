@@ -19,7 +19,10 @@ What SQLite cannot show, against migration 038 at head:
   its own session and the main path's sessions ended their transactions;
 * claims deduplicate per tenant under concurrency, for a standalone tenant
   and across a reparent (the tenant/builder trigger agrees), and nothing is
-  written once ``credit_enforcement_at`` is set.
+  written once ``credit_enforcement_at`` is set;
+* uazapi-webhook-auth: an enforced Uazapi match is metered as an
+  authenticated production turn (``would_debit_mc`` > 0) under the same
+  principal and claim key as a shadow callback, which stays unknown.
 
 Group 3b-1, the enforced ``POST /v1/events`` through the real app on a
 database with ``credit_enforcement_at`` set (LOW-6: the fences and the
@@ -840,6 +843,121 @@ async def test_the_request_holds_at_most_one_connection_while_metering(
     assert {(e.trace_id, e.origin, e.would_debit_mc) for e in effects} >= {
         (handoff_id, "production", 1_000)
     }
+
+
+async def test_an_enforced_uazapi_match_is_metered_as_authenticated_on_postgres(
+    pg: _PG, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uazapi-webhook-auth (option C), through the real app and pool: a
+    shadow callback is metered as today (``unknown``, unauthenticated, zero);
+    with the check enforced, a callback whose envelope token is the stored
+    instance token writes its observational row as an authenticated
+    production turn (``would_debit_mc`` > 0) under the SAME principal and
+    claim key.  Nothing is charged: no credit effect, no ledger entry."""
+
+    enforced = {"on": False}
+
+    async def mode() -> bool:
+        return enforced["on"]
+
+    monkeypatch.setattr("src.api.routes.webhook.uazapi_webhook_auth_enforced", mode)
+
+    def body(world: Any, token: str, message_id: str, phone: str) -> dict[str, Any]:
+        return {
+            "instanceName": world.uazapi_instance,
+            "token": token,
+            "BaseUrl": "https://uazapi.invalid/",
+            "owner": "5511900000000",
+            "EventType": "messages",
+            "chat": {"wa_chatid": f"{phone}@s.whatsapp.net"},
+            "message": {
+                "messageid": message_id,
+                "type": "text",
+                "text": "Olá, quero agendar",
+                "fromMe": False,
+                "sender_pn": f"{phone}@s.whatsapp.net",
+            },
+        }
+
+    async with _running_app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        tenant = UUID(world.uazapi_tenant)
+        async with direct.connect() as connection:
+            token = (
+                await connection.execute(
+                    text(
+                        "SELECT api_credentials ->> 'uazapi_token' FROM "
+                        "clinic_configs WHERE tenant_id = :t"
+                    ),
+                    {"t": tenant},
+                )
+            ).scalar_one()
+        shadow = await client.post(
+            "/v1/webhook/uazapi",
+            json=body(world, token, "pg-uazapi-shadow-1", "5511900000911"),
+        )
+        enforced["on"] = True
+        refused = await client.post(
+            "/v1/webhook/uazapi",
+            json=body(world, "not-the-token", "pg-uazapi-refused-1", "5511900000912"),
+        )
+        matched = await client.post(
+            "/v1/webhook/uazapi",
+            json=body(world, token, "pg-uazapi-enforced-1", "5511900000913"),
+        )
+
+    assert shadow.status_code == 200 and shadow.json()["replied"] is True
+    assert refused.status_code == 401
+    assert refused.json() == {"error": "invalid_webhook_auth"}
+    assert matched.status_code == 200, matched.text
+    assert matched.json()["replied"] is True
+    claims, effects = await _rows(direct, tenant)
+    by_message = {claim.provider_message_id: claim for claim in claims}
+    assert set(by_message) == {"pg-uazapi-shadow-1", "pg-uazapi-enforced-1"}
+    for claim in claims:
+        assert (claim.source, claim.principal_id, claim.mode) == (
+            "uazapi",
+            f"uazapi:{tenant}",
+            "observational",
+        )
+    by_trace = {effect.trace_id: effect for effect in effects}
+    shadow_effect = by_trace[by_message["pg-uazapi-shadow-1"].interaction_id]
+    enforced_effect = by_trace[by_message["pg-uazapi-enforced-1"].interaction_id]
+    assert len(effects) == 2
+    assert (
+        shadow_effect.origin,
+        shadow_effect.authenticated,
+        shadow_effect.would_debit_mc,
+    ) == ("unknown", False, 0)
+    assert (
+        enforced_effect.origin,
+        enforced_effect.authenticated,
+        enforced_effect.would_debit_mc,
+    ) == ("production", True, 1_000)
+    assert enforced_effect.would_debit_mc > 0
+    async with direct.connect() as connection:
+        charged = (
+            await connection.execute(
+                text(
+                    "SELECT (SELECT count(*) FROM credit_effects WHERE tenant_id = :t),"
+                    " (SELECT count(*) FROM credit_ledger_entries e JOIN "
+                    "credit_effects f ON f.builder_id = e.builder_id AND "
+                    "f.effect_id = e.effect_id WHERE f.tenant_id = :t)"
+                ),
+                {"t": tenant},
+            )
+        ).one()
+        sessions = (
+            await connection.execute(
+                text("SELECT user_id FROM sessions WHERE tenant_id = :t"),
+                {"t": tenant},
+            )
+        ).scalars()
+        phones = set(sessions)
+    assert tuple(charged) == (0, 0)
+    # The refused callback created nothing.
+    assert "5511900000912" not in phones
+    assert {"5511900000911", "5511900000913"} <= phones
 
 
 @pytest.mark.parametrize(
