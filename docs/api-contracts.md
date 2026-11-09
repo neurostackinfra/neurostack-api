@@ -245,8 +245,17 @@ apenas transporte e nunca influencia a origem.
 | JWT operacional (`clinic_admin`, `builder`, `super_admin`) | `simulator` |
 | JWT com outro papel (`investor`, desconhecido) | — (`403 caller_role_forbidden`) |
 | Webhook Z-API ou Meta (HMAC) autenticado | `production` |
-| Webhook Evolution/Uazapi e chamadores sem prova de origem | `unknown` |
+| Webhook Uazapi com `uazapi_webhook_auth_enforced` ligada e `token` do envelope igual ao `uazapi_token` gravado de exatamente uma linha da instância | `production` |
+| Webhook Uazapi com a flag desligada, ausente ou ilegível (modo sombra: a verificação só mede) | `unknown` |
+| Webhook Evolution e chamadores sem prova de origem | `unknown` |
 | Eventos tardios de handoff (`handoff.accept`, `handoff.complete`, `handoff.timeout`) | `unknown` |
+
+Com `uazapi_webhook_auth_enforced` ligada, um callback Uazapi cujo `token`
+não confere com o `uazapi_token` gravado de exatamente uma linha da
+instância (token ausente ou diferente, nenhum token gravado, instância
+desconhecida ou mais de uma linha com o mesmo token) responde
+`401 {"error":"invalid_webhook_auth"}` antes de qualquer efeito. O procedimento de sombra, aplicação e rollback está em
+`docs/runbooks/uazapi-webhook-auth.md`.
 
 Para saber a origem de um evento tardio de handoff, junte `payload.handoff_id`
 do evento tardio a `payload.key_info.handoff_id` do evento `handoff.request`

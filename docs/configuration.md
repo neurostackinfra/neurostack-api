@@ -51,16 +51,43 @@ versionados.
 descrito nesta seção; `sdk` lê o AppConfig Data de dentro do processo, com um
 refresher em background por processo (`APPCONFIG_ORIGIN` e `APPCONFIG_TOKEN`
 não são usados). Produção usa `sdk` a partir do passo L7: a task de produção tem apenas os
-containers `app` e `otel`, então não há Agent para `agent` consultar. Hoje
-nenhum nome `APPCONFIG_*` está definido e todas as flags ficam fechadas por
-ausência. Detalhes
+containers `app` e `otel`, então não há Agent para `agent` consultar.
+
+Os nomes definidos em `src/config/settings.py` são `APPCONFIG_ENABLED`
+(padrão `false`), `APPCONFIG_SOURCE` (padrão `agent`), `APPCONFIG_APPLICATION`,
+`APPCONFIG_ENVIRONMENT` e `APPCONFIG_PROFILE` (padrão vazio),
+`APPCONFIG_ORIGIN` (padrão `http://127.0.0.1:2772`) e `APPCONFIG_TOKEN`
+(padrão vazio). Sem `APPCONFIG_ENABLED=true` o mecanismo fica desligado e todas as flags
+valem `false`. Em produção, desde o passo L7 (revision 16 da task definition,
+deployment `COMPLETED` em 2026-11-03), o container `app` leva exatamente o
+grupo completo que o planner (`scripts/asaas_production_wiring.py`)
+renderiza: `APPCONFIG_ENABLED='true'`, `APPCONFIG_SOURCE=sdk`,
+`APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` e `APPCONFIG_PROFILE`.
+`APPCONFIG_ORIGIN`, `APPCONFIG_TOKEN` e qualquer outro nome `APPCONFIG_*` são
+proibidos na task de produção. O valor de produção de cada flag está na versão
+hospedada implantada no profile do AppConfig, não neste documento. Detalhes
 em `docs/runbooks/asaas-deployment.md`, seção "AppConfig and opening financial
 egress (follow-up F2)".
 
-Somente `financial_egress_enabled`, `uazapi_egress_enabled` e
-`agent_media_send_enabled` (envio de arquivos da Central de Mídias pelo agente)
-são aceitas, como decisões independentes no formato
-`{nome_da_flag: {enabled: boolean}}`. Com `agent`, a
+Somente quatro flags são aceitas (`SUPPORTED_FLAGS` em
+`src/infrastructure/appconfig.py`), como decisões independentes no formato
+`{nome_da_flag: {enabled: boolean}}`:
+
+- `financial_egress_enabled`: egress financeiro (criação de checkout);
+- `uazapi_egress_enabled`: chamadas de saída para a Uazapi;
+- `agent_media_send_enabled`: envio de arquivos da Central de Mídias pelo
+  agente;
+- `uazapi_webhook_auth_enforced`: aplicação da verificação do `token` do
+  envelope no webhook da Uazapi. Ligada, um callback cujo `token` não confere
+  com o `uazapi_token` gravado de exatamente uma linha da instância recebe
+  `401 {"error":"invalid_webhook_auth"}`, e um `match` vira turno
+  `production`. Desligada, ausente ou ilegível, a verificação só mede (modo
+  sombra) e nada muda no atendimento. O sentido é invertido em relação às
+  outras: aqui `false` quer dizer **sem autenticação**, então, depois de
+  aplicada, toda versão hospedada do AppConfig precisa levá-la `true`
+  (`docs/runbooks/uazapi-webhook-auth.md`).
+
+Uma flag ausente de uma versão nova do AppConfig vale `false`. Com `agent`, a
 aplicação não mantém cache, refresher ou lifecycle próprios: cada consulta
 observa o snapshot atual do agente. Configuração incompleta, agente
 indisponível, timeout, resposta inválida ou flag ausente resultam em `false` e

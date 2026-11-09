@@ -84,6 +84,16 @@ evidence on 2026-10-25.
   `037`, 2026-10-24; not read again since revision 11 was deployed);
   financial egress closed (the task definition carries no
   `APPCONFIG_ENABLED`).
+- **Later: the egress flags (2026-11-06).** Step L7 has since added the
+  AppConfig group to the task definition, so the flags are read from the
+  hosted AppConfig version, no longer closed by absence. On 2026-11-06 the
+  owner opened `uazapi_egress_enabled` in a new hosted version.
+- **Later: agent media (2026-11-08).** Per the owner's deploy record, the
+  owner opened `agent_media_send_enabled` in production together with the
+  PR-B (#206) deploy. The hosted version may have changed since; the
+  production value of each flag is the one in
+  the hosted version currently deployed to the egress-flags profile, not
+  this list. Read it there.
 
 ## Standing guidance
 
@@ -3586,11 +3596,17 @@ egress flags with `appconfigdata` `StartConfigurationSession` and
 `GetLatestConfiguration` (region `us-east-1`, the locked `boto3`/`botocore`
 main dependencies, the task role's credentials). `APPCONFIG_SOURCE` selects
 the source: `agent` (the default, today's localhost Agent client) or `sdk`
-(this reader). `src/services/egress_policy.py` chooses the reader for
-`financial_egress_enabled`, `uazapi_egress_enabled` and
-`agent_media_send_enabled` (envio-midia-agente: the agent sends Central de
-Mídias files; absent reads false, like the others); `billing_checkout.py`,
-`uazapi_service.py` and the media routes only consume the result.
+(this reader). `src/services/egress_policy.py` chooses the reader for the
+four flags of `SUPPORTED_FLAGS`: `financial_egress_enabled`,
+`uazapi_egress_enabled`, `agent_media_send_enabled` (envio-midia-agente: the
+agent sends Central de Mídias files; absent reads false, like the others)
+and `uazapi_webhook_auth_enforced` (uazapi-webhook-auth: the Uazapi webhook
+refuses a callback whose envelope token does not match with 401; absent or
+false is shadow, where the check only measures, so for this flag false means
+**no authentication**, see
+[`uazapi-webhook-auth.md`](./uazapi-webhook-auth.md)); `billing_checkout.py`,
+`uazapi_service.py`, the media routes and the Uazapi webhook only consume
+the result.
 
 - One reader and one background refresher per process: the lifespan of
   `src/api/main.py` starts the refresher only when `APPCONFIG_ENABLED=true`
@@ -3642,10 +3658,23 @@ Mídias files; absent reads false, like the others); `billing_checkout.py`,
   `GrowthFactor` 100, `ReplicateTo` `NONE`), so that containment (deploying
   `false`) is fast. The profile carries **every** flag: with `sdk`, a flag
   absent from the profile reads false, so `uazapi_egress_enabled` is present
-  with its current value, `false` (Uazapi egress is closed by absence today;
-  opening it is a separate owner decision, not part of L7), and so is
-  `agent_media_send_enabled` (envio-midia-agente; closed until the owner opens
-  it after the behaviour release).
+  with its current value (`true` lets the service call Uazapi; `false` or
+  absent stops every Uazapi call, replies included; opening it was a separate
+  owner decision, not part of L7, taken on 2026-11-06: see
+  [the state section](#state-after-the-live-runs-of-2026-10-22-to-2026-10-25)).
+  The production value of each flag lives in the hosted version deployed to
+  this profile, not in this runbook: read it there before writing a new
+  version. So is
+  `agent_media_send_enabled` (envio-midia-agente; `true` lets the agent send
+  Central de Mídias files; `false` or absent stops every agent file send, in
+  every task; see
+  [`../agent-media-delivery.md`](../agent-media-delivery.md#the-flag-and-the-kill-switch);
+  its production value, like every flag's, lives in the hosted version), and
+  so is `uazapi_webhook_auth_enforced`
+  (uazapi-webhook-auth; `false`, shadow, until the owner enforces it through
+  [`uazapi-webhook-auth.md`](./uazapi-webhook-auth.md); from then on every
+  hosted version must carry it `true`, or the Uazapi webhook silently returns
+  to shadow).
   Use only basic flags (no variants) in this profile. A profile with any
   multi-variant flag is served in Amazon Ion, not JSON: the reader cannot
   parse it, so every process closes every flag and logs
@@ -3664,12 +3693,14 @@ Mídias files; absent reads false, like the others); `billing_checkout.py`,
     "flags": {
       "agent_media_send_enabled": {"name": "agent_media_send_enabled"},
       "financial_egress_enabled": {"name": "financial_egress_enabled"},
-      "uazapi_egress_enabled": {"name": "uazapi_egress_enabled"}
+      "uazapi_egress_enabled": {"name": "uazapi_egress_enabled"},
+      "uazapi_webhook_auth_enforced": {"name": "uazapi_webhook_auth_enforced"}
     },
     "values": {
       "agent_media_send_enabled": {"enabled": false},
       "financial_egress_enabled": {"enabled": false},
-      "uazapi_egress_enabled": {"enabled": false}
+      "uazapi_egress_enabled": {"enabled": false},
+      "uazapi_webhook_auth_enforced": {"enabled": false}
     }
   }
   ```
@@ -3685,12 +3716,17 @@ Mídias files; absent reads false, like the others); `billing_checkout.py`,
   {
     "agent_media_send_enabled": {"enabled": false},
     "financial_egress_enabled": {"enabled": false},
-    "uazapi_egress_enabled": {"enabled": false}
+    "uazapi_egress_enabled": {"enabled": false},
+    "uazapi_webhook_auth_enforced": {"enabled": false}
   }
   ```
 
   To open financial egress (step 5) only
-  `values.financial_egress_enabled.enabled` changes to `true`.
+  `values.financial_egress_enabled.enabled` changes to `true`. This closed
+  content is the L7 template only: once `uazapi_webhook_auth_enforced` is
+  enforced, deploying it (or any version without that flag `true`) returns
+  the Uazapi webhook to shadow, with no authentication, besides closing every
+  egress. Later versions start from the deployed one.
 - **Evidence validators:** the `APPCONFIG_*` names enter the task definition
   only at L7 and all together (Decision 12 of the wish): `APPCONFIG_ENABLED`,
   `APPCONFIG_SOURCE`, `APPCONFIG_APPLICATION`, `APPCONFIG_ENVIRONMENT` and
@@ -3727,11 +3763,27 @@ reader, and the Group 5 planner accepts the `APPCONFIG_*` set.
    deployment's `createdAt` in epoch milliseconds from `DescribeServices`)):
 
    ```bash
-   aws logs filter-log-events --region us-east-1 \
+   QUERY_ID=$(aws logs start-query --region us-east-1 \
      --log-group-name /ecs/neurostack-staging/app \
-     --start-time "$DEPLOY_START_MS" \
-     --filter-pattern '"appconfig_egress_flags_changed"'
+     --start-time "$(( DEPLOY_START_MS / 1000 ))" --end-time "$(date +%s)" \
+     --query-string 'fields @timestamp, @logStream, @message
+   | filter @message like /^\{"poll_ok": (true|false), "financial_egress_enabled": (true|false), "uazapi_egress_enabled": (true|false), "agent_media_send_enabled": (true|false), "uazapi_webhook_auth_enforced": (true|false), "version_label": (null|"[^"]*"), "error_type": (null|"[^"]*"), "error_code": (null|"[^"]*"), "event": "appconfig_egress_flags_changed"/
+   | sort @logStream asc, @timestamp asc
+   | limit 10000' \
+     --output text --query queryId)
+   aws logs get-query-results --region us-east-1 --query-id "$QUERY_ID"
    ```
+
+   The query is anchored on the start of the JSON line the reader writes
+   (`src/infrastructure/appconfig.py`), so the word
+   `appconfig_egress_flags_changed` inside another line (a body value in a
+   `Uazapi webhook:` line, for example) is never counted as a worker's
+   readback; a term filter such as `--filter-pattern
+   '"appconfig_egress_flags_changed"'` would count it. Run
+   `get-query-results` again until it reads `Complete`; the last line of each
+   `@logStream` is that worker's state. The pattern is the reader's line with
+   all four flags; an image older than `uazapi_webhook_auth_enforced` writes
+   a line without it, which this query does not match.
 
    A process that logs `poll_ok=false` stays closed; fix the cause before
    going on: `error_code` `AccessDeniedException` (or another AWS code) means
@@ -3744,8 +3796,9 @@ reader, and the Group 5 planner accepts the `APPCONFIG_*` set.
    closed.
 5. Open: create and deploy a hosted version with
    `financial_egress_enabled.enabled` true, after the owner's order, and
-   `uazapi_egress_enabled` and `agent_media_send_enabled` at their current
-   values (a flag left out reads false). Within
+   `uazapi_egress_enabled`, `agent_media_send_enabled` and
+   `uazapi_webhook_auth_enforced` at their current values (a flag left out
+   reads false). Within
    one poll interval (at most 60 s) each worker process logs
    `financial_egress_enabled=true` with the new version label, and
    `uazapi_egress_enabled` stays false: rerun the same query with
@@ -3754,10 +3807,12 @@ reader, and the Group 5 planner accepts the `APPCONFIG_*` set.
    L8).
 
 **Containment and rollback.** Deploy a hosted version with
-`financial_egress_enabled.enabled` false, keeping `uazapi_egress_enabled` and
-`agent_media_send_enabled` at their current values (a flag left out of the
-version reads false, so dropping the media flag would also stop agent media
-in every task): each worker process closes at its
+`financial_egress_enabled.enabled` false, keeping `uazapi_egress_enabled`,
+`agent_media_send_enabled` and `uazapi_webhook_auth_enforced` at their
+current values (a flag left out of the version reads false, so dropping the
+media flag would also stop agent media in every task, and dropping the
+Uazapi auth flag would return the Uazapi webhook to shadow, with no
+authentication): each worker process closes at its
 next poll (at most one clamped poll interval: 15 s by default, never more
 than 60 s). If AppConfig itself is unreachable or denied, every process
 closes on the failed poll, and a process whose refresher stalls closes after

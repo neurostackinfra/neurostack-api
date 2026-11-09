@@ -118,8 +118,10 @@ class PipelineResult:
 A borda de entrada (rota `/v1/events` ou adaptador de webhook) constrói uma
 única vez um `ResolvedInteractionContext` (`src/interaction_context.py`) com
 tenant efetivo, sessão, `origin` e `interaction_event_id`. A origem vem só da
-credencial: API key e Z-API/Meta → `production`; JWT operacional →
-`simulator`; Evolution/Uazapi e chamadores sem prova → `unknown`. `channel` é
+credencial: API key e Z-API/Meta → `production`; Uazapi → `production` só
+com `uazapi_webhook_auth_enforced` ligada e o `token` do envelope igual ao
+token gravado da instância (`match`), senão `unknown`; JWT operacional →
+`simulator`; Evolution e chamadores sem prova → `unknown`. `channel` é
 transporte e não influencia. No pipeline, o contexto só é consumido depois que
 o lock da sessão (`_lock_session_state`) prova a sessão no tenant; a exceção é
 a captura de mensagem com a sessão pausada no webhook, que grava o `message.in`
