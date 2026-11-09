@@ -47,8 +47,11 @@ ROOT = Path(__file__).resolve().parents[2]
 KEY = "$aact_prod_"
 SANDBOX_KEY = "$aact_hmlg_"
 TOKEN = "CANARYTOKEN" + "x" * 32
-# The decided URL: its host is the only one ``ALLOWED_WEBHOOK_HOSTS`` admits.
+# Staging's decided URL (the default ENVIRONMENT of these fixtures).
 URL = "https://staging.api.neurostack.global/v1/billing/webhook/asaas"
+# Production's URL: the ASAAS_WEBHOOK_URL of envs/prod/app in
+# neurostack-infra-terraform (2026-11-08).
+PRODUCTION_URL = "https://api.neurostack.global/v1/billing/webhook/asaas"
 FOREIGN_HOST_URL = "https://canary-url-host.example/v1/billing/webhook/asaas"
 EMAIL = "canary-mailbox@example.test"
 NAME = "neurostack-billing-staging"
@@ -699,7 +702,11 @@ BAD_CONFIGS = [
     ({"api_key": SecretStr("")}, "api_key_missing"),
     # A sandbox key is valid outside ENVIRONMENT=production only.
     (
-        {"api_key": SecretStr(SANDBOX_KEY), "environment": "production"},
+        {
+            "api_key": SecretStr(SANDBOX_KEY),
+            "environment": "production",
+            "webhook_url": PRODUCTION_URL,
+        },
         "api_key_invalid",
     ),
     ({"api_key": SecretStr("$aact_YTU5YTE0M2M2N2I4MTIxNzlkMjM")}, "api_key_invalid"),
@@ -817,12 +824,32 @@ def test_the_url_pin_is_exactly_the_decided_d3_parameter() -> None:
     """A deliberate safety net: change it with the D3 parameters, never alone."""
 
     decided = _decided_webhook_url()
-    assert cli.ALLOWED_WEBHOOK_URLS == frozenset({decided})
-    assert cli.ALLOWED_WEBHOOK_HOSTS == frozenset({"staging.api.neurostack.global"})
+    assert cli.WEBHOOK_URL_BY_ENVIRONMENT["staging"] == decided
+    assert cli.ALLOWED_WEBHOOK_URLS == frozenset({decided, PRODUCTION_URL})
+    assert cli.ALLOWED_WEBHOOK_HOSTS == frozenset(
+        {"staging.api.neurostack.global", "api.neurostack.global"}
+    )
     assert URL == decided
     checks, reasons = cli.validate_config(make_config(webhook_url=decided))
     assert checks["webhook_url_allowed"] and checks["webhook_host_allowed"]
     assert reasons == ()
+
+
+
+def test_the_production_url_is_allowed_only_in_production() -> None:
+    assert cli.WEBHOOK_URL_BY_ENVIRONMENT["production"] == PRODUCTION_URL
+    checks, _ = cli.validate_config(
+        make_config(webhook_url=PRODUCTION_URL, environment="production")
+    )
+    assert checks["webhook_url_allowed"] and checks["webhook_host_allowed"]
+
+    # Crossed: staging may not register production's URL, nor the reverse.
+    crossed_staging, _ = cli.validate_config(make_config(webhook_url=PRODUCTION_URL))
+    assert not crossed_staging["webhook_url_allowed"]
+    crossed_production, _ = cli.validate_config(
+        make_config(webhook_url=URL, environment="production")
+    )
+    assert not crossed_production["webhook_url_allowed"]
 
 
 async def test_the_decided_host_with_another_path_fails_closed() -> None:
@@ -892,7 +919,11 @@ def test_fake_keys_are_exactly_what_the_validators_accept_and_reject() -> None:
     ]
     _assert_no_canary(str(caught.value), repr(caught.value))
     checks, reasons = cli.validate_config(
-        make_config(api_key=SecretStr(SANDBOX_KEY), environment="production")
+        make_config(
+            api_key=SecretStr(SANDBOX_KEY),
+            environment="production",
+            webhook_url=PRODUCTION_URL,
+        )
     )
     assert checks["api_key_namespace_valid"] is False
     assert reasons == ("api_key_invalid",)

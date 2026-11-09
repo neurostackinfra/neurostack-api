@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,8 +24,12 @@ from src.core.exceptions import ConfigurationError
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _production_settings(**overrides: object) -> Settings:
-    observed_at = datetime.now(timezone.utc).isoformat()
+def _production_settings(
+    _acknowledgement_observed_at: str | None = None, **overrides: object
+) -> Settings:
+    observed_at = (
+        _acknowledgement_observed_at or datetime.now(timezone.utc).isoformat()
+    )
     challenge_nonce = "settings-test-challenge"
     rules_digest = hashlib.sha256(
         (ROOT / "config/prometheus_rules.yml").read_bytes()
@@ -286,20 +290,40 @@ def test_production_startup_error_never_mentions_retired_legacy_gateway() -> Non
     assert "password" not in message
 
 
+def test_production_still_refuses_a_loopback_alert_receiver() -> None:
+    # A receiver that is configured must still be valid: the field validator
+    # rejects loopback/plain HTTP on its own, independent of readiness.
+    with pytest.raises((ConfigurationError, ValidationError)):
+        _production_settings(billing_alert_receiver_url="http://127.0.0.1:9093/webhook")
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"billing_alert_receiver_url": "http://127.0.0.1:9093/webhook"},
+        {"billing_alert_receiver_url": ""},
         {"billing_prometheus_rules_digest": "not-a-digest"},
         {"billing_observability_smoke_digest": ""},
         {"billing_observability_smoke_digest": "a" * 64},
     ],
 )
-def test_production_billing_observability_fails_closed(
+def test_production_billing_observability_is_a_readiness_input_not_a_startup_gate(
     overrides: dict[str, object],
 ) -> None:
-    with pytest.raises((ConfigurationError, ValidationError)):
-        _production_settings(**overrides)
+    # An incomplete observability contract no longer stops production from
+    # starting (a 300 s acknowledgement cannot survive an ECS restart); it
+    # still fails closed where it is evaluated: /ready reports it.
+    loaded = _production_settings(**overrides)
+
+    assert loaded.is_production is True
+    assert loaded.is_billing_observability_compatible is False
+
+
+def test_production_starts_with_a_stale_runtime_acknowledgement() -> None:
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    loaded = _production_settings(_acknowledgement_observed_at=stale)
+
+    assert loaded.is_production is True
+    assert loaded.is_billing_runtime_acknowledgement_compatible is False
 
 
 @pytest.mark.parametrize(
