@@ -2295,6 +2295,22 @@ def _resolve_stt_model(credentials: dict[str, Any]) -> str:
     return str(model or _STT_DEFAULT_MODELS.get(provider, "whisper-large-v3-turbo"))
 
 
+def _stt_usage_metadata(
+    credentials: dict[str, Any], *, audio_seconds: int
+) -> dict[str, Any]:
+    """The ``message.in`` metadata of a transcribed patient audio.
+
+    The three keys ``event_service`` keeps from the webhook payload, read by
+    the trace stats and the builder dashboard to count transcription seconds
+    per model. Z-API builds the same keys inline, from its ``seconds``.
+    """
+    return {
+        "whisper_model": _resolve_stt_model(credentials),
+        "is_audio": True,
+        "audio_seconds": audio_seconds,
+    }
+
+
 def _multimodal_operational(credentials: dict[str, Any]) -> bool:
     """Decision 14's "multimodal operante" predicate.
 
@@ -4737,6 +4753,8 @@ async def uazapi_webhook(
     # A patient audio above ``audio_max_seconds`` is never downloaded or
     # transcribed: it is handed off at the insertion point below.
     audio_too_long = False
+    # Set only when this message is a transcribed audio.
+    stt_usage_metadata: dict[str, Any] = {}
     if audio_is_transcribable:
         creds = await _tenant_creds()
         u_url = (creds.get("uazapi_api_url") or "").strip()
@@ -4860,6 +4878,7 @@ async def uazapi_webhook(
             # load-bearing ``assert message_text is not None`` below is now
             # satisfied on the patient-audio path.
             message_text = transcript
+            stt_usage_metadata = _stt_usage_metadata(creds, audio_seconds=audio_seconds)
 
     # ── bot_active check — if AI is paused, drop silently ──
     bot_skip = await _check_bot_active(tenant_id, from_phone, db)
@@ -5055,6 +5074,7 @@ async def uazapi_webhook(
                 "phone": from_phone,
                 "messageId": msg_id,
                 "source": "uazapi",
+                **stt_usage_metadata,
             },
         ),
     )
@@ -6301,6 +6321,8 @@ async def meta_webhook(
             #   • ``unsupported`` — how Meta delivers a view-once photo, among
             #     other types — keeps the silent non-text skip (Decision 13).
             message_text: str = ""
+            # Set only when this message is a transcribed audio.
+            stt_usage_metadata: dict[str, Any] = {}
 
             if msg_type == "text":
                 message_text = (msg.get("text") or {}).get("body", "").strip()
@@ -6523,6 +6545,14 @@ async def meta_webhook(
                         agent_language=agent_lang,
                         failure_reason=chain_failure,
                     )
+                # Formats without a measured duration record 0 seconds; the
+                # usage cards count every audio as at least one second.
+                stt_usage_metadata = _stt_usage_metadata(
+                    creds,
+                    audio_seconds=(
+                        0 if audio_duration is None else int(audio_duration)
+                    ),
+                )
 
                 # Falls through to the shared text pipeline below.
 
@@ -6581,6 +6611,7 @@ async def meta_webhook(
                         "pushName": contact_name,
                         "messageId": message_id,
                         "source": "meta_cloud",
+                        **stt_usage_metadata,
                     },
                 ),
             )
