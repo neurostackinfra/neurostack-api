@@ -2584,6 +2584,38 @@ async def test_an_enforced_zapi_decision_charges_once_and_delivers_inline_on_pos
     assert not [key for key in payload if "token" in key or "secret" in key]
 
 
+async def _pg_pause_state(
+    direct: AsyncEngine, tenant_id: UUID, phone: str
+) -> tuple[bool, Any]:
+    """The patient's session ``(is_paused, paused_until)``, from another connection."""
+
+    async with direct.connect() as connection:
+        row = (
+            await connection.execute(
+                text(
+                    "SELECT is_paused, paused_until FROM sessions "
+                    "WHERE tenant_id = :t AND user_id = :p"
+                ),
+                {"t": tenant_id, "p": phone},
+            )
+        ).one()
+    return bool(row.is_paused), row.paused_until
+
+
+async def _pg_reactivate(direct: AsyncEngine, tenant_id: UUID, phone: str) -> None:
+    """The team hands the patient's session back to the AI."""
+
+    async with direct.begin() as connection:
+        updated = await connection.execute(
+            text(
+                "UPDATE sessions SET is_paused = false, paused_until = NULL "
+                "WHERE tenant_id = :t AND user_id = :p"
+            ),
+            {"t": tenant_id, "p": phone},
+        )
+        assert updated.rowcount == 1
+
+
 async def test_an_enforced_meta_file_handoff_commits_atomically_on_postgres(
     enforced_pg: _PG,
     enforced_direct: AsyncEngine,
@@ -2650,12 +2682,21 @@ async def test_an_enforced_meta_file_handoff_commits_atomically_on_postgres(
         world, client = running.world, running.client
         tenants.append(UUID(world.meta_tenant))
         answers = []
+        pauses = []
         async with asyncio.timeout(_TURN_SECONDS):
-            for message in (document, forward, audio, forward, audio):
+            for step, message in enumerate((document, forward, audio, forward, audio)):
+                if step == 3:
+                    # Redeliveries after the team handed the session back.
+                    await _pg_reactivate(enforced_direct, tenants[0], phone)
                 raw, headers = _signed_meta(world, message)
                 answers.append(
                     await client.post("/v1/webhook/meta", content=raw, headers=headers)
                 )
+                pauses.append(await _pg_pause_state(enforced_direct, tenants[0], phone))
+                if step == 1:
+                    # The forward paused the AI; the team hands it back
+                    # before the patient's long audio.
+                    await _pg_reactivate(enforced_direct, tenants[0], phone)
             before_fault = await _webhook_rows(enforced_direct, tenants[0])
 
             async def fault(_self: Any, **_kwargs: Any) -> bool:
@@ -2667,6 +2708,9 @@ async def test_an_enforced_meta_file_handoff_commits_atomically_on_postgres(
                 with pytest.raises(RuntimeError, match="after the handoff insert"):
                     await client.post("/v1/webhook/meta", content=raw, headers=headers)
             seen = await _webhook_rows(enforced_direct, tenants[0])
+            pause_after_fault = await _pg_pause_state(
+                enforced_direct, tenants[0], phone
+            )
             details = [
                 await client.get(
                     f"/v1/handoffs/{handoff_id}", headers=_clinic_admin(tenants[0])
@@ -2680,6 +2724,17 @@ async def test_an_enforced_meta_file_handoff_commits_atomically_on_postgres(
         {"ok": True, "skipped": "duplicate_message"},
         {"ok": True, "skipped": "duplicate_message"},
     ]
+    # Each committed file handoff paused the AI in its transaction, with no
+    # deadline (default stand-by); the ack, the redeliveries and the fault
+    # paused nothing.
+    assert pauses == [
+        (False, None),
+        (True, None),
+        (True, None),
+        (False, None),
+        (False, None),
+    ]
+    assert pause_after_fault == (False, None)
     assert seen == before_fault  # the fault left nothing durable
     claims = {c.provider_message_id: c for c in seen.claims}
     assert set(claims) == {"wamid.pg-forward", "wamid.pg-long-audio"}
@@ -2807,8 +2862,13 @@ async def test_an_enforced_zapi_file_handoff_commits_atomically_on_postgres(
             review_after_forward = await _zapi_file_review(
                 enforced_direct, tenant, phone
             )
+            pause_after_forward = await _pg_pause_state(enforced_direct, tenant, phone)
             await _reopen_zapi_file_review(enforced_direct, tenant, phone)
+            await _pg_reactivate(enforced_direct, tenant, phone)
             answers.append(await client.post(path, json=forward("pg-zapi-forward")))
+            pause_after_redelivery = await _pg_pause_state(
+                enforced_direct, tenant, phone
+            )
             before_fault = await _webhook_rows(enforced_direct, tenant)
 
             async def fault(_self: Any, **_kwargs: Any) -> bool:
@@ -2820,6 +2880,7 @@ async def test_an_enforced_zapi_file_handoff_commits_atomically_on_postgres(
                     await client.post(path, json=forward("pg-zapi-broken"))
             seen = await _webhook_rows(enforced_direct, tenant)
             review_at_end = await _zapi_file_review(enforced_direct, tenant, phone)
+            pause_at_end = await _pg_pause_state(enforced_direct, tenant, phone)
         texts = _sent_to(webhook.send_text_message, phone)
     assert [a.json() for a in answers] == [
         {"ok": True, "replied": True, "action": "file_ack"},
@@ -2830,8 +2891,12 @@ async def test_an_enforced_zapi_file_handoff_commits_atomically_on_postgres(
     assert (after_ack.claims, after_ack.effects, after_ack.entries) == ([], [], {})
     assert review_after_ack is True
     assert review_after_forward is None  # cleared in the handoff's transaction
+    # Paused in the handoff's transaction (default stand-by: no deadline).
+    assert pause_after_forward == (True, None)
     assert seen == before_fault  # the fault left nothing durable
     assert review_at_end is True  # the redelivery and the fault rolled back
+    # Both stopped before the pause step: nothing paused the session again.
+    assert pause_after_redelivery == pause_at_end == (False, None)
     [claim] = seen.claims
     assert (claim.source, claim.mode, claim.provider_message_id) == (
         "zapi",

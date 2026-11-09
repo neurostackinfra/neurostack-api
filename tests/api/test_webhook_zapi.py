@@ -2247,6 +2247,8 @@ def _g3_session_row(client: TestClient, tenant_id: UUID, phone: str) -> Any:
             return SimpleNamespace(
                 id=row.id,
                 is_paused=row.is_paused,
+                paused_until=row.paused_until,
+                cognitive_state=dict(row.cognitive_state or {}),
                 metadata=dict(row.session_metadata or {}),
             )
         finally:
@@ -2286,6 +2288,52 @@ def _g3_seed_session(
             await db.close()
 
     return client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _g3_seed_handoff_policy(
+    client: TestClient, tenant_id: UUID, handoff: dict[str, Any]
+) -> None:
+    """Persist the clinic's "Stand-by após handoff" bucket."""
+    from sqlalchemy import update
+
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            await db.execute(
+                update(ClinicConfigTable)
+                .where(ClinicConfigTable.tenant_id == tenant_id)
+                .values(handoff=handoff)
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
+
+
+def _g3_reactivate(client: TestClient, tenant_id: UUID, phone: str) -> None:
+    """The team hands the phone's session back to the AI."""
+    from sqlalchemy import update
+
+    from src.models.session import Session as SessionRow
+    from src.repositories.database import get_db_session
+
+    async def _run() -> None:
+        db = get_db_session()
+        try:
+            await db.execute(
+                update(SessionRow)
+                .where(SessionRow.tenant_id == tenant_id, SessionRow.user_id == phone)
+                .values(is_paused=False, paused_until=None)
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    client._submit(_run())  # type: ignore[attr-defined]
 
 
 def _g3_session_count(client: TestClient, tenant_id: UUID) -> int:
@@ -3217,8 +3265,10 @@ class TestZapiPendingFileReview:
         forward_mid = world.send_results[-1]["messageId"]
         assert forward_mid in [entry[0] for entry in metadata["ai_msg_ids"]]
         assert forward_mid in webhook_module._INMEM_SENT
-        # Decision 19: the forward opens the handoff but never pauses the AI.
-        assert world.session().is_paused is False
+        # The forward pauses the AI like any handoff; the default stand-by
+        # ("Somente manualmente") has no deadline: the Fila de Inativos.
+        session = world.session()
+        assert (session.is_paused, session.paused_until) == (True, None)
 
     def test_english_forward_confirmation(
         self, zapi_file_world: Callable[..., _ZapiFileWorld]
@@ -3754,7 +3804,7 @@ class TestZapiLongAudioOpensAHandoff:
     after the AI-off, pause and credit gates and the session, never
     transcribed, with a tracked notice."""
 
-    _LONG = 180  # the seeded audio_max_seconds is 60
+    _LONG = 180  # no audio_max_seconds seeded: the default is 120
 
     def test_long_audio_opens_the_handoff_and_sends_a_tracked_notice(
         self, zapi_file_world: Callable[..., _ZapiFileWorld]
@@ -3809,7 +3859,15 @@ class TestZapiLongAudioOpensAHandoff:
         notice_mid = world.send_results[-1]["messageId"]
         assert notice_mid in [entry[0] for entry in world.metadata()["ai_msg_ids"]]
         assert notice_mid in webhook_module._INMEM_SENT
-        assert world.session().is_paused is False  # a handoff never pauses
+        # The handoff pauses the AI with no deadline (default stand-by), with
+        # the episode context a later reactivation resumes from.
+        from src.handoff.episode_context import validate_prior_episode_context
+
+        session = world.session()
+        assert (session.is_paused, session.paused_until) == (True, None)
+        assert validate_prior_episode_context(
+            session.cognitive_state.get("prior_episode_context")
+        )
 
     def test_english_clinic_gets_the_english_notice(
         self, zapi_file_world: Callable[..., _ZapiFileWorld]
@@ -3848,6 +3906,9 @@ class TestZapiLongAudioOpensAHandoff:
         world = zapi_file_world()
         world.post(world.audio(seconds=self._LONG))
         notice_mid = world.send_results[-1]["messageId"]
+        # The team hands the session back before the echo arrives, so a
+        # misread echo (a human takeover) would pause it again.
+        _g3_reactivate(world.client, world.tenant_id, world.phone)
         if cross_worker:
             # Another worker, Redis down: only the database knows the id.
             webhook_module._INMEM_SENT.clear()
@@ -3924,6 +3985,208 @@ class TestZapiLongAudioOpensAHandoff:
         assert resp.json().get("replied") is True, resp.json()
         world.handoff.assert_not_awaited()
         assert world.pipeline_contents() == ["Quero marcar uma consulta"]
+
+    @pytest.mark.parametrize(("seconds", "handed_off"), [(120, False), (121, True)])
+    def test_without_a_configured_limit_the_default_is_120_seconds(
+        self,
+        zapi_file_world: Callable[..., _ZapiFileWorld],
+        seconds: int,
+        handed_off: bool,
+    ) -> None:
+        world = zapi_file_world(stt=True)
+
+        with (
+            patch(
+                "src.api.routes.webhook.safe_download_audio",
+                new=AsyncMock(
+                    return_value=SimpleNamespace(content=b"ogg", mime_type="audio/ogg")
+                ),
+            ) as download,
+            patch(
+                "src.services.groq_service.transcribe_audio",
+                new=AsyncMock(return_value="Quero marcar uma consulta"),
+            ),
+        ):
+            resp = world.post(world.audio(seconds=seconds))
+
+        if handed_off:
+            assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+            download.assert_not_called()
+            world.handoff.assert_awaited_once()
+        else:
+            assert resp.json().get("replied") is True, resp.json()
+            world.handoff.assert_not_awaited()
+            assert world.pipeline_contents() == ["Quero marcar uma consulta"]
+
+    @pytest.mark.parametrize(
+        ("handoff", "paused", "deadline"),
+        [
+            # "Somente manualmente" (the default): the Fila de Inativos.
+            ({}, True, None),
+            ({"standby_mode": "active", "handoff_period": "permanent"}, True, None),
+            # "Após um prazo personalizado".
+            (
+                {
+                    "standby_mode": "active",
+                    "handoff_period": "cycle",
+                    "handoff_cycle_hours": 6,
+                },
+                True,
+                timedelta(hours=6),
+            ),
+            (
+                {
+                    "standby_mode": "active",
+                    "handoff_period": "cycle",
+                    "handoff_cycle_days": 2,
+                },
+                True,
+                timedelta(days=2),
+            ),
+            # Stand-by disabled: the AI answers again 24 hours later.
+            ({"standby_mode": "inactive"}, True, timedelta(hours=24)),
+            # The legacy activation switch off: no pause at all.
+            ({"handoff_active": "no"}, False, None),
+        ],
+    )
+    def test_the_pause_follows_the_clinic_stand_by_policy(
+        self,
+        zapi_file_world: Callable[..., _ZapiFileWorld],
+        handoff: dict[str, Any],
+        paused: bool,
+        deadline: timedelta | None,
+    ) -> None:
+        world = zapi_file_world()
+        _g3_seed_handoff_policy(world.client, world.tenant_id, handoff)
+        before = datetime.now(timezone.utc)
+
+        resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        world.handoff.assert_awaited_once()  # the handoff opens either way
+        assert world.sent() == [_g3_long_audio_notice()]
+        session = world.session()
+        assert session.is_paused is paused
+        if deadline is None:
+            assert session.paused_until is None
+        else:
+            until = session.paused_until
+            if until.tzinfo is None:  # SQLite drops the offset
+                until = until.replace(tzinfo=timezone.utc)
+            assert before + deadline <= until <= datetime.now(timezone.utc) + deadline
+
+    def test_a_failed_pause_still_sends_the_notice(
+        self,
+        zapi_file_world: Callable[..., _ZapiFileWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The handoff is committed before the pause: a pause that fails is
+        logged and dropped, and the patient still hears from the team."""
+        from src.repositories import SessionRepository
+
+        world = zapi_file_world()
+
+        with patch.object(
+            SessionRepository,
+            "pause_effective",
+            new=AsyncMock(side_effect=RuntimeError("pause write failed")),
+        ):
+            resp = world.post(world.audio(seconds=self._LONG))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        world.handoff.assert_awaited_once()
+        assert world.sent() == [_g3_long_audio_notice()]
+        notice_mid = world.send_results[-1]["messageId"]
+        assert notice_mid in [entry[0] for entry in world.metadata()["ai_msg_ids"]]
+        assert world.session().is_paused is False
+        assert "File handoff pause failed" in caplog.text
+
+    def test_a_failed_handoff_pauses_nothing(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world()
+        world.handoff.side_effect = RuntimeError("handoff insert failed")
+
+        with pytest.raises(RuntimeError, match="handoff insert failed"):
+            world.post(world.audio(seconds=self._LONG))
+
+        assert world.session().is_paused is False
+        assert world.sent() == []
+
+    def test_a_session_already_paused_keeps_its_pause_and_deadline(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        """The pause never turns an existing deadline into a permanent one."""
+        from sqlalchemy import update
+
+        from src.api.routes import webhook as webhook_module
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        world = zapi_file_world()
+        session_id = world.seed_session()
+        deadline = datetime.now(timezone.utc) + timedelta(hours=3)
+
+        async def _run() -> str:
+            db = get_db_session()
+            try:
+                await db.execute(
+                    update(SessionRow)
+                    .where(SessionRow.id == session_id)
+                    .values(is_paused=True, paused_until=deadline)
+                )
+                await db.commit()
+                outcome = await webhook_module._pause_after_file_handoff(
+                    tenant_id=world.tenant_id,
+                    session_id=session_id,
+                    note="audio_too_long",
+                    db=db,
+                )
+                await db.commit()
+                return outcome
+            finally:
+                await db.close()
+
+        outcome = world.client._submit(_run())  # type: ignore[attr-defined]
+
+        assert outcome == "already_paused"
+        session = world.session()
+        until = session.paused_until
+        if until.tzinfo is None:  # SQLite drops the offset
+            until = until.replace(tzinfo=timezone.utc)
+        assert (session.is_paused, until) == (True, deadline)
+
+    def test_the_session_lands_on_the_inactive_queue_until_handed_back(
+        self, zapi_file_world: Callable[..., _ZapiFileWorld]
+    ) -> None:
+        world = zapi_file_world()
+
+        assert world.post(world.audio(seconds=self._LONG)).json() == {
+            "ok": True,
+            "skipped": "audio_too_long",
+        }
+        session_id = world.session().id
+        headers = _admin_headers(world.tenant_id)
+
+        listed = world.client.get("/v1/sessions/inactive", headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert [item["session_id"] for item in listed.json()["items"]] == [
+            str(session_id)
+        ]
+        # While it is there the AI stays quiet: the next message is the team's.
+        resp = world.post(world.text("Alguém vai ouvir meu áudio?"))
+        assert resp.json() == {"ok": True, "skipped": "session_paused"}
+        assert world.pipeline_contents() == []
+        assert world.sent() == [_g3_long_audio_notice()]
+
+        handed_back = world.client.post(
+            f"/v1/sessions/{session_id}/reactivate", headers=headers
+        )
+        assert handed_back.status_code == 200, handed_back.text
+        assert world.session().is_paused is False
+        listed = world.client.get("/v1/sessions/inactive", headers=headers)
+        assert listed.json()["items"] == []
 
 
 @pytest.mark.parametrize(

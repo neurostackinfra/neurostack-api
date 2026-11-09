@@ -67,6 +67,7 @@ from src.repositories import (
 from src.repositories.database import get_db_session_factory
 from src.services import credit_metering, reply_media_runner
 from src.services.api_credentials import (
+    DEFAULT_AUDIO_MAX_SECONDS,
     OPERATIONAL_MULTIMODAL_PROVIDERS,
     MediaDeliveryProvider,
     media_delivery_provider,
@@ -3394,7 +3395,9 @@ async def _process_zapi_authenticated_body(
             # payload, so this costs no download. Only the decision is taken
             # here: the handoff and its notice wait below the AI-off, pause
             # and credit gates and the session, where Meta's run too.
-            audio_max_seconds = int((creds or {}).get("audio_max_seconds") or 60)
+            audio_max_seconds = int(
+                (creds or {}).get("audio_max_seconds") or DEFAULT_AUDIO_MAX_SECONDS
+            )
             audio_seconds = int(audio_obj.get("seconds") or 0)
             if audio_seconds > audio_max_seconds:
                 audio_too_long = True
@@ -4760,7 +4763,9 @@ async def uazapi_webhook(
         audio_seconds = 0
         if isinstance(content_obj, dict):
             audio_seconds = int(content_obj.get("seconds") or 0)
-        audio_max_seconds = int(creds.get("audio_max_seconds") or 60)
+        audio_max_seconds = int(
+            creds.get("audio_max_seconds") or DEFAULT_AUDIO_MAX_SECONDS
+        )
         if audio_seconds > audio_max_seconds:
             duplicate = _claim_deferred_message()
             if duplicate is not None:
@@ -5480,6 +5485,128 @@ async def _meta_initiate_file_handoff(
     return response
 
 
+async def _pause_after_file_handoff(
+    *,
+    tenant_id: UUID,
+    session_id: UUID,
+    note: str,
+    db: AsyncSession,
+    now: Optional[datetime] = None,
+) -> str:
+    """Pause the session after a file handoff, like an AI handoff does.
+
+    The clinic's "Stand-by após handoff" policy (``resolve_handoff_pause``)
+    decides it, as in the pipeline and the human takeover: "Somente
+    manualmente" pauses with no deadline, which is what the Fila de Inativos
+    lists; a custom period or a disabled stand-by pauses until a deadline;
+    ``handoff_active != "yes"`` does not pause.  The write goes through the
+    single tenant-scoped CAS with a ``prior_episode_context`` built from the
+    AI/person history only: the long audio was never transcribed and the
+    forward request never became a ``message.in``.
+
+    Writes in ``db`` and does not commit: the caller commits it with the
+    handoff's transaction (enforced) or right after the handoff (otherwise).
+    Returns the outcome for the log: ``paused``, ``handoff_inactive``,
+    ``already_paused`` or ``not_found`` (seen before the CAS, or the CAS
+    lost), or ``superseded_session``.  A session already paused keeps its
+    pause and its deadline.
+    """
+    from src.models.session import Session as SessionModel
+
+    current_time = now or datetime.now(timezone.utc)
+    decision = resolve_handoff_pause(
+        await _load_handoff_config(tenant_id, db), current_time
+    )
+    for notice in decision.notices:
+        logger.warning(
+            "handoff_pause_policy_tolerated",
+            extra={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session_id),
+                "field": notice.field,
+                "reason": notice.reason,
+            },
+        )
+    if not decision.should_pause:
+        logger.info(
+            "handoff_pause_skipped",
+            extra={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session_id),
+                "note": note,
+            },
+        )
+        return "handoff_inactive"
+
+    result = await db.execute(
+        select(SessionModel).where(
+            SessionModel.id == session_id,
+            SessionModel.tenant_id == tenant_id,
+        )
+    )
+    session_row = result.scalars().first()
+    if session_row is None or session_row.is_paused:
+        # No CAS ran: a session already paused (by a human or with its own
+        # deadline) keeps its pause as it is.
+        skipped = "not_found" if session_row is None else "already_paused"
+        logger.info(
+            "handoff_pause_skipped",
+            extra={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session_id),
+                "note": note,
+                "outcome": skipped,
+            },
+        )
+        return skipped
+
+    events = await _load_ai_person_history(tenant_id, session_id, db, limit=20)
+    cognitive = session_row.get_cognitive_state()
+    cognitive.prior_episode_context = build_prior_episode_context(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        events=events,
+        current_message=None,
+    )
+    outcome = await SessionRepository(db).pause_effective(
+        tenant_id,
+        session_id,
+        cognitive_state=cognitive.to_dict(),
+        paused_until=decision.paused_until,
+    )
+
+    if outcome == "paused":
+        await db.refresh(
+            session_row,
+            attribute_names=["cognitive_state", "is_paused", "paused_until"],
+        )
+        logger.info(
+            "session_paused",
+            extra={
+                "event": "session_paused",
+                "reason": "file_handoff",
+                "note": note,
+                "session_id": str(session_id),
+                "tenant_id": str(tenant_id),
+                "paused_until": (
+                    decision.paused_until.isoformat() if decision.paused_until else None
+                ),
+            },
+        )
+    else:
+        logger.info(
+            "session_pause_cas_non_winner",
+            extra={
+                "session_id": str(session_id),
+                "tenant_id": str(tenant_id),
+                "field": "cognitive_state",
+                "outcome": outcome,
+                "note": note,
+            },
+        )
+    return outcome
+
+
 async def _meta_file_handoff(
     *,
     tenant_id: UUID,
@@ -5497,21 +5624,42 @@ async def _meta_file_handoff(
     committed, the route sends the patient's text as today.  A dict: the 200 body to answer with,
     nothing handed off and nothing sent.
 
+    Every committed file handoff also pauses the session by the clinic's
+    stand-by policy (``_pause_after_file_handoff``), as an AI handoff does,
+    so the AI stops answering and a pause with no deadline lands on the Fila
+    de Inativos.  Nothing is paused when no handoff is committed.
+
     Without ``enforcement``, main's sequence (the handoff commits on its own;
-    the forward then clears the pending review) and the Group 3a writer.
+    then the pause, and the forward clears the pending review, commit
+    together -- before the Group 3a writer, which rolls back whatever the
+    route's transaction still holds).  The handoff is already committed
+    there, so a failed pause is logged and dropped: the patient still gets
+    the notice and the AI keeps answering, as before the pause existed.
     With it (credit Group 3b-2, O2), ONE transaction in ``db``
-    (``run_meta_file_handoff``): claim, handoff, debit and the
-    ``credit_effect_id`` link commit together -- a hold answers
-    ``credit_pending``, a redelivery ``duplicate_message`` -- and the
-    creation webhook is announced only after that transaction ends.
+    (``run_meta_file_handoff``): claim, handoff, debit, the
+    ``credit_effect_id`` link and the pause commit together -- a hold answers
+    ``credit_pending``, a redelivery ``duplicate_message``, neither pauses --
+    and the creation webhook is announced only after that transaction ends.
     """
     if enforcement is None:
         file_handoff = await _meta_initiate_file_handoff(
             tenant_id, session_id, from_phone, note, context=context
         )
+        try:
+            await _pause_after_file_handoff(
+                tenant_id=tenant_id, session_id=session_id, note=note, db=db
+            )
+        except Exception:
+            logger.exception(
+                "File handoff pause failed tenant=%s session=%s note=%s",
+                tenant_id,
+                session_id,
+                note,
+            )
+            await db.rollback()
         if clear_pending_review:
             await _meta_clear_pending_file_review(session_id, db)
-            await db.commit()
+        await db.commit()
         await record_meta_file_handoff(metering, db, file_handoff, note=note)
         return None
 
@@ -5520,8 +5668,12 @@ async def _meta_file_handoff(
             tenant_id, session_id, from_phone, note, context=context, session=db
         )
 
-    async def clear() -> None:
-        await _meta_clear_pending_file_review(session_id, db)
+    async def before_commit() -> None:
+        await _pause_after_file_handoff(
+            tenant_id=tenant_id, session_id=session_id, note=note, db=db
+        )
+        if clear_pending_review:
+            await _meta_clear_pending_file_review(session_id, db)
 
     try:
         outcome = await credit_metering.run_meta_file_handoff(
@@ -5530,7 +5682,7 @@ async def _meta_file_handoff(
             session_id=session_id,
             note=note,
             initiate=initiate,
-            before_commit=clear if clear_pending_review else None,
+            before_commit=before_commit,
         )
     finally:
         # After the transaction's end only: a rolled-back record is dropped.
@@ -6249,9 +6401,11 @@ async def meta_webhook(
                 # — this triggers a handoff, never a 500.
                 audio_max_seconds_value = (creds or {}).get("audio_max_seconds")
                 if isinstance(audio_max_seconds_value, (str, int, float)):
-                    audio_max_seconds = int(audio_max_seconds_value or 60)
+                    audio_max_seconds = int(
+                        audio_max_seconds_value or DEFAULT_AUDIO_MAX_SECONDS
+                    )
                 else:
-                    audio_max_seconds = 60
+                    audio_max_seconds = DEFAULT_AUDIO_MAX_SECONDS
                 file_size_value = media_info.get("file_size")
                 if isinstance(file_size_value, (str, int, float)):
                     file_size = int(file_size_value or 0)

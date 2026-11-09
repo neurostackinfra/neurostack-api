@@ -43,7 +43,7 @@ from uuid import UUID, uuid4
 import jwt
 import pytest
 from sqlalchemy import event as sa_event
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -1794,6 +1794,11 @@ def test_both_meta_file_handoff_call_sites_record_a_production_trace(
 
     notes = [call["note"] for call in file_handoffs]
     assert notes == ["file_pending_review", "audio_too_long"]
+    # Both handoffs paused the AI with no deadline (the default stand-by),
+    # committed before the observational writer ends the route transaction.
+    for patient in (phone, "5511900000333"):
+        [session] = client._submit(_patient_sessions(world.meta_tenant, patient))
+        assert (session.is_paused, session.paused_until) == (True, None)
     claims = {claim.provider_message_id: claim for claim in _claims(client)}
     assert set(claims) == {"wamid.forward", "wamid.long-audio"}
     effects = {effect.trace_id: effect for effect in _effects(client)}
@@ -3189,6 +3194,11 @@ def test_the_enforced_meta_file_handoffs_commit_claim_handoff_debit_and_link(
         "replied": True,
         "action": "file_handoff",
     }
+    # The forward paused the AI in its transaction (default stand-by: no
+    # deadline); the team hands it back before the patient's long audio.
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert (session.is_paused, session.paused_until) == (True, None)
+    client._submit(_reactivate(world.meta_tenant, phone))
 
     async def resolve(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"url": "https://media.invalid/long.ogg", "file_size": 50_000_000}
@@ -3227,7 +3237,10 @@ def test_the_enforced_meta_file_handoffs_commit_claim_handoff_debit_and_link(
     )
     [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
     assert "pending_file_review" not in (session.session_metadata or {})
-    # A redelivery (the replay store forgot): no second handoff nor debit.
+    assert (session.is_paused, session.paused_until) == (True, None)
+    # A redelivery (the replay store forgot) after the team handed the
+    # session back: no second handoff nor debit, and nothing pauses again.
+    client._submit(_reactivate(world.meta_tenant, phone))
     for message in (forward, audio):
         assert _meta(client, world, message).json() == {
             "ok": True,
@@ -3235,6 +3248,8 @@ def test_the_enforced_meta_file_handoffs_commit_claim_handoff_debit_and_link(
         }
     assert len(_all_rows(client, HandoffRecord)) == 2
     assert _ledger(client) == {"debt": 2 * TRACE_COST_MC}
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert session.is_paused is False
     # GET /handoffs/{id} never exposes the link.
     token = _jwt(world.meta_tenant)
     for record in records.values():
@@ -3275,6 +3290,7 @@ def test_a_hold_seen_in_the_file_handoff_transaction_hands_nothing_off(
     assert webhook._FILE_FORWARDED_MSG_PT not in texts
     [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
     assert session.session_metadata.get("pending_file_review") is True  # untouched
+    assert session.is_paused is False  # nothing handed off, nothing paused
 
 
 def test_a_failure_inside_the_file_handoff_transaction_leaves_nothing(
@@ -3299,9 +3315,48 @@ def test_a_failure_inside_the_file_handoff_transaction_leaves_nothing(
     with pytest.raises(RuntimeError, match="injected after the handoff insert"):
         _meta(client, world, forward)
     assert _all_rows(client, HandoffRecord) == [] and announced == []
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert session.is_paused is False
     assert [
         e for e in _all_rows(client, EventRow) if e.event_type == "handoff.request"
     ] == []
+    assert _claims(client) == [] and _all_rows(client, CreditEffect) == []
+    assert _ledger(client) == {}
+
+
+def test_a_failure_after_the_pause_rolls_the_pause_back(
+    client: Any,
+    enforced: World,
+    providers: Providers,
+    announced: list[UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault after the pause was written (the forward's pending-review
+    clear, the last step before the commit): the pause rolls back with the
+    claim, the handoff and the debit."""
+
+    world, phone = enforced, "5511900008402"
+    assert _meta(client, world, _document(phone)).json()["action"] == "file_ack"
+    pause = webhook._pause_after_file_handoff
+    outcomes: list[str] = []
+
+    async def spied_pause(**kwargs: Any) -> str:
+        outcomes.append(await pause(**kwargs))
+        return outcomes[-1]
+
+    async def broken_clear(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected after the pause")
+
+    monkeypatch.setattr(webhook, "_pause_after_file_handoff", spied_pause)
+    monkeypatch.setattr(webhook, "_meta_clear_pending_file_review", broken_clear)
+    forward = _meta_text("wamid.forward-after-pause", "Pode encaminhar", phone)
+    with pytest.raises(RuntimeError, match="injected after the pause"):
+        _meta(client, world, forward)
+    assert outcomes == ["paused"]  # the pause was written in the transaction
+    [session] = client._submit(_patient_sessions(world.meta_tenant, phone))
+    assert (session.is_paused, session.paused_until) == (False, None)
+    assert session.session_metadata.get("pending_file_review") is True
+    assert _all_rows(client, HandoffRecord) == [] and announced == []
     assert _claims(client) == [] and _all_rows(client, CreditEffect) == []
     assert _ledger(client) == {}
 
@@ -3576,6 +3631,21 @@ async def _reopen_file_review(tenant_id: UUID, phone: str) -> None:
         await database.close()
 
 
+async def _reactivate(tenant_id: UUID, phone: str) -> None:
+    """The team hands the patient's session back to the AI (Fila de Inativos)."""
+
+    database = get_db_session()
+    try:
+        async with database.begin():
+            await database.execute(
+                update(Session)
+                .where(Session.tenant_id == tenant_id, Session.user_id == phone)
+                .values(is_paused=False, paused_until=None)
+            )
+    finally:
+        await database.close()
+
+
 @pytest.fixture
 def file_handoff_outcomes(
     monkeypatch: pytest.MonkeyPatch,
@@ -3752,10 +3822,13 @@ def test_the_enforced_zapi_file_handoff_commits_claim_handoff_debit_and_link(
     assert _effects(client) == []  # the observational writer stood down
     [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
     assert "pending_file_review" not in (session.session_metadata or {})
-    assert session.is_paused is False  # Decision 19
-    # A redelivery while a review is active again (the replay store forgot):
-    # the claim conflicts INSIDE the file handoff transaction and rolls back.
+    # Paused in the same transaction, with no deadline (default stand-by).
+    assert (session.is_paused, session.paused_until) == (True, None)
+    # A redelivery while a review is active again and the team handed the
+    # session back (the replay store forgot): the claim conflicts INSIDE the
+    # file handoff transaction and rolls back before the pause step.
     client._submit(_reopen_file_review(world.zapi_tenant, phone))
+    client._submit(_reactivate(world.zapi_tenant, phone))
     assert _zapi(client, world, forward).json() == {
         "ok": True,
         "skipped": "duplicate_message",
@@ -3769,6 +3842,7 @@ def test_the_enforced_zapi_file_handoff_commits_claim_handoff_debit_and_link(
     assert announced == [record.id]
     [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
     assert session.session_metadata.get("pending_file_review") is True  # untouched
+    assert session.is_paused is False  # the conflict never reached the pause
     assert _sends(providers, "send_text_message", phone) == texts  # nothing sent
 
 
@@ -3802,6 +3876,7 @@ def test_a_hold_seen_in_the_zapi_file_handoff_transaction_hands_nothing_off(
     assert webhook._FILE_FORWARDED_MSG_PT not in texts
     [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
     assert session.session_metadata.get("pending_file_review") is True  # untouched
+    assert session.is_paused is False  # nothing handed off, nothing paused
 
 
 def test_an_observed_zapi_forward_records_one_production_trace(
@@ -3825,6 +3900,8 @@ def test_an_observed_zapi_forward_records_one_production_trace(
     }
     [call] = file_handoffs
     assert call["note"] == "file_pending_review"
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert (session.is_paused, session.paused_until) == (True, None)
     assert call["context"].origin is InteractionOrigin.PRODUCTION
     [claim] = _claims(client)
     assert (claim.source, claim.mode, claim.provider_message_id) == (
@@ -3884,8 +3961,20 @@ def test_the_enforced_zapi_long_audio_handoff_commits_claim_handoff_debit_and_li
     assert _message_in_contents(client) == []  # never reached the pipeline
     assert _effects(client) == []  # the observational writer stood down
     [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
-    assert session.is_paused is False  # a handoff never pauses the AI
-    # A redelivery (the replay store forgot): no second handoff nor debit.
+    # The handoff paused the AI in its transaction, with no deadline (default
+    # stand-by): the session is on the Fila de Inativos.
+    assert (session.is_paused, session.paused_until) == (True, None)
+    # A redelivery while it is paused (the replay store forgot) stops at the
+    # pause gate: the session is already with the team.
+    paused = _zapi(client, world, long_audio)
+    assert paused.json() == {"ok": True, "skipped": "session_paused"}
+    assert len(_all_rows(client, HandoffRecord)) == 1
+    assert len(_claims(client)) == 1
+    assert _ledger(client) == {"debt": TRACE_COST_MC}
+    assert _sends(providers, "send_text_message", phone) == texts
+    # After the team handed the session back: the claim conflicts, no second
+    # handoff nor debit, and nothing pauses again.
+    client._submit(_reactivate(world.zapi_tenant, phone))
     assert _zapi(client, world, long_audio).json() == {
         "ok": True,
         "skipped": "duplicate_message",
@@ -3893,6 +3982,8 @@ def test_the_enforced_zapi_long_audio_handoff_commits_claim_handoff_debit_and_li
     assert len(_all_rows(client, HandoffRecord)) == 1
     assert _ledger(client) == {"debt": TRACE_COST_MC}
     assert _sends(providers, "send_text_message", phone) == texts  # nothing sent
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, phone))
+    assert session.is_paused is False
 
 
 def test_an_observed_zapi_long_audio_records_one_production_trace(
@@ -3926,6 +4017,9 @@ def test_an_observed_zapi_long_audio_records_one_production_trace(
     )
     assert _all_rows(client, CreditEffect) == []
     assert _message_in_contents(client) == []
+    # Committed before the observational writer ends the route transaction.
+    [session] = client._submit(_patient_sessions(world.zapi_tenant, "5511900000555"))
+    assert (session.is_paused, session.paused_until) == (True, None)
 
 
 def _uazapi_long_audio(world: World, message_id: str) -> dict[str, Any]:
@@ -3978,6 +4072,9 @@ def test_the_uazapi_long_audio_handoff_is_observed_and_never_enforced(
     assert _message_in_contents(client) == []
     texts = _sends(providers, "send_uazapi_text", "5511900000302")
     assert texts[-1] == webhook._AUDIO_TOO_LONG_MSG_PT
+    # Committed before the observational writer ends the route transaction.
+    [session] = client._submit(_patient_sessions(world.uazapi_tenant, "5511900000302"))
+    assert (session.is_paused, session.paused_until) == (True, None)
 
 
 @pytest.mark.parametrize("source", ["uazapi", "evolution"])

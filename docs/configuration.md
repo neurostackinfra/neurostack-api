@@ -914,7 +914,7 @@ Uma entrada ou troca para qualquer provider STT ativo, assim como uma mudança d
 máscara, vazio e `null` não contam. Quando provider e endpoint não mudam, uma
 edição apenas de modelo ou controle pode ser parcial. Para Scribe ou OpenRouter,
 a URL precisa ser a base canônica da tabela abaixo. `audio_max_seconds` não
-integra o bundle e mantém o default 60 quando ausente.
+integra o bundle e mantém o default 120 quando ausente.
 
 Um incumbent legado resolvido como `outros` pode repetir exatamente sua visão
 canônica sem reescrever o JSON persistido ou migrar com um bundle fresco para

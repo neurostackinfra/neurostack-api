@@ -2439,8 +2439,9 @@ async def run_meta_file_handoff(
     (``initiate_handoff(..., session=db)``: record and ``handoff.request``
     in this transaction) -> debit/debt -> the effect with its
     ``decision_digest`` -> ``credit_effect_id`` merged into the record's
-    context by ``(tenant_id, id)`` -> ``before_commit`` (the forward clears
-    the pending file review) -> commit.  No SRM, no LLM: the handoff IS the
+    context by ``(tenant_id, id)`` -> ``before_commit`` (the session's
+    stand-by pause, and the forward clears the pending file review) ->
+    commit.  No SRM, no LLM: the handoff IS the
     decision.  The caller dispatches the creation webhook after the commit.
     Any exception rolls everything back and propagates."""
 

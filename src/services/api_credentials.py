@@ -135,6 +135,9 @@ MULTIMODAL_FIELDS = frozenset(
         "multimodal_text_fallback_enabled",
     }
 )
+# Patient audio above this many seconds is handed off instead of transcribed,
+# when the clinic did not set ``audio_max_seconds`` (accepted range 10-300).
+DEFAULT_AUDIO_MAX_SECONDS: Final = 120
 STT_FIELDS = frozenset(
     {
         "stt_provider",
@@ -663,7 +666,7 @@ def resolve_stt_credentials(credentials: Mapping[str, Any]) -> dict[str, Any]:
         if not resolved.get("stt_provider"):
             resolved["stt_provider"] = "outros"
         if resolved.get("audio_max_seconds") is None:
-            resolved["audio_max_seconds"] = 60
+            resolved["audio_max_seconds"] = DEFAULT_AUDIO_MAX_SECONDS
     return resolved
 
 
@@ -981,7 +984,9 @@ def credential_status(credentials: Mapping[str, Any]) -> dict[str, Any]:
     whatsapp_readiness = _whatsapp_readiness(credentials)
     result.update(
         {
-            "audio_max_seconds": resolved.get("audio_max_seconds", 60),
+            "audio_max_seconds": resolved.get(
+                "audio_max_seconds", DEFAULT_AUDIO_MAX_SECONDS
+            ),
             "llm_base_url": resolved.get("llm_api_url"),
             "whisper_api_key_set": bool(resolved.get("stt_api_key")),
             "whisper_api_key_masked": mask_secret(resolved.get("stt_api_key")),

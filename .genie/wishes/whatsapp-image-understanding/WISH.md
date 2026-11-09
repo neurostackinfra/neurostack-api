@@ -63,7 +63,7 @@ ignoradas entre 02:39 e 02:48 UTC de 2026-11-07). Este wish faz duas coisas:
 - Melhorar a detecção de intenção de encaminhar (`_META_FORWARD_KEYWORDS`): reusada como está; o
   prazo de validade limita os falsos positivos.
 - Pausar a IA depois de um encaminhamento: hoje o encaminhamento do Meta não pausa, e continua assim
-  (risco registrado).
+  (risco registrado). Revisto pelo owner em 2026-11-08, fora deste wish: ver a Decisão 19.
 
 ## Decisions
 
@@ -87,7 +87,7 @@ ignoradas entre 02:39 e 02:48 UTC de 2026-11-07). Este wish faz duas coisas:
 | 16 | Evolution sai deste wish e vai para `whatsapp-image-understanding-evolution` | A divisão foi apresentada ao dono em 2026-11-07, sem objeção; não há evidência nem helper para o Evolution (L9). |
 | 17 | Ordem de envio da confirmação e da confirmação de encaminhamento: enviar → `_track_sent_message` (+ `_store_ai_msg_id_to_db` quando houver id) → `_meta_set_pending_file_review` (só na confirmação) → `db.commit()`. No uazapi, o id vem de `_extract_normalised_send_id` (`:1372`, como em `:3656-3660`) antes de `_track_sent_message({"messageid": mid})` e `_store_ai_msg_id_to_db`. A flag só é gravada depois de um envio bem-sucedido; se o envio falha, nada fica pendente | Correção N-M3: o eco de uma mensagem não rastreada no Z-API pausa a sessão (`:1724-1800`), e uma flag gravada sem envio suprimiria as confirmações seguintes. |
 | 18 | Corpos e logs. Confirmação suprimida: `{"ok": True, "replied": False, "action": "file_ack_suppressed"}`. Confirmação enviada: `{"ok": True, "replied": True, "action": "file_ack"}`. Egress do uazapi fechado no envio da confirmação: `{"ok": True, "replied": False, "reason": "uazapi_egress_disabled"}`, sem flag (como `:3669-3674`). Documento e vídeo não emitem `image_description_attempt`, mas logam `"<Canal> file ack sent to %s (type=%s)"`, como o Meta | Correção N-L4. |
-| 19 | "Pausada" significa só `is_paused` (o que `_check_pause_state` lê). O encaminhamento abre o handoff mas não pausa a IA, como no Meta hoje | Correção N-L9; mudar isso fica fora do escopo (risco registrado). |
+| 19 | "Pausada" significa só `is_paused` (o que `_check_pause_state` lê). O encaminhamento abre o handoff mas não pausa a IA, como no Meta hoje. **Revista pelo owner em 2026-11-08** (branch `feat/file-handoff-pause`): o encaminhamento e o áudio longo, nos três canais, pausam a sessão pela política "Stand-by após handoff" da clínica (`resolve_handoff_pause`), como um handoff da IA; no padrão "Somente manualmente" a conversa entra na Fila de Inativos | Correção N-L9; mudar isso fica fora do escopo (risco registrado). A revisão fecha o risco: o owner quer a conversa encaminhada na Fila de Inativos, sem a IA respondendo. |
 
 ## Simplicity Case
 
@@ -416,7 +416,7 @@ _What must be verified on dev after merge. The QA agent tests each criterion._
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | Dado de saúde (exame, receita, ferida) vai para o OpenRouter e a descrição fica no histórico | High | Aceito pelo dono (Decisão 15); aviso aos tenants no Rollout; aviso LGPD antes da primeira descrição; prompt sem diagnóstico; nenhum byte persistido; log sem a descrição; visualização única excluída no uazapi e no Z-API. |
-| Depois de "Já encaminhei", a IA continua respondendo, porque o encaminhamento não pausa (`is_paused`) | Medium | Comportamento atual do Meta, agora também no uazapi e no Z-API; mudar isso fica fora do escopo (Decisão 19). Se a equipe reclamar, um wish próprio pausa a IA no encaminhamento. |
+| Depois de "Já encaminhei", a IA continua respondendo, porque o encaminhamento não pausa (`is_paused`) | Medium | Comportamento atual do Meta, agora também no uazapi e no Z-API; mudar isso fica fora do escopo (Decisão 19). Se a equipe reclamar, um wish próprio pausa a IA no encaminhamento. **Resolvido em 2026-11-08** (Decisão 19 revista). |
 | A palavra "manda", "envia" ou "equipe" (inclusive dentro de "demanda") na resposta é lida como pedido de encaminhar | Medium | Só vale com a pendência ativa (2h, Decisão 4); fora desse prazo o pipeline segue normal. As palavras-chave são reusadas sem mudança. No Meta, uma resposta em áudio não resolve a pendência (só texto, como hoje), então ela fica ativa até 2h. |
 | Rajadas e álbuns: imagens simultâneas num tenant sem capacidade disputam `_file_ack_needed` e podem gerar mais de uma confirmação; com capacidade, um álbum de N fotos gera N descrições, N respostas e N débitos | Medium | Aceito; medir pelo `image_description_attempt` e pelos logs de confirmação antes de adicionar agrupamento. |
 | No uazapi, uma imagem com legenda reentregue durante uma pausa grava um evento de captura pausada duplicado (a imagem só faz claim depois de `_check_pause_state`, `:1657-1672`) | Low | Aceito: só o registro duplica; nada é enviado ao paciente nem ao OpenRouter. |
