@@ -231,8 +231,8 @@ _AGENT_MEDIA_PROVIDER = _enum(*sorted(MEDIA_DELIVERY_PROVIDERS))
 #   asset_gone     -- no longer deliverable on this channel: deleted (or left
 #                     the tenant) since selection, or after the claim, before
 #                     the bytes were read (asset_gone_before_send); no longer
-#                     automatic (auto_suggest off or no trigger_intents); a
-#                     format the provider does not send (mime_not_sendable);
+#                     automatic (auto_suggest off); a format the provider
+#                     does not send (mime_not_sendable);
 #                     refused by the sender's own check on the re-read's first
 #                     bytes (ogg_opus_not_mono: a non-mono OGG on Meta, or
 #                     empty_media_payload / unsupported_media_type); or the

@@ -9,6 +9,7 @@ import tomllib
 from collections.abc import Mapping, MutableMapping, MutableSequence, MutableSet
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from uuid import uuid4
 
 import pytest
@@ -17,6 +18,10 @@ from neurostack_core.presets import get_preset
 from neurostack_core.protocol import (
     MEDIA_BINDABLE_INTENT_IDS,
     MEDIA_BINDABLE_INTENT_SEQUENCE,
+    MEDIA_IMPLICIT_INTENT_IDS,
+    MEDIA_IMPLICIT_INTENT_SEQUENCE,
+    MEDIA_TOPIC_INTENTS,
+    MEDIA_TOPIC_SEQUENCE,
     OFFICIAL_INTENT_IDS,
     OFFICIAL_INTENT_SEQUENCE,
 )
@@ -235,46 +240,102 @@ def test_missing_or_extra_preset_stage_ids_raise_preset_error(
 
 
 # envio-midia-agente Group 2: the intents a Central de Mídias file may be
-# bound to.  Zero tolerance: media never attaches to scheduling, and
-# fora_do_horario enqueues a handoff.
+# bound to, grouped in the four "Quando enviar" topics (owner, 2026-11-08).
+# Zero tolerance: media never attaches to a scheduling flow that acts on an
+# appointment, fora_do_horario enqueues a handoff, a complaint always hands
+# off, and safety intents never carry media.
+_MEDIA_TOPICS = {
+    "pedido_preco": ("pedido_preco",),
+    "agendar": ("agendar", "pre_atendimento"),
+    "interesse_tratamento": (
+        "interesse_tratamento",
+        "comparacao_tratamentos",
+        "objecao_vou_pensar",
+        "detalhes_servicos",
+        "cultura_historia",
+        "qualificacao_publico",
+        "informacoes_profissionais",
+    ),
+    "pos_atendimento_duvida": ("pos_atendimento_duvida",),
+}
 _MEDIA_BINDABLE_INTENTS = (
-    "saudacao",
     "interesse_tratamento",
     "pedido_preco",
     "comparacao_tratamentos",
     "objecao_vou_pensar",
+    "agendar",
     "detalhes_servicos",
     "pre_atendimento",
-    "faq",
     "cultura_historia",
     "qualificacao_publico",
     "informacoes_profissionais",
     "pos_atendimento_duvida",
 )
+_MEDIA_IMPLICIT_INTENTS = ("saudacao", "faq")
 _NEVER_MEDIA_BINDABLE = frozenset(
     {
-        "agendar",
         "reagendar",
         "cancelar",
         "confirmar_presenca",
         "disponibilidade_horarios",
         "fora_do_horario",
+        "reclamacao",
+        "conduta_inadequada_ameaca",
+        "pos_atendimento_sintomas_preocupantes",
+        "pedido_alterar_medicacao",
+        "pedido_atendente_humano",
+        "orcamento_existente",
+        "cobranca_renegociacao",
+        "documentos_e_comprovantes",
     }
 )
 
 
-def test_media_bindable_intents_are_exactly_the_twelve_informative_ones() -> None:
+def test_media_topics_are_the_four_quando_enviar_checkboxes_in_order() -> None:
+    assert dict(MEDIA_TOPIC_INTENTS) == _MEDIA_TOPICS
+    assert MEDIA_TOPIC_SEQUENCE == (
+        "pedido_preco",
+        "agendar",
+        "interesse_tratamento",
+        "pos_atendimento_duvida",
+    )
+    assert tuple(MEDIA_TOPIC_INTENTS) == MEDIA_TOPIC_SEQUENCE
+    assert isinstance(MEDIA_TOPIC_INTENTS, MappingProxyType)
+    assert all(isinstance(members, tuple) for members in MEDIA_TOPIC_INTENTS.values())
+
+
+def test_media_topics_are_disjoint_official_and_in_canonical_order() -> None:
+    members = [intent for group in MEDIA_TOPIC_INTENTS.values() for intent in group]
+    assert len(members) == len(set(members))  # no intent in two topics
+    assert set(members) <= OFFICIAL_INTENT_IDS
+    for topic, group in MEDIA_TOPIC_INTENTS.items():
+        assert topic in group  # each topic is named by one of its intents
+        assert list(group) == [i for i in OFFICIAL_INTENT_SEQUENCE if i in group]
+
+
+def test_media_bindable_intents_are_exactly_the_topics_intents() -> None:
     assert MEDIA_BINDABLE_INTENT_SEQUENCE == _MEDIA_BINDABLE_INTENTS
     assert MEDIA_BINDABLE_INTENT_IDS == frozenset(_MEDIA_BINDABLE_INTENTS)
-    assert len(MEDIA_BINDABLE_INTENT_IDS) == len(MEDIA_BINDABLE_INTENT_SEQUENCE) == 12
+    assert MEDIA_BINDABLE_INTENT_IDS == frozenset(
+        intent for group in MEDIA_TOPIC_INTENTS.values() for intent in group
+    )
+    assert len(MEDIA_BINDABLE_INTENT_IDS) == len(MEDIA_BINDABLE_INTENT_SEQUENCE) == 11
     assert isinstance(MEDIA_BINDABLE_INTENT_SEQUENCE, tuple)
     assert isinstance(MEDIA_BINDABLE_INTENT_IDS, frozenset)
 
 
-def test_media_bindable_intents_are_official_and_never_scheduling() -> None:
+def test_media_implicit_intents_are_greeting_and_faq_and_never_bindable() -> None:
+    assert MEDIA_IMPLICIT_INTENT_SEQUENCE == _MEDIA_IMPLICIT_INTENTS
+    assert MEDIA_IMPLICIT_INTENT_IDS == frozenset(_MEDIA_IMPLICIT_INTENTS)
+    assert MEDIA_IMPLICIT_INTENT_IDS <= OFFICIAL_INTENT_IDS
+    assert not MEDIA_IMPLICIT_INTENT_IDS & MEDIA_BINDABLE_INTENT_IDS
+
+
+def test_media_intents_are_official_and_never_act_on_an_appointment() -> None:
     assert MEDIA_BINDABLE_INTENT_IDS <= OFFICIAL_INTENT_IDS
     assert _NEVER_MEDIA_BINDABLE <= OFFICIAL_INTENT_IDS  # the names are real
     assert not MEDIA_BINDABLE_INTENT_IDS & _NEVER_MEDIA_BINDABLE
+    assert not MEDIA_IMPLICIT_INTENT_IDS & _NEVER_MEDIA_BINDABLE
     # The canonical order the API stores and returns is the official one.
     official_order = [
         intent

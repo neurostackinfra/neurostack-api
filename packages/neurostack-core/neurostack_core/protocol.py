@@ -151,31 +151,64 @@ OFFICIAL_INTENT_SEQUENCE: Final[tuple[str, ...]] = (
 
 OFFICIAL_INTENT_IDS: Final[frozenset[str]] = frozenset(OFFICIAL_INTENT_SEQUENCE)
 
-# The official intents a Central de Mídias file may be bound to
-# (``media_assets.trigger_intents``): informative turns only, never a
-# scheduling, safety, handoff, billing or patient-data flow.  Media never
-# attaches to scheduling (``agendar``, ``reagendar``, ``cancelar``,
-# ``confirmar_presenca``, ``disponibilidade_horarios``), and
-# ``fora_do_horario`` is out too because it enqueues a handoff
-# (``ENFILEIRAR_HANDOFF_FORA_DO_HORARIO``).  The order is the one of
-# ``OFFICIAL_INTENT_SEQUENCE``: the API stores and returns bound intents in it.
-MEDIA_BINDABLE_INTENT_SEQUENCE: Final[tuple[str, ...]] = (
-    "saudacao",
-    "interesse_tratamento",
-    "pedido_preco",
-    "comparacao_tratamentos",
-    "objecao_vou_pensar",
-    "detalhes_servicos",
-    "pre_atendimento",
-    "faq",
-    "cultura_historia",
-    "qualificacao_publico",
-    "informacoes_profissionais",
-    "pos_atendimento_duvida",
+# The topics of the Central de Mídias' "Quando enviar", in the order the
+# screen shows them, each with the official intents its checkbox binds
+# (``media_assets.trigger_intents``).  They are the dashboard's intent groups,
+# minus every intent no file may be sent on: safety
+# (``pos_atendimento_sintomas_preocupantes``, ``pedido_alterar_medicacao``),
+# handoff and billing (``orcamento_existente``), and the scheduling flows that
+# act on an appointment (``reagendar``, ``cancelar``, ``confirmar_presenca``,
+# ``disponibilidade_horarios``) or enqueue a handoff (``fora_do_horario``,
+# ``ENFILEIRAR_HANDOFF_FORA_DO_HORARIO``).  The owner opened ``agendar`` (the
+# scheduling request) to media on 2026-11-08.  Its turns include questions
+# about free slots ("tem vaga sexta?"): the scheduling gate still runs on the
+# reply's text, and the attachment drops whenever it replaces it, but no gate
+# reads a file's content.  The confirmation question and the check-back after
+# the scheduling link never carry media (``media_turn_exclusion``).
+# "Reclamação" is no topic: every complaint turn hands off
+# (``handoff_gerencia``), and a handoff turn never carries media.  Each tuple
+# follows ``OFFICIAL_INTENT_SEQUENCE``.
+MEDIA_TOPIC_INTENTS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "pedido_preco": ("pedido_preco",),
+        "agendar": ("agendar", "pre_atendimento"),
+        "interesse_tratamento": (
+            "interesse_tratamento",
+            "comparacao_tratamentos",
+            "objecao_vou_pensar",
+            "detalhes_servicos",
+            "cultura_historia",
+            "qualificacao_publico",
+            "informacoes_profissionais",
+        ),
+        "pos_atendimento_duvida": ("pos_atendimento_duvida",),
+    }
+)
+
+MEDIA_TOPIC_SEQUENCE: Final[tuple[str, ...]] = tuple(MEDIA_TOPIC_INTENTS)
+
+# The intents a Central de Mídias file may be bound to: exactly the topics'
+# intents, in the order of ``OFFICIAL_INTENT_SEQUENCE`` (the API stores and
+# returns bound intents in it).
+MEDIA_BINDABLE_INTENT_SEQUENCE: Final[tuple[str, ...]] = tuple(
+    intent
+    for intent in OFFICIAL_INTENT_SEQUENCE
+    if any(intent in members for members in MEDIA_TOPIC_INTENTS.values())
 )
 
 MEDIA_BINDABLE_INTENT_IDS: Final[frozenset[str]] = frozenset(
     MEDIA_BINDABLE_INTENT_SEQUENCE
+)
+
+# "Outras", the topic the screen never shows: turns of these intents may send
+# any file whose automatic sending is on, whatever its ``trigger_intents``.
+# They are never stored (the topic is implied, not bound).  The dashboard's
+# other "Outras" intents stay out: no signal (``duvida_generica_sem_contexto``,
+# ``fora_do_escopo``), handoff, billing or patient data.
+MEDIA_IMPLICIT_INTENT_SEQUENCE: Final[tuple[str, ...]] = ("saudacao", "faq")
+
+MEDIA_IMPLICIT_INTENT_IDS: Final[frozenset[str]] = frozenset(
+    MEDIA_IMPLICIT_INTENT_SEQUENCE
 )
 
 ACTION_IDS: Final[frozenset[str]] = frozenset(item.value for item in ActionType)
@@ -323,6 +356,10 @@ __all__ = [
     "IntentCategory",
     "MEDIA_BINDABLE_INTENT_IDS",
     "MEDIA_BINDABLE_INTENT_SEQUENCE",
+    "MEDIA_IMPLICIT_INTENT_IDS",
+    "MEDIA_IMPLICIT_INTENT_SEQUENCE",
+    "MEDIA_TOPIC_INTENTS",
+    "MEDIA_TOPIC_SEQUENCE",
     "OFFICIAL_INTENT_IDS",
     "OFFICIAL_INTENT_SEQUENCE",
     "POLICY_RULE_IDS",

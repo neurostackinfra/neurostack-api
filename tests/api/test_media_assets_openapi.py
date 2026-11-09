@@ -4,7 +4,11 @@ from typing import Any, cast
 
 from fastapi.openapi.models import OpenAPI
 
-from neurostack_core.protocol import MEDIA_BINDABLE_INTENT_SEQUENCE
+from neurostack_core.protocol import (
+    MEDIA_BINDABLE_INTENT_SEQUENCE,
+    MEDIA_IMPLICIT_INTENT_SEQUENCE,
+    MEDIA_TOPIC_SEQUENCE,
+)
 from src.api.main import create_app
 
 MEDIA_OPERATIONS = {
@@ -18,7 +22,7 @@ MEDIA_OPERATIONS = {
 _TRIGGER_INTENTS = {
     "type": "array",
     "items": {"type": "string", "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE)},
-    "maxItems": 12,
+    "maxItems": 11,
 }
 MEDIA_SECURITY: list[dict[str, list[str]]] = [
     {"ApiKeyAuth": []},
@@ -274,6 +278,8 @@ def test_bindable_intents_publishes_the_allowlist_flag_state_and_limits() -> Non
     body = components["MediaBindableIntentsResponse"]
     assert set(body["required"]) == {
         "intents",
+        "topics",
+        "implicit_intents",
         "delivery_enabled",
         "max_bytes_by_category",
         "sendable_mime_types",
@@ -281,6 +287,21 @@ def test_bindable_intents_publishes_the_allowlist_flag_state_and_limits() -> Non
     assert body["properties"]["intents"]["items"] == {
         "type": "string",
         "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+    }
+    assert body["properties"]["topics"]["items"] == {
+        "$ref": "#/components/schemas/MediaTopic"
+    }
+    topic = components["MediaTopic"]
+    assert set(topic["required"]) == {"id", "intents"}
+    assert topic["properties"]["id"]["enum"] == list(MEDIA_TOPIC_SEQUENCE)
+    assert topic["properties"]["intents"]["minItems"] == 1
+    assert topic["properties"]["intents"]["items"] == {
+        "type": "string",
+        "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+    }
+    assert body["properties"]["implicit_intents"]["items"] == {
+        "type": "string",
+        "enum": list(MEDIA_IMPLICIT_INTENT_SEQUENCE),
     }
     assert body["properties"]["delivery_enabled"]["type"] == "boolean"
     sendable = body["properties"]["sendable_mime_types"]

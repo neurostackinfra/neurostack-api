@@ -645,13 +645,14 @@ async def test_the_orm_reads_and_writes_trigger_intents_as_text_arrays(
         asset = await database.get(MediaAsset, media_id)
         assert asset is not None
         assert asset.trigger_intents == ["detalhes_servicos"]
-        asset.trigger_intents = ["saudacao", "pedido_preco"]
+        asset.trigger_intents = ["interesse_tratamento", "pedido_preco"]
         await database.commit()
 
     async with engine.connect() as connection:
         stored = await connection.scalar(
             text(
-                "SELECT trigger_intents = ARRAY['saudacao', 'pedido_preco']::text[] "
+                "SELECT trigger_intents = "
+                "ARRAY['interesse_tratamento', 'pedido_preco']::text[] "
                 "AND pg_typeof(trigger_intents) = 'text[]'::regtype "
                 "FROM media_assets WHERE id = :id"
             ),

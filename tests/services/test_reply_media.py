@@ -905,9 +905,7 @@ async def test_an_unreadable_flag_is_off(
     assert harness.factory.opened == 0
 
 
-@pytest.mark.parametrize(
-    "case", ["missing", "foreign_tenant", "auto_suggest_off", "no_trigger_intents"]
-)
+@pytest.mark.parametrize("case", ["missing", "foreign_tenant", "auto_suggest_off"])
 async def test_an_asset_gone_or_no_longer_automatic_is_refused_before_the_permit(
     harness: _Harness, case: str
 ) -> None:
@@ -916,10 +914,8 @@ async def test_an_asset_gone_or_no_longer_automatic_is_refused_before_the_permit
         media_id = uuid4()
     elif case == "foreign_tenant":
         media_id = await _store(db, _asset(db.foreign))
-    elif case == "auto_suggest_off":
-        media_id = await _store(db, _asset(db.tenant, auto_suggest=False))
     else:
-        media_id = await _store(db, _asset(db.tenant, trigger_intents=()))
+        media_id = await _store(db, _asset(db.tenant, auto_suggest=False))
 
     result = await harness.deliver(media_id, language="en")
 
@@ -928,6 +924,18 @@ async def test_an_asset_gone_or_no_longer_automatic_is_refused_before_the_permit
     assert harness.trace == ["flag", "asset", "notice", "record"]
     assert harness.channel.text_calls == [_EN_NOTICE]
     await _nothing_written(db)
+
+
+async def test_an_automatic_asset_bound_to_no_subject_is_still_sent(
+    harness: _Harness,
+) -> None:
+    # "Outras" is implied: a greeting or FAQ turn may pick a file bound to no
+    # subject, so the re-read refuses only a file no longer automatic.
+    db = harness.db
+    media_id = await _store(db, _asset(db.tenant, trigger_intents=()))
+
+    assert (await harness.deliver(media_id)).outcome == "sent"
+    assert harness.reasons() == ["sent"]
 
 
 async def test_the_category_ceiling_is_inclusive_and_refuses_one_byte_more(

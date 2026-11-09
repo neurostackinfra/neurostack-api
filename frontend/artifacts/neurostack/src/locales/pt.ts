@@ -715,13 +715,12 @@ export const pt: Record<TranslationKey, string> = {
   // Grupo 7 (envio-midia-agente): {when} e {trigger} são os rótulos dos campos
   // acima, para a regra citar sempre os campos que a clínica vê.
   media_trigger_intents_label: "Quando enviar",
-  media_trigger_intents_help: "Marque os assuntos do paciente em que este arquivo pode ser enviado.",
+  media_trigger_intents_help: "Marque os assuntos do paciente em que este arquivo pode ser enviado. Saudação e perguntas frequentes já estão incluídas.",
   media_trigger_intents_loading: "Carregando assuntos…",
   media_trigger_intents_error: "Não foi possível carregar os assuntos.",
   media_delivery_inactive: "Envio automático ainda não ativo para o canal da clínica.",
   media_delivery_unknown: "Não foi possível verificar se o envio automático está ativo.",
-  media_delivery_rule: "A IA pode enviar este arquivo pelo WhatsApp quando o assunto do paciente estiver marcado em \"{when}\" e combinar com o contexto do \"{trigger}\", no máximo uma vez a cada 24 h por paciente.",
-  media_alert_no_subject: "Sem assunto marcado em \"{when}\": esta mídia nunca será enviada.",
+  media_delivery_rule: "A IA pode enviar este arquivo pelo WhatsApp quando a conversa combinar com \"{when}\" e com o contexto do \"{trigger}\", no máximo uma vez a cada 24 h por paciente.",
   media_alert_too_large: "Grande demais para envio pelo WhatsApp: o limite deste tipo é {limit}.",
   media_alert_format_not_sent: "Este formato não é enviado automaticamente pelo canal da clínica.",
   media_upload_action: "Enviar mídia",

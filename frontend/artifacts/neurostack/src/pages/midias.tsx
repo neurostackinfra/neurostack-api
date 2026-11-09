@@ -76,12 +76,21 @@ interface MediaAsset {
 
 type CategoryByteLimits = Record<MediaCategory, number>;
 
+interface MediaTopic {
+  id: string;
+  intents: string[];
+}
+
 // GET /v1/media-assets/bindable-intents, per clinic. "loading" and "error"
 // promise nothing: no delivery rule, no client-side size check.
 interface BindableState {
   scope: string;
   status: "loading" | "ready" | "error";
+  // The storage allowlist, in the API's canonical order.
   intents: string[];
+  // The "Quando enviar" checkboxes, in screen order: each topic id is an
+  // intent id (its label) and binds every intent it lists.
+  topics: MediaTopic[];
   deliveryEnabled: boolean;
   maxBytes: CategoryByteLimits | null;
   // The canonical MIME types the clinic's channel sends (Z-API: no OGG or
@@ -96,6 +105,7 @@ function loadingBindable(scope: string): BindableState {
     scope,
     status: "loading",
     intents: [],
+    topics: [],
     deliveryEnabled: false,
     maxBytes: null,
     sendableMimeTypes: null,
@@ -350,11 +360,13 @@ function parseBindable(
   if (!body || typeof body !== "object") return null;
   const {
     intents,
+    topics,
     delivery_enabled,
     max_bytes_by_category,
     sendable_mime_types,
   } = body as {
     intents?: unknown;
+    topics?: unknown;
     delivery_enabled?: unknown;
     max_bytes_by_category?: unknown;
     sendable_mime_types?: unknown;
@@ -368,6 +380,8 @@ function parseBindable(
   ) {
     return null;
   }
+  const parsedTopics = parseTopics(topics, intents as string[]);
+  if (!parsedTopics) return null;
   const limits = max_bytes_by_category as Record<string, unknown>;
   const maxBytes = {} as CategoryByteLimits;
   for (const category of MEDIA_CATEGORIES) {
@@ -384,22 +398,77 @@ function parseBindable(
       : null;
   return {
     intents: intents as string[],
+    topics: parsedTopics,
     deliveryEnabled: delivery_enabled,
     maxBytes,
     sendableMimeTypes,
   };
 }
 
-// The bound intents in the API's canonical order, without any the allowlist
-// no longer carries (the server would refuse them with a 422).
-function canonicalIntents(selected: readonly string[], allowed: readonly string[]) {
-  return allowed.filter((intent) => selected.includes(intent));
+// Every topic needs a unique string id and a non-empty list of intents the
+// allowlist carries, and the topics must split the allowlist exactly: each
+// intent in one topic, none left out. One bad topic fails the whole read, and
+// so does an empty list (no checkbox, and a save would unbind everything).
+function parseTopics(
+  topics: unknown,
+  allowed: readonly string[],
+): MediaTopic[] | null {
+  if (!Array.isArray(topics) || topics.length === 0) return null;
+  const parsed: MediaTopic[] = [];
+  for (const topic of topics) {
+    if (!topic || typeof topic !== "object") return null;
+    const { id, intents } = topic as { id?: unknown; intents?: unknown };
+    if (
+      typeof id !== "string" ||
+      parsed.some((other) => other.id === id) ||
+      !Array.isArray(intents) ||
+      intents.length === 0 ||
+      !intents.every(
+        (intent) => typeof intent === "string" && allowed.includes(intent),
+      )
+    ) {
+      return null;
+    }
+    parsed.push({ id, intents: [...(intents as string[])] });
+  }
+  const bound = parsed.flatMap((topic) => topic.intents);
+  if (
+    bound.length !== allowed.length ||
+    !allowed.every((intent) => bound.includes(intent))
+  ) {
+    return null;
+  }
+  return parsed;
 }
 
-function toggleIntent(selected: readonly string[], intent: string, on: boolean) {
-  return on
-    ? [...selected.filter((item) => item !== intent), intent]
-    : selected.filter((item) => item !== intent);
+// A topic reads as checked when any of its intents is bound, so a file bound
+// to part of a topic (before topics existed) still shows it.
+function isTopicSelected(topic: MediaTopic, selected: readonly string[]) {
+  return topic.intents.some((intent) => selected.includes(intent));
+}
+
+function toggleTopic(
+  selected: readonly string[],
+  topic: MediaTopic,
+  on: boolean,
+) {
+  const rest = selected.filter((intent) => !topic.intents.includes(intent));
+  return on ? [...rest, ...topic.intents] : rest;
+}
+
+// What is saved is what is shown: every intent of every checked topic, in
+// the API's canonical order. An intent no topic carries (a legacy "faq" or
+// "saudacao") is dropped, because the server would refuse it with a 422.
+function boundIntents(
+  selected: readonly string[],
+  bindable: Pick<BindableState, "intents" | "topics">,
+) {
+  const checked = bindable.topics.filter((topic) =>
+    isTopicSelected(topic, selected),
+  );
+  return bindable.intents.filter((intent) =>
+    checked.some((topic) => topic.intents.includes(intent)),
+  );
 }
 
 // split/join, not replace: a file name or label must never be read as a
@@ -495,8 +564,11 @@ function AutoSuggestSection({
   );
 }
 
-// "Quando enviar": one checkbox per bindable intent, in the API's order and
-// labelled like every other intent in the product.
+// "Quando enviar": one checkbox per topic, in the API's order and labelled
+// like the intent its id names. Checking a topic binds all of its intents and
+// unchecking it unbinds them all. Greetings and FAQ ("Outras") are always
+// included by the server and get no checkbox. Two columns at most, because
+// the edit dialog is 512 px wide and the breakpoints follow the window.
 function TriggerIntentsField({
   id,
   bindable,
@@ -504,7 +576,6 @@ function TriggerIntentsField({
   onChange,
   disabled,
   onRetry,
-  compact = false,
 }: {
   id: string;
   bindable: BindableState;
@@ -512,9 +583,6 @@ function TriggerIntentsField({
   onChange: (selected: string[]) => void;
   disabled: boolean;
   onRetry: () => void;
-  // Inside the 512 px edit dialog: never more than two columns, because the
-  // breakpoints follow the window, not the dialog.
-  compact?: boolean;
 }) {
   const { t } = useI18n();
   return (
@@ -541,23 +609,21 @@ function TriggerIntentsField({
           </Button>
         </div>
       ) : (
-        <div
-          className={`grid gap-2 sm:grid-cols-2 ${compact ? "" : "lg:grid-cols-3"}`}
-        >
-          {bindable.intents.map((intent) => (
+        <div className="grid gap-2 sm:grid-cols-2">
+          {bindable.topics.map((topic) => (
             <label
-              key={intent}
+              key={topic.id}
               className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"
             >
               <input
                 type="checkbox"
-                checked={selected.includes(intent)}
+                checked={isTopicSelected(topic, selected)}
                 onChange={(event) =>
-                  onChange(toggleIntent(selected, intent, event.target.checked))
+                  onChange(toggleTopic(selected, topic, event.target.checked))
                 }
                 disabled={disabled}
               />
-              {getIntentLabel(intent, t)}
+              {getIntentLabel(topic.id, t)}
             </label>
           ))}
         </div>
@@ -931,9 +997,6 @@ export default function Midias() {
     currentBindable.deliveryEnabled &&
     currentBindable.sendableMimeTypes !== null &&
     !currentBindable.sendableMimeTypes.includes(mime);
-  const noSubjectText = fill(t("media_alert_no_subject"), {
-    when: t("media_trigger_intents_label"),
-  });
   const currentEdit = editState?.scope === scope ? editState : null;
   const currentDelete = deleteState?.scope === scope ? deleteState : null;
   const currentBusy = busyAsset?.scope === scope ? busyAsset : null;
@@ -1103,10 +1166,7 @@ export default function Midias() {
     // One part per bound intent: the API reads trigger_intents as a repeated
     // field, never as one joined value.
     if (currentBindable.status === "ready") {
-      for (const intent of canonicalIntents(
-        triggerIntents,
-        currentBindable.intents,
-      )) {
+      for (const intent of boundIntents(triggerIntents, currentBindable)) {
         form.append("trigger_intents", intent);
       }
     }
@@ -1220,9 +1280,9 @@ export default function Midias() {
           // the field is left out, so a failed read never unbinds anything.
           ...(currentBindable.status === "ready"
             ? {
-                trigger_intents: canonicalIntents(
+                trigger_intents: boundIntents(
                   currentEdit.triggerIntents,
-                  currentBindable.intents,
+                  currentBindable,
                 ),
               }
             : {}),
@@ -1540,7 +1600,7 @@ export default function Midias() {
             />
             {/* Polite live region, rendered (and in the accessibility tree)
                 before its warnings so a screen reader announces them as the
-                switch or the file changes. Never hide it while empty: a
+                file changes. Never hide it while empty: a
                 region that appears with its content is often not announced.
                 Empty, it has no height and its margin collapses into the
                 form's gap, so it adds no space. */}
@@ -1549,9 +1609,6 @@ export default function Midias() {
               aria-live="polite"
               data-testid="media-upload-warnings"
             >
-              {autoSuggest && triggerIntents.length === 0 && (
-                <MediaWarning>{noSubjectText}</MediaWarning>
-              )}
               {fileFormat && isUnsendableFormat(fileFormat.mime) && (
                 <MediaWarning>{t("media_alert_format_not_sent")}</MediaWarning>
               )}
@@ -1691,8 +1748,6 @@ export default function Midias() {
                       asset.mime_type,
                       asset.original_filename,
                     );
-                    const noSubject =
-                      asset.auto_suggest && asset.trigger_intents.length === 0;
                     const tooLarge = isTooLarge(asset);
                     const unsendable = isUnsendableFormat(asset.mime_type);
                     return (
@@ -1715,11 +1770,8 @@ export default function Midias() {
                               <p className="mt-0.5 text-xs text-muted-foreground sm:hidden">
                                 {typeLabel} · {format}
                               </p>
-                              {(noSubject || tooLarge || unsendable) && (
+                              {(tooLarge || unsendable) && (
                                 <div className="mt-1 space-y-0.5">
-                                  {noSubject && (
-                                    <MediaWarning>{noSubjectText}</MediaWarning>
-                                  )}
                                   {tooLarge && (
                                     <MediaWarning>
                                       {tooLargeText(asset.category)}
@@ -1893,7 +1945,6 @@ export default function Midias() {
                 }
                 disabled={currentBusy?.kind === "edit"}
                 onRetry={retryBindable}
-                compact
               />
               <div className="space-y-1.5">
                 <Label htmlFor="media-edit-usage-trigger">
@@ -1956,13 +2007,6 @@ export default function Midias() {
                 autoSuggest={currentEdit.autoSuggest}
                 testId="media-edit-delivery-notice"
               />
-              {/* Mounted while empty, as the upload form's region above. */}
-              <div aria-live="polite" data-testid="media-edit-warnings">
-                {currentEdit.autoSuggest &&
-                  currentEdit.triggerIntents.length === 0 && (
-                    <MediaWarning>{noSubjectText}</MediaWarning>
-                  )}
-              </div>
               <DialogFooter>
                 <Button
                   type="button"

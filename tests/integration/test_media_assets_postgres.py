@@ -2452,9 +2452,9 @@ async def test_media_route_postgres_trigger_intents_roundtrip(
     tenant = _builder_context(graph)
     request = _route_request()
     intents = (
-        ("trigger_intents", "faq"),
-        ("trigger_intents", "saudacao"),
-        ("trigger_intents", "faq"),
+        ("trigger_intents", "detalhes_servicos"),
+        ("trigger_intents", "interesse_tratamento"),
+        ("trigger_intents", "detalhes_servicos"),
     )
     async with postgres_harness.session() as session:
         asset = await media_route.upload_media_asset(
@@ -2465,7 +2465,7 @@ async def test_media_route_postgres_trigger_intents_roundtrip(
             tenant=tenant,
             session=session,
         )
-    assert asset.trigger_intents == ["saudacao", "faq"]
+    assert asset.trigger_intents == ["interesse_tratamento", "detalhes_servicos"]
 
     async def stored(media_id: UUID) -> Any:
         async with postgres_harness.engine.connect() as connection:
@@ -2479,7 +2479,10 @@ async def test_media_route_postgres_trigger_intents_roundtrip(
                 )
             ).one()
 
-    assert tuple(await stored(asset.id)) == (["saudacao", "faq"], "text[]")
+    assert tuple(await stored(asset.id)) == (
+        ["interesse_tratamento", "detalhes_servicos"],
+        "text[]",
+    )
 
     async with postgres_harness.session() as session:
         page = await media_route.list_media_assets(
@@ -2490,7 +2493,9 @@ async def test_media_route_postgres_trigger_intents_roundtrip(
             tenant=tenant,
             session=session,
         )
-    assert [item.trigger_intents for item in page.items] == [["saudacao", "faq"]]
+    assert [item.trigger_intents for item in page.items] == [
+        ["interesse_tratamento", "detalhes_servicos"]
+    ]
 
     async with postgres_harness.session() as session:
         patched = await media_route.patch_media_asset(
@@ -2509,13 +2514,13 @@ async def test_media_route_postgres_trigger_intents_roundtrip(
         "text[]",
     )
 
-    # PATCH with an unknown (a scheduling) intent: 422, the row unchanged.
+    # PATCH with an unknown (a rescheduling) intent: 422, the row unchanged.
     async with postgres_harness.session() as session:
         with pytest.raises(HTTPException) as refused_patch:
             await media_route.patch_media_asset(
                 media_id=asset.id,
                 patch=MediaAssetPatchRequest.model_validate_json(
-                    '{"display_name": "nunca", "trigger_intents": ["agendar"]}'
+                    '{"display_name": "nunca", "trigger_intents": ["reagendar"]}'
                 ),
                 request=request,
                 tenant_id=graph.destination_tenant_id,
@@ -2627,7 +2632,14 @@ async def test_media_route_postgres_bindable_intents_reads_the_target_credential
                 tenant=TenantContext(tenant_id, api_key="tenant-scoped"),
                 session=session,
             )
-        assert len(response.intents) == 12
+        assert len(response.intents) == 11
+        assert [topic.id for topic in response.topics] == [
+            "pedido_preco",
+            "agendar",
+            "interesse_tratamento",
+            "pos_atendimento_duvida",
+        ]
+        assert response.implicit_intents == ["saudacao", "faq"]
         return response.delivery_enabled, response.sendable_mime_types
 
     # Z-API documents only audio/mpeg: OGG and M4A are not sendable there.

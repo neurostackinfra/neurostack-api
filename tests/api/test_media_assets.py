@@ -931,7 +931,7 @@ async def test_patch_replaces_trigger_intents_deduplicated_in_canonical_order(
     tenant_id = uuid4()
     current = _asset_row(tenant_id, trigger_intents=("detalhes_servicos",))
     updated = _asset_row(
-        tenant_id, media_id=current.id, trigger_intents=("saudacao", "faq")
+        tenant_id, media_id=current.id, trigger_intents=("agendar", "pre_atendimento")
     )
     session = _PatchSession(current, updated)
 
@@ -939,12 +939,15 @@ async def test_patch_replaces_trigger_intents_deduplicated_in_canonical_order(
         monkeypatch,
         session,
         MediaAssetPatchRequest.model_validate_json(
-            '{"trigger_intents": ["faq", "saudacao", "faq"]}'
+            '{"trigger_intents": ["pre_atendimento", "agendar", "pre_atendimento"]}'
         ),
     )
 
-    assert _updated_trigger_intents(session.statements[1]) == ["saudacao", "faq"]
-    assert result.trigger_intents == ["saudacao", "faq"]
+    assert _updated_trigger_intents(session.statements[1]) == [
+        "agendar",
+        "pre_atendimento",
+    ]
+    assert result.trigger_intents == ["agendar", "pre_atendimento"]
     assert session.committed is True
 
 
@@ -953,10 +956,13 @@ async def test_patch_without_trigger_intents_keeps_them_and_empty_unbinds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tenant_id = uuid4()
-    current = _asset_row(tenant_id, trigger_intents=("pedido_preco", "faq"))
+    current = _asset_row(tenant_id, trigger_intents=("pedido_preco", "agendar"))
     session = _PatchSession(current, current)
     await _patch(monkeypatch, session, MediaAssetPatchRequest(display_name="novo"))
-    assert _updated_trigger_intents(session.statements[1]) == ["pedido_preco", "faq"]
+    assert _updated_trigger_intents(session.statements[1]) == [
+        "pedido_preco",
+        "agendar",
+    ]
 
     session = _PatchSession(current, _asset_row(tenant_id, trigger_intents=()))
     result = await _patch(
@@ -972,15 +978,22 @@ async def test_patch_without_trigger_intents_keeps_them_and_empty_unbinds(
 @pytest.mark.parametrize(
     ("body", "code"),
     [
-        ('{"trigger_intents": ["agendar"]}', "media_trigger_intent_unknown"),
-        ('{"trigger_intents": ["faq", "reagendar"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["reagendar"]}', "media_trigger_intent_unknown"),
+        (
+            '{"trigger_intents": ["agendar", "cancelar"]}',
+            "media_trigger_intent_unknown",
+        ),
         ('{"trigger_intents": ["fora_do_horario"]}', "media_trigger_intent_unknown"),
-        ('{"trigger_intents": ["Faq"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["reclamacao"]}', "media_trigger_intent_unknown"),
+        # "Outras" is implied, never stored.
+        ('{"trigger_intents": ["saudacao"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["faq"]}', "media_trigger_intent_unknown"),
+        ('{"trigger_intents": ["Agendar"]}', "media_trigger_intent_unknown"),
         ('{"trigger_intents": [""]}', "media_trigger_intent_unknown"),
         ('{"trigger_intents": null}', "media_metadata_invalid"),
         (
             '{"trigger_intents": ["faq", "faq", "faq", "faq", "faq", "faq", "faq", '
-            '"faq", "faq", "faq", "faq", "faq", "faq"]}',
+            '"faq", "faq", "faq", "faq", "faq"]}',
             "media_metadata_invalid",
         ),
     ],
@@ -1180,19 +1193,38 @@ async def test_bindable_intents_delivery_enabled_follows_flag_and_readiness(
         else []
     )
     assert response.intents == [
-        "saudacao",
         "interesse_tratamento",
         "pedido_preco",
         "comparacao_tratamentos",
         "objecao_vou_pensar",
+        "agendar",
         "detalhes_servicos",
         "pre_atendimento",
-        "faq",
         "cultura_historia",
         "qualificacao_publico",
         "informacoes_profissionais",
         "pos_atendimento_duvida",
     ]
+    # The "Quando enviar" checkboxes, in screen order, and the implied
+    # "Outras".
+    assert [topic.model_dump() for topic in response.topics] == [
+        {"id": "pedido_preco", "intents": ["pedido_preco"]},
+        {"id": "agendar", "intents": ["agendar", "pre_atendimento"]},
+        {
+            "id": "interesse_tratamento",
+            "intents": [
+                "interesse_tratamento",
+                "comparacao_tratamentos",
+                "objecao_vou_pensar",
+                "detalhes_servicos",
+                "cultura_historia",
+                "qualificacao_publico",
+                "informacoes_profissionais",
+            ],
+        },
+        {"id": "pos_atendimento_duvida", "intents": ["pos_atendimento_duvida"]},
+    ]
+    assert response.implicit_intents == ["saudacao", "faq"]
     assert response.max_bytes_by_category.model_dump() == {
         "video": 16_000_000,
         "audio": 16_000_000,

@@ -52,21 +52,49 @@ interface TestAsset {
   updated_at: string;
 }
 
-// The API's allowlist (MEDIA_BINDABLE_INTENT_SEQUENCE) and limits
-// (MEDIA_CATEGORY_MAX_BYTES) as the endpoint returns them today.
+// The API's storage allowlist (MEDIA_BINDABLE_INTENT_SEQUENCE), its "Quando
+// enviar" topics (MEDIA_TOPIC_INTENTS) and limits (MEDIA_CATEGORY_MAX_BYTES)
+// as the endpoint returns them today.
 const BINDABLE_INTENTS = [
-  "saudacao",
   "interesse_tratamento",
   "pedido_preco",
   "comparacao_tratamentos",
   "objecao_vou_pensar",
+  "agendar",
   "detalhes_servicos",
   "pre_atendimento",
-  "faq",
   "cultura_historia",
   "qualificacao_publico",
   "informacoes_profissionais",
   "pos_atendimento_duvida",
+];
+// "Interesse Tratamento" binds these seven, in the canonical order.
+const INTEREST_INTENTS = [
+  "interesse_tratamento",
+  "comparacao_tratamentos",
+  "objecao_vou_pensar",
+  "detalhes_servicos",
+  "cultura_historia",
+  "qualificacao_publico",
+  "informacoes_profissionais",
+];
+const BINDABLE_TOPICS = [
+  { id: "pedido_preco", intents: ["pedido_preco"] },
+  { id: "agendar", intents: ["agendar", "pre_atendimento"] },
+  { id: "interesse_tratamento", intents: INTEREST_INTENTS },
+  { id: "pos_atendimento_duvida", intents: ["pos_atendimento_duvida"] },
+];
+const EN_TOPIC_LABELS = [
+  "Price Request",
+  "Scheduling",
+  "Treatment Interest",
+  "Post-Care Query",
+];
+const PT_TOPIC_LABELS = [
+  "Pedido de Preço",
+  "Solicitação de Agendamento",
+  "Interesse Tratamento",
+  "Dúvida Pós-Procedimento",
 ];
 const API_MAX_BYTES = {
   video: 16_000_000,
@@ -78,6 +106,8 @@ const API_MAX_BYTES = {
 function bindableBody(overrides: Record<string, unknown> = {}) {
   return {
     intents: BINDABLE_INTENTS,
+    topics: BINDABLE_TOPICS,
+    implicit_intents: ["saudacao", "faq"],
     delivery_enabled: false,
     max_bytes_by_category: API_MAX_BYTES,
     ...overrides,
@@ -1722,13 +1752,16 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
   const PT_UNKNOWN =
     "Não foi possível verificar se o envio automático está ativo.";
   const EN_RULE =
-    'The AI may send this file over WhatsApp when the patient\'s subject is selected in "When to send" and fits the "Usage trigger" context, at most once every 24 h per patient.';
+    'The AI may send this file over WhatsApp when the conversation fits "When to send" and the "Usage trigger" context, at most once every 24 h per patient.';
   const PT_RULE =
-    'A IA pode enviar este arquivo pelo WhatsApp quando o assunto do paciente estiver marcado em "Quando enviar" e combinar com o contexto do "Gatilho de uso", no máximo uma vez a cada 24 h por paciente.';
-  const EN_NO_SUBJECT =
-    'No subject selected in "When to send": this media will never be sent.';
-  const PT_NO_SUBJECT =
-    'Sem assunto marcado em "Quando enviar": esta mídia nunca será enviada.';
+    'A IA pode enviar este arquivo pelo WhatsApp quando a conversa combinar com "Quando enviar" e com o contexto do "Gatilho de uso", no máximo uma vez a cada 24 h por paciente.';
+  const EN_HELP =
+    "Select the patient subjects in which this file may be sent. Greetings and frequently asked questions are already included.";
+  const PT_HELP =
+    "Marque os assuntos do paciente em que este arquivo pode ser enviado. Saudação e perguntas frequentes já estão incluídas.";
+  // The warning the page showed before greetings and FAQ were always
+  // included: an automatic file with no subject is sent in those turns now.
+  const NO_SUBJECT = /never be sent|nunca será enviada/;
   const EN_FORMAT =
     "This format is not sent automatically by the clinic's channel.";
   const PT_FORMAT =
@@ -1753,19 +1786,61 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     return screen.getAllByRole("group", { name })[0];
   }
 
-  it("offers every bindable intent under When to send, labelled like the rest of the product", async () => {
+  function checkboxLabels(group: HTMLElement) {
+    return within(group)
+      .getAllByRole("checkbox")
+      .map((box) => box.closest("label")?.textContent);
+  }
+
+  // Serves `bound` in the list and records every PATCH body.
+  function patchesOf(bound: TestAsset) {
+    const bodies: Array<Record<string, unknown>> = [];
+    mocks.fetch.mockImplementation(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "PATCH") {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          bodies.push(body);
+          return jsonResponse({ ...bound, ...body });
+        }
+        return jsonResponse({ items: [bound], next_cursor: null, has_more: false });
+      },
+    );
+    return bodies;
+  }
+
+  // Records the multipart body of the upload.
+  function uploadsOf() {
+    const bodies: FormData[] = [];
+    mocks.fetch.mockImplementation(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          bodies.push(init.body as FormData);
+          return jsonResponse(asset({ id: "asset-new" }), 201);
+        }
+        return jsonResponse(EMPTY_PAGE);
+      },
+    );
+    return bodies;
+  }
+
+  it("offers the four topics under When to send, in the API's order, labelled like the rest of the product", async () => {
     listOf([]);
     renderPage();
     await limitsLoaded();
 
     const group = whenToSend();
-    expect(
-      within(group)
-        .getAllByRole("checkbox")
-        .map((box) => box.closest("label")?.textContent),
-    ).toEqual(BINDABLE_INTENTS.map((intent) => getIntentLabel(intent, (key) => en[key])));
-    expect(within(group).getByRole("checkbox", { name: "Greeting" })).not.toBeChecked();
-    expect(group).not.toHaveTextContent(getIntentLabel("agendar", (key) => en[key]));
+    expect(checkboxLabels(group)).toEqual(EN_TOPIC_LABELS);
+    expect(checkboxLabels(group)).toEqual(
+      BINDABLE_TOPICS.map((topic) => getIntentLabel(topic.id, (key) => en[key])),
+    );
+    for (const box of within(group).getAllByRole("checkbox")) {
+      expect(box).not.toBeChecked();
+    }
+    // Greetings and FAQ are implied, complaints hand off: no box for them.
+    for (const name of ["Greeting", "FAQ", "Complaint", "Other"]) {
+      expect(within(group).queryByRole("checkbox", { name })).not.toBeInTheDocument();
+    }
+    expect(within(group).getByText(EN_HELP)).toBeInTheDocument();
     // The other two fields keep their labels.
     expect(screen.getByLabelText("Usage trigger")).toHaveAttribute(
       "placeholder",
@@ -1789,10 +1864,11 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     await limitsLoaded();
 
     const group = whenToSend("Quando enviar");
-    expect(
-      within(group).getByRole("checkbox", { name: "Dúvida Pós-Procedimento" }),
-    ).toBeInTheDocument();
-    expect(within(group).getAllByRole("checkbox")).toHaveLength(12);
+    expect(checkboxLabels(group)).toEqual(PT_TOPIC_LABELS);
+    for (const name of ["Saudação", "FAQ", "Reclamação", "Outras"]) {
+      expect(within(group).queryByRole("checkbox", { name })).not.toBeInTheDocument();
+    }
+    expect(within(group).getByText(PT_HELP)).toBeInTheDocument();
     expect(screen.getByLabelText("Gatilho de uso")).toHaveAttribute(
       "placeholder",
       "Descreva o contexto de envio.",
@@ -1941,68 +2017,69 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     }
   });
 
-  it("sends trigger_intents as one repeated multipart field per intent, in the API's order", async () => {
-    let uploadBody: FormData | undefined;
-    mocks.fetch.mockImplementation(
-      (_input: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") {
-          uploadBody = init.body as FormData;
-          return jsonResponse(
-            asset({ id: "asset-new", trigger_intents: ["saudacao", "faq"] }),
-            201,
-          );
-        }
-        return jsonResponse(EMPTY_PAGE);
-      },
-    );
+  it("sends every intent of a checked topic as one repeated multipart field, in the API's order", async () => {
+    const uploads = uploadsOf();
     renderPage();
     await limitsLoaded();
 
     pickFile(sizedFile("guia.pdf", "application/pdf", 1_000));
     const group = whenToSend();
-    fireEvent.click(within(group).getByRole("checkbox", { name: "FAQ" }));
-    fireEvent.click(within(group).getByRole("checkbox", { name: "Greeting" }));
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Treatment Interest" }));
+    expect(
+      within(group).getByRole("checkbox", { name: "Treatment Interest" }),
+    ).toBeChecked();
     submitUpload();
 
-    await waitFor(() => expect(uploadBody).toBeDefined());
-    expect(uploadBody?.getAll("trigger_intents")).toEqual(["saudacao", "faq"]);
+    await waitFor(() => expect(uploads).toHaveLength(1));
+    expect(uploads[0].getAll("trigger_intents")).toEqual(INTEREST_INTENTS);
     expect(await screen.findByText("Media uploaded successfully.")).toBeInTheDocument();
     // The form resets the selection with the rest of the draft.
-    expect(within(whenToSend()).getByRole("checkbox", { name: "FAQ" })).not.toBeChecked();
+    expect(
+      within(whenToSend()).getByRole("checkbox", { name: "Treatment Interest" }),
+    ).not.toBeChecked();
   });
 
-  it("sends no trigger_intents part when no intent is selected", async () => {
-    let uploadBody: FormData | undefined;
-    mocks.fetch.mockImplementation(
-      (_input: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") {
-          uploadBody = init.body as FormData;
-          return jsonResponse(asset({ id: "asset-new", trigger_intents: [] }), 201);
-        }
-        return jsonResponse(EMPTY_PAGE);
-      },
-    );
+  it("merges two checked topics in the API's order and unchecking one removes all of its intents", async () => {
+    const uploads = uploadsOf();
+    renderPage();
+    await limitsLoaded();
+
+    pickFile(sizedFile("guia.pdf", "application/pdf", 1_000));
+    const group = whenToSend();
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Scheduling" }));
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Treatment Interest" }));
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Price Request" }));
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Scheduling" }));
+    expect(
+      within(group).getByRole("checkbox", { name: "Scheduling" }),
+    ).not.toBeChecked();
+    submitUpload();
+
+    await waitFor(() => expect(uploads).toHaveLength(1));
+    expect(uploads[0].getAll("trigger_intents")).toEqual([
+      "interesse_tratamento",
+      "pedido_preco",
+      "comparacao_tratamentos",
+      "objecao_vou_pensar",
+      "detalhes_servicos",
+      "cultura_historia",
+      "qualificacao_publico",
+      "informacoes_profissionais",
+    ]);
+  });
+
+  it("sends no trigger_intents part when no topic is checked", async () => {
+    const uploads = uploadsOf();
     renderPage();
     await limitsLoaded();
     pickFile(sizedFile("guia.pdf", "application/pdf", 1_000));
     submitUpload();
-    await waitFor(() => expect(uploadBody).toBeDefined());
-    expect(uploadBody?.getAll("trigger_intents")).toEqual([]);
+    await waitFor(() => expect(uploads).toHaveLength(1));
+    expect(uploads[0].getAll("trigger_intents")).toEqual([]);
   });
 
-  it("prefills the edit dialog and PATCHes trigger_intents as a JSON list", async () => {
-    const bound = asset({ trigger_intents: ["pos_atendimento_duvida"] });
-    const bodies: Array<Record<string, unknown>> = [];
-    mocks.fetch.mockImplementation(
-      (_input: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "PATCH") {
-          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-          bodies.push(body);
-          return jsonResponse({ ...bound, ...body });
-        }
-        return jsonResponse({ items: [bound], next_cursor: null, has_more: false });
-      },
-    );
+  it("prefills the edit dialog and PATCHes the checked topics' intents as a JSON list", async () => {
+    const bodies = patchesOf(asset({ trigger_intents: ["pos_atendimento_duvida"] }));
     renderPage();
     await limitsLoaded();
 
@@ -2011,72 +2088,112 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     );
     let dialog = screen.getByRole("dialog");
     let group = within(dialog).getByRole("group", { name: "When to send" });
+    expect(checkboxLabels(group)).toEqual(EN_TOPIC_LABELS);
     expect(
       within(group).getByRole("checkbox", { name: "Post-Care Query" }),
     ).toBeChecked();
-    fireEvent.click(within(group).getByRole("checkbox", { name: "FAQ" }));
-    fireEvent.click(within(group).getByRole("checkbox", { name: "Greeting" }));
+    expect(
+      within(group).getByRole("checkbox", { name: "Treatment Interest" }),
+    ).not.toBeChecked();
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Treatment Interest" }));
     fireEvent.click(within(group).getByRole("checkbox", { name: "Post-Care Query" }));
     fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
     await screen.findByText("Media metadata updated.");
-    expect(bodies[0].trigger_intents).toEqual(["saudacao", "faq"]);
+    expect(bodies[0].trigger_intents).toEqual(INTEREST_INTENTS);
 
-    // Unbinding every intent sends an empty list, and the dialog warns first.
+    // Unchecking the topic removes all seven, and sends an empty list.
     fireEvent.click(
       screen.getByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
     );
     dialog = screen.getByRole("dialog");
     group = within(dialog).getByRole("group", { name: "When to send" });
+    expect(
+      within(group).getByRole("checkbox", { name: "Treatment Interest" }),
+    ).toBeChecked();
+    fireEvent.click(within(group).getByRole("checkbox", { name: "Treatment Interest" }));
     for (const box of within(group).getAllByRole("checkbox")) {
-      if ((box as HTMLInputElement).checked) fireEvent.click(box);
+      expect(box).not.toBeChecked();
     }
-    expect(within(dialog).getByText(EN_NO_SUBJECT)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
     await waitFor(() => expect(bodies).toHaveLength(2));
     expect(bodies[1].trigger_intents).toEqual([]);
   });
 
-  it("warns that an automatic file without a subject will never be sent", async () => {
-    listOf([
-      asset({ id: "unbound", original_filename: "sem.pdf", trigger_intents: [] }),
-      asset({
-        id: "off",
-        original_filename: "off.pdf",
-        auto_suggest: false,
-        trigger_intents: [],
-      }),
-      asset({ id: "bound", original_filename: "ok.pdf" }),
-    ]);
+  it("shows a legacy partial binding as its topic checked and saves the whole topic", async () => {
+    const bodies = patchesOf(asset({ trigger_intents: ["comparacao_tratamentos"] }));
     renderPage();
     await limitsLoaded();
 
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    const group = within(dialog).getByRole("group", { name: "When to send" });
     expect(
-      within(await screen.findByTestId("media-item-unbound")).getByText(EN_NO_SUBJECT),
-    ).toBeInTheDocument();
-    expect(
-      within(screen.getByTestId("media-item-off")).queryByText(EN_NO_SUBJECT),
-    ).not.toBeInTheDocument();
-    expect(
-      within(screen.getByTestId("media-item-bound")).queryByText(EN_NO_SUBJECT),
-    ).not.toBeInTheDocument();
-
-    // The upload form warns once the switch is on and clears with a subject.
-    const form = screen.getByRole("button", { name: "Upload media" }).closest("form")!;
-    expect(within(form).queryByText(EN_NO_SUBJECT)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "AI Automatic Suggestion" }));
-    expect(within(form).getByText(EN_NO_SUBJECT)).toBeInTheDocument();
-    fireEvent.click(within(whenToSend()).getByRole("checkbox", { name: "FAQ" }));
-    expect(within(form).queryByText(EN_NO_SUBJECT)).not.toBeInTheDocument();
+      within(group)
+        .getAllByRole("checkbox")
+        .map((box) => (box as HTMLInputElement).checked),
+    ).toEqual([false, false, true, false]);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
+    await screen.findByText("Media metadata updated.");
+    expect(bodies[0].trigger_intents).toEqual(INTEREST_INTENTS);
   });
 
-  it("says it in Portuguese too", async () => {
-    localStorage.setItem("ns_locale", "pt");
-    listOf([asset({ id: "unbound", trigger_intents: [] })]);
-    renderPage();
-    expect(
-      within(await screen.findByTestId("media-item-unbound")).getByText(PT_NO_SUBJECT),
-    ).toBeInTheDocument();
-  });
+  it.each([
+    [["faq", "saudacao", "pos_atendimento_duvida"], ["pos_atendimento_duvida"]],
+    [["faq"], []],
+    [["saudacao", "reclamacao"], []],
+  ])(
+    "drops a stored intent no topic carries (%j) before PATCHing",
+    async (stored, saved) => {
+      const bodies = patchesOf(asset({ trigger_intents: stored }));
+      renderPage();
+      await limitsLoaded();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
+      );
+      const dialog = screen.getByRole("dialog");
+      const group = within(dialog).getByRole("group", { name: "When to send" });
+      expect(
+        within(group)
+          .getAllByRole("checkbox")
+          .filter((box) => (box as HTMLInputElement).checked)
+          .map((box) => box.closest("label")?.textContent),
+      ).toEqual(saved.length ? ["Post-Care Query"] : []);
+      fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }));
+      await screen.findByText("Media metadata updated.");
+      expect(bodies[0].trigger_intents).toEqual(saved);
+    },
+  );
+
+  it.each(["en", "pt"])(
+    "never warns that a file without a checked topic will not be sent (%s)",
+    async (locale) => {
+      localStorage.setItem("ns_locale", locale);
+      serveBindable({ delivery_enabled: true });
+      listOf([
+        asset({ id: "unbound", original_filename: "sem.pdf", trigger_intents: [] }),
+        asset({ id: "legacy", original_filename: "faq.pdf", trigger_intents: ["faq"] }),
+      ]);
+      renderPage();
+      await limitsLoaded();
+      await screen.findByTestId("media-item-unbound");
+
+      // Rows, the upload form with the switch on, and the dialog.
+      fireEvent.click(screen.getByRole("switch"));
+      expect(screen.getByTestId("media-upload-warnings")).toBeEmptyDOMElement();
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: `${locale === "pt" ? "Editar" : "Edit"}: sem.pdf`,
+        }),
+      );
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      expect(screen.queryByText(NO_SUBJECT)).not.toBeInTheDocument();
+      for (const dictionary of [en, pt]) {
+        expect(dictionary).not.toHaveProperty("media_alert_no_subject");
+      }
+    },
+  );
 
   it("flags a file over the API's category limit as too large to send, not over a hard-coded one", async () => {
     // A 1 MB PDF limit from the API: a 1.5 MB PDF is over it, although it is
@@ -2191,13 +2308,51 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     await waitFor(() =>
       expect(screen.getByTestId("media-delivery-notice").textContent).toBe(EN_RULE),
     );
-    expect(within(whenToSend()).getAllByRole("checkbox")).toHaveLength(12);
+    expect(checkboxLabels(whenToSend())).toEqual(EN_TOPIC_LABELS);
   });
 
   it.each([
     ["an intent list that is not strings", { intents: [1, 2] }],
     ["a missing limit", { max_bytes_by_category: { image: 5_000_000 } }],
     ["a delivery flag that is not a boolean", { delivery_enabled: "true" }],
+    ["a body without topics", { topics: undefined }],
+    ["topics that are not a list", { topics: { pedido_preco: ["pedido_preco"] } }],
+    ["a topic that is not an object", { topics: ["pedido_preco"] }],
+    ["a topic without a string id", { topics: [{ id: 7, intents: ["pedido_preco"] }] }],
+    ["a topic without intents", { topics: [{ id: "pedido_preco" }] }],
+    ["a topic with an empty intent list", { topics: [{ id: "pedido_preco", intents: [] }] }],
+    ["a topic intent that is not a string", { topics: [{ id: "pedido_preco", intents: [1] }] }],
+    [
+      "a topic intent outside the allowlist",
+      { topics: [{ id: "outras", intents: ["saudacao", "faq"] }] },
+    ],
+    [
+      "two topics with the same id",
+      {
+        topics: [
+          { id: "pedido_preco", intents: ["pedido_preco"] },
+          { id: "pedido_preco", intents: ["agendar"] },
+        ],
+      },
+    ],
+    ["an empty topic list", { topics: [] }],
+    [
+      "an intent in two topics",
+      {
+        intents: ["pedido_preco", "agendar"],
+        topics: [
+          { id: "pedido_preco", intents: ["pedido_preco", "agendar"] },
+          { id: "agendar", intents: ["agendar"] },
+        ],
+      },
+    ],
+    [
+      "an intent no topic carries",
+      {
+        intents: ["pedido_preco", "agendar"],
+        topics: [{ id: "pedido_preco", intents: ["pedido_preco"] }],
+      },
+    ],
   ])("treats %s as a failed read", async (_label, overrides) => {
     serveBindable({ delivery_enabled: true, ...overrides });
     listOf([]);
@@ -2205,6 +2360,26 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     await limitsLoaded();
     expect(screen.getByTestId("media-delivery-notice").textContent).toBe(EN_UNKNOWN);
     expect(within(whenToSend()).queryAllByRole("checkbox")).toHaveLength(0);
+  });
+
+  it("leaves trigger_intents out of the PATCH and offers a retry when the topics are off-contract", async () => {
+    serveBindable({ delivery_enabled: true, topics: [{ id: "pedido_preco" }] });
+    const bodies = patchesOf(asset({ trigger_intents: ["pos_atendimento_duvida"] }));
+    renderPage();
+    await limitsLoaded();
+
+    const group = whenToSend();
+    expect(within(group).getByText("The subjects could not be loaded.")).toBeInTheDocument();
+    expect(within(group).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
+    );
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Save changes" }),
+    );
+    await screen.findByText("Media metadata updated.");
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).not.toHaveProperty("trigger_intents");
   });
 
   describe("formats the clinic's channel does not send", () => {
@@ -2291,7 +2466,7 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
         await limitsLoaded();
         await screen.findByTestId("media-item-ogg");
 
-        expect(within(whenToSend()).getAllByRole("checkbox")).toHaveLength(12);
+        expect(checkboxLabels(whenToSend())).toEqual(EN_TOPIC_LABELS);
         fireEvent.click(screen.getByRole("switch"));
         expect(screen.getByTestId("media-delivery-notice").textContent).toBe(EN_RULE);
         pickFile(sizedFile("recado.m4a", "audio/x-m4a", 1_000));
@@ -2388,31 +2563,6 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     });
   });
 
-  it("drops a stored intent the allowlist no longer carries before PATCHing", async () => {
-    // "agendar" was bindable once; the API's list no longer carries it.
-    const bound = asset({ trigger_intents: ["agendar", "pos_atendimento_duvida"] });
-    let patchBody: Record<string, unknown> | undefined;
-    mocks.fetch.mockImplementation(
-      (_input: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "PATCH") {
-          patchBody = JSON.parse(String(init.body)) as Record<string, unknown>;
-          return jsonResponse({ ...bound, ...patchBody });
-        }
-        return jsonResponse({ items: [bound], next_cursor: null, has_more: false });
-      },
-    );
-    renderPage();
-    await limitsLoaded();
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
-    );
-    fireEvent.click(
-      within(screen.getByRole("dialog")).getByRole("button", { name: "Save changes" }),
-    );
-    await screen.findByText("Media metadata updated.");
-    expect(patchBody?.trigger_intents).toEqual(["pos_atendimento_duvida"]);
-  });
-
   it("never shows one clinic's sending state while the next clinic's read is loading", async () => {
     setRole("builder", "clinic-a");
     const pendingB = deferredResponse();
@@ -2445,7 +2595,7 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     const view = render(tree());
     await limitsLoaded();
     expect(screen.getByTestId("media-delivery-notice").textContent).toBe(EN_INACTIVE);
-    expect(within(whenToSend()).getAllByRole("checkbox")).toHaveLength(12);
+    expect(checkboxLabels(whenToSend())).toEqual(EN_TOPIC_LABELS);
 
     mocks.auth.viewingClinicId = "clinic-b";
     view.rerender(tree());
@@ -2462,42 +2612,52 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     );
 
     await act(async () =>
-      pendingB.resolveJson(bindableBody({ intents: ["faq"] })),
+      pendingB.resolveJson(
+        bindableBody({
+          intents: ["pos_atendimento_duvida"],
+          topics: [{ id: "pos_atendimento_duvida", intents: ["pos_atendimento_duvida"] }],
+        }),
+      ),
     );
-    expect(within(whenToSend()).getAllByRole("checkbox")).toHaveLength(1);
+    expect(checkboxLabels(whenToSend())).toEqual(["Post-Care Query"]);
   });
 
-  it("announces the form and dialog warnings politely, never the table rows", async () => {
+  it("announces the form's warnings politely, never the table rows", async () => {
     serveBindable({
       delivery_enabled: true,
       sendable_mime_types: ["audio/mpeg", "application/pdf"],
     });
-    listOf([asset({ id: "unbound", original_filename: "sem.pdf", trigger_intents: [] })]);
+    const ogg = asset({
+      id: "ogg",
+      original_filename: "voz.ogg",
+      category: "audio",
+      mime_type: "audio/ogg",
+      trigger_intents: [],
+    });
+    listOf([ogg]);
     renderPage();
     await limitsLoaded();
 
     const live = screen.getByTestId("media-upload-warnings");
     expect(live).toHaveAttribute("aria-live", "polite");
     expect(live).toBeEmptyDOMElement();
+    // The switch alone no longer warns: greetings and FAQ always count.
     fireEvent.click(screen.getByRole("switch"));
-    expect(within(live).getByText(EN_NO_SUBJECT)).toBeInTheDocument();
+    expect(live).toBeEmptyDOMElement();
     pickFile(sizedFile("recado.m4a", "audio/x-m4a", 1_000));
     expect(within(live).getByText(EN_FORMAT)).toBeInTheDocument();
 
-    const row = await screen.findByTestId("media-item-unbound");
-    expect(within(row).getByText(EN_NO_SUBJECT).closest("[aria-live]")).toBeNull();
+    const row = await screen.findByTestId("media-item-ogg");
+    expect(within(row).getByText(EN_FORMAT).closest("[aria-live]")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Edit: sem.pdf" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit: voz.ogg" }));
     const dialog = screen.getByRole("dialog");
-    expect(
-      within(dialog).getByText(EN_NO_SUBJECT).closest("[aria-live]"),
-    ).toHaveAttribute("aria-live", "polite");
     expect(within(dialog).getByText(en.media_edit_description)).toBeInTheDocument();
     expect(en.media_edit_description).toContain('"When to send"');
     expect(pt.media_edit_description).toContain('"Quando enviar"');
   });
 
-  it("keeps both warning regions mounted and not hidden while empty, so the first warning is announced", async () => {
+  it("keeps the upload warning region mounted and not hidden while empty, so the first warning is announced", async () => {
     serveBindable({ delivery_enabled: true, sendable_mime_types: ["application/pdf"] });
     listOf([asset()]);
     renderPage();
@@ -2514,25 +2674,17 @@ describe("<Midias /> agent sending rule, fields and alerts", () => {
     expect(upload).not.toHaveAttribute("hidden");
     expect(upload).not.toHaveAttribute("aria-hidden");
     expect(hides(upload)).toEqual([]);
-
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
-    );
-    const edit = within(screen.getByRole("dialog")).getByTestId("media-edit-warnings");
-    expect(edit).toBeEmptyDOMElement();
-    expect(edit).toHaveAttribute("aria-live", "polite");
-    expect(edit).not.toHaveAttribute("hidden");
-    expect(edit).not.toHaveAttribute("aria-hidden");
-    expect(hides(edit)).toEqual([]);
   });
 
-  it("keeps the edit dialog scrollable and its subjects in two columns at most", async () => {
+  it("keeps the edit dialog scrollable and the subjects in two columns at most, everywhere", async () => {
     listOf([asset()]);
     renderPage();
     await limitsLoaded();
     // jsdom has no layout: the real measurement is the Chromium run. This
-    // pins the two classes that make it work.
-    expect(whenToSend().querySelector(".grid")).toHaveClass("lg:grid-cols-3");
+    // pins the classes that make it work.
+    const uploadGrid = whenToSend().querySelector(".grid");
+    expect(uploadGrid).toHaveClass("sm:grid-cols-2");
+    expect(uploadGrid).not.toHaveClass("lg:grid-cols-3");
     fireEvent.click(
       await screen.findByRole("button", { name: "Edit: Orientações Pós-Botox.pdf" }),
     );

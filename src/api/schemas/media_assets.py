@@ -10,10 +10,12 @@ from src.services.media_assets import (
     MEDIA_BINDABLE_INTENT_SEQUENCE,
     MEDIA_CANONICAL_MIME_TYPES,
     MEDIA_CATEGORY_MAX_BYTES,
+    MEDIA_IMPLICIT_INTENT_SEQUENCE,
+    MEDIA_TOPIC_SEQUENCE,
     MEDIA_TRIGGER_INTENTS_MAX_ITEMS,
 )
 
-# The published shape of ``trigger_intents``: the 12 bindable intents, at most
+# The published shape of ``trigger_intents``: the bindable intents, at most
 # one entry each.  Documentation only on requests: an unknown name is the
 # route's stable 422 ``media_trigger_intent_unknown``, never a framework error.
 TRIGGER_INTENTS_SCHEMA: dict[str, Any] = {
@@ -122,18 +124,60 @@ class MediaCategoryByteLimits(BaseModel):
     image: int = Field(gt=0)
 
 
-class MediaBindableIntentsResponse(BaseModel):
-    """What the Central de Mídias may bind a file to, and whether it is sent."""
+class MediaTopic(BaseModel):
+    """One "Quando enviar" checkbox and the intents it binds."""
 
+    id: str = Field(
+        description="The topic's id, an official intent that names it.",
+        json_schema_extra={"enum": list(MEDIA_TOPIC_SEQUENCE)},
+    )
     intents: list[str] = Field(
+        min_length=1,
         description=(
-            "Every intent a media asset may be bound to, in canonical order. "
-            "Scheduling intents and fora_do_horario are never bindable."
+            "The bindable intents the topic binds, in canonical order; no "
+            "intent belongs to two topics."
         ),
         json_schema_extra={
             "items": {
                 "type": "string",
                 "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+            }
+        },
+    )
+
+
+class MediaBindableIntentsResponse(BaseModel):
+    """What the Central de Mídias may bind a file to, and whether it is sent."""
+
+    intents: list[str] = Field(
+        description=(
+            "Every intent a media asset may be bound to, in canonical order: "
+            "the union of the topics' intents. Never bindable: "
+            "fora_do_horario, every scheduling intent but agendar, and the "
+            "implicit intents."
+        ),
+        json_schema_extra={
+            "items": {
+                "type": "string",
+                "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+            }
+        },
+    )
+    topics: list[MediaTopic] = Field(
+        description=(
+            "The topics the Central de Mídias shows, in display order. Binding "
+            "a topic binds all of its intents."
+        ),
+    )
+    implicit_intents: list[str] = Field(
+        description=(
+            "The intents whose turns may send any media asset whose automatic "
+            "sending is on, whatever its trigger_intents. Never bindable."
+        ),
+        json_schema_extra={
+            "items": {
+                "type": "string",
+                "enum": list(MEDIA_IMPLICIT_INTENT_SEQUENCE),
             }
         },
     )

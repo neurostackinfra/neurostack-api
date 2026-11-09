@@ -130,7 +130,7 @@ def _source_media(source_id: UUID) -> list[MediaAsset]:
             usage_trigger=f"MEDIA_TRIGGER_SENTINEL {index}" if index == 0 else None,
             auto_suggest=index == 0,
             # The clone copies the bound intents too (envio-midia-agente).
-            trigger_intents=["pedido_preco", "faq"] if index == 0 else [],
+            trigger_intents=["pedido_preco", "agendar"] if index == 0 else [],
         )
         for index, payload in enumerate(_MEDIA_PAYLOADS)
     ]

@@ -171,7 +171,9 @@ async def _seed(world: _World) -> None:
             tenant, "Manual", intents=["detalhes_servicos"], auto_suggest=False
         ),
         "unbound": _asset(tenant, "Sem assunto", intents=[]),
-        "other_intent": _asset(tenant, "FAQ", intents=["faq"]),
+        "other_intent": _asset(
+            tenant, "Cuidados pós", intents=["pos_atendimento_duvida"]
+        ),
         "deleted": _asset(tenant, "Apagado", intents=["detalhes_servicos"]),
         "foreign": _asset(other, "De outra clínica", intents=["detalhes_servicos"]),
     }
@@ -371,15 +373,43 @@ async def test_only_the_tenants_bound_auto_files_within_the_limit_are_candidates
 async def test_another_intent_and_another_tenant_see_only_their_own_files(
     world: _World,
 ) -> None:
-    faq = await _select(world.head, world.tenant, world.sessions[0], intent="faq")
+    post = await _select(
+        world.head, world.tenant, world.sessions[0], intent="pos_atendimento_duvida"
+    )
     foreign = await _select(world.head, world.other_tenant, world.other_session)
     nothing = await _select(
-        world.head, world.tenant, world.sessions[0], intent="saudacao"
+        world.head, world.tenant, world.sessions[0], intent="agendar"
     )
 
-    assert _keys(world, faq) == ["other_intent"]
+    assert _keys(world, post) == ["other_intent"]
     assert _keys(world, foreign) == ["foreign"]
     assert nothing is None
+
+
+@pytest.mark.parametrize("intent", ["saudacao", "faq"])
+async def test_an_outras_turn_sees_every_automatic_file_of_its_tenant(
+    world: _World, intent: str
+) -> None:
+    # "Outras" is implied: bound or not, every file with the switch on is a
+    # candidate, under the same tenant, limit and price filters.
+    shown = await _select(world.head, world.tenant, world.sessions[0], intent=intent)
+    hidden = await _select(
+        world.head,
+        world.tenant,
+        world.sessions[0],
+        intent=intent,
+        clinic_config=_PRICE_HIDDEN,
+    )
+
+    assert _keys(world, shown) == [
+        "other_intent",
+        "unbound",
+        "at_limit",
+        "price",
+        "bound",
+    ]
+    assert shown is not None and shown.capped is False
+    assert _keys(world, hidden) == ["other_intent", "unbound", "at_limit", "bound"]
 
 
 async def test_a_price_file_follows_the_prompt_on_any_bound_intent(
@@ -447,7 +477,8 @@ async def test_more_than_five_candidates_are_capped_newest_first(
 ) -> None:
     tenant_id, session_id = uuid4(), uuid4()
     assets = [
-        _asset(tenant_id, f"Arquivo {index}", intents=["faq"]) for index in range(7)
+        _asset(tenant_id, f"Arquivo {index}", intents=["detalhes_servicos"])
+        for index in range(7)
     ]
     async with _maker(world.head)() as database:
         database.add(_tenant(tenant_id))
@@ -465,7 +496,7 @@ async def test_more_than_five_candidates_are_capped_newest_first(
                 {"age": age + 1, "id": asset.id},
             )
 
-    offer = await _select(world.head, tenant_id, session_id, intent="faq")
+    offer = await _select(world.head, tenant_id, session_id, intent="detalhes_servicos")
 
     assert offer is not None and offer.capped is True
     assert [candidate.media_id for candidate in offer.candidates] == [
@@ -490,7 +521,7 @@ async def test_only_the_formats_the_turns_provider_sends_are_candidates(
         "mp3": _asset(
             tenant_id,
             "Áudio MP3",
-            intents=["faq"],
+            intents=["detalhes_servicos"],
             category="audio",
             mime_type="audio/mpeg",
             payload=b"ID3\x04" + bytes(64),
@@ -498,7 +529,7 @@ async def test_only_the_formats_the_turns_provider_sends_are_candidates(
         "ogg": _asset(
             tenant_id,
             "Áudio OGG",
-            intents=["faq"],
+            intents=["detalhes_servicos"],
             category="audio",
             mime_type="audio/ogg",
             payload=_ogg_opus(),
@@ -506,12 +537,12 @@ async def test_only_the_formats_the_turns_provider_sends_are_candidates(
         "m4a": _asset(
             tenant_id,
             "Áudio M4A",
-            intents=["faq"],
+            intents=["detalhes_servicos"],
             category="audio",
             mime_type="audio/mp4",
             payload=bytes(4) + b"ftypM4A " + bytes(52),
         ),
-        "pdf": _asset(tenant_id, "Preparo", intents=["faq"]),
+        "pdf": _asset(tenant_id, "Preparo", intents=["detalhes_servicos"]),
     }
     async with _maker(world.head)() as database:
         database.add(_tenant(tenant_id))
@@ -533,7 +564,11 @@ async def test_only_the_formats_the_turns_provider_sends_are_candidates(
     offered: dict[str, list[str]] = {}
     for provider in ("meta", "zapi", "uazapi", "evolution"):
         offer = await _select(
-            world.head, tenant_id, session_id, intent="faq", provider=provider
+            world.head,
+            tenant_id,
+            session_id,
+            intent="detalhes_servicos",
+            provider=provider,
         )
         assert offer is not None, provider
         offered[provider] = [by_id[item.media_id] for item in offer.candidates]
@@ -557,7 +592,7 @@ async def test_an_empty_format_set_reads_no_row_on_postgresql(world: _World) -> 
         database.add(_tenant(tenant_id))
         await database.flush()
         database.add(_session(tenant_id, session_id))
-        database.add(_asset(tenant_id, "Preparo", intents=["faq"]))
+        database.add(_asset(tenant_id, "Preparo", intents=["detalhes_servicos"]))
         await database.commit()
 
     found: dict[str, int] = {}
@@ -570,7 +605,7 @@ async def test_an_empty_format_set_reads_no_row_on_postgresql(world: _World) -> 
                 database,
                 tenant_id=tenant_id,
                 session_id=session_id,
-                intent="faq",
+                intent="detalhes_servicos",
                 price_allowed=True,
                 sendable=sendable,
             )
