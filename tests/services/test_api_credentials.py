@@ -585,9 +585,9 @@ def test_legacy_only_stt_resolves_to_canonical_status_and_projection() -> None:
     projection = runtime_projection(credentials)
 
     assert resolved["stt_provider"] == "outros"
-    assert resolved["audio_max_seconds"] == 60
+    assert resolved["audio_max_seconds"] == 120  # the default limit
     assert status["stt_provider"] == "outros"
-    assert status["audio_max_seconds"] == 60
+    assert status["audio_max_seconds"] == 120
     assert status["stt_api_url"] == "https://speech.example/v1"
     assert status["stt_model_name"] == "legacy-whisper-model"
     assert status["stt_api_key_set"] is True
@@ -596,7 +596,7 @@ def test_legacy_only_stt_resolves_to_canonical_status_and_projection() -> None:
         "stt_provider": "outros",
         "stt_api_url": "https://speech.example/v1",
         "stt_model_name": "legacy-whisper-model",
-        "audio_max_seconds": 60,
+        "audio_max_seconds": 120,
     }
 
 

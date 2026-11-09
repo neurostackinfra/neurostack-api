@@ -977,8 +977,8 @@ class TestMetaWebhookAudioFlow:
             message_id=wamid,
         )
 
-        # ~5 minutes of audio ≈ 300 * 16000 = 4.8MB, well over the 60s default
-        # cap (which yields max_bytes = 60 * 16000 = 960KB)
+        # ~5 minutes of audio ≈ 300 * 16000 = 4.8MB, well over the 120s default
+        # cap (which yields max_bytes = 120 * 16000 = 1.92MB)
         fake_media_info = {
             "url": "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=long",
             "mime_type": "audio/ogg; codecs=opus",
@@ -3672,6 +3672,11 @@ class TestMetaInteractionOrigin:
         assert request.session_id == context.session_id
         assert request.key_info["file_review_note"] == note
         service.run_pipeline.assert_not_awaited()
+        # Both file handoffs pause the AI like an AI handoff; the default
+        # stand-by has no deadline, so the session is on the Fila de Inativos.
+        [session] = _tenant_rows(client, tenant_id, "session")
+        assert session.id == request.session_id
+        assert (session.is_paused, session.paused_until) == (True, None)
 
 
 # ============================================

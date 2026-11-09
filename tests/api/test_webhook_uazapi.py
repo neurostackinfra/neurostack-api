@@ -3796,7 +3796,12 @@ class TestUazapiGroup4PatientAudioTranscription:
             ("pending", session.id)
         ]
         assert state.traces == 0
-        assert session.is_paused is False
+        # The handoff pauses the AI with no deadline (default stand-by): the
+        # session is on the Fila de Inativos.
+        assert _session_row(client, session.id) == {
+            "is_paused": True,
+            "paused_until": None,
+        }
         notice_mid = _fake_uazapi_send_result_id(send_mock)
         assert notice_mid in [entry[0] for entry in session.metadata["ai_msg_ids"]]
 
@@ -5717,8 +5722,11 @@ class TestUazapiPendingFileReview:
         forward_mid = world.send_results[-1]["MessageID"]
         assert forward_mid in [entry[0] for entry in metadata["ai_msg_ids"]]
         assert forward_mid in webhook_module._INMEM_SENT
-        # Decision 19: the forward opens the handoff but never pauses the AI.
-        assert _session_row(world.client, session_id)["is_paused"] is False
+        # The forward pauses the AI like any handoff, with no deadline here.
+        assert _session_row(world.client, session_id) == {
+            "is_paused": True,
+            "paused_until": None,
+        }
 
     def test_english_forward_confirmation(
         self, file_world: Callable[..., _FileWorld]

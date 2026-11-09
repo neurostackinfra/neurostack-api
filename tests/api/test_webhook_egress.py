@@ -453,7 +453,7 @@ class TestZapiLongAudioHandoff:
                     instance_id,
                     str(uuid4()),
                     "https://cdn.example.com/audio.ogg",
-                    # default audio_max_seconds is 60
+                    # default audio_max_seconds is 120
                     seconds=180,
                 ),
                 headers={"Content-Type": "application/json"},
