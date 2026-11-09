@@ -34,6 +34,7 @@ from src.services.media_assets import (
     media_payload_sha256,
     media_storage_advisory_key,
     ogg_opus_channel_count,
+    ogg_opus_duration_seconds,
     ogg_opus_identification_header,
     parse_auto_suggest_wire,
     read_media_payload_limited,
@@ -41,6 +42,7 @@ from src.services.media_assets import (
     validate_media_metadata,
     validate_trigger_intents,
 )
+from tests.ogg_opus_audio import ogg_opus_file, ogg_page, opus_identification_header
 
 
 class _ByteStream:
@@ -460,6 +462,135 @@ def test_a_301_byte_prefix_always_gives_the_answer_of_the_whole_payload() -> Non
         assert ogg_opus_channel_count(payload[:301]) == ogg_opus_channel_count(
             payload
         ), payload
+
+
+# The ID header page plus the comment header page of ``ogg_opus_file``.
+_HEADER_PAGES_SIZE = len(ogg_opus_file(0.0, audio_pages=0))
+
+
+@pytest.mark.parametrize(
+    ("seconds", "pre_skip"),
+    [(0.5, 312), (61.0, 312), (121.0, 312), (299.98, 3840), (60.0, 0)],
+)
+def test_an_ogg_opus_duration_is_its_last_granule_minus_the_pre_skip(
+    seconds: float, pre_skip: int
+) -> None:
+    payload = ogg_opus_file(seconds, pre_skip=pre_skip)
+    assert ogg_opus_duration_seconds(payload) == pytest.approx(seconds, abs=1e-4)
+
+
+def test_the_duration_does_not_depend_on_the_file_size() -> None:
+    # The very thing a byte estimate gets wrong: the same 2 minutes in a tiny
+    # file and in a padded one, split into many pages of large packets.
+    small = ogg_opus_file(120.0, audio_pages=2, packet_size=10)
+    large = ogg_opus_file(120.0, audio_pages=40, packet_size=1000)
+    assert len(large) > 100 * len(small)
+    assert ogg_opus_duration_seconds(small) == pytest.approx(120.0)
+    assert ogg_opus_duration_seconds(large) == pytest.approx(120.0)
+
+
+def test_a_header_only_ogg_opus_lasts_zero_seconds() -> None:
+    head = ogg_page(opus_identification_header(), granule=0, header_type=0x02)
+    tags = ogg_page(b"OpusTags" + bytes(8), granule=0)
+    assert ogg_opus_duration_seconds(head + tags) == 0.0
+
+
+def test_a_page_where_no_packet_ends_keeps_the_previous_granule() -> None:
+    # Granule -1: the page only continues a packet (RFC 3533), it says nothing
+    # about the sample count, and must not be read as a huge unsigned number.
+    payload = ogg_opus_file(30.0) + ogg_page(bytes(40), granule=-1)
+    assert ogg_opus_duration_seconds(payload) == pytest.approx(30.0)
+
+
+def test_only_the_opus_stream_counts_in_a_multiplexed_file() -> None:
+    other = ogg_page(bytes(40), granule=48_000 * 3600, serial=b"\x01\x02\x03\x04")
+    assert ogg_opus_duration_seconds(ogg_opus_file(30.0) + other) == pytest.approx(30.0)
+
+
+def test_a_negative_duration_is_clamped_to_zero() -> None:
+    # A last granule below the pre-skip is a broken stream, never a duration
+    # below zero that would pass any limit check backwards.
+    head = ogg_page(
+        opus_identification_header(pre_skip=3840), granule=0, header_type=0x02
+    )
+    assert ogg_opus_duration_seconds(head + ogg_page(bytes(40), granule=100)) == 0.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"ID3\x04" + bytes(400), id="mp3"),
+        pytest.param(b"#!AMR\n" + bytes(400), id="amr"),
+        pytest.param(b"", id="empty"),
+        pytest.param(
+            ogg_page(b"\x01vorbis" + bytes(23), granule=0, header_type=0x02)
+            + ogg_page(bytes(40), granule=48_000 * 30),
+            id="ogg_vorbis",
+        ),
+        pytest.param(ogg_opus_file(30.0)[:-1], id="truncated_last_page"),
+        pytest.param(ogg_opus_file(30.0) + b"\x00", id="trailing_byte"),
+        pytest.param(ogg_opus_file(30.0) + b"OggS" + bytes(10), id="truncated_header"),
+        pytest.param(
+            ogg_opus_file(30.0)[:_HEADER_PAGES_SIZE]
+            + b"junk"
+            + ogg_opus_file(30.0)[_HEADER_PAGES_SIZE:],
+            id="bytes_between_pages",
+        ),
+        pytest.param(
+            ogg_opus_file(30.0) + b"OggS\x01" + ogg_page(bytes(40), granule=1)[5:],
+            id="unknown_page_version",
+        ),
+        pytest.param(
+            ogg_opus_file(30.0)
+            + ogg_page(bytes(40), granule=1, segments=bytes([255, 255, 255])),
+            id="packet_past_the_end",
+        ),
+        pytest.param(
+            ogg_opus_file(30.0) + ogg_page(b"", granule=1, segments=b"")[:26] + b"\xc8",
+            id="segment_table_past_the_end",
+        ),
+    ],
+)
+def test_a_payload_without_a_whole_ogg_opus_stream_has_no_duration(
+    payload: bytes,
+) -> None:
+    assert ogg_opus_duration_seconds(payload) is None
+
+
+def test_a_packet_spread_over_several_lacing_values_is_walked_whole() -> None:
+    # 600 bytes = lacing 255, 255, 90: the page ends after their sum, not
+    # after the first value.
+    payload = ogg_opus_file(45.0, packet_size=600)
+    assert ogg_opus_duration_seconds(payload) == pytest.approx(45.0)
+
+
+def _mutated_ogg_opus_files(count: int) -> Iterator[bytes]:
+    """Whole multi-page Ogg Opus files with a few bytes changed, some cut."""
+
+    rng = random.Random(7845)
+    for _ in range(count):
+        payload = bytearray(
+            ogg_opus_file(
+                rng.uniform(0, 300),
+                pre_skip=rng.randrange(65536),
+                audio_pages=rng.randrange(1, 8),
+                packet_size=rng.randrange(1, 700),
+            )
+        )
+        for _ in range(rng.randrange(4)):
+            payload[rng.randrange(len(payload))] = rng.randrange(256)
+        cut = rng.choice([len(payload), rng.randrange(len(payload) + 1)])
+        yield bytes(payload[:cut])
+
+
+def test_the_duration_never_raises_on_arbitrary_bytes() -> None:
+    walked = 0
+    for payload in [*_locator_cases(2000), *_mutated_ogg_opus_files(3000)]:
+        result = ogg_opus_duration_seconds(payload)
+        assert result is None or result >= 0.0, payload
+        walked += ogg_opus_identification_header(payload) is not None
+    # The page walk itself is exercised, not only the OpusHead locator.
+    assert walked > 1500
 
 
 def test_every_stored_format_has_one_server_made_file_extension() -> None:

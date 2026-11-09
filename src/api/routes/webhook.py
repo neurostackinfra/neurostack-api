@@ -93,7 +93,7 @@ from src.services.handoff_service import (
     dispatch_committed_handoff_webhooks,
     record_handoff_post_commit_dispatch_failure,
 )
-from src.services.media_assets import MEDIA_IMAGE_MAX_BYTES
+from src.services.media_assets import MEDIA_IMAGE_MAX_BYTES, ogg_opus_duration_seconds
 from src.services.meta_service import (
     download_meta_media_audio,
     extract_meta_message_id,
@@ -5196,9 +5196,13 @@ _META_AUDIO_TYPES = frozenset({"audio", "voice"})
 # acknowledgement (whatsapp-image-understanding, Decision 5).
 _META_FILE_TYPES = frozenset({"image", "document", "video", "sticker"})
 
-# Rough Opus voice-note bitrate. Meta's webhook + media resolve endpoint do
-# not expose duration, so we cap by size at ~16 KB/s to reject multi-minute
-# audios before spending network / STT budget on them.
+# Pre-download size ceiling for a Meta audio, ~16 KB/s (128 kbps). Meta's
+# webhook + media resolve endpoint do not expose duration, so a file above
+# ``audio_max_seconds`` times this is too long before spending network / STT
+# budget on it. It is far above a WhatsApp voice note's Opus bitrate, so for
+# voice notes it only stops the very long ones; the real duration read from
+# the downloaded Ogg Opus decides the rest. For the formats without a measured
+# duration (MP3, AAC, AMR, M4A) it remains the only check.
 _META_AUDIO_APPROX_BYTES_PER_SECOND = 16000
 
 # Keywords that mark a "forward it to your team" reply after the fixed
@@ -6276,7 +6280,8 @@ async def meta_webhook(
             # ── dispatch by message type ──
             #
             # Group 4 adds two paths on top of the Group 2 text flow:
-            #   • ``audio`` / ``voice`` — resolve media_id, cap by size to
+            #   • ``audio`` / ``voice`` — resolve media_id, cap by size before
+            #     the download and by the real Ogg Opus duration after it to
             #     protect the STT budget, then transcribe via Whisper and
             #     fall through to the normal text pipeline.
             #   • ``image`` with the tenant's OpenRouter bundle operational
@@ -6394,11 +6399,12 @@ async def meta_webhook(
                     )
                     return {"ok": True, "skipped": "media_resolve_failed"}
 
-                # 2) Enforce audio_max_seconds by approximate byte count.
-                # Meta exposes neither duration nor download size in the
-                # webhook, so we lean on the file_size the resolve endpoint
-                # returns and treat > audio_max_seconds*16KB as "too long"
-                # — this triggers a handoff, never a 500.
+                # 2) Enforce audio_max_seconds. Meta's webhook carries no
+                # duration, so a file_size above audio_max_seconds*16KB (the
+                # resolve endpoint's) is too long before any download; below
+                # it the audio is downloaded and an Ogg Opus (every WhatsApp
+                # voice note) is measured by its real duration (step 3). Too
+                # long is a handoff, never a 500.
                 audio_max_seconds_value = (creds or {}).get("audio_max_seconds")
                 if isinstance(audio_max_seconds_value, (str, int, float)):
                     audio_max_seconds = int(
@@ -6412,7 +6418,51 @@ async def meta_webhook(
                 else:
                     file_size = 0
                 max_bytes = audio_max_seconds * _META_AUDIO_APPROX_BYTES_PER_SECOND
+                too_long_reason: Optional[str] = None
                 if file_size and file_size > max_bytes:
+                    too_long_reason = (
+                        f"{file_size} bytes > ~{audio_max_seconds}s"
+                        f"*{_META_AUDIO_APPROX_BYTES_PER_SECOND}B"
+                    )
+                else:
+                    # 3) Download bytes — streaming with MIME allowlist + the
+                    # same byte cap, then measure an Ogg Opus by its pages. A
+                    # duration is compared in whole seconds, like the integer
+                    # ``seconds`` Z-API and Uazapi report. Any other format
+                    # (MP3, AAC, AMR, M4A) has no duration here and keeps the
+                    # size check above alone.
+                    try:
+                        audio_bytes = await download_meta_media_audio(
+                            media_url, meta_token, max_bytes=max_bytes
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Meta audio download failed for %s tenant=%s — %s",
+                            media_id,
+                            tenant_id,
+                            exc,
+                        )
+                        return {"ok": True, "skipped": "media_download_failed"}
+                    audio_duration = ogg_opus_duration_seconds(audio_bytes)
+                    if audio_duration is None:
+                        # An Ogg that cannot be measured silently weakens the
+                        # gate to the size check: make it visible.
+                        if "ogg" in mime_type.lower():
+                            logger.warning(
+                                "Meta Ogg audio without a measurable duration "
+                                "for %s tenant=%s — size check only",
+                                media_id,
+                                tenant_id,
+                            )
+                    elif int(audio_duration) > audio_max_seconds:
+                        too_long_reason = (
+                            f"{audio_duration:.1f}s > {audio_max_seconds}s"
+                        )
+                if too_long_reason is not None:
+                    # A new session's LGPD notice goes out before the handoff,
+                    # as on Z-API: this turn never reaches the pipeline that
+                    # would otherwise send it.
+                    await _send_meta_privacy_notice()
                     handoff_msg = (
                         _AUDIO_TOO_LONG_MSG_EN
                         if agent_lang == "en"
@@ -6446,28 +6496,11 @@ async def meta_webhook(
                                 exc,
                             )
                     logger.info(
-                        "Meta audio too long (%d bytes > ~%ds*%dB) for %s — handoff",
-                        file_size,
-                        audio_max_seconds,
-                        _META_AUDIO_APPROX_BYTES_PER_SECOND,
+                        "Meta audio too long (%s) for %s — handoff",
+                        too_long_reason,
                         from_phone,
                     )
                     return {"ok": True, "skipped": "audio_too_long"}
-
-                # 3) Download bytes — streaming with MIME allowlist + byte cap
-                # (max_bytes already computed for the size-check above)
-                try:
-                    audio_bytes = await download_meta_media_audio(
-                        media_url, meta_token, max_bytes=max_bytes
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Meta audio download failed for %s tenant=%s — %s",
-                        media_id,
-                        tenant_id,
-                        exc,
-                    )
-                    return {"ok": True, "skipped": "media_download_failed"}
 
                 # 4) Run the same fallback chain Z-API runs: STT, then a
                 # multimodal model, then a text reroute. The ``(text, reason)``
