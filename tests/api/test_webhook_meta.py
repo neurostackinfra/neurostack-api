@@ -60,6 +60,7 @@ from src.services.multimodal_service import (
     MultimodalImageError,
 )
 from src.services.safe_egress import SafeDownload, UnsafeEgressError
+from tests.ogg_opus_audio import ogg_opus_file
 
 API_CRED_PATH = "/v1/config/api-credentials"
 WEBHOOK_PATH = "/v1/webhook/meta"
@@ -1157,6 +1158,212 @@ class TestMetaWebhookAudioFlow:
         )
 
 
+@dataclass
+class _MetaAudioRun:
+    response: httpx.Response
+    download: AsyncMock
+    transcribe: AsyncMock
+    handoff: AsyncMock
+    send: AsyncMock
+    pipeline: AsyncMock
+    logs: list[str]
+
+
+class TestMetaWebhookAudioRealDuration:
+    """Meta's webhook carries no duration. The file size is only a ceiling
+    checked before the download; a downloaded Ogg Opus (every WhatsApp voice
+    note) is then measured by its own pages, in whole seconds like Z-API's and
+    Uazapi's ``seconds``."""
+
+    def _run(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        audio_bytes: bytes,
+        audio_max_seconds: int = 60,
+        mime_type: str = "audio/ogg; codecs=opus",
+    ) -> _MetaAudioRun:
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials_with_whisper(
+            client, tenant_id, phone_id, audio_max_seconds=audio_max_seconds
+        )
+        payload = _meta_audio_payload(
+            phone_number_id=phone_id,
+            from_phone="5511900007777",
+            media_id=f"media_{uuid4().hex[:12]}",
+            message_id=f"wamid.audio_duration_{uuid4().hex[:10]}",
+            mime_type=mime_type,
+        )
+        media_info = {
+            "url": "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=d",
+            "mime_type": mime_type,
+            "file_size": len(audio_bytes),
+        }
+        download = AsyncMock(return_value=audio_bytes)
+        transcribe = AsyncMock(return_value="Quero remarcar minha consulta")
+        handoff = AsyncMock()
+        send = AsyncMock(return_value=_fake_meta_send_result())
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(return_value=media_info),
+            ),
+            patch("src.api.routes.webhook.download_meta_media_audio", new=download),
+            patch("src.api.routes.webhook._stt_transcribe_audio", new=transcribe),
+            patch("src.api.routes.webhook.send_meta_cloud_text", new=send),
+            patch("src.api.routes.webhook._meta_initiate_file_handoff", new=handoff),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+            caplog.at_level("INFO", logger="src.api.routes.webhook"),
+        ):
+            service = MagicMock()
+            service._load_clinic_config = AsyncMock(return_value={})
+            service.run_pipeline = AsyncMock(return_value=(MagicMock(), {}, []))
+            service.finish_response = AsyncMock(
+                return_value=_fake_event_response("Sem problemas, para quando?")
+            )
+            mock_get_service.return_value = service
+            response = _post_meta(client, payload)
+        return _MetaAudioRun(
+            response=response,
+            download=download,
+            transcribe=transcribe,
+            handoff=handoff,
+            send=send,
+            pipeline=service.run_pipeline,
+            logs=[record.getMessage() for record in caplog.records],
+        )
+
+    def _assert_handed_off(self, run: _MetaAudioRun) -> None:
+        assert run.response.status_code == 200, run.response.text
+        assert run.response.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert run.transcribe.await_count == 0
+        assert run.pipeline.await_count == 0
+        assert run.handoff.await_count == 1
+        assert run.handoff.await_args.args[3] == "audio_too_long"
+        assert run.send.await_count == 1
+        assert "encaminhar" in run.send.await_args.args[3].lower()
+
+    def _assert_transcribed(self, run: _MetaAudioRun, audio_bytes: bytes) -> None:
+        assert run.response.status_code == 200, run.response.text
+        assert run.response.json() == {"ok": True, "replied": True}
+        assert run.handoff.await_count == 0
+        assert run.transcribe.await_count == 1
+        assert run.transcribe.await_args.kwargs["audio_bytes"] == audio_bytes
+        assert run.pipeline.await_count == 1
+
+    def test_a_small_voice_note_longer_than_the_limit_is_handed_off(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        # Four minutes in a file far below the 60 s * 16 KB ceiling: the byte
+        # estimate alone took it for a 1-second audio and transcribed it.
+        audio_bytes = ogg_opus_file(240.0)
+        assert len(audio_bytes) < 60 * 16000 // 100
+
+        run = self._run(client, tenant_id, caplog, audio_bytes=audio_bytes)
+
+        self._assert_handed_off(run)
+        assert run.download.await_count == 1
+        assert any(
+            "Meta audio too long (240.0s > 60s)" in message for message in run.logs
+        )
+
+    @pytest.mark.parametrize(
+        ("audio_max_seconds", "seconds", "too_long"),
+        [
+            pytest.param(60, 59.5, False, id="under"),
+            pytest.param(60, 60.0, False, id="exactly_the_limit"),
+            pytest.param(60, 60.99, False, id="the_fraction_is_dropped"),
+            pytest.param(60, 61.0, True, id="one_second_over"),
+            pytest.param(120, 120.5, False, id="configured_limit_kept"),
+            pytest.param(120, 121.0, True, id="configured_limit_exceeded"),
+        ],
+    )
+    def test_the_limit_is_compared_in_whole_seconds(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+        audio_max_seconds: int,
+        seconds: float,
+        too_long: bool,
+    ):
+        audio_bytes = ogg_opus_file(seconds)
+
+        run = self._run(
+            client,
+            tenant_id,
+            caplog,
+            audio_bytes=audio_bytes,
+            audio_max_seconds=audio_max_seconds,
+        )
+
+        if too_long:
+            self._assert_handed_off(run)
+        else:
+            self._assert_transcribed(run, audio_bytes)
+
+    @pytest.mark.parametrize(
+        ("audio_bytes", "mime_type"),
+        [
+            pytest.param(b"ID3\x04" + bytes(4000), "audio/mpeg", id="mp3"),
+            pytest.param(b"#!AMR\n" + bytes(4000), "audio/amr", id="amr"),
+            pytest.param(
+                ogg_opus_file(240.0) + b"\x00",
+                "audio/ogg; codecs=opus",
+                id="ogg_with_trailing_bytes",
+            ),
+        ],
+    )
+    def test_an_audio_without_a_measured_duration_keeps_the_size_check(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+        audio_bytes: bytes,
+        mime_type: str,
+    ):
+        # No duration is not zero seconds and not too long: under the size
+        # ceiling the audio is transcribed, as before.
+        run = self._run(
+            client, tenant_id, caplog, audio_bytes=audio_bytes, mime_type=mime_type
+        )
+
+        self._assert_transcribed(run, audio_bytes)
+        # Only an Ogg that cannot be measured is worth a warning: the gate
+        # fell back to the size check for a format it should have measured.
+        unmeasured = [
+            message
+            for message in run.logs
+            if "Meta Ogg audio without a measurable duration" in message
+        ]
+        assert len(unmeasured) == (1 if "ogg" in mime_type else 0)
+
+    def test_a_file_over_the_size_ceiling_is_handed_off_before_the_download(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        # A short audio in a file above audio_max_seconds * 16 KB: the ceiling
+        # still decides before any download, whatever the real duration.
+        audio_bytes = ogg_opus_file(10.0, audio_pages=4000, packet_size=250)
+        assert len(audio_bytes) > 60 * 16000
+
+        run = self._run(client, tenant_id, caplog, audio_bytes=audio_bytes)
+
+        self._assert_handed_off(run)
+        assert run.download.await_count == 0
+        assert any(
+            f"Meta audio too long ({len(audio_bytes)} bytes > ~60s*16000B)" in message
+            for message in run.logs
+        )
+
+
 # ============================================
 # POST /v1/webhook/meta — files / attachments (Group 4)
 # ============================================
@@ -1589,6 +1796,76 @@ class TestMetaWebhookPrivacyNotice:
         assert [call.args[3] for call in mock_send.await_args_list] == [
             _LGPD_EXPECTED_NOTICE,
             "Claro, como posso ajudar?",
+        ]
+
+    @pytest.mark.parametrize("too_long_by", ["real_duration", "file_size"])
+    def test_first_message_long_audio_sends_notice_before_the_handoff(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        too_long_by: str,
+    ):
+        """A new patient whose first message is an audio over the limit gets
+        the LGPD notice first, as on Z-API, then the handoff and its notice."""
+        phone_id = f"pn_{uuid4().hex[:8]}"
+        _seed_meta_credentials_with_whisper(
+            client, tenant_id, phone_id, audio_max_seconds=60
+        )
+        audio_bytes = (
+            ogg_opus_file(240.0)
+            if too_long_by == "real_duration"
+            else ogg_opus_file(10.0, audio_pages=4000, packet_size=250)
+        )
+        order: list[str] = []
+
+        async def _send(*args: Any, **kwargs: Any) -> dict:
+            order.append(args[3])
+            return _fake_meta_send_result(f"wamid.out_{uuid4().hex[:10]}")
+
+        async def _handoff(*args: Any, **kwargs: Any) -> MagicMock:
+            order.append("handoff")
+            return MagicMock()
+
+        with (
+            patch(
+                "src.api.routes.webhook.resolve_meta_media",
+                new=AsyncMock(
+                    return_value={
+                        "url": "https://lookaside.fbsbx.com/whatsapp_business/a",
+                        "mime_type": "audio/ogg; codecs=opus",
+                        "file_size": len(audio_bytes),
+                    }
+                ),
+            ),
+            patch(
+                "src.api.routes.webhook.download_meta_media_audio",
+                new=AsyncMock(return_value=audio_bytes),
+            ),
+            patch(
+                "src.api.routes.webhook._stt_transcribe_audio", new=AsyncMock()
+            ) as mock_transcribe,
+            patch("src.api.routes.webhook.send_meta_cloud_text", new=_send),
+            patch("src.api.routes.webhook._meta_initiate_file_handoff", new=_handoff),
+            patch("src.api.routes.webhook.get_event_service") as mock_get_service,
+        ):
+            mock_get_service.return_value = _meta_lgpd_service()
+            resp = _post_meta(
+                client,
+                _meta_audio_payload(
+                    phone_number_id=phone_id,
+                    from_phone="5511900010009",
+                    media_id=f"media_{uuid4().hex[:12]}",
+                    message_id=f"wamid.audio_{uuid4().hex[:10]}",
+                ),
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True, "skipped": "audio_too_long"}
+        assert mock_transcribe.await_count == 0
+        assert order == [
+            _LGPD_EXPECTED_NOTICE,
+            "handoff",
+            webhook_module._AUDIO_TOO_LONG_MSG_PT,
         ]
 
     @pytest.mark.parametrize("msg_type", ["image", "document", "video", "sticker"])

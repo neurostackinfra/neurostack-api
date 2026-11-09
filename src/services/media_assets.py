@@ -760,7 +760,8 @@ def _mp4_is_audio_only(payload: bytes) -> bool:
 def ogg_opus_identification_header(payload: bytes) -> bytes | None:
     """The 19-byte RFC 7845 ``OpusHead`` of an Ogg Opus stream, else ``None``.
 
-    The one locator of the upload sniff and of the senders' channel check.
+    The one locator of the upload sniff, of the senders' channel check and of
+    :func:`ogg_opus_duration_seconds`.
     RFC 3533 page header: capture ``OggS``, stream structure version 0, the
     beginning-of-stream flag, the segment count at offset 26 and then the
     segment table; the identification header must open the first packet of
@@ -808,6 +809,59 @@ def ogg_opus_channel_count(payload: bytes) -> int | None:
 
     identification = ogg_opus_identification_header(payload)
     return None if identification is None else identification[9]
+
+
+# RFC 7845 section 4: an Opus granule position counts samples at 48 kHz,
+# whatever the input sample rate was.
+_OPUS_GRANULE_RATE = 48_000
+
+
+def ogg_opus_duration_seconds(payload: bytes) -> float | None:
+    """The playback duration of a whole Ogg Opus file, else ``None``.
+
+    RFC 7845 section 4: the granule position of the last page that ends a
+    packet is the stream's sample count, pre-skip included, so the duration
+    is ``(last granule - pre-skip) / 48000``. The pages are walked from the
+    first one, each by the size its header declares (RFC 3533), so every page
+    header must start exactly where the previous page ends and the last page
+    must end exactly where the payload does. Only the logical stream of the
+    first page (the one carrying the ``OpusHead``) counts, and a granule of
+    -1 (no packet ends on that page) is skipped.
+
+    ``None`` means "no duration", never "zero seconds": no ``OpusHead`` (any
+    other format), or a page that is truncated, misplaced or followed by
+    trailing bytes. Never raises.
+    """
+
+    identification = ogg_opus_identification_header(payload)
+    if identification is None:
+        return None
+    pre_skip = int.from_bytes(identification[10:12], "little")
+    serial = payload[14:18]
+    last_granule = 0
+    offset = 0
+    size = len(payload)
+    while offset < size:
+        if (
+            size - offset < 27
+            or payload[offset : offset + 4] != b"OggS"
+            or payload[offset + 4] != 0
+        ):
+            return None
+        body_offset = offset + 27 + payload[offset + 26]
+        # A segment table that runs past the end also lands here: the page
+        # ends at least where its table does.
+        page_end = body_offset + sum(payload[offset + 27 : body_offset])
+        if page_end > size:
+            return None
+        if payload[offset + 14 : offset + 18] == serial:
+            granule = int.from_bytes(
+                payload[offset + 6 : offset + 14], "little", signed=True
+            )
+            if granule >= 0:
+                last_granule = granule
+        offset = page_end
+    return max(last_granule - pre_skip, 0) / _OPUS_GRANULE_RATE
 
 
 def _looks_like_ogg_opus(payload: bytes) -> bool:
