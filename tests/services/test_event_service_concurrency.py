@@ -191,4 +191,6 @@ async def test_webhook_helper_does_not_rollback_post_commit_failure() -> None:
         phase[1],
         phase[2],
         context=context,
+        # envio-midia-agente G6: a caller without media wiring offers none.
+        media_delivery_provider=None,
     )

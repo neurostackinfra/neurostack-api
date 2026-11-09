@@ -9,7 +9,11 @@ from src.config.logging import get_logger
 from src.config.settings import settings
 from src.infrastructure.appconfig import AppConfigClient, AppConfigDataFlagReader
 
-EgressFlag = Literal["financial_egress_enabled", "uazapi_egress_enabled"]
+EgressFlag = Literal[
+    "financial_egress_enabled",
+    "uazapi_egress_enabled",
+    "agent_media_send_enabled",
+]
 EgressDisabledCode = Literal[
     "financial_egress_disabled",
     "uazapi_egress_disabled",
@@ -50,6 +54,22 @@ class EgressPolicy:
             "uazapi_egress_enabled",
             UAZAPI_EGRESS_DISABLED,
         )
+
+    async def agent_media_send_enabled(self) -> bool:
+        """Whether the agent may send media now; ``False`` for any doubt.
+
+        A question, not a gate: the media path turns ``False`` into its own
+        outcome (no candidates, ``flag_off``) instead of an error.  Only
+        cancellation propagates.
+        """
+
+        try:
+            enabled = await self._flag_reader.is_enabled("agent_media_send_enabled")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return enabled is True
 
     async def _require_enabled(
         self,
@@ -123,3 +143,22 @@ async def require_uazapi_egress() -> None:
     """Require the Uazapi gate for one outbound operation."""
 
     await _current_policy().require_uazapi_egress()
+
+
+async def agent_media_send_enabled() -> bool:
+    """Read ``agent_media_send_enabled`` once; never raises (fail-closed).
+
+    ``True`` only when the selected reader answers the flag unambiguously
+    ``{"enabled": true}``: absent, false, not a boolean, AppConfig disabled
+    or unconfigured, the Agent unreachable, a stale or failed SDK poll, or a
+    reader that cannot even be built all read ``False``.  Read by the
+    Central de Mídias promise (``delivery_enabled``) and, in later groups,
+    once at selection and again at delivery.  Only cancellation propagates.
+    """
+
+    try:
+        return await _current_policy().agent_media_send_enabled()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False

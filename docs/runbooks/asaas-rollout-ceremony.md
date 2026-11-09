@@ -633,9 +633,11 @@ operator quorum. It does **not** change the persisted rollout state.
   closed.
 - *Command:* deploy, in AWS AppConfig, a new hosted version of the
   egress-flags profile where `financial_egress_enabled` has
-  `"enabled": false` (keep `uazapi_egress_enabled` at its current value),
-  with the profile's no-bake deployment strategy, as described in that
-  section. Whoever holds the AWS permission does it on the owner's order;
+  `"enabled": false` (keep `uazapi_egress_enabled` and
+  `agent_media_send_enabled` at their current values: a flag left out of the
+  new version reads false, so dropping `agent_media_send_enabled` would also
+  stop agent media in every task), with the profile's no-bake deployment
+  strategy, as described in that section. Whoever holds the AWS permission does it on the owner's order;
   this tool takes no part.
 - *Verify:* each task's reader normally closes the flag at its next poll,
   within one poll interval (at most 60 s) of the deployment; a failed poll

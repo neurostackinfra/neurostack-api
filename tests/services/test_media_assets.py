@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import tracemalloc
 from collections.abc import Iterator
 from contextlib import nullcontext
@@ -17,7 +18,9 @@ from src.models.tenant import Tenant
 from src.services import media_assets
 from src.services.media_assets import (
     MEDIA_AUDIO_VIDEO_MAX_BYTES,
+    MEDIA_CANONICAL_MIME_TYPES,
     MEDIA_CATEGORY_MAX_BYTES,
+    MEDIA_FILE_EXTENSIONS,
     MEDIA_IMAGE_MAX_BYTES,
     MEDIA_PDF_MAX_BYTES,
     MEDIA_STORAGE_CAP_BYTES,
@@ -30,10 +33,13 @@ from src.services.media_assets import (
     classify_media_payload,
     media_payload_sha256,
     media_storage_advisory_key,
+    ogg_opus_channel_count,
+    ogg_opus_identification_header,
     parse_auto_suggest_wire,
     read_media_payload_limited,
     validate_media_classification,
     validate_media_metadata,
+    validate_trigger_intents,
 )
 
 
@@ -51,7 +57,7 @@ class _ByteStream:
         return chunk
 
 
-def _opus_head(version: int = 1, channels: int = 2) -> bytes:
+def _opus_head(version: int = 1, channels: int = 1) -> bytes:
     """The 19-byte RFC 7845 identification header."""
 
     return (
@@ -310,6 +316,166 @@ def test_classification_rejects_ogg_containers_without_an_opus_head(
 ) -> None:
     with pytest.raises(MediaAssetDomainError, match="media_signature_invalid"):
         classify_media_payload(payload)
+
+
+@pytest.mark.parametrize("channels", [2, 3, 6, 8, 255])
+@pytest.mark.parametrize("declared", ["audio/ogg", "audio/ogg; codecs=opus"])
+def test_an_ogg_opus_that_is_not_mono_is_refused_with_its_own_code(
+    channels: int, declared: str
+) -> None:
+    # The signature still says Opus: the refusal is about the channels, so the
+    # screen can say "export it in mono" instead of "this format is not accepted".
+    payload = _ogg_page(body=_opus_head(channels=channels))
+    assert classify_media_payload(payload).mime_type == "audio/ogg"
+    with pytest.raises(MediaAssetDomainError, match=r"^media_audio_not_mono$"):
+        validate_media_classification(payload, declared)
+
+
+def test_a_non_mono_ogg_over_the_audio_limit_is_told_to_be_mono_first() -> None:
+    # Exporting to mono also shrinks the file, so the channels come first.
+    head = _ogg_page(body=_opus_head(channels=2))
+    payload = head + bytes(MEDIA_AUDIO_VIDEO_MAX_BYTES + 1 - len(head))
+    with pytest.raises(MediaAssetDomainError, match=r"^media_audio_not_mono$"):
+        validate_media_classification(payload, "audio/ogg")
+    mono = _ogg_page() + bytes(len(payload) - len(head))
+    with pytest.raises(MediaAssetDomainError, match=r"^media_size_exceeded$"):
+        validate_media_classification(mono, "audio/ogg")
+
+
+@pytest.mark.parametrize("channels", [1, 2, 8, 255])
+def test_the_opus_locator_reads_the_identification_header_of_the_first_page(
+    channels: int,
+) -> None:
+    head = _opus_head(channels=channels)
+    assert ogg_opus_identification_header(_ogg_page(body=head)) == head
+    assert ogg_opus_channel_count(_ogg_page(body=head)) == channels
+    # A header packet past 254 bytes spans two lacing values (RFC 3533): the
+    # packet starts after the whole segment table, not at a fixed offset.
+    padded = head + bytes(300 - len(head))
+    two_segments = _ogg_page(segments=bytes([255, 45]), body=padded)
+    assert ogg_opus_identification_header(two_segments) == head
+    assert ogg_opus_channel_count(two_segments) == channels
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # OpusHead exactly where the first packet would start, but no capture
+        # pattern: not an Ogg page, whatever follows.
+        b"XXXX" + _ogg_page()[4:],
+        b"oggs" + _ogg_page()[4:],
+        _ogg_page(version=1),
+        _ogg_page(header_type=0x00),
+        _ogg_page(body=_opus_head(version=0x10)),
+        _ogg_page(body=_opus_head()[:18]),
+        _ogg_page()[:26],
+        _ogg_page(segment_count=255),
+        b"",
+    ],
+)
+def test_the_opus_locator_finds_nothing_outside_a_first_ogg_opus_page(
+    payload: bytes,
+) -> None:
+    assert ogg_opus_identification_header(payload) is None
+    assert ogg_opus_channel_count(payload) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # The lacing [10, 9] ends the first packet after 10 bytes: OpusHead is
+        # split across two packets, so the first one is no ID header.
+        pytest.param(_ogg_page(segments=bytes([10, 9])), id="first-packet-of-10-bytes"),
+        pytest.param(_ogg_page(segments=bytes([18])), id="first-packet-of-18-bytes"),
+        # A continued page carries the tail of an earlier packet.
+        pytest.param(_ogg_page(header_type=0x03), id="continuation-flag"),
+        pytest.param(_ogg_page(header_type=0x01), id="continuation-without-bos"),
+        # No segments: the page holds no packet at all.
+        pytest.param(_ogg_page(segments=b""), id="zero-segments"),
+        # A lacing of 255 with no shorter value after it: the first packet
+        # runs past the page, so the page does not hold the whole ID header.
+        pytest.param(
+            _ogg_page(segments=bytes([255]), body=_opus_head() + bytes(236)),
+            id="first-packet-unterminated",
+        ),
+    ],
+)
+def test_a_first_page_that_does_not_hold_one_whole_id_header_is_not_opus(
+    payload: bytes,
+) -> None:
+    assert ogg_opus_identification_header(payload) is None
+    assert ogg_opus_channel_count(payload) is None
+    with pytest.raises(MediaAssetDomainError, match=r"^media_signature_invalid$"):
+        validate_media_classification(payload, "audio/ogg")
+
+
+def test_an_id_header_ending_exactly_at_byte_301_is_read_from_a_301_byte_prefix() -> (
+    None
+):
+    # 255 lacing values, the first of them the 19-byte ID header: OpusHead
+    # sits at bytes 282 to 301, the farthest a valid first page can put it.
+    head = _opus_head(channels=1)
+    page = _ogg_page(segments=bytes([19]) + bytes(254), body=head)
+    assert len(page) == 301
+    assert ogg_opus_identification_header(page[:301]) == head
+    assert ogg_opus_channel_count(page[:301]) == 1
+    assert ogg_opus_channel_count(page[:300]) is None
+    stereo = _ogg_page(segments=bytes([19]) + bytes(254), body=_opus_head(channels=2))
+    assert ogg_opus_channel_count(stereo + bytes(1000)) == 2
+    assert ogg_opus_channel_count((stereo + bytes(1000))[:301]) == 2
+
+
+def _locator_cases(count: int) -> Iterator[bytes]:
+    """Valid, mutated and random first pages, seeded so a failure replays."""
+
+    rng = random.Random(7845)
+    for _ in range(count):
+        segments = bytes(
+            rng.choice([0, 9, 10, 18, 19, 20, 254, 255, rng.randrange(256)])
+            for _ in range(rng.choice([0, 1, 2, 3, rng.randrange(256), 255]))
+        )
+        page = bytearray(
+            _ogg_page(
+                header_type=rng.choice([0x00, 0x01, 0x02, 0x03, 0x06]),
+                segments=segments,
+                body=_opus_head(
+                    version=rng.choice([0, 1, 15, 16]),
+                    channels=rng.choice([0, 1, 2, 255]),
+                )
+                + rng.randbytes(rng.randrange(400)),
+            )
+        )
+        for _ in range(rng.randrange(3)):
+            page[rng.randrange(len(page))] = rng.randrange(256)
+        yield bytes(page[: rng.choice([len(page), rng.randrange(len(page) + 1)])])
+        yield rng.randbytes(rng.randrange(400))
+
+
+def test_a_301_byte_prefix_always_gives_the_answer_of_the_whole_payload() -> None:
+    # The sender's pre-claim check reads only the first 301 bytes; it must
+    # never accept or refuse what the whole stored payload would not.
+    for payload in _locator_cases(4000):
+        whole = ogg_opus_identification_header(payload)
+        assert ogg_opus_identification_header(payload[:301]) == whole, payload
+        assert ogg_opus_channel_count(payload[:301]) == ogg_opus_channel_count(
+            payload
+        ), payload
+
+
+def test_every_stored_format_has_one_server_made_file_extension() -> None:
+    # One table names the download fallback and the Meta upload; a MIME added
+    # to the allowlist without an extension would be a KeyError on both.
+    assert set(MEDIA_FILE_EXTENSIONS) == MEDIA_CANONICAL_MIME_TYPES
+    # Meta's supported-media table spells JPEG as .jpeg (error 131053).
+    assert MEDIA_FILE_EXTENSIONS == {
+        "image/jpeg": ".jpeg",
+        "image/png": ".png",
+        "application/pdf": ".pdf",
+        "audio/mpeg": ".mp3",
+        "audio/ogg": ".ogg",
+        "audio/mp4": ".m4a",
+        "video/mp4": ".mp4",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1199,3 +1365,85 @@ async def test_lock_phase_failure_or_divergent_owner_rolls_back_before_media(
     assert not any("media_assets" in sql for sql in session.statements)
     with pytest.raises(MediaStorageGuardError, match="not active"):
         await guard.validate_projection(0)
+
+
+# envio-midia-agente Group 2: the media -> intent binding.
+_BINDABLE = (
+    "saudacao",
+    "interesse_tratamento",
+    "pedido_preco",
+    "comparacao_tratamentos",
+    "objecao_vou_pensar",
+    "detalhes_servicos",
+    "pre_atendimento",
+    "faq",
+    "cultura_historia",
+    "qualificacao_publico",
+    "informacoes_profissionais",
+    "pos_atendimento_duvida",
+)
+
+
+def test_trigger_intents_drop_duplicates_into_the_canonical_order() -> None:
+    assert validate_trigger_intents([]) == []
+    assert validate_trigger_intents(["faq", "saudacao", "faq"]) == ["saudacao", "faq"]
+    assert validate_trigger_intents(
+        ["pos_atendimento_duvida", "pedido_preco", "pedido_preco"]
+    ) == ["pedido_preco", "pos_atendimento_duvida"]
+    # Every bindable intent at once, in reverse: the canonical order back.
+    assert validate_trigger_intents(list(reversed(_BINDABLE))) == list(_BINDABLE)
+    assert media_assets.MEDIA_TRIGGER_INTENTS_MAX_ITEMS == len(_BINDABLE) == 12
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # Scheduling and the out-of-hours handoff: never bindable.
+        "agendar",
+        "reagendar",
+        "cancelar",
+        "confirmar_presenca",
+        "disponibilidade_horarios",
+        "fora_do_horario",
+        # Official, but not informative.
+        "pedido_atendente_humano",
+        "cobranca_renegociacao",
+        # Exact names only: no folding, no trimming.
+        "FAQ",
+        " faq",
+        "faq ",
+        "",
+        "faq,saudacao",
+        "inexistente",
+        None,
+        1,
+        ["faq"],
+    ],
+)
+def test_trigger_intents_refuse_any_name_outside_the_allowlist(value: object) -> None:
+    with pytest.raises(MediaAssetDomainError) as caught:
+        validate_trigger_intents(["faq", value])
+    assert caught.value.code == "media_trigger_intent_unknown"
+
+
+def test_trigger_intents_refuse_more_entries_than_bindable_intents() -> None:
+    with pytest.raises(MediaAssetDomainError) as caught:
+        validate_trigger_intents([*_BINDABLE, "faq"])
+    assert caught.value.code == "media_metadata_invalid"
+    # The count is checked before any name, so an over-long list of unknown
+    # names is still the size error.
+    with pytest.raises(MediaAssetDomainError) as caught:
+        validate_trigger_intents(["agendar"] * 13)
+    assert caught.value.code == "media_metadata_invalid"
+
+
+def test_media_assets_map_trigger_intents_as_a_non_null_text_array() -> None:
+    column = MediaAsset.__table__.c.trigger_intents
+    assert column.nullable is False
+    assert str(column.type.compile(dialect=postgresql.dialect())) == "TEXT[]"
+    assert column.server_default is not None
+    assert str(column.server_default.arg) == "'{}'"
+    # Every ORM insert names the column with a fresh empty list.
+    assert column.default is not None
+    first, second = column.default.arg(None), column.default.arg(None)
+    assert first == second == [] and first is not second

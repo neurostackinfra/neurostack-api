@@ -11,10 +11,10 @@ from typing import cast
 
 from neurostack_core.presets import get_preset
 from neurostack_core.prompt.models import PromptMessage, PromptMode, PromptVariables
+from neurostack_core.prompt.price_policy import resolve_price_disclosure
 from neurostack_core.prompt.templates.base import BaseTemplate, TemplateSection
 from neurostack_core.prompt.timeutils import clinic_now
 from neurostack_core.protocol import (
-    CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY,
     CARE_MODALITY_SLOT,
     INSURANCE_CARE_MODALITY,
     INSURANCE_TRIAGE_CUSTOM_KEY,
@@ -364,13 +364,12 @@ class NormalTemplate(BaseTemplate):
         # emit NO monetary value in ANY block below — that includes the pricing
         # policy AND the initial-consultation/complimentary block. If insurance
         # is off the triage feature is inactive and behavior is unchanged.
-        accepts_ins = custom.get("accepts_insurance")
-        insurance_active = bool(
-            accepts_ins and str(accepts_ins).lower() not in ("no", "false", "0", "none")
-        )
-        hold_price = insurance_active and not custom.get(
-            CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY
-        )
+        # The rule itself is ``resolve_price_disclosure`` (prompt/price_policy):
+        # the agent's media selection reads the same one (``can_show_price``)
+        # to offer a price file only when this block may quote a price.
+        disclosure = resolve_price_disclosure(custom)
+        insurance_active = disclosure.insurance_active
+        hold_price = disclosure.hold_price
 
         if hold_price:
             # Convenio-safe pricing policy — no monetary value emitted.
@@ -379,18 +378,11 @@ class NormalTemplate(BaseTemplate):
             # Pricing policy — two clear states: PODE_FALAR (yes) or NÃO_PODE_FALAR (else).
             # pricing_mode values are normalised to lower-case (pipeline sends range_allowed /
             # exact_allowed / consult_only).  provide_prices=yes always means exact_allowed.
-            provide_prices = custom.get("provide_prices")
-            pricing_mode = str(custom.get("pricing_mode", "")).lower().strip()
-            is_range_allowed = pricing_mode == "range_allowed"
-            is_exact_allowed = (
-                provide_prices in (True, "yes", "true", "True")
-                or pricing_mode == "exact_allowed"
-            )
-            can_share_price = is_range_allowed or is_exact_allowed
-
-            if can_share_price:
+            if disclosure.can_share_price:
                 price_detail = (
-                    _CLINIC_LITERALS[6] if is_range_allowed else _CLINIC_LITERALS[7]
+                    _CLINIC_LITERALS[6]
+                    if disclosure.range_allowed
+                    else _CLINIC_LITERALS[7]
                 )
                 section.add(f"{_CLINIC_LITERALS[8]}{price_detail}{_CLINIC_LITERALS[9]}")
             else:

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { en } from "@/locales/en";
 import { pt } from "@/locales/pt";
 import {
   getIntentLabel,
@@ -87,4 +88,25 @@ describe("intent presentation catalog", () => {
       expect(getIntentLabel(intentName, () => "wrong inherited label")).toBe(intentName);
     },
   );
+});
+
+// MEDIA_BINDABLE_INTENT_SEQUENCE in packages/neurostack-core/neurostack_core/
+// protocol.py: the Central de Mídias labels "Quando enviar" through this
+// catalog, so each one needs a real PT and EN label, never the raw id.
+const mediaBindableIntents = [
+  "saudacao", "interesse_tratamento", "pedido_preco", "comparacao_tratamentos",
+  "objecao_vou_pensar", "detalhes_servicos", "pre_atendimento", "faq",
+  "cultura_historia", "qualificacao_publico", "informacoes_profissionais",
+  "pos_atendimento_duvida",
+];
+
+describe("media bindable intents", () => {
+  it.each(mediaBindableIntents)("labels %s in Portuguese and English", (intentName) => {
+    expect(INTENT_PRESENTATION).toHaveProperty(intentName);
+    for (const dictionary of [pt, en]) {
+      const label = getIntentLabel(intentName, key => dictionary[key]);
+      expect(label).not.toBe(intentName);
+      expect(label.trim()).not.toBe("");
+    }
+  });
 });

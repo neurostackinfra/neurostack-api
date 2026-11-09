@@ -3586,9 +3586,11 @@ egress flags with `appconfigdata` `StartConfigurationSession` and
 `GetLatestConfiguration` (region `us-east-1`, the locked `boto3`/`botocore`
 main dependencies, the task role's credentials). `APPCONFIG_SOURCE` selects
 the source: `agent` (the default, today's localhost Agent client) or `sdk`
-(this reader). `src/services/egress_policy.py` chooses the reader for both
-`financial_egress_enabled` and `uazapi_egress_enabled`; `billing_checkout.py`
-and `uazapi_service.py` only consume the result.
+(this reader). `src/services/egress_policy.py` chooses the reader for
+`financial_egress_enabled`, `uazapi_egress_enabled` and
+`agent_media_send_enabled` (envio-midia-agente: the agent sends Central de
+Mídias files; absent reads false, like the others); `billing_checkout.py`,
+`uazapi_service.py` and the media routes only consume the result.
 
 - One reader and one background refresher per process: the lifespan of
   `src/api/main.py` starts the refresher only when `APPCONFIG_ENABLED=true`
@@ -3611,7 +3613,7 @@ and `uazapi_service.py` only consume the result.
 - An empty `Configuration` means unchanged: the cached document stays and
   its freshness is renewed. An empty first answer stays closed.
 - State transitions (not every poll) are logged as
-  `appconfig_egress_flags_changed` with `poll_ok`, both flag booleans, the
+  `appconfig_egress_flags_changed` with `poll_ok`, each flag's boolean, the
   `VersionLabel` and, on failure, only `error_type` (the exception type) and
   `error_code` (for an AWS `ClientError`, its error code such as
   `AccessDeniedException`, restricted to `[A-Za-z0-9_.-]`, else `unknown`;
@@ -3638,19 +3640,21 @@ and `uazapi_service.py` only consume the result.
   no bake time and no growth duration (a custom strategy:
   `DeploymentDurationInMinutes` 0, `FinalBakeTimeInMinutes` 0,
   `GrowthFactor` 100, `ReplicateTo` `NONE`), so that containment (deploying
-  `false`) is fast. The profile carries **both** flags: with `sdk`, a flag
+  `false`) is fast. The profile carries **every** flag: with `sdk`, a flag
   absent from the profile reads false, so `uazapi_egress_enabled` is present
   with its current value, `false` (Uazapi egress is closed by absence today;
-  opening it is a separate owner decision, not part of L7).
+  opening it is a separate owner decision, not part of L7), and so is
+  `agent_media_send_enabled` (envio-midia-agente; closed until the owner opens
+  it after the behaviour release).
   Use only basic flags (no variants) in this profile. A profile with any
   multi-variant flag is served in Amazon Ion, not JSON: the reader cannot
-  parse it, so every process closes both flags and logs
+  parse it, so every process closes every flag and logs
   `appconfig_egress_flags_changed` with `poll_ok=false` and
   `error_type=_PollFailed` (`error_code` null), retrying with backoff;
   recover by deploying a version with only basic flags. A retrieved document
   that still carries the hosted `version`/`flags`/`values` envelope (for
   example a freeform profile holding the hosted JSON) logs `poll_ok=true`
-  with both flags false: it reads closed as well.
+  with every flag false: it reads closed as well.
 - **Hosted content (closed).** The hosted version is created with content
   type `application/json` in the `AWS.AppConfig.FeatureFlags` format:
 
@@ -3658,10 +3662,12 @@ and `uazapi_service.py` only consume the result.
   {
     "version": "1",
     "flags": {
+      "agent_media_send_enabled": {"name": "agent_media_send_enabled"},
       "financial_egress_enabled": {"name": "financial_egress_enabled"},
       "uazapi_egress_enabled": {"name": "uazapi_egress_enabled"}
     },
     "values": {
+      "agent_media_send_enabled": {"enabled": false},
       "financial_egress_enabled": {"enabled": false},
       "uazapi_egress_enabled": {"enabled": false}
     }
@@ -3677,6 +3683,7 @@ and `uazapi_service.py` only consume the result.
 
   ```json
   {
+    "agent_media_send_enabled": {"enabled": false},
     "financial_egress_enabled": {"enabled": false},
     "uazapi_egress_enabled": {"enabled": false}
   }
@@ -3736,7 +3743,9 @@ reader, and the Group 5 planner accepts the `APPCONFIG_*` set.
    have `APPCONFIG_SOURCE=sdk` or `APPCONFIG_ENABLED=true`, and its flags are
    closed.
 5. Open: create and deploy a hosted version with
-   `financial_egress_enabled.enabled` true, after the owner's order. Within
+   `financial_egress_enabled.enabled` true, after the owner's order, and
+   `uazapi_egress_enabled` and `agent_media_send_enabled` at their current
+   values (a flag left out reads false). Within
    one poll interval (at most 60 s) each worker process logs
    `financial_egress_enabled=true` with the new version label, and
    `uazapi_egress_enabled` stays false: rerun the same query with
@@ -3745,7 +3754,10 @@ reader, and the Group 5 planner accepts the `APPCONFIG_*` set.
    L8).
 
 **Containment and rollback.** Deploy a hosted version with
-`financial_egress_enabled.enabled` false: each worker process closes at its
+`financial_egress_enabled.enabled` false, keeping `uazapi_egress_enabled` and
+`agent_media_send_enabled` at their current values (a flag left out of the
+version reads false, so dropping the media flag would also stop agent media
+in every task): each worker process closes at its
 next poll (at most one clamped poll interval: 15 s by default, never more
 than 60 s). If AppConfig itself is unreachable or denied, every process
 closes on the failed poll, and a process whose refresher stalls closes after

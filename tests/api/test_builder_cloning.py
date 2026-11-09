@@ -129,6 +129,8 @@ def _source_media(source_id: UUID) -> list[MediaAsset]:
             payload=payload,
             usage_trigger=f"MEDIA_TRIGGER_SENTINEL {index}" if index == 0 else None,
             auto_suggest=index == 0,
+            # The clone copies the bound intents too (envio-midia-agente).
+            trigger_intents=["pedido_preco", "faq"] if index == 0 else [],
         )
         for index, payload in enumerate(_MEDIA_PAYLOADS)
     ]
@@ -1359,6 +1361,7 @@ class _FakeMediaRow:
     payload: bytes
     usage_trigger: str | None
     auto_suggest: bool
+    trigger_intents: list[str]
 
     def _asdict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in MEDIA_ASSET_CLONE_FIELDS}
@@ -1382,6 +1385,7 @@ def _fake_media_row(payload: bytes) -> _FakeMediaRow:
         payload=payload,
         usage_trigger=None,
         auto_suggest=False,
+        trigger_intents=[],
     )
 
 

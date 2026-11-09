@@ -1,17 +1,24 @@
-"""Final public OpenAPI contract for the five Media Assets operations."""
+"""Final public OpenAPI contract for the six Media Assets operations."""
 
 from typing import Any, cast
 
 from fastapi.openapi.models import OpenAPI
 
+from neurostack_core.protocol import MEDIA_BINDABLE_INTENT_SEQUENCE
 from src.api.main import create_app
 
 MEDIA_OPERATIONS = {
     ("/v1/media-assets", "post"),
     ("/v1/media-assets", "get"),
+    ("/v1/media-assets/bindable-intents", "get"),
     ("/v1/media-assets/{media_id}/content", "get"),
     ("/v1/media-assets/{media_id}", "patch"),
     ("/v1/media-assets/{media_id}", "delete"),
+}
+_TRIGGER_INTENTS = {
+    "type": "array",
+    "items": {"type": "string", "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE)},
+    "maxItems": 12,
 }
 MEDIA_SECURITY: list[dict[str, list[str]]] = [
     {"ApiKeyAuth": []},
@@ -38,7 +45,7 @@ def test_complete_document_is_valid_openapi_31() -> None:
     OpenAPI.model_validate(schema)
 
 
-def test_all_five_operations_publish_tenant_override_and_correct_security() -> None:
+def test_all_six_operations_publish_tenant_override_and_correct_security() -> None:
     schema = _schema()
     published = {
         (path, method)
@@ -70,7 +77,7 @@ def test_upload_documents_closed_single_file_multipart_and_byte_limits() -> None
     # the file cap is that largest category alone.
     assert request_body["x-maxBytes"] == 21_000_000
     assert multipart["additionalProperties"] is False
-    assert multipart["maxProperties"] == 5
+    assert multipart["maxProperties"] == 6
     assert multipart["required"] == ["file", "display_name", "original_filename"]
     assert set(multipart["properties"]) == {
         "file",
@@ -78,7 +85,11 @@ def test_upload_documents_closed_single_file_multipart_and_byte_limits() -> None
         "original_filename",
         "usage_trigger",
         "auto_suggest",
+        "trigger_intents",
     }
+    # Repeated once per bound intent; at most one part per bindable intent.
+    assert multipart["properties"]["trigger_intents"] == _TRIGGER_INTENTS
+    assert "media_trigger_intent_unknown" in request_body["description"]
     assert multipart["properties"]["file"]["format"] == "binary"
     assert multipart["properties"]["file"]["x-maxBytes"] == 20_000_000
     assert multipart["properties"]["display_name"]["maxLength"] == 200
@@ -119,6 +130,11 @@ def test_list_patch_response_and_download_schemas_publish_exact_limits() -> None
     assert patch["minProperties"] == 1
     assert patch["properties"]["auto_suggest"] == {"type": "boolean"}
     assert patch["properties"]["usage_trigger"]["anyOf"][1] == {"type": "null"}
+    assert patch["properties"]["trigger_intents"] == _TRIGGER_INTENTS
+    # Every response carries the bound intents (possibly empty).
+    assert "trigger_intents" in components["MediaAssetResponse"]["required"]
+    assert response["trigger_intents"]["type"] == "array"
+    assert response["trigger_intents"]["items"] == {"type": "string"}
 
     listing = _operation(schema, "/v1/media-assets", "get")
     assert _parameter(listing, "page_size")["schema"] == {
@@ -197,6 +213,7 @@ def test_each_operation_documents_its_stable_error_surface() -> None:
     expected = {
         ("/v1/media-assets", "post"): {"400", "401", "403", "409", "413", "422", "503"},
         ("/v1/media-assets", "get"): {"400", "401", "403", "422", "503"},
+        ("/v1/media-assets/bindable-intents", "get"): {"401", "403", "422", "503"},
         ("/v1/media-assets/{media_id}/content", "get"): {
             "401",
             "403",
@@ -227,3 +244,62 @@ def test_each_operation_documents_its_stable_error_surface() -> None:
             content = responses[status_code].get("content", {})
             assert "application/json" in content
             assert content["application/json"]["schema"]
+
+
+def test_the_unknown_intent_code_is_documented_on_every_write() -> None:
+    schema = _schema()
+    for path, method in (
+        ("/v1/media-assets", "post"),
+        ("/v1/media-assets/{media_id}", "patch"),
+    ):
+        responses = _operation(schema, path, method)["responses"]
+        assert "media_trigger_intent_unknown" in responses["422"]["description"]
+
+
+def test_upload_documents_that_an_ogg_opus_must_be_mono() -> None:
+    operation = _operation(_schema(), "/v1/media-assets", "post")
+    assert "media_audio_not_mono" in operation["responses"]["422"]["description"]
+    file_property = operation["requestBody"]["content"]["multipart/form-data"][
+        "schema"
+    ]["properties"]["file"]
+    assert "OGG-Opus (mono only)" in file_property["description"]
+
+
+def test_bindable_intents_publishes_the_allowlist_flag_state_and_limits() -> None:
+    schema = _schema()
+    operation = _operation(schema, "/v1/media-assets/bindable-intents", "get")
+    reference = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert reference == {"$ref": "#/components/schemas/MediaBindableIntentsResponse"}
+    components = schema["components"]["schemas"]
+    body = components["MediaBindableIntentsResponse"]
+    assert set(body["required"]) == {
+        "intents",
+        "delivery_enabled",
+        "max_bytes_by_category",
+        "sendable_mime_types",
+    }
+    assert body["properties"]["intents"]["items"] == {
+        "type": "string",
+        "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+    }
+    assert body["properties"]["delivery_enabled"]["type"] == "boolean"
+    sendable = body["properties"]["sendable_mime_types"]
+    assert sendable["type"] == "array"
+    assert sendable["items"] == {
+        "type": "string",
+        "enum": [
+            "application/pdf",
+            "audio/mp4",
+            "audio/mpeg",
+            "audio/ogg",
+            "image/jpeg",
+            "image/png",
+            "video/mp4",
+        ],
+    }
+    limits = components["MediaCategoryByteLimits"]
+    assert set(limits["required"]) == {"video", "audio", "pdf", "image"}
+    assert limits["additionalProperties"] is False
+    # Not a media operation that reads rows: no media_id, no request body.
+    assert "requestBody" not in operation
+    assert {item["name"] for item in operation["parameters"]} >= {"tenant_id"}

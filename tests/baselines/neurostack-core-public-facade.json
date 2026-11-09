@@ -32,6 +32,7 @@
     "PromptEngine",
     "PromptMode",
     "PromptVariables",
+    "can_show_price",
     "get_prompt_engine",
     "resolve_clinic_tz"
   ],

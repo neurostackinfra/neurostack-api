@@ -9,14 +9,39 @@ public HTTPS host with the DNS/IP filter).
 
 import base64
 import logging
+from collections.abc import Mapping
+from typing import Final
 
 import httpx
 
+from src.services.media_send_body import (
+    MEDIA_SEND_TIMEOUT,
+    MediaCategory,
+    base64_json_body,
+    require_sendable_media,
+    sanitize_transport_error,
+)
 from src.services.safe_egress import safe_async_client
 
 logger = logging.getLogger(__name__)
 
 ZAPI_BASE = "https://api.z-api.io"
+
+# media_assets category -> (Z-API route suffix, body key holding the media).
+_ZAPI_MEDIA_ROUTES: Final[Mapping[str, tuple[str, str]]] = {
+    "image": ("send-image", "image"),
+    "pdf": ("send-document/pdf", "document"),
+    "audio": ("send-audio", "audio"),
+    "video": ("send-video", "video"),
+}
+
+# media_assets category -> Evolution ``sendMedia`` ``mediatype``. Audio is
+# absent on purpose: it goes through ``sendWhatsAppAudio``.
+_EVOLUTION_MEDIATYPES: Final[Mapping[str, str]] = {
+    "image": "image",
+    "pdf": "document",
+    "video": "video",
+}
 
 
 def _response_json_object(response: httpx.Response) -> dict[str, object]:
@@ -121,6 +146,87 @@ async def send_zapi_audio(
             raise _sanitize_http_status_error(exc) from None
         data = _response_json_object(resp)
         logger.info("Z-API send_audio to %s - status %s", phone, resp.status_code)
+        return data
+
+
+async def send_zapi_media(
+    instance_id: str,
+    token: str,
+    phone: str,
+    payload: bytes,
+    *,
+    category: MediaCategory,
+    mime_type: str,
+    filename: str,
+    client_token: str = "",
+) -> dict[str, object]:
+    """Send a media asset through Z-API.
+
+    Contract (checked 2026-11-07), index https://developer.z-api.io/llms.txt:
+    - image: https://developer.z-api.io/en/message/send-message-image
+      ``POST /instances/{id}/token/{token}/send-image`` ``{phone, image}``;
+    - pdf: https://developer.z-api.io/en/message/send-message-document
+      ``POST .../send-document/{extension}`` ``{phone, document, fileName}``;
+    - audio: https://developer.z-api.io/en/message/send-message-audio
+      ``POST .../send-audio`` ``{phone, audio}``; the page shows only
+      ``audio/mpeg`` (docs scout, 2026-11-08), so OGG and M4A are not sent
+      (``media_send_body.sendable_mime_types("zapi")``);
+    - video: https://developer.z-api.io/en/message/send-message-video
+      ``POST .../send-video`` ``{phone, video}``.
+    Each media field takes a link or a base64 data URI
+    (``data:<mime>;base64,...``). The response carries ``zaapId``,
+    ``messageId`` and ``id``.
+
+    Args:
+        instance_id: Z-API instance ID.
+        token: Z-API instance token (part of the URL path).
+        phone: Recipient phone in E.164 without leading '+'.
+        payload: The asset bytes.
+        category: ``media_assets.category``: image, pdf, audio or video.
+        mime_type: Canonical MIME type of the asset.
+        filename: ``media_assets.original_filename`` (``fileName`` for PDFs).
+        client_token: Z-API account security header, sent when set.
+
+    Raises:
+        ValueError: unsupported category/MIME pair or empty payload.
+        RuntimeError: sanitized upstream failure (no URL, no token).
+    """
+
+    require_sendable_media("zapi", category, mime_type, payload)
+    route, media_key = _ZAPI_MEDIA_ROUTES[category]
+    fields: dict[str, object] = {"phone": phone}
+    if category == "pdf":
+        fields["fileName"] = filename
+    body, content_length = base64_json_body(
+        fields, media_key, payload, data_uri_mime=mime_type
+    )
+
+    url = f"{ZAPI_BASE}/instances/{instance_id}/token/{token}/{route}"
+    async with safe_async_client(url, kind="zapi", timeout=MEDIA_SEND_TIMEOUT) as (
+        client,
+        validated,
+    ):
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(content_length),
+            "Host": validated.sni_host,
+        }
+        if client_token:
+            headers["Client-Token"] = client_token
+        try:
+            resp = await client.post(validated.url, content=body, headers=headers)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        except httpx.RequestError as exc:
+            raise sanitize_transport_error(exc) from None
+        data = _response_json_object(resp)
+        logger.info(
+            "Z-API send_media to %s - route %s status %s",
+            phone,
+            route,
+            resp.status_code,
+        )
         return data
 
 
@@ -282,4 +388,92 @@ async def send_evolution_audio(
             raise _sanitize_http_status_error(exc) from None
         data = _response_json_object(resp)
         logger.info("Evolution send_audio to %s - status %s", phone, resp.status_code)
+        return data
+
+
+async def send_evolution_media(
+    api_url: str,
+    instance_name: str,
+    api_key: str,
+    phone: str,
+    payload: bytes,
+    *,
+    category: MediaCategory,
+    mime_type: str,
+    filename: str,
+) -> dict[str, object]:
+    """Send a media asset through an Evolution API instance.
+
+    Contract (checked 2026-11-07):
+    - https://doc.evolution-api.com/v2/api-reference/message-controller/send-media
+      and the v2 source (``src/api/dto/sendMessage.dto.ts``,
+      ``src/validate/message.schema.ts``, ``sendMessage.controller.ts``):
+      ``POST /message/sendMedia/{instance}`` with header ``apikey`` and JSON
+      ``number``, ``mediatype`` (image|document|video|audio), ``mimetype``,
+      ``media`` (URL or raw base64, no data URI) and ``fileName`` (required
+      for a base64 document).
+    - Audio goes through ``POST /message/sendWhatsAppAudio/{instance}`` with
+      ``{number, audio: <raw base64>, encoding: true}``, the same shape
+      :func:`send_evolution_audio` uses, so it arrives as a voice note.
+
+    Args:
+        api_url: Evolution API base URL.
+        instance_name: Evolution instance name.
+        api_key: Evolution API key.
+        phone: Recipient phone in E.164 without leading '+'.
+        payload: The asset bytes.
+        category: ``media_assets.category``: image, pdf, audio or video.
+        mime_type: Canonical MIME type of the asset.
+        filename: ``media_assets.original_filename``.
+
+    Returns:
+        Evolution response dict (message id at ``key.id``).
+
+    Raises:
+        ValueError: unsupported category/MIME pair or empty payload.
+        RuntimeError: sanitized upstream failure (no URL, no API key).
+    """
+
+    require_sendable_media("evolution", category, mime_type, payload)
+    base = api_url.rstrip("/")
+    fields: dict[str, object]
+    if category == "audio":
+        url = f"{base}/message/sendWhatsAppAudio/{instance_name}"
+        fields = {"number": phone, "encoding": True}
+        media_key = "audio"
+    else:
+        url = f"{base}/message/sendMedia/{instance_name}"
+        fields = {
+            "number": phone,
+            "mediatype": _EVOLUTION_MEDIATYPES[category],
+            "mimetype": mime_type,
+            "fileName": filename,
+        }
+        media_key = "media"
+    body, content_length = base64_json_body(fields, media_key, payload)
+
+    async with safe_async_client(url, kind="evolution", timeout=MEDIA_SEND_TIMEOUT) as (
+        client,
+        validated,
+    ):
+        headers = {
+            "apikey": api_key,
+            "Content-Type": "application/json",
+            "Content-Length": str(content_length),
+            "Host": validated.sni_host,
+        }
+        try:
+            resp = await client.post(validated.url, content=body, headers=headers)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        except httpx.RequestError as exc:
+            raise sanitize_transport_error(exc) from None
+        data = _response_json_object(resp)
+        logger.info(
+            "Evolution send_media to %s - category %s status %s",
+            phone,
+            category,
+            resp.status_code,
+        )
         return data

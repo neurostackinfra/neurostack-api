@@ -1238,9 +1238,9 @@ class TestEvolutionInteractionOrigin:
             seen["run"] = context
             return await real_run(self, request, session, context=context)
 
-        async def _finish(self: Any, *args: Any, context: Any) -> Any:
+        async def _finish(self: Any, *args: Any, context: Any, **kwargs: Any) -> Any:
             seen["finish"] = context
-            seen["response"] = await real_finish(self, *args, context=context)
+            seen["response"] = await real_finish(self, *args, context=context, **kwargs)
             return seen["response"]
 
         with (

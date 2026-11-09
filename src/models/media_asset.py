@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Text,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -102,6 +104,20 @@ class MediaAsset(Base, TimestampMixin):
         nullable=False,
         default=False,
         server_default="false",
+    )
+    # Migration 045: ``TEXT[] NOT NULL DEFAULT '{}'``, the official intents
+    # (``MEDIA_BINDABLE_INTENT_SEQUENCE``) whose turns may send this file, in
+    # that sequence's order and without duplicates (the API normalizes).
+    # PostgreSQL is the only production dialect; the in-memory SQLite of the
+    # unit tests has no array type, so there the list is stored as JSON (the
+    # same role the JSONB patch of ``init_database`` plays for JSONB).  The
+    # Python default makes every ORM insert name the column with ``[]``, on
+    # both dialects; the server default covers SQL that does not name it.
+    trigger_intents: Mapped[list[str]] = mapped_column(
+        ARRAY(Text).with_variant(JSON(), "sqlite"),
+        nullable=False,
+        default=list,
+        server_default=text("'{}'"),
     )
 
     tenant: Mapped["Tenant"] = relationship(

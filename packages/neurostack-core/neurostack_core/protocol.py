@@ -151,6 +151,33 @@ OFFICIAL_INTENT_SEQUENCE: Final[tuple[str, ...]] = (
 
 OFFICIAL_INTENT_IDS: Final[frozenset[str]] = frozenset(OFFICIAL_INTENT_SEQUENCE)
 
+# The official intents a Central de Mídias file may be bound to
+# (``media_assets.trigger_intents``): informative turns only, never a
+# scheduling, safety, handoff, billing or patient-data flow.  Media never
+# attaches to scheduling (``agendar``, ``reagendar``, ``cancelar``,
+# ``confirmar_presenca``, ``disponibilidade_horarios``), and
+# ``fora_do_horario`` is out too because it enqueues a handoff
+# (``ENFILEIRAR_HANDOFF_FORA_DO_HORARIO``).  The order is the one of
+# ``OFFICIAL_INTENT_SEQUENCE``: the API stores and returns bound intents in it.
+MEDIA_BINDABLE_INTENT_SEQUENCE: Final[tuple[str, ...]] = (
+    "saudacao",
+    "interesse_tratamento",
+    "pedido_preco",
+    "comparacao_tratamentos",
+    "objecao_vou_pensar",
+    "detalhes_servicos",
+    "pre_atendimento",
+    "faq",
+    "cultura_historia",
+    "qualificacao_publico",
+    "informacoes_profissionais",
+    "pos_atendimento_duvida",
+)
+
+MEDIA_BINDABLE_INTENT_IDS: Final[frozenset[str]] = frozenset(
+    MEDIA_BINDABLE_INTENT_SEQUENCE
+)
+
 ACTION_IDS: Final[frozenset[str]] = frozenset(item.value for item in ActionType)
 
 POLICY_RULE_IDS: Final[frozenset[str]] = frozenset(
@@ -294,6 +321,8 @@ __all__ = [
     "INSURANCE_CARE_MODALITY",
     "INSURANCE_TRIAGE_CUSTOM_KEY",
     "IntentCategory",
+    "MEDIA_BINDABLE_INTENT_IDS",
+    "MEDIA_BINDABLE_INTENT_SEQUENCE",
     "OFFICIAL_INTENT_IDS",
     "OFFICIAL_INTENT_SEQUENCE",
     "POLICY_RULE_IDS",

@@ -137,8 +137,10 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
     # lifecycle transitions, balance thresholds, debt recorded, debt settled,
     # hold/purge) + 1 asaas-rollout-opening Group 2c family (the label-less
     # billing fact consumer not-ready counter: a turned-away presentation is
-    # not an attempt, so it stays out of the closed attempts outcome enum).
-    assert len(METRIC_DIMENSION_CONTRACTS) == 87
+    # not an attempt, so it stays out of the closed attempts outcome enum)
+    # + 2 envio-midia-agente Group 2 families (agent media selection and
+    # delivery).
+    assert len(METRIC_DIMENSION_CONTRACTS) == 89
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 
@@ -330,3 +332,104 @@ def test_arbitrary_legacy_values_collapse_to_a_bounded_vocabulary() -> None:
         flow_mode="patient@example.com",
     )
     assert labels == {"flow_mode": "unknown"}
+
+
+# envio-midia-agente Group 2 (Decision 14): the two agent media families.
+_AGENT_MEDIA_SELECTION_OUTCOMES = frozenset(
+    {"selected", "none", "invalid_marker", "dropped", "candidates_capped"}
+)
+_AGENT_MEDIA_DELIVERY_OUTCOMES = frozenset(
+    {
+        "sent",
+        "deduplicated",
+        "failed",
+        "asset_gone",
+        "too_large",
+        "busy",
+        "credit_refused",
+        "flag_off",
+    }
+)
+_AGENT_MEDIA_PROVIDERS = frozenset({"meta", "zapi", "uazapi", "evolution"})
+
+
+def test_the_agent_media_families_are_closed_enums_without_identity() -> None:
+    selection = metric_dimension_contract("neurostack_agent_media_selection")
+    delivery = metric_dimension_contract("neurostack_agent_media_delivery")
+
+    assert selection.labels == ("outcome",)
+    assert delivery.labels == ("provider", "outcome")
+    for contract in (selection, delivery):
+        for policy in contract.policies.values():
+            # Closed: no normalizer, no fallback that would hide a typo.
+            assert (policy.source, policy.normalizer, policy.fallback) == (
+                "enum",
+                None,
+                None,
+            )
+    assert selection.policies["outcome"].vocabulary == _AGENT_MEDIA_SELECTION_OUTCOMES
+    assert delivery.policies["outcome"].vocabulary == _AGENT_MEDIA_DELIVERY_OUTCOMES
+    assert delivery.policies["provider"].vocabulary == _AGENT_MEDIA_PROVIDERS
+    # The family names are the contract keys, without the counters' _total.
+    assert "neurostack_agent_media_selection_total" not in METRIC_DIMENSION_CONTRACTS
+    assert "neurostack_agent_media_delivery_total" not in METRIC_DIMENSION_CONTRACTS
+
+
+def test_the_agent_media_counters_are_registered_and_pre_created() -> None:
+    from prometheus_client import REGISTRY
+
+    from src.observability.metrics import (
+        AGENT_MEDIA_DELIVERY_TOTAL,
+        AGENT_MEDIA_SELECTION_TOTAL,
+    )
+
+    assert AGENT_MEDIA_SELECTION_TOTAL._name == "neurostack_agent_media_selection"
+    assert AGENT_MEDIA_DELIVERY_TOTAL._name == "neurostack_agent_media_delivery"
+    families = {
+        family.name: family
+        for family in REGISTRY.collect()
+        if family.name.startswith("neurostack_agent_media_")
+    }
+    assert set(families) == {
+        "neurostack_agent_media_selection",
+        "neurostack_agent_media_delivery",
+    }
+    selection = {
+        sample.labels["outcome"]
+        for sample in families["neurostack_agent_media_selection"].samples
+        if sample.name.endswith("_total")
+    }
+    delivery = {
+        (sample.labels["provider"], sample.labels["outcome"])
+        for sample in families["neurostack_agent_media_delivery"].samples
+        if sample.name.endswith("_total")
+    }
+    # Every closed child exists from import, so a rare first event is seen.
+    assert selection == _AGENT_MEDIA_SELECTION_OUTCOMES
+    assert delivery == {
+        (provider, outcome)
+        for provider in _AGENT_MEDIA_PROVIDERS
+        for outcome in _AGENT_MEDIA_DELIVERY_OUTCOMES
+    }
+
+
+@pytest.mark.parametrize(
+    ("family", "labels"),
+    [
+        ("neurostack_agent_media_selection", {"outcome": "flag_off"}),
+        ("neurostack_agent_media_selection", {"outcome": "tenant-123"}),
+        (
+            "neurostack_agent_media_delivery",
+            {"provider": "meta_cloud", "outcome": "sent"},
+        ),
+        (
+            "neurostack_agent_media_delivery",
+            {"provider": "zapi", "outcome": "skipped_repeat"},
+        ),
+    ],
+)
+def test_the_agent_media_families_reject_values_outside_their_enum(
+    family: str, labels: dict[str, str]
+) -> None:
+    with pytest.raises(MetricDimensionContractError, match="rejected value"):
+        bounded_metric_labels(family, **labels)

@@ -25,6 +25,12 @@ FACADES = {
 APPROVED_SURFACES_BY_CONSUMER = {
     **{path: frozenset(FACADES) for path in LEGACY_CONSUMERS},
     Path("src/api/schemas/sessions.py"): frozenset({"neurostack_core.protocol"}),
+    # envio-midia-agente: the bindable-intent allowlist, read in one place.
+    Path("src/services/media_assets.py"): frozenset({"neurostack_core.protocol"}),
+    # envio-midia-agente: the price rule shared by the prompt and the media.
+    Path("src/services/price_disclosure_policy.py"): frozenset(
+        {"neurostack_core.prompt"}
+    ),
 }
 REMOVED_SOURCE_PREFIXES = ("src.flow", "src.policy", "src.prompt", "src.srm")
 ROOT_EXPORTED_SYMBOLS = frozenset(

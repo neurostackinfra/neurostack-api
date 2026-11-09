@@ -9,11 +9,20 @@ All outbound HTTP goes through :mod:`src.services.safe_egress`. Meta pins
 touches the wire.
 """
 
+import io
 import logging
-from typing import Optional
+from collections.abc import Mapping
+from typing import Final, Optional
 
 import httpx
 
+from src.services.media_assets import MEDIA_FILE_EXTENSIONS
+from src.services.media_send_body import (
+    MEDIA_SEND_TIMEOUT,
+    MediaCategory,
+    require_sendable_media,
+    sanitize_transport_error,
+)
 from src.services.safe_egress import safe_async_client, safe_download_audio
 
 logger = logging.getLogger(__name__)
@@ -21,6 +30,14 @@ logger = logging.getLogger(__name__)
 # Public Graph API base — pinned to v18.0 to match the payload shapes we handle
 # in the webhook. Bump both here and in the webhook parser when upgrading.
 META_GRAPH_BASE = "https://graph.facebook.com/v18.0"
+
+# media_assets category -> Graph message type.
+_META_MEDIA_TYPES: Final[Mapping[str, str]] = {
+    "image": "image",
+    "pdf": "document",
+    "audio": "audio",
+    "video": "video",
+}
 
 
 def _response_json_object(response: httpx.Response) -> dict[str, object]:
@@ -162,6 +179,134 @@ async def send_meta_cloud_audio(
         data = _response_json_object(response)
         logger.info("Meta send_audio to %s - status %s", to_phone, response.status_code)
         return data
+
+
+async def send_meta_cloud_media(
+    phone_number_id: str,
+    access_token: str,
+    to_phone: str,
+    payload: bytes,
+    *,
+    category: MediaCategory,
+    mime_type: str,
+    filename: str,
+) -> dict[str, object]:
+    """Upload a media asset and send it through Meta Cloud API.
+
+    Contract (checked 2026-11-07):
+    - Upload: https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media
+      ``POST /{phone_number_id}/media`` multipart with ``messaging_product``,
+      ``type`` (the MIME type) and ``file``; returns ``{"id": <media_id>}``.
+    - Send: https://developers.facebook.com/docs/whatsapp/cloud-api/messages/document-messages
+      ``POST /{phone_number_id}/messages`` with ``type`` image|document|audio|video
+      and ``{<type>: {"id": <media_id>}}``; documents also carry ``filename``
+      (with extension, so WhatsApp shows the right icon).
+    - Audio (https://developers.facebook.com/docs/whatsapp/cloud-api/messages/audio-messages,
+      docs scout 2026-11-08): ``audio/ogg`` is OPUS with mono input only;
+      ``audio/mp4`` (M4A) and ``audio/mpeg`` too. The upload file name's
+      extension must match ``type`` or the upload fails with 131053, so the
+      multipart name is ``media`` plus the MIME's extension; the author's
+      ``filename`` only names the document in the message.
+
+    The asset goes into the multipart body as a ``BytesIO`` view of the
+    payload, so httpx reads and writes it in small chunks: a raw ``bytes``
+    field would reach the transport as one 20 MB block, which TLS then copies
+    whole. ``BytesIO`` over ``bytes`` shares the buffer, and the
+    ``Content-Length`` is unchanged.
+
+    Args:
+        phone_number_id: Meta Cloud API phone number ID.
+        access_token: Meta access token (Bearer).
+        to_phone: Recipient phone in E.164 without leading '+'.
+        payload: The asset bytes.
+        category: ``media_assets.category``: image, pdf, audio or video.
+        mime_type: Canonical MIME type of the asset.
+        filename: ``media_assets.original_filename`` (the document's
+            ``filename`` in the message).
+
+    Returns:
+        Graph API ``/messages`` response; the id is at ``messages[0].id``.
+
+    Raises:
+        ValueError: a category/MIME pair Meta does not send, an empty payload
+            or a non-mono Ogg Opus (``require_sendable_media``), before any
+            network call.
+        RuntimeError: sanitized upstream failure (no URL, no token).
+    """
+
+    message_type = _meta_media_type(category, mime_type, payload)
+    # Meta checks the upload name's extension against ``type`` (error 131053),
+    # so it comes from the canonical MIME, never from the author's file name.
+    upload_filename = f"media{MEDIA_FILE_EXTENSIONS[mime_type]}"
+
+    upload_url = f"{META_GRAPH_BASE}/{phone_number_id}/media"
+    async with safe_async_client(
+        upload_url, kind="meta", timeout=MEDIA_SEND_TIMEOUT
+    ) as (client, validated):
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Host": validated.sni_host,
+        }
+        try:
+            response = await client.post(
+                validated.url,
+                headers=headers,
+                data={"messaging_product": "whatsapp", "type": mime_type},
+                files={"file": (upload_filename, io.BytesIO(payload), mime_type)},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        except httpx.RequestError as exc:
+            raise sanitize_transport_error(exc) from None
+        upload_payload = _response_json_object(response)
+
+    media_id = upload_payload.get("id")
+    if not isinstance(media_id, str) or not media_id:
+        raise RuntimeError("missing_uploaded_media_id")
+
+    media_object: dict[str, str] = {"id": media_id}
+    if message_type == "document":
+        media_object["filename"] = filename
+    message = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_phone,
+        "type": message_type,
+        message_type: media_object,
+    }
+    send_url = f"{META_GRAPH_BASE}/{phone_number_id}/messages"
+    async with safe_async_client(send_url, kind="meta", timeout=MEDIA_SEND_TIMEOUT) as (
+        client,
+        validated,
+    ):
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Host": validated.sni_host,
+        }
+        try:
+            response = await client.post(validated.url, headers=headers, json=message)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _sanitize_http_status_error(exc) from None
+        except httpx.RequestError as exc:
+            raise sanitize_transport_error(exc) from None
+        data = _response_json_object(response)
+        logger.info(
+            "Meta send_media to %s - type %s status %s",
+            to_phone,
+            message_type,
+            response.status_code,
+        )
+        return data
+
+
+def _meta_media_type(category: str, mime_type: str, payload: bytes) -> str:
+    """Map an asset category to its Graph message type, failing closed."""
+
+    require_sendable_media("meta", category, mime_type, payload)
+    return _META_MEDIA_TYPES[category]
 
 
 def extract_meta_message_id(send_result: dict[str, object]) -> Optional[str]:

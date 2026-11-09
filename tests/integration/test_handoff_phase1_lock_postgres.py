@@ -330,6 +330,7 @@ class _ObservedEventService(EventService):
         message_history: Any,
         *,
         context: ResolvedInteractionContext | None = None,
+        media_delivery_provider: Any = None,
     ) -> Any:
         self.at_finish = await _observe(self._factory, self._session_id)
         self.sent_before_finish = len(self._dispatcher.sent)

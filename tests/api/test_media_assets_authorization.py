@@ -371,7 +371,7 @@ async def test_builder_own_tenant_requires_claim_and_ownership_filter(
     assert "tenants.builder_id =" in statements[0]
 
 
-def test_all_five_registered_routes_accept_optional_tenant_id() -> None:
+def test_all_six_registered_routes_accept_optional_tenant_id() -> None:
     by_path_method: set[tuple[str, str]] = set()
     for registered in route.router.routes:
         if not isinstance(registered, APIRoute):
@@ -382,7 +382,149 @@ def test_all_five_registered_routes_accept_optional_tenant_id() -> None:
     assert by_path_method >= {
         ("", "POST"),
         ("", "GET"),
+        ("/bindable-intents", "GET"),
         ("/{media_id}/content", "GET"),
         ("/{media_id}", "PATCH"),
         ("/{media_id}", "DELETE"),
     }
+    bindable = next(
+        registered
+        for registered in route.router.routes
+        if isinstance(registered, APIRoute) and registered.path == "/bindable-intents"
+    )
+    assert {param.name for param in bindable.dependant.query_params} == {"tenant_id"}
+    assert bindable.dependant.query_params[0].field_info.default is None
+
+
+# ---------------------------------------------------------------------------
+# envio-midia-agente Group 2: GET /v1/media-assets/bindable-intents has the
+# scoping of every media route: resolve, classify, then read the target only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bindable_intents_resolves_then_classifies_before_the_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    order: list[str] = []
+    target = Tenant(
+        id=tenant_id,
+        name="Clinic",
+        api_key_hash="h",
+        is_active=True,
+        plan_type="clinic",
+        config={},
+    )
+
+    async def resolve(*args: Any, **kwargs: Any) -> UUID:
+        order.append("resolve")
+        return tenant_id
+
+    class Result:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+        def scalar_one_or_none(self) -> Any:
+            return self.value
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            rendered = str(statement).lower()
+            assert "media_assets" not in rendered
+            if "clinic_configs" in rendered:
+                order.append("credentials")
+                assert order == ["resolve", "classify", "credentials"]
+                # The target is revalidated in the credentials statement too.
+                assert "tenants.is_active is true" in rendered
+                assert "clinic_configs.tenant_id =" in rendered
+                return Result(None)
+            order.append("classify")
+            assert "tenants.is_active is true" in rendered
+            assert "tenants.plan_type !=" in rendered
+            return Result(target)
+
+        async def rollback(self) -> None:
+            return None
+
+    monkeypatch.setattr(route, "resolve_effective_tenant", resolve)
+    response = await route.get_media_bindable_intents(
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id, api_key="key"),
+        session=Session(),  # type: ignore[arg-type]
+    )
+
+    assert order == ["resolve", "classify", "credentials"]
+    assert response.delivery_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_bindable_intents_invalid_target_is_forbidden_before_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = uuid4()
+    statements: list[str] = []
+
+    async def resolve(*args: Any, **kwargs: Any) -> UUID:
+        return tenant_id
+
+    class Result:
+        def scalar_one_or_none(self) -> None:
+            return None
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            rendered = str(statement).lower()
+            statements.append(rendered)
+            assert "clinic_configs" not in rendered
+            return Result()
+
+        async def rollback(self) -> None:
+            return None
+
+    monkeypatch.setattr(route, "resolve_effective_tenant", resolve)
+    with pytest.raises(HTTPException) as caught:
+        await route.get_media_bindable_intents(
+            request=_request(),
+            tenant_id=None,
+            tenant=TenantContext(tenant_id),
+            session=Session(),  # type: ignore[arg-type]
+        )
+
+    assert caught.value.status_code == 403
+    assert getattr(caught.value, "detail") == {"code": "media_tenant_forbidden"}
+    assert len(statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_bindable_intents_unowned_builder_override_is_denied_by_the_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+
+    class Result:
+        def scalar_one_or_none(self) -> None:
+            return None
+
+    class Session:
+        async def execute(self, statement: Any) -> Result:
+            rendered = str(statement).lower()
+            statements.append(rendered)
+            assert "clinic_configs" not in rendered
+            return Result()
+
+        async def rollback(self) -> None:
+            return None
+
+    with pytest.raises(HTTPException) as caught:
+        await route.get_media_bindable_intents(
+            request=_request(),
+            tenant_id=uuid4(),
+            tenant=TenantContext(uuid4(), role="builder", builder_id=uuid4()),
+            session=Session(),  # type: ignore[arg-type]
+        )
+
+    assert caught.value.status_code == 403
+    assert getattr(caught.value, "detail") == {"code": "tenant_override_forbidden"}
+    assert len(statements) == 1

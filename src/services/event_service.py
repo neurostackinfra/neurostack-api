@@ -17,6 +17,7 @@ from src.api.schemas.events import (
     CanonicalEventRequest,
     ContextOutput,
     ContextSource,
+    EventAttachment,
     EventDetailResponse,
     EventResponse,
     EventType,
@@ -44,6 +45,7 @@ from src.models.session import CognitiveStateData, Session
 from src.observability.metrics import LLM_GENERATION_ATTEMPTS_TOTAL
 from src.repositories import EventRepository
 from src.repositories.session import SessionRepository
+from src.services import media_selection
 from src.services.api_credentials import (
     LLM_OVERLAY_FIELDS,
     build_cache_payload,
@@ -56,6 +58,15 @@ from src.services.conversation_language import (
     LanguageSwitchResult,
     evaluate_conversation_language,
     normalize_configured_language,
+)
+from src.services.media_marker import parse_media_marker
+from src.services.media_selection import (
+    MediaCandidate,
+    MediaDeliveryProvider,
+    MediaOffer,
+    MediaSelectionOutcome,
+    media_offer_messages,
+    record_media_selection,
 )
 
 if TYPE_CHECKING:
@@ -1543,6 +1554,7 @@ class EventService:
         message_history: list[dict[str, str]],
         *,
         context: Optional[ResolvedInteractionContext] = None,
+        media_delivery_provider: Optional[MediaDeliveryProvider] = None,
     ) -> EventResponse:
         """
         Phase 2 — slow I/O: LLM call + event-store writes.
@@ -1553,8 +1565,16 @@ class EventService:
         ``context`` must be the same object given to ``run_pipeline``
         (``None`` → the ``unknown`` factory). ``interaction_event_id`` in the
         response is set only after the Event Store batch persisted it.
+
+        ``media_delivery_provider`` is the WhatsApp provider that will carry
+        the reply, a server parameter of its webhook (envio-midia-agente).
+        ``None`` (every other caller): the turn offers no media, with no
+        database or flag read, and ``response.attachment`` is ``None``.
         """
         context = _resolve_interaction_context(request, context)
+        media_offer = await self._select_media_offer(
+            result, clinic_config, context, media_delivery_provider
+        )
 
         # Convert pipeline result to API response (LLM call happens here)
         (
@@ -1570,6 +1590,7 @@ class EventService:
             tenant_id=request.tenant_id,
             message_history=message_history,
             active_language=result.response_language,
+            media_offer=media_offer,
         )
 
         # Save events to Event Store (separate DB connections, committed independently)
@@ -1603,14 +1624,19 @@ class EventService:
         message_history: list[dict[str, str]],
         *,
         context: Optional[ResolvedInteractionContext] = None,
+        media_delivery_provider: Optional[MediaDeliveryProvider] = None,
     ) -> "GeneratedResponse":
         """Phase 2's answer without any write: the LLM of
         ``_convert_pipeline_result_to_response`` (outside every transaction).
 
         ``interaction_event_id`` of the response stays ``None``: the enforced
         caller sets it only after its final transaction committed the bundle.
+        ``media_delivery_provider`` as in :meth:`finish_response`.
         """
-        _resolve_interaction_context(request, context)
+        context = _resolve_interaction_context(request, context)
+        media_offer = await self._select_media_offer(
+            result, clinic_config, context, media_delivery_provider
+        )
         (
             response,
             llm_usage,
@@ -1624,6 +1650,7 @@ class EventService:
             tenant_id=request.tenant_id,
             message_history=message_history,
             active_language=result.response_language,
+            media_offer=media_offer,
         )
         return GeneratedResponse(
             response=response,
@@ -1703,6 +1730,28 @@ class EventService:
             request, result, clinic_config, message_history, context=context
         )
 
+    @staticmethod
+    async def _select_media_offer(
+        result: "PipelineResult",
+        clinic_config: Optional[dict[str, Any]],
+        context: ResolvedInteractionContext,
+        media_delivery_provider: Optional[MediaDeliveryProvider],
+    ) -> Optional[MediaOffer]:
+        """The turn's media candidates (envio-midia-agente), or ``None``.
+
+        No provider: ``None`` at once, before any database or flag read.
+        Otherwise :func:`media_selection.select_media_candidates`, which reads
+        the flag before any media SQL and never raises.
+        """
+        if media_delivery_provider is None:
+            return None
+        return await media_selection.select_media_candidates(
+            result=result,
+            clinic_config=clinic_config,
+            context=context,
+            delivery_provider=media_delivery_provider,
+        )
+
     async def _convert_pipeline_result_to_response(
         self,
         result: "PipelineResult",
@@ -1711,6 +1760,7 @@ class EventService:
         tenant_id: Optional[UUID] = None,
         message_history: Optional[list[dict[str, str]]] = None,
         active_language: Optional[str] = None,
+        media_offer: Optional[MediaOffer] = None,
     ) -> tuple[
         EventResponse,
         dict[str, int],
@@ -1734,6 +1784,12 @@ class EventService:
         Args:
             result: Pipeline result
             user_message: Original user message for LLM context
+            media_offer: The turn's media candidates (envio-midia-agente).
+                ``None`` or empty: the outbound messages are exactly the
+                ones without media. Otherwise its two messages (constant
+                ``system`` policy, then the JSON ``user`` data) go right
+                before the current-turn message, and the reply's
+                ``[[MIDIA:n]]`` marker resolves ``attachment``.
 
         Returns:
             ``(response, llm_usage, llm_model, llm_attempts, llm_usage_total)``
@@ -1770,6 +1826,8 @@ class EventService:
         llm_attempts: list[dict[str, Any]] = []
         language_code = active_language or result.response_language or "pt-BR"
         deterministic_response = getattr(result, "deterministic_response", None)
+        # envio-midia-agente: set once the offer's messages reached the LLM.
+        media_offered: Optional[MediaOffer] = None
         if deterministic_response is not None:
             suggested_response = deterministic_response
         elif not result.handoff_required:
@@ -1838,6 +1896,16 @@ class EventService:
                     # Insert conversation history for multi-turn context
                     for msg in message_history or []:
                         messages.append(msg)
+                    # Media offer (envio-midia-agente, Decision 10): the
+                    # constant policy ``system`` message and its JSON ``user``
+                    # data, at a fixed position right before the current
+                    # turn's message. No candidates: nothing is added, and
+                    # the list is exactly the one without media.
+                    if media_offer is not None and media_offer.candidates:
+                        messages.extend(
+                            media_offer_messages(media_offer, language_code)
+                        )
+                        media_offered = media_offer
                     messages.append({"role": "user", "content": user_message})
                     # Reinforce greeting for saudacao intent — LLM tends to echo patient's wrong greeting
                     if result.state_patch.get("last_intent") == "saudacao":
@@ -2084,6 +2152,34 @@ class EventService:
         # increment or mutate the aggregate in parallel.
         llm_usage_total: dict[str, int] = _fold_llm_usage_total(llm_attempts)
 
+        # Media marker (envio-midia-agente): every ``[[MIDIA...]]`` variant
+        # and a truncated ``[[`` tail leave the LLM text HERE, before the
+        # price and scheduling gates, the TTS, the persisted
+        # ``suggested_response`` and the training records read it -- also
+        # on a turn that offered nothing. Only an index the server numbered
+        # on this turn's offer resolves a file; text that was only markers
+        # becomes no reply (the ``no_llm_response`` path) and drops it.
+        media_choice: Optional[MediaCandidate] = None
+        media_outcome: Optional[MediaSelectionOutcome] = None
+        if deterministic_response is None and suggested_response is not None:
+            parsed = parse_media_marker(
+                suggested_response,
+                len(media_offered.candidates) if media_offered else 0,
+            )
+            suggested_response = parsed.text
+            if media_offered is not None:
+                chosen = media_offered.candidate(parsed.index)
+                if chosen is None:
+                    media_outcome = "invalid_marker" if parsed.marker_found else "none"
+                elif parsed.text is None:
+                    media_outcome = "dropped"
+                else:
+                    media_choice = chosen
+                    media_outcome = "selected"
+        elif media_offered is not None:
+            # Candidates reached the LLM but no usable reply came back.
+            media_outcome = "none"
+
         # Observability guard: flag when a monetary token appears in the
         # finalized response while atendimento_tipo != particular.
         # Increments a Prometheus counter + emits a warning log; stays at
@@ -2129,6 +2225,10 @@ class EventService:
                 )
                 if _sched_replacement is not None:
                     suggested_response = _sched_replacement
+                    # The text the file went with is gone: so is the file.
+                    if media_choice is not None:
+                        media_choice = None
+                        media_outcome = "dropped"
 
         # If handoff is required, append the handoff user message to the response.
         # When language is EN, use English fallback instead of the PT template message.
@@ -2156,6 +2256,36 @@ class EventService:
             suggested_response=suggested_response,
             deterministic=deterministic_response is not None,
         )
+
+        attachment: Optional[EventAttachment] = None
+        if media_choice is not None and (
+            result.handoff_required or deterministic_response is not None
+        ):
+            # Defensive: the selection excludes these turns before any offer.
+            media_choice = None
+            media_outcome = "dropped"
+        if media_offered is not None:
+            if media_offered.capped:
+                record_media_selection(
+                    "candidates_capped",
+                    tenant_id=result.tenant_id,
+                    session_id=result.session_id,
+                )
+            if media_outcome is not None:
+                record_media_selection(
+                    media_outcome,
+                    tenant_id=result.tenant_id,
+                    session_id=result.session_id,
+                    media_id=media_choice.media_id if media_choice else None,
+                )
+        if media_choice is not None:
+            attachment = EventAttachment(
+                media_id=media_choice.media_id,
+                display_name=media_choice.display_name,
+                category=media_choice.category,
+                mime_type=media_choice.mime_type,
+                size_bytes=media_choice.size_bytes,
+            )
 
         recent_messages = [
             MessageHistory(
@@ -2207,6 +2337,7 @@ class EventService:
                 context=context,
                 mode=flow_mode,
                 handoff_summary=handoff_summary,
+                attachment=attachment,
                 processed_at=result.processed_at,
                 processing_time_ms=result.processing_time_ms,
             ),

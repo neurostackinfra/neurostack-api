@@ -26,7 +26,6 @@ from neurostack_core.prompt import (
     CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY,
     CARE_MODALITY_SLOT,
     INSURANCE_TRIAGE_CUSTOM_KEY,
-    PRIVATE_PAY_CARE_MODALITY,
     GeneratedPrompt,
     PromptEngine,
     PromptMode,
@@ -70,6 +69,10 @@ from src.observability.scheduling_gate import (
 )
 from src.services import HandoffService, get_handoff_service
 from src.services.business_hours import format_business_hours
+from src.services.price_disclosure_policy import (
+    can_quote_private_pay,
+    clinic_price_variables,
+)
 
 logger = get_logger(__name__)
 
@@ -721,7 +724,6 @@ class CognitivePipeline:
             identity = _json_object(cfg.get("identity"))
             operations = _json_object(cfg.get("operations"))
             business = _json_object(cfg.get("business_rules"))
-            pricing = _json_object(cfg.get("pricing"))
             persona = _json_object(cfg.get("persona"))
             custom_vars["agent_name"] = (
                 identity.get("agent_name")
@@ -746,7 +748,11 @@ class CognitivePipeline:
             custom_vars["full_address"] = operations.get("full_address", "")
             custom_vars["differentials"] = business.get("differentials", "")
             custom_vars["payment_methods"] = business.get("payment_methods", "")
-            custom_vars["pricing_mode"] = pricing.get("disclosure_mode", "CONSULT_ONLY")
+            # The price variables come from the adapter the agent's media
+            # selection also reads (envio-midia-agente): one source for when
+            # a price may be shown.  Assigned at their historical positions.
+            price_vars = clinic_price_variables(cfg)
+            custom_vars["pricing_mode"] = price_vars["pricing_mode"]
 
             # Extended config injection (Group 1 — clinic-config-fullstack)
             custom_vars["agent_presentation"] = identity.get("agent_presentation", "")
@@ -757,9 +763,9 @@ class CognitivePipeline:
             custom_vars["parking_info"] = operations.get("parking_info", "")
             custom_vars["scheduling_hours"] = operations.get("scheduling_hours", "")
             custom_vars["service_format"] = operations.get("service_format", "")
-            custom_vars["accepts_insurance"] = business.get("accepts_insurance", False)
+            custom_vars["accepts_insurance"] = price_vars["accepts_insurance"]
             custom_vars["insurance_list"] = business.get("insurance_list", "")
-            custom_vars["provide_prices"] = business.get("provide_prices", False)
+            custom_vars["provide_prices"] = price_vars["provide_prices"]
             custom_vars["initial_consultation"] = business.get(
                 "initial_consultation", ""
             )
@@ -919,8 +925,8 @@ class CognitivePipeline:
         )
         # Collapses 3 states (convenio / particular / undefined) → 2 (quote / hold).
         # Prompt only emits monetary values when this is True.
-        custom_vars[CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY] = (
-            atendimento_tipo == PRIVATE_PAY_CARE_MODALITY
+        custom_vars[CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY] = can_quote_private_pay(
+            atendimento_tipo
         )
 
         _verification_status = getattr(

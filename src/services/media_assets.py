@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import AsyncContextManager, Final, Protocol
 from uuid import UUID
@@ -13,6 +13,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
+# The only application module that reads the bindable-intent allowlist from
+# the core protocol; the media routes and schemas take it from here.
+from neurostack_core.protocol import MEDIA_BINDABLE_INTENT_IDS
+from neurostack_core.protocol import (
+    MEDIA_BINDABLE_INTENT_SEQUENCE as MEDIA_BINDABLE_INTENT_SEQUENCE,
+)
 from src.models.builder import Builder
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
@@ -39,7 +45,24 @@ MEDIA_CANONICAL_MIME_TYPES: Final = frozenset(
         "image/png",
     }
 )
+# Canonical MIME -> file extension, the one table for every name the server
+# makes up: the download fallback name and the Meta upload name, which Meta
+# checks against the MIME (error 131053). The extensions are the ones Meta's
+# supported-media table lists, hence ``.jpeg`` and not ``.jpg``.
+MEDIA_FILE_EXTENSIONS: Final[dict[str, str]] = {
+    "video/mp4": ".mp4",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
+    "application/pdf": ".pdf",
+    "image/jpeg": ".jpeg",
+    "image/png": ".png",
+}
 MEDIA_STORAGE_CAP_BYTES = 500_000_000
+# A request names at most one entry per bindable intent (the allowlist's
+# size): a multipart upload with more ``trigger_intents`` parts, or a PATCH
+# with a longer list, is refused before any name is read.
+MEDIA_TRIGGER_INTENTS_MAX_ITEMS: Final = len(MEDIA_BINDABLE_INTENT_SEQUENCE)
 MEDIA_READ_CHUNK_BYTES = 1024 * 1024
 _ADVISORY_KEY_PREFIX = b"media-storage-owner:v1\0"
 _MP4_BRANDS = frozenset(
@@ -509,6 +532,27 @@ def parse_auto_suggest_wire(value: bytes | str | None) -> bool:
     raise MediaAssetDomainError("media_metadata_invalid")
 
 
+def validate_trigger_intents(values: Iterable[object]) -> list[str]:
+    """Normalize the intents a media asset is bound to (``trigger_intents``).
+
+    Every value must be one of ``MEDIA_BINDABLE_INTENT_IDS`` exactly (no case
+    folding or trimming): anything else, scheduling intents and
+    ``fora_do_horario`` included, is ``media_trigger_intent_unknown``.
+    Duplicates are removed and the result follows the allowlist's canonical
+    order (``MEDIA_BINDABLE_INTENT_SEQUENCE``), whatever order the caller
+    sent, so the stored list and every response are stable.  More than
+    :data:`MEDIA_TRIGGER_INTENTS_MAX_ITEMS` values is ``media_metadata_invalid``.
+    """
+    received = list(values)
+    if len(received) > MEDIA_TRIGGER_INTENTS_MAX_ITEMS:
+        raise MediaAssetDomainError("media_metadata_invalid")
+    for value in received:
+        if not isinstance(value, str) or value not in MEDIA_BINDABLE_INTENT_IDS:
+            raise MediaAssetDomainError("media_trigger_intent_unknown")
+    bound = set(received)
+    return [intent for intent in MEDIA_BINDABLE_INTENT_SEQUENCE if intent in bound]
+
+
 def validate_media_metadata(
     *,
     display_name: str,
@@ -713,19 +757,64 @@ def _mp4_is_audio_only(payload: bytes) -> bool:
     return b"soun" in handlers and b"vide" not in handlers
 
 
-def _looks_like_ogg_opus(payload: bytes) -> bool:
-    # RFC 3533 page header, then the RFC 7845 identification header which must
-    # open the first packet of the first page. Vorbis and FLAC in the same
-    # container are deliberately not recognized.
+def ogg_opus_identification_header(payload: bytes) -> bytes | None:
+    """The 19-byte RFC 7845 ``OpusHead`` of an Ogg Opus stream, else ``None``.
+
+    The one locator of the upload sniff and of the senders' channel check.
+    RFC 3533 page header: capture ``OggS``, stream structure version 0, the
+    beginning-of-stream flag, the segment count at offset 26 and then the
+    segment table; the identification header must open the first packet of
+    that first page, a packet of at least 19 bytes that ends on the page, with
+    a major version of 0. Vorbis and FLAC in the same container are
+    deliberately not recognized. Every byte read lies in the first 301
+    (27 + 255 + 19), so a 301-byte prefix gives the answer of the whole
+    payload. Never raises: a short or malformed payload is ``None``.
+    """
+
     if len(payload) < 27 or not payload.startswith(b"OggS"):
-        return False
-    if payload[4] != 0 or not payload[5] & 0x02:
-        return False
+        return None
+    # Stream structure version 0; beginning of stream set, continuation clear:
+    # the first page opens a packet, it does not carry the tail of one.
+    if payload[4] != 0 or payload[5] & 0x03 != 0x02:
+        return None
     identification_offset = 27 + payload[26]
+    # The first packet is the lacing values up to and including the first one
+    # below 255 (RFC 3533). RFC 7845 puts the whole ID header, 19 bytes or
+    # more, in that packet; one that runs past the page, or a page with no
+    # segments and so no packet, is not a first page.
+    first_packet = 0
+    for lacing in payload[27:identification_offset]:
+        first_packet += lacing
+        if lacing < 255:
+            break
+    else:
+        return None
+    if first_packet < 19:
+        return None
     identification = payload[identification_offset : identification_offset + 19]
     if len(identification) < 19 or not identification.startswith(b"OpusHead"):
-        return False
-    return identification[8] & 0xF0 == 0 and identification[9] >= 1
+        return None
+    if identification[8] & 0xF0 != 0:
+        return None
+    return bytes(identification)
+
+
+def ogg_opus_channel_count(payload: bytes) -> int | None:
+    """The channel count of an Ogg Opus stream, ``None`` without an OpusHead.
+
+    Read from :func:`ogg_opus_identification_header`, so the upload sniff and
+    the senders' mono check can never disagree on where the header is.
+    """
+
+    identification = ogg_opus_identification_header(payload)
+    return None if identification is None else identification[9]
+
+
+def _looks_like_ogg_opus(payload: bytes) -> bool:
+    # Zero channels is not a playable stream (RFC 7845 5.1). Any other count is
+    # recognized here as Opus; validate_media_classification refuses non-mono.
+    channels = ogg_opus_channel_count(payload)
+    return channels is not None and channels >= 1
 
 
 def classify_media_payload(payload: bytes) -> MediaClassification:
@@ -774,6 +863,11 @@ def validate_media_classification(
     a container is ``audio/mp4`` only when its track handlers prove it: at
     least one ``soun`` and no ``vide``. Declared ``video/mp4`` it stays
     ``video/mp4`` without any walk, exactly as before.
+
+    An OGG-Opus must be mono (``media_audio_not_mono``): Meta accepts
+    ``audio/ogg`` with mono input only, and no other provider sends OGG, so a
+    stored OGG is always one the agent can send. The check comes before the
+    size cap because exporting to mono also shrinks the file.
     """
     declared = canonical_declared_mime(declared_mime_type)
     if declared not in MEDIA_CANONICAL_MIME_TYPES:
@@ -787,6 +881,8 @@ def validate_media_classification(
         classification = MediaClassification("audio", "audio/mp4")
     if classification.mime_type != declared:
         raise MediaAssetDomainError("media_type_mismatch")
+    if classification.mime_type == "audio/ogg" and ogg_opus_channel_count(payload) != 1:
+        raise MediaAssetDomainError("media_audio_not_mono")
     if len(payload) > MEDIA_CATEGORY_MAX_BYTES[classification.category]:
         raise MediaAssetDomainError("media_size_exceeded")
     return classification

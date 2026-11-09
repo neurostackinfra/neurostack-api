@@ -2,6 +2,7 @@
 
 from neurostack_core.prompt.engine import PromptEngine, get_prompt_engine
 from neurostack_core.prompt.models import GeneratedPrompt, PromptMode, PromptVariables
+from neurostack_core.prompt.price_policy import can_show_price
 from neurostack_core.prompt.timeutils import resolve_clinic_tz
 from neurostack_core.protocol import (
     CAN_QUOTE_PRIVATE_PAY_CUSTOM_KEY,
@@ -21,6 +22,7 @@ __all__ = [
     "PromptEngine",
     "PromptMode",
     "PromptVariables",
+    "can_show_price",
     "get_prompt_engine",
     "resolve_clinic_tz",
 ]

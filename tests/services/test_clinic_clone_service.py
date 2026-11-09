@@ -443,6 +443,7 @@ def _media_source_row(**overrides: Any) -> dict[str, Any]:
         "payload": _MEDIA_PAYLOAD,
         "usage_trigger": "quando pedirem preços",
         "auto_suggest": True,
+        "trigger_intents": ["pedido_preco", "detalhes_servicos"],
     }
     values.update(overrides)
     return values
@@ -509,3 +510,25 @@ def test_media_clones_of_one_source_are_independent_instances() -> None:
     first.display_name = "renamed copy"
     assert second.display_name == source["display_name"]
     assert source["display_name"] == "  Tabela de preços 👁️  "
+    # The bound intents are copied per clone, never shared with the source.
+    assert first.trigger_intents == ["pedido_preco", "detalhes_servicos"]
+    assert first.trigger_intents is not source["trigger_intents"]
+    assert first.trigger_intents is not second.trigger_intents
+    first.trigger_intents.append("faq")
+    assert second.trigger_intents == ["pedido_preco", "detalhes_servicos"]
+    assert source["trigger_intents"] == ["pedido_preco", "detalhes_servicos"]
+
+
+def test_media_clone_copies_the_bound_trigger_intents() -> None:
+    assert "trigger_intents" in MEDIA_ASSET_CLONE_FIELDS
+    source = _media_source_row(trigger_intents=["saudacao", "faq"])
+
+    clone = build_media_asset_clone(_AllowlistOnlyRow(source), uuid4())
+
+    assert clone.trigger_intents == ["saudacao", "faq"]
+    assert (
+        build_media_asset_clone(
+            _media_source_row(trigger_intents=[]), uuid4()
+        ).trigger_intents
+        == []
+    )

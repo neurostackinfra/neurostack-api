@@ -88,13 +88,14 @@ def _mp4(size: int) -> bytes:
 
 
 def _ogg(size: int) -> bytes:
+    # Mono: upload refuses any other channel count (media_audio_not_mono).
     page = (
         b"OggS"
         + bytes([0, 0x02])
         + bytes(20)
         + b"\x01\x13"
         + b"OpusHead"
-        + bytes([1, 2])
+        + bytes([1, 1])
         + (312).to_bytes(2, "little")
         + (48_000).to_bytes(4, "little")
         + bytes(3)
@@ -769,6 +770,7 @@ def test_media_uses_media_assets_only(client: Any) -> None:
     media_paths = sorted(path for path in schema["paths"] if "media" in path)
     assert media_paths == [
         "/v1/media-assets",
+        "/v1/media-assets/bindable-intents",
         "/v1/media-assets/{media_id}",
         "/v1/media-assets/{media_id}/content",
     ]
@@ -776,6 +778,12 @@ def test_media_uses_media_assets_only(client: Any) -> None:
     assert (
         "402"
         in schema["paths"]["/v1/media-assets/{media_id}/content"]["get"]["responses"]
+    )
+    # envio-midia-agente: the allowlist/limits read stores and sends nothing,
+    # so it is no credit surface.
+    assert (
+        "402"
+        not in schema["paths"]["/v1/media-assets/bindable-intents"]["get"]["responses"]
     )
 
 

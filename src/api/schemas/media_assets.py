@@ -1,10 +1,26 @@
 """Schemas shared by Media Assets API operations."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
+
+from src.services.media_assets import (
+    MEDIA_BINDABLE_INTENT_SEQUENCE,
+    MEDIA_CANONICAL_MIME_TYPES,
+    MEDIA_CATEGORY_MAX_BYTES,
+    MEDIA_TRIGGER_INTENTS_MAX_ITEMS,
+)
+
+# The published shape of ``trigger_intents``: the 12 bindable intents, at most
+# one entry each.  Documentation only on requests: an unknown name is the
+# route's stable 422 ``media_trigger_intent_unknown``, never a framework error.
+TRIGGER_INTENTS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string", "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE)},
+    "maxItems": MEDIA_TRIGGER_INTENTS_MAX_ITEMS,
+}
 
 
 class MediaAssetResponse(BaseModel):
@@ -29,6 +45,12 @@ class MediaAssetResponse(BaseModel):
     size_bytes: int = Field(gt=0, le=50_000_000)
     usage_trigger: str | None = Field(default=None, max_length=500)
     auto_suggest: bool
+    trigger_intents: list[str] = Field(
+        description=(
+            "Intents whose turns may send this file, in the canonical order of "
+            "GET /v1/media-assets/bindable-intents; empty when none."
+        ),
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -68,6 +90,7 @@ class MediaAssetPatchRequest(BaseModel):
                     ]
                 },
                 "auto_suggest": {"type": "boolean"},
+                "trigger_intents": TRIGGER_INTENTS_SCHEMA,
             },
         },
     )
@@ -76,6 +99,9 @@ class MediaAssetPatchRequest(BaseModel):
     original_filename: str | None = None
     usage_trigger: str | None = None
     auto_suggest: bool | None = None
+    # The names are checked by the route (media_trigger_intent_unknown), which
+    # also removes duplicates and stores the canonical order; [] unbinds all.
+    trigger_intents: list[str] | None = None
 
     @model_validator(mode="after")
     def require_at_least_one_field(self) -> "MediaAssetPatchRequest":
@@ -83,6 +109,62 @@ class MediaAssetPatchRequest(BaseModel):
         if not self.model_fields_set:
             raise ValueError("at least one media metadata field is required")
         return self
+
+
+class MediaCategoryByteLimits(BaseModel):
+    """Largest payload of each category, in bytes (upload and agent send)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video: int = Field(gt=0)
+    audio: int = Field(gt=0)
+    pdf: int = Field(gt=0)
+    image: int = Field(gt=0)
+
+
+class MediaBindableIntentsResponse(BaseModel):
+    """What the Central de Mídias may bind a file to, and whether it is sent."""
+
+    intents: list[str] = Field(
+        description=(
+            "Every intent a media asset may be bound to, in canonical order. "
+            "Scheduling intents and fora_do_horario are never bindable."
+        ),
+        json_schema_extra={
+            "items": {
+                "type": "string",
+                "enum": list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+            }
+        },
+    )
+    delivery_enabled: bool = Field(
+        description=(
+            "True only while the agent media send flag is effective and the "
+            "clinic's WhatsApp provider authenticates its webhook (its turns "
+            "are production turns): Meta with its app secret, or Z-API with "
+            "its inbound token."
+        ),
+    )
+    max_bytes_by_category: MediaCategoryByteLimits
+    sendable_mime_types: list[str] = Field(
+        description=(
+            "The canonical MIME types the clinic's WhatsApp provider sends as "
+            "agent media, sorted; empty when the clinic has no provider that "
+            "sends media. A stored file outside it is never sent by the agent."
+        ),
+        json_schema_extra={
+            "items": {
+                "type": "string",
+                "enum": [mime for mime in sorted(MEDIA_CANONICAL_MIME_TYPES)],
+            }
+        },
+    )
+
+
+def media_category_byte_limits() -> MediaCategoryByteLimits:
+    """The published limits, read from ``MEDIA_CATEGORY_MAX_BYTES`` only."""
+
+    return MediaCategoryByteLimits(**MEDIA_CATEGORY_MAX_BYTES)
 
 
 class MediaAssetErrorDetail(BaseModel):

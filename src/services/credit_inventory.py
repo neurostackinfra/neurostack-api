@@ -199,14 +199,46 @@ async def read_credit_mode(request: HTTPConnection, session: object) -> CreditMo
     :class:`~src.services.credit_metering.CreditEnforcementUnavailable`.
     """
 
-    global _enforcement_seen
-
     if not isinstance(session, AsyncSession):
         return CREDIT_OFF
     if not isinstance(getattr(request, "scope", None), dict):
         return CREDIT_OFF  # not an ASGI request (a suite's fake)
     if not request_credit_switch(request):
         return CREDIT_OFF
+    return await _read_enforcement_mode(session)
+
+
+async def read_credit_mode_without_request(
+    session: object, *, switch_on: bool | None = None
+) -> CreditMode:
+    """:func:`read_credit_mode` for a caller that has no ``Request``: the
+    agent's media delivery (envio-midia-agente Group 5), inline after a
+    webhook's reply or from the response-outbox publisher.
+
+    The switch is ``switch_on`` when the caller captured one (a webhook
+    request's entry value), else the process-wide verdict read now
+    (:func:`~src.services.credit_switch.credit_switch_effective`, what the
+    publisher re-reads before every row).  Everything after the switch is
+    :func:`read_credit_mode`'s: switch off, or a session that is not a real
+    ``AsyncSession``: :data:`CREDIT_OFF`, no SQL; a failed read keeps the
+    caller observational unless this process already saw
+    ``credit_enforcement_at`` set -- then
+    :class:`~src.services.credit_metering.CreditEnforcementUnavailable`.
+    """
+
+    if not isinstance(session, AsyncSession):
+        return CREDIT_OFF
+    effective = credit_switch_effective() if switch_on is None else switch_on
+    if effective is not True:
+        return CREDIT_OFF
+    return await _read_enforcement_mode(session)
+
+
+async def _read_enforcement_mode(session: AsyncSession) -> CreditMode:
+    """The switch is on: ``credit_enforcement_at``, read once (the D1 rule)."""
+
+    global _enforcement_seen
+
     try:
         enforced_at = await CreditRepository(session).enforcement_at()
     except Exception as error:
@@ -2084,6 +2116,7 @@ __all__ = [
     "object_copy_runtime_enabled",
     "qdrant_runtime_enabled",
     "read_credit_mode",
+    "read_credit_mode_without_request",
     "readback",
     "record_observational_egress",
     "record_observational_upload",

@@ -44,6 +44,7 @@ from src.models.tenant import Tenant
 from src.models.user import User, UserRole
 from src.services import media_assets as media_service
 from src.services.media_assets import (
+    MEDIA_CANONICAL_MIME_TYPES,
     MediaOwnerTransition,
     MediaStorageCapacityExceeded,
     MediaStorageGuardError,
@@ -465,6 +466,57 @@ async def test_the_category_mime_invariant_admits_audio_mp4_as_audio_only(
         ("audio", "audio/mpeg"),
         ("audio", "audio/ogg"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_live_category_mime_check_is_the_stored_formats_mirror(
+    postgres_harness: _Harness,
+) -> None:
+    """The senders' ``STORED_MEDIA_MIME_TYPES`` is the CHECK at the head:
+    every category x canonical MIME pair is accepted exactly when the mirror
+    lists it."""
+
+    from src.services.media_send_body import STORED_MEDIA_MIME_TYPES
+
+    tenant_id = uuid4()
+    async with postgres_harness.session() as session:
+        session.add(
+            Tenant(
+                id=tenant_id,
+                name="Mirror Tenant",
+                slug=f"mirror-{tenant_id.hex}",
+                api_key_hash=f"mirror-{tenant_id.hex}",
+                config={},
+            )
+        )
+        await session.commit()
+
+    accepted: dict[str, set[str]] = {
+        category: set() for category in STORED_MEDIA_MIME_TYPES
+    }
+    for category in STORED_MEDIA_MIME_TYPES:
+        for mime_type in sorted(MEDIA_CANONICAL_MIME_TYPES):
+            async with postgres_harness.session() as session:
+                session.add(
+                    _asset(
+                        tenant_id,
+                        f"{category}:{mime_type}".encode(),
+                        category=category,
+                        mime_type=mime_type,
+                    )
+                )
+                try:
+                    await session.commit()
+                except SQLAlchemyError as error:
+                    assert "ck_media_assets_category_mime" in str(error), error
+                    await session.rollback()
+                else:
+                    accepted[category].add(mime_type)
+
+    assert accepted == {
+        category: set(mime_types)
+        for category, mime_types in STORED_MEDIA_MIME_TYPES.items()
+    }
 
 
 _CATEGORY_MIME_DEFINITION = text(
@@ -2185,7 +2237,12 @@ async def test_divergent_owner_reverts_prior_caller_work_without_media_queries(
 class _UploadRequest:
     """Minimal request surface consumed by the upload route."""
 
-    def __init__(self, payload: bytes, display_name: str) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        display_name: str,
+        extra: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         self.headers = Headers()
         self.url = SimpleNamespace(path="/v1/media-assets")
         self._form = FormData(
@@ -2200,6 +2257,7 @@ class _UploadRequest:
                 ),
                 ("display_name", display_name),
                 ("original_filename", f"{display_name}.pdf"),
+                *extra,
             ]
         )
 
@@ -2380,3 +2438,206 @@ async def test_two_route_uploads_serialize_on_cap_without_deadlock(
         )
         assert owner_total == 90
         assert owner_total <= 100
+
+
+@pytest.mark.asyncio
+async def test_media_route_postgres_trigger_intents_roundtrip(
+    postgres_harness: _Harness,
+) -> None:
+    """envio-midia-agente Group 2: trigger_intents through the routes, on
+    TEXT[]: stored deduplicated in canonical order, listed, replaced by
+    PATCH, and an unknown name refused (422) with nothing written."""
+
+    graph = await _seed_graph(postgres_harness, source_payloads=(b"existing",))
+    tenant = _builder_context(graph)
+    request = _route_request()
+    intents = (
+        ("trigger_intents", "faq"),
+        ("trigger_intents", "saudacao"),
+        ("trigger_intents", "faq"),
+    )
+    async with postgres_harness.session() as session:
+        asset = await media_route.upload_media_asset(
+            request=_UploadRequest(  # type: ignore[arg-type]
+                b"%PDF-1.7\nintents", "intents", extra=intents
+            ),
+            tenant_id=graph.destination_tenant_id,
+            tenant=tenant,
+            session=session,
+        )
+    assert asset.trigger_intents == ["saudacao", "faq"]
+
+    async def stored(media_id: UUID) -> Any:
+        async with postgres_harness.engine.connect() as connection:
+            return (
+                await connection.execute(
+                    text(
+                        "SELECT trigger_intents, pg_typeof(trigger_intents)::text "
+                        "FROM media_assets WHERE id = :id"
+                    ),
+                    {"id": media_id},
+                )
+            ).one()
+
+    assert tuple(await stored(asset.id)) == (["saudacao", "faq"], "text[]")
+
+    async with postgres_harness.session() as session:
+        page = await media_route.list_media_assets(
+            request=request,
+            tenant_id=graph.destination_tenant_id,
+            cursor=None,
+            page_size=25,
+            tenant=tenant,
+            session=session,
+        )
+    assert [item.trigger_intents for item in page.items] == [["saudacao", "faq"]]
+
+    async with postgres_harness.session() as session:
+        patched = await media_route.patch_media_asset(
+            media_id=asset.id,
+            patch=MediaAssetPatchRequest.model_validate_json(
+                '{"trigger_intents": ["pos_atendimento_duvida", "pedido_preco"]}'
+            ),
+            request=request,
+            tenant_id=graph.destination_tenant_id,
+            tenant=tenant,
+            session=session,
+        )
+    assert patched.trigger_intents == ["pedido_preco", "pos_atendimento_duvida"]
+    assert tuple(await stored(asset.id)) == (
+        ["pedido_preco", "pos_atendimento_duvida"],
+        "text[]",
+    )
+
+    # PATCH with an unknown (a scheduling) intent: 422, the row unchanged.
+    async with postgres_harness.session() as session:
+        with pytest.raises(HTTPException) as refused_patch:
+            await media_route.patch_media_asset(
+                media_id=asset.id,
+                patch=MediaAssetPatchRequest.model_validate_json(
+                    '{"display_name": "nunca", "trigger_intents": ["agendar"]}'
+                ),
+                request=request,
+                tenant_id=graph.destination_tenant_id,
+                tenant=tenant,
+                session=session,
+            )
+    assert refused_patch.value.status_code == 422
+    assert getattr(refused_patch.value, "detail") == {
+        "code": "media_trigger_intent_unknown"
+    }
+    async with postgres_harness.session() as session:
+        unchanged = await session.get(MediaAsset, asset.id)
+        assert unchanged is not None
+        assert unchanged.display_name == "intents"
+        assert unchanged.trigger_intents == ["pedido_preco", "pos_atendimento_duvida"]
+
+    # POST with an unknown intent: 422, nothing inserted.
+    async with postgres_harness.session() as session:
+        before = await session.scalar(
+            select(func.count(MediaAsset.id)).where(
+                MediaAsset.tenant_id == graph.destination_tenant_id
+            )
+        )
+    async with postgres_harness.session() as session:
+        with pytest.raises(HTTPException) as refused_upload:
+            await media_route.upload_media_asset(
+                request=_UploadRequest(  # type: ignore[arg-type]
+                    b"%PDF-1.7\nrefused",
+                    "refused",
+                    extra=(("trigger_intents", "fora_do_horario"),),
+                ),
+                tenant_id=graph.destination_tenant_id,
+                tenant=tenant,
+                session=session,
+            )
+    assert refused_upload.value.status_code == 422
+    assert getattr(refused_upload.value, "detail") == {
+        "code": "media_trigger_intent_unknown"
+    }
+    async with postgres_harness.session() as session:
+        after = await session.scalar(
+            select(func.count(MediaAsset.id)).where(
+                MediaAsset.tenant_id == graph.destination_tenant_id
+            )
+        )
+    assert after == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["on", "off", "absent"])
+async def test_media_route_postgres_bindable_intents_reads_the_target_credentials(
+    postgres_harness: _Harness, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """envio-midia-agente Group 2: the credentials read of bindable-intents
+    on real PostgreSQL (JSONB, the target revalidated in the same
+    statement): Z-API with its inbound token is ready, a complete uazapi
+    is not, a clinic without a config row is not; and only the flag on opens
+    the ready one."""
+
+    from src.models.clinic_config_table import ClinicConfigTable
+    from tests.api.test_media_assets import _install_flag_document
+
+    _install_flag_document(monkeypatch, flag)
+    zapi, uazapi, bare = uuid4(), uuid4(), uuid4()
+    async with postgres_harness.session() as session:
+        session.add_all(
+            [
+                Tenant(
+                    id=tenant_id,
+                    name=f"Bindable {tenant_id.hex[:6]}",
+                    slug=f"bindable-{tenant_id.hex}",
+                    api_key_hash=f"bindable-{tenant_id.hex}",
+                    plan_type="clinic",
+                    config={},
+                )
+                for tenant_id in (zapi, uazapi, bare)
+            ]
+        )
+        await session.flush()
+        session.add_all(
+            [
+                ClinicConfigTable(
+                    tenant_id=zapi,
+                    api_credentials={
+                        "whatsapp_provider": "zapi",
+                        "zapi_instance_id": "instance",
+                        "zapi_token": "token",
+                        "zapi_inbound_token_digest": "cd" * 32,
+                    },
+                ),
+                ClinicConfigTable(
+                    tenant_id=uazapi,
+                    api_credentials={
+                        "whatsapp_provider": "uazapi",
+                        "uazapi_api_url": "https://uazapi.example",
+                        "uazapi_instance_name": "clinic",
+                        "uazapi_token": "token",
+                    },
+                ),
+            ]
+        )
+        await session.commit()
+
+    async def bindable(tenant_id: UUID) -> tuple[bool, list[str]]:
+        async with postgres_harness.session() as session:
+            response = await media_route.get_media_bindable_intents(
+                request=_route_request(),
+                tenant_id=None,
+                tenant=TenantContext(tenant_id, api_key="tenant-scoped"),
+                session=session,
+            )
+        assert len(response.intents) == 12
+        return response.delivery_enabled, response.sendable_mime_types
+
+    # Z-API documents only audio/mpeg: OGG and M4A are not sendable there.
+    zapi_sendable = [
+        "application/pdf",
+        "audio/mpeg",
+        "image/jpeg",
+        "image/png",
+        "video/mp4",
+    ]
+    assert await bindable(zapi) == (flag == "on", zapi_sendable)
+    assert await bindable(uazapi) == (False, zapi_sendable)
+    assert await bindable(bare) == (False, [])
