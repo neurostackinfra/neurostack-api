@@ -245,6 +245,9 @@ def test_each_service_refusal_maps_to_its_published_reason() -> None:
         "cutoff acceptance author is not an active super_admin": (
             "author_not_active_super_admin"
         ),
+        "uazapi has no enforced credit adapter": (
+            "uazapi_enforced_credit_adapter_missing"
+        ),
     }
 
 
@@ -722,3 +725,172 @@ def test_run_step_refuses_an_empty_or_foreign_override(tmp_path: Path) -> None:
         )
         assert result.returncode != 0
         assert not (tmp_path / "aws-args.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# uazapi-webhook-auth: the L10 guard through the task's own handlers.
+# ---------------------------------------------------------------------------
+
+GUARD_REASON = "uazapi_enforced_credit_adapter_missing"
+
+
+def test_the_guard_reason_is_closed_and_never_a_cutoff_reason() -> None:
+    """In ``REASONS`` (else ``RunResult`` raises), never in
+    ``CUTOFF_REASON_CODES``: no acceptance can name it."""
+
+    assert ops.UAZAPI_ADAPTER_REASON == GUARD_REASON
+    assert GUARD_REASON in ops.REASONS
+    assert GUARD_REASON in ops.REJECTION_REASONS.values()
+    assert GUARD_REASON not in ops.CUTOFF_REASON_CODES
+    document = ops.RunResult(
+        command="arm", verdict="refused", reasons=(GUARD_REASON,)
+    ).document()
+    assert (document["exit_code"], document["reasons"]) == (20, [GUARD_REASON])
+
+
+async def test_an_acceptance_cannot_name_the_guard() -> None:
+    code, document = await _invoke(_accept(**{"--reason-code": GUARD_REASON}))
+    assert (code, document["verdict"], document["reasons"]) == (
+        30,
+        "unconfigured",
+        ["usage"],
+    )
+
+
+class _Session:
+    """Just enough of an ``AsyncSession`` for the handlers' own bookkeeping."""
+
+    def __init__(self) -> None:
+        self.rollbacks = 0
+        self.commits = 0
+
+    def get_bind(self) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def __aenter__(self) -> "_Session":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _fake_database(monkeypatch: pytest.MonkeyPatch) -> _Session:
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    from src.repositories.credit import CreditRepository
+
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(CreditRepository, "lock_rollout_control", AsyncMock())
+    monkeypatch.setattr(CreditRepository, "database_now", AsyncMock(return_value=now))
+    monkeypatch.setattr(
+        ops,
+        "_fresh_enforcement",
+        AsyncMock(return_value=ops._Enforcement(None, None, None)),
+    )
+    return _Session()
+
+
+async def test_arm_without_the_swap_is_refused_with_exit_20(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real ``arm_enforcement`` behind the real handler: ``refused``,
+    exit 20, the closed reason -- no ``ValueError`` from ``RunResult`` and
+    no orphan step, readiness, cutoff, commit or state write."""
+
+    from unittest.mock import AsyncMock
+
+    from src.services.credit_rollout import CreditRolloutService
+
+    session = _fake_database(monkeypatch)
+    later = AsyncMock()
+    for name in ("reconcile_orphans", "capability_ready", "cutoff_report"):
+        monkeypatch.setattr(CreditRolloutService, name, later)
+
+    async def arn() -> str:
+        return TASK_ARN
+
+    args = ops.parse_arguments(["arm", "--report-digest", DIGEST])
+    result = await ops._arm(args, lambda: session, arn, {"effective": True})
+
+    assert (result.verdict, result.reasons, result.exit_code) == (
+        "refused",
+        (GUARD_REASON,),
+        20,
+    )
+    assert result.document()["reasons"] == [GUARD_REASON]
+    later.assert_not_awaited()
+    assert (session.commits, session.rollbacks) == (0, 1)
+
+
+@pytest.mark.parametrize("swapped", [False, True])
+async def test_status_reports_the_guard_so_ready_never_precedes_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, swapped: bool
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from src.services import credit_rollout
+    from src.services.credit_rollout import (
+        CapabilityReadiness,
+        CreditRolloutService,
+        CutoffReport,
+        DeletionClosurePreview,
+        OrphanReport,
+    )
+
+    session = _fake_database(monkeypatch)
+    ready = CapabilityReadiness(
+        environment="test",
+        billing_fact_schema_digest="a" * 64,
+        inbox_high_watermark=0,
+        reconciliation_complete=True,
+        readback_complete=True,
+        has_open_gap=False,
+        has_backlog=False,
+        has_alert=False,
+    )
+    monkeypatch.setattr(
+        ops, "_enforcement", AsyncMock(return_value=ops._Enforcement(None, None, None))
+    )
+    monkeypatch.setattr(ops, "_accepted_findings", AsyncMock(return_value=set()))
+    monkeypatch.setattr(
+        CreditRolloutService, "capability_ready", AsyncMock(return_value=ready)
+    )
+    monkeypatch.setattr(
+        CreditRolloutService, "orphan_report", AsyncMock(return_value=OrphanReport())
+    )
+    monkeypatch.setattr(
+        CreditRolloutService,
+        "deletion_closure_preview",
+        AsyncMock(return_value=DeletionClosurePreview(0, OrphanReport(), ready)),
+    )
+    monkeypatch.setattr(
+        CreditRolloutService,
+        "cutoff_report",
+        AsyncMock(return_value=CutoffReport((), DIGEST, False)),
+    )
+    if swapped:
+        monkeypatch.setattr(
+            credit_rollout, "uazapi_enforced_credit_adapter_available", lambda: True
+        )
+
+    result = await ops._status(lambda: session, {"effective": True})
+
+    document = result.document()
+    assert (document["verdict"], document["exit_code"]) == ("ok", 0)
+    assert document["readiness"]["ready"] is True  # capability, as of now
+    if swapped:
+        assert document["reasons"] == []
+        assert document["readiness"]["ready_after_arm_closures"] is True
+    else:
+        # Everything else is ready, yet ``arm`` would be refused: say so.
+        assert document["reasons"] == [GUARD_REASON]
+        assert document["readiness"]["ready_after_arm_closures"] is False

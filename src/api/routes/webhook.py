@@ -26,6 +26,7 @@ from typing import (
     get_args,
     overload,
 )
+from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -59,6 +60,11 @@ from src.interaction_context import (
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.event import Event as EventModel
 from src.models.tenant import Tenant as TenantModel
+from src.observability.metric_dimensions import (
+    UazapiWebhookAuthMode,
+    UazapiWebhookAuthResult,
+)
+from src.observability.metrics import UAZAPI_WEBHOOK_AUTH_TOTAL
 from src.repositories import (
     EventRepository,
     SessionRepository,
@@ -87,7 +93,11 @@ from src.services.credit_metering import (
     zapi_ingress,
 )
 from src.services.credit_switch import request_credit_switch
-from src.services.egress_policy import EgressDisabledError, require_uazapi_egress
+from src.services.egress_policy import (
+    EgressDisabledError,
+    require_uazapi_egress,
+    uazapi_webhook_auth_enforced,
+)
 from src.services.event_service import get_event_service
 from src.services.handoff_service import (
     dispatch_committed_handoff_webhooks,
@@ -4491,6 +4501,283 @@ async def _send_uazapi_file_forwarded(
     )
 
 
+# ── Uazapi inbound authentication (uazapi-webhook-auth) ─────────────
+#
+# uazapi 2.6.0 puts the instance ``token`` in every callback envelope. The
+# check compares it with the ``uazapi_token`` stored for every row of the
+# envelope's ``instanceName``. The stored token never leaves
+# ``_load_uazapi_auth_candidates`` (the candidates carry booleans only), and
+# neither token nor any derivative of one reaches a log, a metric label, a
+# response or an exception.
+
+# The closed ``UazapiWebhookAuthResult`` and ``UazapiWebhookAuthMode`` are the
+# metric's vocabularies (``src/observability/metric_dimensions.py``): one
+# definition, imported here.
+# The 401 body of an enforced refusal (the same for every failed result).
+UAZAPI_WEBHOOK_AUTH_REFUSAL: Final[Mapping[str, str]] = MappingProxyType(
+    {"error": "invalid_webhook_auth"}
+)
+_DEFAULT_URL_PORTS: Final[Mapping[str, int]] = MappingProxyType(
+    {"http": 80, "https": 443}
+)
+
+
+@dataclass(frozen=True)
+class _UazapiAuthCandidate:
+    """One ``clinic_configs`` row of the callback's instance, as compared.
+
+    Only booleans: the stored token is compared inside the loader and
+    dropped there.
+    """
+
+    tenant_id: UUID
+    token_configured: bool
+    token_matches: bool
+    provider_matches: bool
+    base_url_matches: bool
+
+
+@dataclass(frozen=True)
+class _UazapiAuth:
+    """The check's outcome; ``matched`` is set only for ``match``."""
+
+    result: UazapiWebhookAuthResult
+    matched: Optional[_UazapiAuthCandidate]
+    candidates: tuple[_UazapiAuthCandidate, ...]
+
+
+def _uazapi_comparable_token(value: object) -> Optional[str]:
+    """A token as compared: a ``str`` that is not empty after ``strip()``.
+
+    Anything else (absent, ``None``, an ``int``, a ``dict``, blank) is no
+    token, so ``compare_digest("", "")`` can never make two missing tokens
+    equal. The send path strips the stored token too, and it is not stripped
+    when saved.
+    """
+
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _uazapi_tokens_equal(presented: Optional[str], stored: Optional[str]) -> bool:
+    """Constant-time equality of two comparable tokens; never raises.
+
+    Compared as UTF-8 bytes: ``hmac.compare_digest`` raises ``TypeError`` for
+    a non-ASCII ``str``. A string UTF-8 cannot encode (a lone surrogate the
+    JSON decoder lets through) equals nothing.
+    """
+
+    if presented is None or stored is None:
+        return False
+    try:
+        return hmac.compare_digest(
+            presented.strip().encode("utf-8"), stored.strip().encode("utf-8")
+        )
+    except Exception:
+        return False
+
+
+def _normalised_base_url(value: object) -> Optional[tuple[str, str, str]]:
+    """``(scheme, host[:port], path)`` with case, default port and trailing
+    slash normalised; ``None`` when it is not an absolute URL. Never raises."""
+
+    try:
+        if not isinstance(value, str):
+            return None
+        parts = urlsplit(value.strip())
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        if not scheme or not host:
+            return None
+        if ":" in host:
+            host = f"[{host}]"
+        if port is not None and port != _DEFAULT_URL_PORTS.get(scheme):
+            host = f"{host}:{port}"
+        return scheme, host, parts.path.rstrip("/")
+    except Exception:
+        return None
+
+
+def _uazapi_base_urls_match(presented: object, stored: object) -> bool:
+    """The envelope ``BaseUrl`` names the stored ``uazapi_api_url``."""
+
+    left = _normalised_base_url(presented)
+    return left is not None and left == _normalised_base_url(stored)
+
+
+def _uazapi_auth_candidate(
+    *,
+    tenant_id: UUID,
+    stored_token: object,
+    stored_api_url: object,
+    whatsapp_provider: object,
+    envelope_token: object,
+    envelope_base_url: object,
+) -> _UazapiAuthCandidate:
+    """Compare one stored row with the envelope; pure, never raises."""
+
+    stored = _uazapi_comparable_token(stored_token)
+    return _UazapiAuthCandidate(
+        tenant_id=tenant_id,
+        token_configured=stored is not None,
+        token_matches=_uazapi_tokens_equal(
+            _uazapi_comparable_token(envelope_token), stored
+        ),
+        provider_matches=isinstance(whatsapp_provider, str)
+        and whatsapp_provider == "uazapi",
+        base_url_matches=_uazapi_base_urls_match(envelope_base_url, stored_api_url),
+    )
+
+
+def _uazapi_auth_result(
+    candidates: tuple[_UazapiAuthCandidate, ...], *, token_present: bool
+) -> _UazapiAuth:
+    """The closed result over every row of the instance; pure.
+
+    No row: ``unknown_instance``. Exactly one matching row: ``match``. Two or
+    more: ``ambiguous_instance``. No matching row: ``token_missing`` without
+    a usable envelope token, else ``token_not_configured`` when no row has a
+    stored token, else ``mismatch``.
+    """
+
+    if not candidates:
+        return _UazapiAuth("unknown_instance", None, candidates)
+    matching = [candidate for candidate in candidates if candidate.token_matches]
+    if len(matching) == 1:
+        return _UazapiAuth("match", matching[0], candidates)
+    if matching:
+        return _UazapiAuth("ambiguous_instance", None, candidates)
+    if not token_present:
+        return _UazapiAuth("token_missing", None, candidates)
+    if not any(candidate.token_configured for candidate in candidates):
+        return _UazapiAuth("token_not_configured", None, candidates)
+    return _UazapiAuth("mismatch", None, candidates)
+
+
+async def _load_uazapi_auth_candidates(
+    instance_name: str,
+    *,
+    envelope_token: object,
+    envelope_base_url: object,
+    db: AsyncSession,
+) -> tuple[_UazapiAuthCandidate, ...]:
+    """Every row whose ``uazapi_instance_name`` is ``instance_name``, in one
+    statement, each compared with the envelope (Uazapi only).
+
+    Reads only ``tenant_id``, ``uazapi_token``, ``uazapi_api_url`` and
+    ``whatsapp_provider``; the stored token is dropped once compared.
+    """
+
+    credentials = ClinicConfigTable.api_credentials
+    rows = (
+        await db.execute(
+            select(
+                ClinicConfigTable.tenant_id,
+                credentials["uazapi_token"],
+                credentials["uazapi_api_url"],
+                credentials["whatsapp_provider"],
+            )
+            .where(credentials["uazapi_instance_name"].astext == instance_name)
+            .order_by(ClinicConfigTable.tenant_id)
+        )
+    ).all()
+    return tuple(
+        _uazapi_auth_candidate(
+            tenant_id=row[0],
+            stored_token=row[1],
+            stored_api_url=row[2],
+            whatsapp_provider=row[3],
+            envelope_token=envelope_token,
+            envelope_base_url=envelope_base_url,
+        )
+        for row in rows
+    )
+
+
+# The longest instance name rendered in a log line (the rest is cut).
+_UAZAPI_LOG_INSTANCE_LIMIT: Final = 128
+
+
+def _loggable_instance(instance: str) -> str:
+    """A body-controlled ``instanceName`` as one inert log token; never raises.
+
+    Percent-encoded with nothing kept but the unreserved characters, so a
+    newline, a space or an ``=`` cannot start a new line or forge a field;
+    an ordinary name (``my-instance_1``) renders unchanged. Cut at
+    ``_UAZAPI_LOG_INSTANCE_LIMIT`` characters (``...[truncated]`` marks the
+    cut: ``[`` and ``]`` are always encoded in the name itself).
+    """
+
+    try:
+        head = instance[:_UAZAPI_LOG_INSTANCE_LIMIT]
+        rendered = quote(head, safe="", errors="backslashreplace")
+        if len(instance) > _UAZAPI_LOG_INSTANCE_LIMIT:
+            rendered += "...[truncated]"
+        return rendered
+    except Exception:
+        return "[unloggable]"
+
+
+def _record_uazapi_webhook_auth(
+    auth: _UazapiAuth,
+    *,
+    mode: UazapiWebhookAuthMode,
+    instance: str,
+    routed_tenant_id: Optional[UUID],
+    token_present: bool,
+    owner_present: bool,
+    from_me: bool,
+) -> None:
+    """Count and log one check (``uazapi_webhook_auth``); never raises.
+
+    The row the per-row fields describe is the matching one, else the row
+    the request was routed to, else the instance's only row. The line is
+    rendered from ``fields`` by name, in its order; the only body-controlled
+    value, ``instance``, is rendered through ``_loggable_instance``.
+    """
+
+    try:
+        routed = next(
+            (c for c in auth.candidates if c.tenant_id == routed_tenant_id), None
+        )
+        if auth.matched is not None:
+            relevant: Optional[_UazapiAuthCandidate] = auth.matched
+        elif routed is not None:
+            relevant = routed
+        else:
+            relevant = auth.candidates[0] if len(auth.candidates) == 1 else None
+        fields = {
+            "mode": mode,
+            "result": auth.result,
+            "instance": instance,
+            "token_present": token_present,
+            "routed_matches": auth.matched is not None
+            and routed_tenant_id == auth.matched.tenant_id,
+            "provider_matches": relevant is not None and relevant.provider_matches,
+            "owner_present": owner_present,
+            "from_me": from_me,
+            "base_url_matches": relevant is not None and relevant.base_url_matches,
+        }
+    except Exception:
+        logger.error("uazapi_webhook_auth dropped: unreadable outcome")
+        return
+    with suppress(Exception):
+        UAZAPI_WEBHOOK_AUTH_TOTAL.labels(mode=mode, result=auth.result).inc()
+    refused = mode == "enforce" and auth.result != "match"
+    with suppress(Exception):
+        rendered = {**fields, "instance": _loggable_instance(instance)}
+        (logger.warning if refused or auth.result == "check_error" else logger.info)(
+            " ".join(
+                ["uazapi_webhook_auth", *(f"{name}=%({name})s" for name in fields)]
+            ),
+            rendered,
+            extra={"event": "uazapi_webhook_auth", **fields},
+        )
+
+
 # ── Uazapi webhook endpoint ─────────────────────────────────────────
 
 
@@ -4499,8 +4786,12 @@ async def _send_uazapi_file_forwarded(
     summary="Uazapi Webhook",
     description=(
         "Receives incoming WhatsApp messages from a self-hosted Uazapi "
-        "(wuzapi) gateway and responds automatically. Tenant is resolved by "
-        "``uazapi_instance_name`` (the ``instance`` field on the payload)."
+        "(wuzapi) gateway and responds automatically. The envelope ``token`` "
+        "is checked against the instance token stored for the payload's "
+        "``instanceName``: with ``uazapi_webhook_auth_enforced`` on, anything "
+        "but exactly one matching tenant is 401 and a match routes to that "
+        "tenant; otherwise the check only measures and the tenant is resolved "
+        "by ``uazapi_instance_name`` as before."
     ),
     tags=["Webhook"],
     response_model=None,
@@ -4513,16 +4804,29 @@ async def uazapi_webhook(
     """
     Uazapi sends a POST for every incoming message.
 
-    Expected payload (text message):
+    The callback envelope carries the instance ``token`` (uazapi 2.6.0). It
+    is compared with the token stored for every tenant of ``instanceName``
+    after the minimal parsing below and before the replay claim, so a
+    refused callback claims, creates and stores nothing. Enforced, anything
+    but exactly one matching tenant answers 401 ``invalid_webhook_auth``, and
+    a match routes to that tenant as a ``production`` turn whose credit
+    principal is authenticated (``inbound_verified``). Otherwise the check
+    only measures (``uazapi_webhook_auth``): the callback is routed by
+    instance name and is ``unknown``, as it always was.
+
+    Expected payload (text message, commercial schema):
     {
-      "instance": "my-instance",
-      "event": "message",
-      "data": {
-        "from": "5511999999999@s.whatsapp.net",
-        "body": "Olá",
+      "instanceName": "my-instance",
+      "token": "<instance token>",
+      "BaseUrl": "https://my-instance.uazapi.com",
+      "owner": "5511900000000",
+      "message": {
+        "sender_pn": "5511999999999@s.whatsapp.net",
+        "text": "Olá",
         "type": "text",
-        "id": "3EB0..."
-      }
+        "messageid": "3EB0..."
+      },
+      "chat": {"wa_chatid": "5511999999999@s.whatsapp.net"}
     }
     """
     body: dict[str, Any] = await request.json()
@@ -4573,7 +4877,7 @@ async def uazapi_webhook(
 
     logger.info(
         "Uazapi webhook: instance=%s from=%s type=%s mediaType=%s body_len=%d fromMe=%s",
-        instance_name,
+        _loggable_instance(instance_name),
         raw_from,
         msg_type,
         media_type,
@@ -4615,22 +4919,77 @@ async def uazapi_webhook(
     # point below. Staff media, audio and stickers keep their own paths.
     patient_file_kind = None if is_from_me or is_audio_media else _uazapi_file_kind(msg)
 
-    # ── resolve tenant from instance_name ──
-    tenant_id = await _resolve_tenant_by_credential(
-        "uazapi_instance_name",
-        instance_name,
-        db,
+    # ── inbound authentication: the envelope token (uazapi-webhook-auth) ──
+    # The mode is read ONCE, here: before the instance query and outside any
+    # transaction (nothing ran on ``db`` yet). That one reading decides the
+    # logged ``mode``, the 401, the origin and the credit principal. Unread
+    # or failed, it is the shadow mode: measure only, serve as before.
+    auth_enforced = await uazapi_webhook_auth_enforced()
+    token_present = _uazapi_comparable_token(body.get("token")) is not None
+    try:
+        candidates = await _load_uazapi_auth_candidates(
+            instance_name,
+            envelope_token=body.get("token"),
+            envelope_base_url=body.get("BaseUrl"),
+            db=db,
+        )
+    except Exception as exc:
+        if auth_enforced:
+            # Enforced: fail closed. A 500 (a server fault, as Z-API's), before
+            # the claim: nothing is routed or created.
+            raise
+        # Shadow never changes serving: the query was the session's first
+        # statement, so rolling back leaves it as the resolver always found
+        # it (a dead database fails the resolver, as it always did).
+        with suppress(Exception):
+            await db.rollback()
+        logger.warning(
+            "uazapi_webhook_auth check failed in shadow: %s", type(exc).__name__
+        )
+        auth = _UazapiAuth("check_error", None, ())
+    else:
+        auth = _uazapi_auth_result(candidates, token_present=token_present)
+    tenant_id: Optional[UUID]
+    if auth_enforced:
+        # Enforced: only the one matching row is routed to.
+        tenant_id = auth.matched.tenant_id if auth.matched is not None else None
+    else:
+        # Shadow: routed exactly as before, by instance name.
+        tenant_id = await _resolve_tenant_by_credential(
+            "uazapi_instance_name",
+            instance_name,
+            db,
+        )
+    owner = body.get("owner")
+    _record_uazapi_webhook_auth(
+        auth,
+        mode="enforce" if auth_enforced else "shadow",
+        instance=instance_name,
+        routed_tenant_id=tenant_id,
+        token_present=token_present,
+        owner_present=isinstance(owner, str) and bool(owner.strip()),
+        from_me=is_from_me,
     )
+    if auth_enforced and auth.result != "match":
+        # Before the claim, the session and any event: nothing is created.
+        return JSONResponse(status_code=401, content=dict(UAZAPI_WEBHOOK_AUTH_REFUSAL))
+
+    # ── no tenant: shadow routing found no row for the instance ──
     if not tenant_id:
         logger.warning(
             "Uazapi webhook: no tenant for instance %s",
-            instance_name,
+            _loggable_instance(instance_name),
         )
         return {"ok": True, "skipped": "unknown_instance"}
 
     # Origin, classified once: an instance name is a lookup key, not a proof
-    # of the sender's authenticity, so Uazapi is never production.
-    origin = InteractionOrigin.UNKNOWN
+    # of the sender's authenticity. Only an enforced match proves the caller
+    # (the envelope token is the stored instance token): then the turn is
+    # production and its credit principal authenticated; otherwise unknown.
+    inbound_verified = auth_enforced and auth.result == "match"
+    origin = (
+        InteractionOrigin.PRODUCTION if inbound_verified else InteractionOrigin.UNKNOWN
+    )
 
     # Media-gate carve-outs:
     #   * ``is_from_me and is_audio_media`` — staff voice note. Group 3 routes
@@ -4976,7 +5335,9 @@ async def uazapi_webhook(
             note="audio_too_long",
             context=context,
             db=db,
-            metering=uazapi_ingress(request, message=msg, context=context),
+            metering=uazapi_ingress(
+                request, message=msg, context=context, inbound_verified=inbound_verified
+            ),
             enforcement=None,
             clear_pending_review=False,
         )
@@ -5015,7 +5376,12 @@ async def uazapi_webhook(
                     note="file_pending_review",
                     context=context,
                     db=db,
-                    metering=uazapi_ingress(request, message=msg, context=context),
+                    metering=uazapi_ingress(
+                        request,
+                        message=msg,
+                        context=context,
+                        inbound_verified=inbound_verified,
+                    ),
                     enforcement=None,
                     clear_pending_review=True,
                 )
@@ -5085,7 +5451,9 @@ async def uazapi_webhook(
         event_request=event_request,
         db=db,
         context=context,
-        metering=uazapi_ingress(request, message=msg, context=context),
+        metering=uazapi_ingress(
+            request, message=msg, context=context, inbound_verified=inbound_verified
+        ),
         media=media,
     )
 

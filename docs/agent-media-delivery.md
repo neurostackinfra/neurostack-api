@@ -46,13 +46,17 @@ from the payload:
 |---|---|---|
 | Meta Cloud | `PRODUCTION` when the request carries a valid `X-Hub-Signature-256` HMAC over `meta_app_secret` | the signature proves the caller |
 | Z-API | `PRODUCTION` | the capability URL token matches `zapi_inbound_token_digest` and the body's instance |
-| uazapi | `UNKNOWN` | the instance name is a lookup key, not a proof |
+| uazapi | `PRODUCTION` only when `uazapi_webhook_auth_enforced` is on and the callback's envelope `token` equals the stored `uazapi_token` of exactly one row of the instance (`match`); otherwise `UNKNOWN` | in shadow (the flag off, absent or unreadable) the check only measures and the instance name stays a lookup key; enforced, the instance token proves the caller and anything but `match` is refused with 401 |
 | Evolution | `UNKNOWN` | the instance name is a lookup key, not a proof |
 
-So **uazapi and Evolution receive no media until `cloud-readiness`**
-authenticates their webhooks and turns their origin into `PRODUCTION` (see
+So **Evolution receives no media until its webhook is authenticated**, and
+**uazapi receives none while its webhook authentication is in shadow**. The
+uazapi check (wish `uazapi-webhook-auth`) ships in shadow; enforcing it is an
+owner step with its own order
+([`runbooks/uazapi-webhook-auth.md`](runbooks/uazapi-webhook-auth.md)), and
+from then on the clinic's verified turns are `PRODUCTION` (see
 [Decision 12](#decision-12-before-uazapi-or-evolution-become-production)).
-Their senders exist and are tested; they start working on their own once the
+Both senders exist and are tested; they start working on their own once the
 origin changes.
 
 The four webhooks pass the delivery provider as a server parameter. Only
@@ -69,20 +73,22 @@ true only when **both** hold:
 - `media_delivery_provider_ready(credentials)` is true for the clinic's
   `api_credentials`.
 
-`media_delivery_provider_ready` is the single readiness point:
+`media_delivery_provider_ready` is the single readiness point. For a
+uazapi clinic, `bindable-intents` reads `uazapi_webhook_auth_enforced` and,
+only when it is on, `uazapi_egress_enabled`, and passes both to it:
 
 | `whatsapp_provider` | Ready when | Otherwise |
 |---|---|---|
 | `meta_cloud` | `meta_phone_number_id`, `meta_permanent_token` **and** `meta_app_secret` are set | without the secret the readiness is `signature_pending` and the webhook answers 401: not ready |
 | `zapi` | `zapi_instance_id`, `zapi_token` **and** `zapi_inbound_token_digest` are set | not ready |
-| `uazapi` | never | not ready until `cloud-readiness` plugs its gate in here |
-| `evolution` | never | not ready until `cloud-readiness` plugs its gate in here |
+| `uazapi` | `uazapi_api_url`, `uazapi_instance_name` **and** `uazapi_token` are set, `uazapi_webhook_auth_enforced` is on (its verified turns are production) **and** `uazapi_egress_enabled` is open (the file can be sent) | not ready; in shadow it is never ready |
+| `evolution` | never | not ready until its webhook is authenticated and a gate is plugged in here |
 | `dialog360`, `twilio`, anything else | never | no media sender at all |
 
 Readiness drives only the screen's promise. The selection does not call it.
 The selection is cut by the turn's origin, and the delivery reads the flag
-again. The `cloud-readiness` provider gate is wired into
-`media_delivery_provider_ready` by whoever merges second, with a test.
+again. A future Evolution gate is wired into `media_delivery_provider_ready`
+with a test, as the uazapi one was.
 
 ### Formats each provider sends
 
@@ -161,7 +167,7 @@ any exclusion, so that case logs nothing at all, not even at debug level.
 | `no_delivery_provider` | the caller gave no provider (`POST /v1/events`, simulator, webchat, or a process without an `agent_sends` pool). Silent: never logged |
 | `unknown_delivery_provider` | the provider is not `meta`, `zapi`, `uazapi` or `evolution` |
 | `provider_sends_no_media` | the provider's sendable set is empty |
-| `origin_not_production` | `context.origin` is not `PRODUCTION` (today: every uazapi and Evolution turn) |
+| `origin_not_production` | `context.origin` is not `PRODUCTION` (today: every Evolution turn, and every uazapi turn unless its webhook authentication is enforced and the callback matched) |
 | `identity_mismatch` | the pipeline result's tenant or session differs from the context's |
 | `deterministic_response` | the pipeline already produced a literal reply (scheduling link and similar) |
 | `handoff` | handoff required, handoff mode, a handoff reason or summary, or a turn that pauses the session |
@@ -522,8 +528,10 @@ outer bound or by shutdown sends no notice.
 The send is credit egress, mode by mode, like a panel download, using the
 same functions and the same pricing ([`billing/credits.md`](billing/credits.md),
 "Units"). It is **charged to the tenant** of the turn whatever the turn's
-credit principal kind (uazapi and Evolution turns are unauthenticated kinds
-with no decision debit; the media does not change that).
+credit principal kind (Evolution turns, and uazapi turns in shadow, are
+unauthenticated with no decision debit; a verified uazapi turn is metered as
+authenticated, observationally only, since uazapi has no enforced credit
+adapter until `uazapi-credit-enforcement`; the media does not change that).
 
 | Mode | What happens |
 |---|---|
@@ -540,9 +548,10 @@ with no decision debit; the media does not change that).
 ## The flag and the kill switch
 
 `agent_media_send_enabled` is an AppConfig egress flag, read by the same
-reader as `financial_egress_enabled` and `uazapi_egress_enabled`
-(`src/services/egress_policy.py`, `EgressFlag`). It is global. The cut by
-provider comes from the turn's origin.
+reader as `financial_egress_enabled`, `uazapi_egress_enabled` and
+`uazapi_webhook_auth_enforced` (`src/services/egress_policy.py`, `EgressFlag`
+and `QuestionFlag`; the reader accepts exactly the `SUPPORTED_FLAGS` of
+`src/infrastructure/appconfig.py`). It is global. The cut by provider comes from the turn's origin.
 
 - **Fail-closed.** It is true only when the reader answers
   `{"enabled": true}`. Absent, false, not a boolean, AppConfig disabled or
@@ -551,10 +560,16 @@ provider comes from the turn's origin.
 - **Read three times:** by `bindable-intents` (the screen's promise), by the
   selection before any SQL, and again at delivery step 1.
 - **A flag left out of a new AppConfig version reads false.** Every hosted
-  version of the egress-flags profile must carry all three flags. Dropping
+  version of the egress-flags profile must carry all four flags
+  (`agent_media_send_enabled`, `financial_egress_enabled`,
+  `uazapi_egress_enabled`, `uazapi_webhook_auth_enforced`). Dropping
   `agent_media_send_enabled` while changing another flag silently stops
   agent media in every task, and dropping another flag while changing this
-  one closes that other egress.
+  one closes that other egress. For `uazapi_webhook_auth_enforced`, a
+  dropped flag means **no authentication**: once it is enforced, every
+  version must carry it `true`, or the uazapi webhook silently returns to
+  shadow ([`runbooks/uazapi-webhook-auth.md`](runbooks/uazapi-webhook-auth.md),
+  Decision 11).
 
 **To close it (kill switch, no deploy).** The setup (application,
 environment, profile, no-bake strategy, IAM) is in
@@ -563,7 +578,9 @@ and opening financial egress (follow-up F2)". **Do not deploy that
 section's "Hosted content (closed)" JSON block as is.** It is the L7
 template, with every flag false: deploying it would also close
 `financial_egress_enabled` (checkout creation) and `uazapi_egress_enabled`
-(every uazapi reply), either of which may be open in production. Instead:
+(every uazapi reply), either of which may be open in production, and would
+turn `uazapi_webhook_auth_enforced` off, which returns the uazapi webhook to
+shadow (no authentication). Instead:
 
 1. **Start from what is deployed now.** Find the profile's current
    configuration version (the latest completed deployment of the
@@ -593,16 +610,35 @@ template, with every flag false: deploying it would also close
    the hosted deployment's start time, as in the runbook's L7 step 4:
 
    ```bash
-   aws logs filter-log-events --region us-east-1 \
+   QUERY_ID=$(aws logs start-query --region us-east-1 \
      --log-group-name /ecs/neurostack-staging/app \
-     --start-time "$HOSTED_DEPLOY_START_MS" \
-     --filter-pattern '"appconfig_egress_flags_changed"'
+     --start-time "$(( HOSTED_DEPLOY_START_MS / 1000 ))" --end-time "$(date +%s)" \
+     --query-string 'fields @timestamp, @logStream, @message
+   | filter @message like /^\{"poll_ok": (true|false), "financial_egress_enabled": (true|false), "uazapi_egress_enabled": (true|false), "agent_media_send_enabled": (true|false), "uazapi_webhook_auth_enforced": (true|false), "version_label": (null|"[^"]*"), "error_type": (null|"[^"]*"), "error_code": (null|"[^"]*"), "event": "appconfig_egress_flags_changed"/
+   | sort @logStream asc, @timestamp asc
+   | limit 10000' \
+     --output text --query queryId)
+   aws logs get-query-results --region us-east-1 --query-id "$QUERY_ID"
    ```
+
+   The query is anchored on the start of the JSON line the reader writes
+   (`src/infrastructure/appconfig.py`), so the word
+   `appconfig_egress_flags_changed` inside another line (a body value in a
+   `Uazapi webhook:` line, for example) is never counted as a worker's
+   readback; a term filter such as `--filter-pattern
+   '"appconfig_egress_flags_changed"'` would count it. Run
+   `get-query-results` again until it reads `Complete`; the last line of each
+   `@logStream` is that worker's state. The pattern is the reader's line with
+   all four flags; an image older than `uazapi_webhook_auth_enforced` writes
+   a line without it, which this query does not match.
 
    Expect one line per worker (4 per task, so 8 with 2 tasks), each with
    `agent_media_send_enabled=false`, the new version label, and the other
-   two flags unchanged. A worker with no line has not seen the change yet,
+   three flags unchanged. A worker with no line has not seen the change yet,
    or its refresher stalled. A line with `poll_ok=false` also reads closed.
+   A worker started after the deployment writes its first line with
+   `poll_ok=true` at its first successful poll, and reads every flag false
+   until then.
 
 **How long it takes.** With `APPCONFIG_SOURCE=sdk`, each worker closes at its
 next poll: one clamped poll interval, 15 s by default and never more than
@@ -662,8 +698,9 @@ back to back.
    `PRODUCTION` origin; readiness drives only the screen. Opening it, for
    the [live QA](#live-qa-owner-step) or for any other reason, opens media
    for **every clinic whose turns are `PRODUCTION` origin**: today Meta with
-   `meta_app_secret` and Z-API with the inbound token; after
-   `cloud-readiness`, uazapi and Evolution too, whatever
+   `meta_app_secret` and Z-API with the inbound token; once
+   `uazapi_webhook_auth_enforced` is on, the uazapi clinics whose callbacks
+   match too (and Evolution once its webhook is authenticated), whatever
    `media_delivery_provider_ready` says. Every file with the switch on can
    go: on the turns of its subjects, and on every greeting and FAQ turn (the
    implied "Outras"), whatever it is bound to. The Central de Mídias lets a
@@ -707,9 +744,10 @@ How to read it:
 - The count is an upper bound: the selection also drops files whose format
   the provider does not send or that exceed their ceiling.
 - Tell the owner the counts for the routes that are `PRODUCTION` at the time
-  of the open, when asking for the "vai". A non-zero uazapi or Evolution row
-  after `cloud-readiness` means those clinics start receiving media and
-  paying egress at that open.
+  of the open, when asking for the "vai". A non-zero uazapi row while
+  `uazapi_webhook_auth_enforced` is on (or an Evolution row once Evolution
+  is authenticated) means those clinics start receiving media and paying
+  egress at that open.
 
 ## Rollback
 
@@ -736,22 +774,38 @@ How to read it:
 
 ## Decision 12: before uazapi or Evolution become production
 
-When `cloud-readiness` switches the uazapi or Evolution webhook origin to
-`PRODUCTION`, the flag stops being a Meta and Z-API matter. The flag is
-global, and the send path checks only that the turn is `PRODUCTION` origin:
+When a uazapi or Evolution webhook origin becomes `PRODUCTION`, the flag
+stops being a Meta and Z-API matter. The flag is global, and the send path
+checks only that the turn is `PRODUCTION` origin:
 `media_delivery_provider_ready` drives only the screen's promise. So once
 those turns are `PRODUCTION`, **opening the flag for any reason, live QA on
-a test instance included, is the reopen**: it opens media for every uazapi
-and Evolution clinic with automatic files, the production customer on
+a test instance included, is the reopen**: it opens media for every clinic
+of that provider with automatic files, the production customer on
 uazapi among them. It needs the owner's informed "vai" as such.
 
-1. **Close `agent_media_send_enabled` before** the origin switch deploys
-   ([kill switch](#the-flag-and-the-kill-switch), with its verify step).
+**uazapi.** Its origin becomes `PRODUCTION` when the AppConfig flag
+`uazapi_webhook_auth_enforced` is opened, not when code deploys: the check
+ships in shadow, where every uazapi turn stays `UNKNOWN`. Enforcing it
+follows the numbered order of
+[`runbooks/uazapi-webhook-auth.md`](runbooks/uazapi-webhook-auth.md), "The
+enforce order (Decision 10)", which carries the steps below with their hard
+preconditions and per-worker readbacks. **No code prevents enforcing while
+media is open: that order is the only control.** The uazapi readiness gate
+is already wired into `media_delivery_provider_ready` (ready only with auth
+enforced and uazapi egress open), with tests.
+
+**Evolution.** Its webhook is not authenticated yet; the same steps apply
+when it is, with its provider gate wired into `media_delivery_provider_ready`
+(with a test) so the screen's promise matches what the send path will do.
+
+1. **Close `agent_media_send_enabled` before** the origin switch (for
+   uazapi, before opening `uazapi_webhook_auth_enforced`;
+   [kill switch](#the-flag-and-the-kill-switch), with its verify step).
    Otherwise those clinics would start receiving media and paying egress
    with no step of their own.
-2. Wire the `cloud-readiness` provider gate into
-   `media_delivery_provider_ready`, with a test, so the screen's promise
-   matches what the send path will do.
+2. Switch the origin and verify it on real traffic (for uazapi: open
+   `uazapi_webhook_auth_enforced`, read it back per worker, and read `match`
+   and `PRODUCTION`, per the runbook).
 3. Run the [pre-check](#pre-check-before-any-open) and give the owner its
    uazapi and Evolution counts.
 4. **Reopen the flag only with the owner's explicit "vai"**, given for that
@@ -765,7 +819,9 @@ outside production, on an environment whose AppConfig flag is not the
 production one. Never open the production flag "just for QA".
 
 uazapi media also goes through `require_uazapi_egress`, so it needs
-`uazapi_egress_enabled` open as well.
+`uazapi_egress_enabled` open as well. Rolling the uazapi authentication back
+to shadow (closing `uazapi_webhook_auth_enforced`) stops uazapi media at the
+selection (`origin_not_production`) whatever `agent_media_send_enabled` says.
 
 ## Live QA (owner step)
 
@@ -924,8 +980,9 @@ Automática por IA" on.
 | `MEDIA_CATEGORY_MAX_BYTES` | image 5,000,000; PDF 20,000,000; audio and video 16,000,000 | `src/services/media_assets.py` |
 | `_SENDABLE_MIME_TYPES`, `sendable_mime_types`, `require_sendable_media` | per provider | `src/services/media_send_body.py` |
 | `MEDIA_SEND_TIMEOUT` | 60 s, connect 5 s | `src/services/media_send_body.py` |
-| `media_delivery_provider_ready`, `MEDIA_DELIVERY_PROVIDERS` | Meta, Z-API ready; uazapi, Evolution never | `src/services/api_credentials.py` |
+| `media_delivery_provider_ready`, `MEDIA_DELIVERY_PROVIDERS` | Meta, Z-API ready; uazapi only with `uazapi_webhook_auth_enforced` on and `uazapi_egress_enabled` open; Evolution never | `src/services/api_credentials.py` |
 | `agent_media_send_enabled` | AppConfig, fail-closed | `src/services/egress_policy.py` |
+| `uazapi_webhook_auth_enforced` | AppConfig; off, absent or unreadable is shadow (no authentication) | `src/services/egress_policy.py`, `src/api/routes/webhook.py` |
 | `MEDIA_CANDIDATES_MAX` | 5 | `src/services/media_selection.py` |
 | `MEDIA_RECENTLY_SENT_NAMES_MAX` | 5 | `src/services/media_selection.py` |
 | `parse_media_marker` | `[[MIDIA:n]]`, index of at most 6 digits | `src/services/media_marker.py` |

@@ -1132,6 +1132,22 @@ def _install_flag_document(monkeypatch: pytest.MonkeyPatch, flag: str) -> list[s
             "financial_egress_enabled": {"enabled": True},
             "uazapi_egress_enabled": {"enabled": True},
         },
+        # uazapi-webhook-auth: what a Uazapi clinic also needs.
+        "uazapi_open": {
+            "uazapi_webhook_auth_enforced": {"enabled": True},
+            "uazapi_egress_enabled": {"enabled": True},
+            "agent_media_send_enabled": {"enabled": True},
+        },
+        "uazapi_egress_closed": {
+            "uazapi_webhook_auth_enforced": {"enabled": True},
+            "uazapi_egress_enabled": {"enabled": False},
+            "agent_media_send_enabled": {"enabled": True},
+        },
+        "uazapi_shadow": {
+            "uazapi_webhook_auth_enforced": {"enabled": False},
+            "uazapi_egress_enabled": {"enabled": True},
+            "agent_media_send_enabled": {"enabled": True},
+        },
     }
     monkeypatch.setattr(settings, "appconfig_source", "agent")
     monkeypatch.setattr(settings, "appconfig_enabled", True)
@@ -1183,13 +1199,15 @@ async def test_bindable_intents_delivery_enabled_follows_flag_and_readiness(
 
     assert response.delivery_enabled is (ready and flag == "on")
     # The flag is consulted (one Agent read) only for a provider that
-    # delivers production turns.
+    # delivers production turns.  A Uazapi clinic first reads its webhook
+    # authentication flag (uazapi-webhook-auth), closed in these documents,
+    # so nothing else is read for it.
     assert reads == (
         [
             "/applications/neurostack/environments/production"
             "/configurations/egress-flags"
         ]
-        if ready
+        if ready or provider_case == "uazapi_complete"
         else []
     )
     assert response.intents == [
@@ -1278,10 +1296,62 @@ async def test_bindable_intents_flag_is_read_only_after_the_transaction_ends(
     flag_read = (
         "/applications/neurostack/environments/production/configurations/egress-flags"
     )
+    # A Uazapi clinic reads its (closed) webhook authentication flag instead.
     assert timeline == (
-        ["execute", "rollback", flag_read] if ready else ["execute", "rollback"]
+        ["execute", "rollback", flag_read]
+        if ready or provider_case == "uazapi_complete"
+        else ["execute", "rollback"]
     )
     assert response.delivery_enabled is ready
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flag", "reads", "enabled"),
+    [
+        ("uazapi_open", 3, True),
+        ("uazapi_egress_closed", 2, False),
+        ("uazapi_shadow", 1, False),
+    ],
+)
+async def test_bindable_intents_promise_uazapi_only_enforced_and_with_open_egress(
+    monkeypatch: pytest.MonkeyPatch, flag: str, reads: int, enabled: bool
+) -> None:
+    """uazapi-webhook-auth: a Uazapi clinic's verified turns are production
+    only while its webhook authentication is enforced, and its file needs
+    open egress.  Every flag is read after the read transaction ended, each
+    only when the previous one is open, the media flag last."""
+
+    timeline = _install_flag_document(monkeypatch, flag)
+    tenant_id = uuid4()
+    target = Tenant(id=tenant_id, name="Clinic", api_key_hash="h", config={})
+
+    async def authorize(*args: Any, **kwargs: Any) -> Tenant:
+        return target
+
+    class Session(_CredentialsSession):
+        async def execute(self, statement: Any) -> Any:
+            timeline.append("execute")
+            return await super().execute(statement)
+
+        async def rollback(self) -> None:
+            timeline.append("rollback")
+            await super().rollback()
+
+    monkeypatch.setattr(route, "_authorized_target", authorize)
+    response = await route.get_media_bindable_intents(
+        request=_request(),
+        tenant_id=None,
+        tenant=TenantContext(tenant_id, api_key="key"),
+        session=Session(_UAZAPI_COMPLETE),  # type: ignore[arg-type]
+    )
+
+    flag_read = (
+        "/applications/neurostack/environments/production/configurations/egress-flags"
+    )
+    assert timeline == ["execute", "rollback", *[flag_read] * reads]
+    assert response.delivery_enabled is enabled
+    assert response.sendable_mime_types == _SENDABLE_BY_PROVIDER_CASE["uazapi_complete"]
 
 
 @pytest.mark.asyncio
@@ -1428,15 +1498,30 @@ async def test_bindable_intents_storage_failure_is_503_and_rolls_back(
     assert rolled_back == [True]
 
 
+@pytest.mark.parametrize("egress", [False, True], ids=["egress_closed", "egress_open"])
+@pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforced"])
 @pytest.mark.parametrize("case", sorted(_PROVIDER_CASES))
-def test_media_delivery_provider_ready_matrix(case: str) -> None:
+def test_media_delivery_provider_ready_matrix(
+    case: str, enforced: bool, egress: bool
+) -> None:
     from src.services.api_credentials import (
         credential_status,
         media_delivery_provider_ready,
     )
 
     credentials, ready = _PROVIDER_CASES[case]
-    assert media_delivery_provider_ready(credentials or {}) is ready
+    # The Uazapi flags decide for a Uazapi clinic alone: its verified turns
+    # are production only while enforced, and its file needs open egress.
+    if case == "uazapi_complete":
+        ready = enforced and egress
+    assert (
+        media_delivery_provider_ready(
+            credentials or {},
+            uazapi_auth_enforced=enforced,
+            uazapi_egress_enabled=egress,
+        )
+        is ready
+    )
     # Derived from the readiness the credentials panel shows, never wider.
     if ready:
         assert credential_status(credentials or {})["whatsapp_readiness"] == "active"
@@ -1457,28 +1542,65 @@ def test_media_delivery_provider_ready_matrix(case: str) -> None:
         {**_ZAPI_READY, "whatsapp_provider": "ZAPI"},
         {"whatsapp_provider": "dialog360"},
         {"whatsapp_provider": "twilio"},
+        {**_UAZAPI_COMPLETE, "uazapi_token": ""},
+        {**_UAZAPI_COMPLETE, "uazapi_api_url": None},
+        {**_UAZAPI_COMPLETE, "uazapi_instance_name": ""},
+        {**_UAZAPI_COMPLETE, "whatsapp_provider": "UAZAPI"},
+        _EVOLUTION_COMPLETE,
     ],
 )
 def test_media_delivery_provider_ready_is_false_for_anything_else(
     credentials: Any,
 ) -> None:
+    """Even with both Uazapi flags open."""
+
     from src.services.api_credentials import media_delivery_provider_ready
 
-    assert media_delivery_provider_ready(credentials) is False
+    assert (
+        media_delivery_provider_ready(
+            credentials, uazapi_auth_enforced=True, uazapi_egress_enabled=True
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("value", [1, "true", None])
+def test_media_delivery_provider_ready_needs_exactly_true_flags(value: Any) -> None:
+    from src.services.api_credentials import media_delivery_provider_ready
+
+    for enforced, egress in ((value, True), (True, value)):
+        assert (
+            media_delivery_provider_ready(
+                _UAZAPI_COMPLETE,
+                uazapi_auth_enforced=enforced,
+                uazapi_egress_enabled=egress,
+            )
+            is False
+        )
 
 
 def test_the_ready_providers_are_the_authenticated_webhook_kinds() -> None:
     """Drift alarm: the providers media may use are exactly the ingress kinds
     the credit principal counts as authenticated (Meta HMAC, Z-API capability
-    token); when cloud-readiness authenticates uazapi or Evolution this fails
-    and the readiness single point must be revisited with it."""
+    token), plus the kinds it counts as authenticated per request only
+    (``inbound_verified``: a Uazapi envelope token matching the stored
+    instance token), which are ready only behind their flags.  When another
+    provider is authenticated this fails and the readiness single point must
+    be revisited with it."""
 
     from src.services import api_credentials, credit_principal
 
+    provider_of_kind = {"meta": "meta_cloud", "zapi": "zapi", "uazapi": "uazapi"}
     authenticated_webhook_kinds = {"meta", "zapi", "uazapi", "evolution"} - set(
         credit_principal._UNAUTHENTICATED_KINDS
     )
-    provider_of_kind = {"meta": "meta_cloud", "zapi": "zapi"}
     assert {
         provider_of_kind[kind] for kind in authenticated_webhook_kinds
     } == api_credentials._PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS
+    assert {
+        provider_of_kind[kind] for kind in credit_principal._INBOUND_VERIFIABLE_KINDS
+    } == api_credentials._VERIFIED_ORIGIN_WHATSAPP_PROVIDERS
+    assert not (
+        api_credentials._VERIFIED_ORIGIN_WHATSAPP_PROVIDERS
+        & api_credentials._PRODUCTION_ORIGIN_WHATSAPP_PROVIDERS
+    )

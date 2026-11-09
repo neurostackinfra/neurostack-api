@@ -30,8 +30,13 @@ credit switch is effective enforces the credits:
   lifecycle;
 - a **standalone tenant** (no builder) is `credit_pending`, so the agent
   stops answering it;
-- Uazapi/Evolution traffic stays unauthenticated: it is never enforced and
-  never debited.
+- Evolution traffic stays unauthenticated: it is never enforced and never
+  debited. Uazapi traffic is unauthenticated too, except a callback whose
+  envelope token matched while `uazapi_webhook_auth_enforced` is on
+  ([`uazapi-webhook-auth.md`](./uazapi-webhook-auth.md)): that turn is
+  metered as an authenticated production turn, but no enforced adapter
+  charges or blocks it yet. That is why `arm` refuses until the follow-up
+  wish `uazapi-credit-enforcement` lands (prerequisite 7).
 
 **An acceptance is not an exemption** (Decision 11). Accepting a cutoff
 finding only lets the arming transaction proceed with that tenant as it is.
@@ -66,6 +71,16 @@ All of these must hold before `arm`. The owner confirms them for this step:
    per finding" below).
 6. The owner has an **active `super_admin`** account. Its user id is the
    `--author-user-id` of every acceptance.
+7. **Arming requires `uazapi-credit-enforcement`.** Until that follow-up
+   wish lands, with the enforced uazapi credit adapter, `arm` always refuses
+   with `uazapi_enforced_credit_adapter_missing` (`refused`, exit 20),
+   whatever the readiness, the orphans and the cutoff say. The guard is the
+   predicate `uazapi_enforced_credit_adapter_available()` in
+   `src/services/credit_rollout.py`, which always answers `False`: nothing
+   an operator sets lifts it, and the reason is not a cutoff reason code, so
+   no acceptance clears it. Until then `status` carries the same reason in
+   `reasons` and reports `readiness.ready_after_arm_closures: false`, so
+   **prerequisite 4 cannot be met before `uazapi-credit-enforcement` lands.**
 
 ## Running a step
 
@@ -163,7 +178,10 @@ Read the output as follows:
   `readiness.ready_after_arm_closures` are what `arm` would then see. They
   are computed by reading only, with the same selection and the same orphan
   and readiness code that `arm` runs. `arm` refuses unless
-  `ready_after_arm_closures` is `true` (prerequisite 4).
+  `ready_after_arm_closures` is `true` (prerequisite 4). While the uazapi
+  guard holds (prerequisite 7), `ready_after_arm_closures` is `false`
+  whatever the readiness, and `reasons` is
+  `["uazapi_enforced_credit_adapter_missing"]`; the verdict stays `ok`.
 - `cutoff` holds `digest`, `ready`, `finding_count` and `accepted_count`.
 
 ### 2. `report` (read-only)
@@ -184,7 +202,7 @@ jq -n '{containerOverrides: [{name: "app",
 | `standalone` | traffic from a tenant with no builder: `credit_pending` once armed |
 | `builder_without_coverage` | the tenant's current builder has no current binding nor a reconciled top-up: 72-hour debt once armed |
 | `message_without_observation` | `message.in` events without any observational credit effect |
-| `unknown_unauthenticated_traffic` | Uazapi/Evolution or unknown, unauthenticated traffic |
+| `unknown_unauthenticated_traffic` | Uazapi/Evolution or unknown, unauthenticated traffic (a verified Uazapi turn still counts here until `uazapi-credit-enforcement`) |
 
 The report covers the current and the previous São Paulo civil month,
 evaluated at the database clock. The digest changes whenever the findings
@@ -268,7 +286,10 @@ jq -n --arg digest "${DIGEST:?}" \
 
 `arm` calls `arm_enforcement(set_by=<this task's ARN>, at=None,
 expected_report_digest=<--report-digest>)`. Under the rollout lock, in one
-transaction, it closes deleted-tenant orphans, requires that no other orphan
+transaction, it first checks the clock and the uazapi guard (prerequisite
+7: until `uazapi-credit-enforcement` lands it refuses here with
+`uazapi_enforced_credit_adapter_missing`, before any write), then closes
+deleted-tenant orphans, requires that no other orphan
 is open (`orphans_open`) and that readiness holds (`readiness_incomplete`),
 and evaluates the cutoff report at the database clock. It refuses when that
 report's digest differs from `--report-digest`, even if the new report would
@@ -294,7 +315,7 @@ triple under that exact digest. Only then does it write
 |---|---|---|
 | `ok` / `accepted` / `armed` | 0 | the command's success |
 | `already_armed` | 10 | enforcement was already armed, and this run changed nothing (for `arm`, also the loser of two concurrent runs; for `accept`, also an arm committed while it ran) |
-| `refused` | 20 | a gate refused, and nothing was written. `reasons`: `report_digest_mismatch`, `report_digest_malformed` (the service's own boundary check; the task already refuses a malformed `--report-digest` as `usage`), `cutoff_unaccepted`, `finding_not_in_report`, `author_not_active_super_admin`, `readiness_incomplete`, `orphans_open`, `clock_refused`, `refused_unclassified`. Fix the cause, then re-run `report` / `status` |
+| `refused` | 20 | a gate refused, and nothing was written. `reasons`: `report_digest_mismatch`, `report_digest_malformed` (the service's own boundary check; the task already refuses a malformed `--report-digest` as `usage`), `cutoff_unaccepted`, `finding_not_in_report`, `author_not_active_super_admin`, `readiness_incomplete`, `orphans_open`, `clock_refused`, `uazapi_enforced_credit_adapter_missing` (the uazapi guard, prerequisite 7: always, until `uazapi-credit-enforcement` lands; no acceptance clears it), `refused_unclassified`. Fix the cause, then re-run `report` / `status` |
 | `switch_off` | 21 | the switch is not effective in the task's process (`switch.reason`), and nothing was written. With the configuration off, nothing was read either. With the configuration on, the switch read `alembic_version` (for example `schema_below_minimum`) |
 | `unconfigured` | 30 | `usage` (malformed invocation, including an e-mail address in the rationale), `settings_invalid`, or `task_identity_unavailable` |
 | `readback_mismatch` | 40 | **the commit happened**, but the row read back differs from what the transaction wrote. Stop, do not retry, run `status` and escalate to the owner |

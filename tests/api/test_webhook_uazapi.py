@@ -31,7 +31,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -44,6 +44,10 @@ from src.api.routes import webhook as webhook_module
 from src.config.settings import settings
 from src.handoff.pause_policy import resolve_handoff_pause
 from src.interaction_context import InteractionOrigin, ResolvedInteractionContext
+from src.observability.metric_dimensions import (
+    UAZAPI_WEBHOOK_AUTH_RESULTS,
+    UazapiWebhookAuthResult,
+)
 from src.services.egress_policy import EgressDisabledError
 from src.services.multimodal_service import (
     IMAGE_NO_CONTENT_MARKER,
@@ -5932,3 +5936,1129 @@ class TestUazapiFileMediaUnchanged:
         world.download.assert_not_awaited()
         world.send.assert_not_awaited()
         assert world.pipeline_contents() == []
+
+
+# ============================================
+# uazapi-webhook-auth Group 1 — the envelope token check
+# ============================================
+
+# Never printed: every check below asserts it reaches no log, metric label,
+# response or exception (the stored token is seeded with it, the envelope
+# presents it).
+_AUTH_SENTINEL = "uzSENTINEL-7f3c9e1a-token-NEVER-LOGGED"
+# The results a seeded world can produce: the vocabulary but ``check_error``
+# (a failed instance query, raised on purpose by its own tests).
+_AUTH_RESULTS = tuple(
+    result for result in get_args(UazapiWebhookAuthResult) if result != "check_error"
+)
+
+
+def _auth_candidate(stored: Any, presented: Any, **fields: Any) -> Any:
+    return webhook_module._uazapi_auth_candidate(
+        tenant_id=fields.pop("tenant_id", uuid4()),
+        stored_token=stored,
+        stored_api_url=fields.pop("api_url", "https://uazapi.example.com"),
+        whatsapp_provider=fields.pop("provider", "uazapi"),
+        envelope_token=presented,
+        envelope_base_url=fields.pop("base_url", None),
+    )
+
+
+def _auth_of(stored_tokens: list[Any], presented: Any) -> Any:
+    candidates = tuple(_auth_candidate(token, presented) for token in stored_tokens)
+    present = webhook_module._uazapi_comparable_token(presented) is not None
+    return webhook_module._uazapi_auth_result(candidates, token_present=present)
+
+
+@pytest.mark.parametrize(
+    ("stored", "presented", "result"),
+    [
+        ([], _AUTH_SENTINEL, "unknown_instance"),
+        ([_AUTH_SENTINEL], _AUTH_SENTINEL, "match"),
+        (["other-token"], _AUTH_SENTINEL, "mismatch"),
+        ([_AUTH_SENTINEL], None, "token_missing"),
+        ([""], _AUTH_SENTINEL, "token_not_configured"),
+        ([None, "   ", 7], _AUTH_SENTINEL, "token_not_configured"),
+        ([_AUTH_SENTINEL, _AUTH_SENTINEL], _AUTH_SENTINEL, "ambiguous_instance"),
+        # empty-vs-empty is never a match (compare_digest("", "") is True)
+        ([""], "", "token_missing"),
+        (["  "], " \t", "token_missing"),
+        ([None], None, "token_missing"),
+        # surrounding whitespace is stripped on both sides (as the send path)
+        ([f"  {_AUTH_SENTINEL}\n"], f"\t{_AUTH_SENTINEL} ", "match"),
+        # non-ASCII text: compared as UTF-8 bytes, never raising
+        (["tökén-ção-😀"], "tökén-ção-😀", "match"),
+        (["tökén-ção"], "token-cao", "mismatch"),
+        ([_AUTH_SENTINEL], "tökén-ção-😀", "mismatch"),
+        # a lone surrogate (the JSON decoder lets it through) equals nothing
+        ([_AUTH_SENTINEL], "\ud800", "mismatch"),
+        (["\ud800"], "\ud800", "mismatch"),
+        # not a string: no token at all, whatever the stored one is
+        (["7"], 7, "token_missing"),
+        ([_AUTH_SENTINEL], {"token": _AUTH_SENTINEL}, "token_missing"),
+        ([_AUTH_SENTINEL], [_AUTH_SENTINEL], "token_missing"),
+        (["True"], True, "token_missing"),
+        ([7], "7", "token_not_configured"),
+        ([{"t": 1}], _AUTH_SENTINEL, "token_not_configured"),
+        # a duplicate instance with exactly one matching row is a match
+        (["other-token", _AUTH_SENTINEL], _AUTH_SENTINEL, "match"),
+        (["", _AUTH_SENTINEL, "other"], _AUTH_SENTINEL, "match"),
+    ],
+)
+def test_the_auth_result_is_closed_and_never_raises(
+    stored: list[Any], presented: Any, result: str
+) -> None:
+    auth = _auth_of(stored, presented)
+
+    assert auth.result == result
+    assert auth.result in UAZAPI_WEBHOOK_AUTH_RESULTS
+    assert (auth.matched is not None) is (result == "match")
+    for rendered in (repr(auth), str(auth)):
+        assert _AUTH_SENTINEL not in rendered
+
+
+def test_the_duplicate_match_is_the_matching_row() -> None:
+    wrong, right = uuid4(), uuid4()
+    candidates = (
+        _auth_candidate("other-token", _AUTH_SENTINEL, tenant_id=wrong),
+        _auth_candidate(_AUTH_SENTINEL, _AUTH_SENTINEL, tenant_id=right),
+    )
+    auth = webhook_module._uazapi_auth_result(candidates, token_present=True)
+    assert auth.result == "match" and auth.matched is not None
+    assert auth.matched.tenant_id == right
+    # Reversed order: still the matching row.
+    auth = webhook_module._uazapi_auth_result(candidates[::-1], token_present=True)
+    assert auth.matched is not None and auth.matched.tenant_id == right
+
+
+@pytest.mark.parametrize(
+    ("presented", "stored", "matches"),
+    [
+        ("https://clinic.uazapi.com", "https://clinic.uazapi.com", True),
+        ("https://clinic.uazapi.com/", "https://clinic.uazapi.com", True),
+        ("HTTPS://Clinic.UAZAPI.com", "https://clinic.uazapi.com/", True),
+        ("https://clinic.uazapi.com:443", "https://clinic.uazapi.com", True),
+        (" https://clinic.uazapi.com/api/ ", "https://clinic.uazapi.com/api", True),
+        ("https://clinic.uazapi.com:8443", "https://clinic.uazapi.com", False),
+        ("http://clinic.uazapi.com", "https://clinic.uazapi.com", False),
+        ("https://other.uazapi.com", "https://clinic.uazapi.com", False),
+        ("https://clinic.uazapi.com/a", "https://clinic.uazapi.com/b", False),
+        (None, "https://clinic.uazapi.com", False),
+        ("https://clinic.uazapi.com", None, False),
+        (None, None, False),
+        ("clinic.uazapi.com", "clinic.uazapi.com", False),
+        ("http://[::1", "http://[::1", False),
+        ("https://clinic.uazapi.com:99999", "https://clinic.uazapi.com:99999", False),
+        ({"url": "x"}, {"url": "x"}, False),
+    ],
+)
+def test_the_base_url_comparison_is_normalised_and_never_raises(
+    presented: Any, stored: Any, matches: bool
+) -> None:
+    assert webhook_module._uazapi_base_urls_match(presented, stored) is matches
+
+
+# -- the route ---------------------------------------------------------------
+
+
+@dataclass
+class _AuthWorld:
+    client: TestClient
+    instance: str
+    tenants: list[UUID]
+    flag_reads: list[bool] = field(default_factory=list)
+    claims: list[tuple[str, UUID, str]] = field(default_factory=list)
+    origins: list[InteractionOrigin] = field(default_factory=list)
+    ingresses: list[Any] = field(default_factory=list)
+    run_pipeline: AsyncMock = field(default_factory=AsyncMock)
+    send: AsyncMock = field(default_factory=AsyncMock)
+
+    def seed(self, tenant_id: UUID, *, token: Any, api_url: str) -> None:
+        credentials: dict[str, Any] = {
+            "whatsapp_provider": "uazapi",
+            "uazapi_api_url": api_url,
+            "uazapi_instance_name": self.instance,
+        }
+        if token is not ...:
+            credentials["uazapi_token"] = token
+        _seed_legacy_uazapi_credentials(self.client, tenant_id, credentials)
+        self.tenants.append(tenant_id)
+
+    def payload(self, token: Any = ..., **extra: Any) -> dict[str, Any]:
+        body = _uazapi_text_payload(
+            instance=self.instance,
+            from_phone="5511977776666",
+            body="Olá, quero agendar",
+            message_id=f"3EB0_auth_{uuid4().hex[:10]}",
+        )
+        if token is not ...:
+            body["token"] = token
+        body.update(extra)
+        return body
+
+    def rows(self) -> dict[UUID, tuple[int, int]]:
+        """(sessions, events) per seeded tenant."""
+
+        from sqlalchemy import func, select
+
+        from src.models.event import Event as EventRow
+        from src.models.session import Session as SessionRow
+        from src.repositories.database import get_db_session
+
+        async def _run() -> dict[UUID, tuple[int, int]]:
+            db = get_db_session()
+            try:
+                counts: dict[UUID, tuple[int, int]] = {}
+                for tenant in self.tenants:
+                    sessions = await db.scalar(
+                        select(func.count())
+                        .select_from(SessionRow)
+                        .where(SessionRow.tenant_id == tenant)
+                    )
+                    events = await db.scalar(
+                        select(func.count())
+                        .select_from(EventRow)
+                        .where(EventRow.tenant_id == tenant)
+                    )
+                    counts[tenant] = (int(sessions or 0), int(events or 0))
+                return counts
+            finally:
+                await db.close()
+
+        return self.client._submit(_run())  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def auth_world(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[bool], _AuthWorld]]:
+    """The Uazapi route with every effect observed: the mode it reads, the
+    claim, the origin of its context, the credit ingress it builds, the
+    pipeline and the reply send."""
+
+    from src.services import credit_metering
+
+    def build(enforced: bool) -> _AuthWorld:
+        world = _AuthWorld(
+            client=client, instance=f"auth_{uuid4().hex[:8]}", tenants=[]
+        )
+
+        async def mode() -> bool:
+            world.flag_reads.append(enforced)
+            return enforced
+
+        claim = webhook_module._claim_incoming_message
+
+        def spy_claim(source: str, tenant_id: UUID, message_id: str) -> bool:
+            world.claims.append((source, tenant_id, message_id))
+            return claim(source, tenant_id, message_id)
+
+        context_of = webhook_module.build_interaction_context
+
+        def spy_context(**kwargs: Any) -> Any:
+            world.origins.append(kwargs["origin"])
+            return context_of(**kwargs)
+
+        def spy_ingress(request: Any, **kwargs: Any) -> Any:
+            # What the ingress would carry with the switch on (the suite runs
+            # it off); the route's own call is unchanged.
+            switched = SimpleNamespace(
+                scope={"state": {"credit_switch_effective": True}}
+            )
+            world.ingresses.append(credit_metering.uazapi_ingress(switched, **kwargs))
+            return credit_metering.uazapi_ingress(request, **kwargs)
+
+        monkeypatch.setattr(webhook_module, "uazapi_webhook_auth_enforced", mode)
+        monkeypatch.setattr(webhook_module, "_claim_incoming_message", spy_claim)
+        monkeypatch.setattr(webhook_module, "build_interaction_context", spy_context)
+        monkeypatch.setattr(webhook_module, "uazapi_ingress", spy_ingress)
+        monkeypatch.setattr(webhook_module, "_get_redis", lambda: None)
+        service = MagicMock()
+        service._load_clinic_config = AsyncMock(return_value={})
+        world.run_pipeline.return_value = (MagicMock(), {}, [])
+        service.run_pipeline = world.run_pipeline
+        service.finish_response = AsyncMock(
+            return_value=_fake_event_response("Claro, posso ajudar.")
+        )
+        monkeypatch.setattr(webhook_module, "get_event_service", lambda: service)
+        world.send.return_value = _fake_uazapi_send_result()
+        monkeypatch.setattr(webhook_module, "send_uazapi_text", world.send)
+        webhook_module._INMEM_INCOMING.clear()
+        return world
+
+    yield build
+    webhook_module._INMEM_INCOMING.clear()
+
+
+def _seed_auth_case(world: _AuthWorld, result: str) -> tuple[Any, UUID | None]:
+    """Seed the rows of *result*; return (envelope token, matching tenant)."""
+
+    tenant = uuid4()
+    if result == "unknown_instance":
+        return _AUTH_SENTINEL, None
+    if result == "ambiguous_instance":
+        world.seed(tenant, token=_AUTH_SENTINEL, api_url="https://a.uazapi.example")
+        world.seed(uuid4(), token=_AUTH_SENTINEL, api_url="https://b.uazapi.example")
+        return _AUTH_SENTINEL, None
+    stored = "" if result == "token_not_configured" else _AUTH_SENTINEL
+    world.seed(tenant, token=stored, api_url="https://uazapi.example.com")
+    presented = {
+        "match": _AUTH_SENTINEL,
+        "mismatch": "not-the-instance-token",
+        "token_missing": ...,
+        "token_not_configured": _AUTH_SENTINEL,
+    }[result]
+    return presented, tenant if result == "match" else None
+
+
+def _auth_count(mode: str, result: str) -> float:
+    from src.observability.metrics import UAZAPI_WEBHOOK_AUTH_TOTAL
+
+    return float(
+        UAZAPI_WEBHOOK_AUTH_TOTAL.labels(mode=mode, result=result)._value.get()
+    )
+
+
+def _auth_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "uazapi_webhook_auth"
+    ]
+
+
+# The ``uazapi_webhook_auth`` line's fields, in their rendered order.
+_AUTH_LOG_FIELDS = (
+    "mode",
+    "result",
+    "instance",
+    "token_present",
+    "routed_matches",
+    "provider_matches",
+    "owner_present",
+    "from_me",
+    "base_url_matches",
+)
+
+
+def _assert_auth_line_names_its_values(record: logging.LogRecord) -> dict[str, str]:
+    """The rendered line is ``uazapi_webhook_auth`` then ``name=value`` for
+    every field, in order, each value the record's own (``instance`` through
+    the log-safe rendering): no field can be mislabelled."""
+
+    head, *pairs = record.getMessage().split(" ")
+    assert head == "uazapi_webhook_auth"
+    rendered = dict(pair.split("=", 1) for pair in pairs)
+    assert tuple(rendered) == _AUTH_LOG_FIELDS
+    expected = {name: str(getattr(record, name)) for name in _AUTH_LOG_FIELDS}
+    expected["instance"] = webhook_module._loggable_instance(
+        getattr(record, "instance")
+    )
+    assert rendered == expected
+    return rendered
+
+
+class TestUazapiWebhookAuthEnforced:
+    """Enforced: anything but one match is 401 with nothing created."""
+
+    @pytest.mark.parametrize("result", [r for r in _AUTH_RESULTS if r != "match"])
+    def test_a_failed_check_is_401_before_any_claim_session_or_event(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+        result: str,
+    ) -> None:
+        world = auth_world(True)
+        presented, _ = _seed_auth_case(world, result)
+        before = _auth_count("enforce", result)
+
+        with caplog.at_level(logging.DEBUG):
+            response = world.client.post(WEBHOOK_PATH, json=world.payload(presented))
+
+        assert response.status_code == 401
+        assert response.json() == {"error": "invalid_webhook_auth"}
+        assert world.flag_reads == [True]
+        assert world.claims == []
+        assert world.origins == [] and world.ingresses == []
+        assert all(counts == (0, 0) for counts in world.rows().values())
+        world.run_pipeline.assert_not_awaited()
+        world.send.assert_not_awaited()
+        assert _auth_count("enforce", result) == before + 1
+        (record,) = _auth_records(caplog)
+        assert (record.mode, record.result) == ("enforce", result)  # type: ignore[attr-defined]
+        assert record.levelname == "WARNING"
+
+    def test_a_match_is_a_production_turn_with_an_authenticated_principal(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from src.services.credit_metering import _claim_key
+        from src.services.credit_principal import TenantBuilder, derive_credit_principal
+
+        world = auth_world(True)
+        presented, tenant = _seed_auth_case(world, "match")
+        assert tenant is not None
+        payload = world.payload(presented)
+        before = _auth_count("enforce", "match")
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            response = world.client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        # One reading decided the 401-or-route, the origin and the principal.
+        assert world.flag_reads == [True]
+        message_id = payload["message"]["messageid"]
+        # The claim key is unchanged: (tenant, "uazapi", messageid).
+        assert world.claims == [("uazapi", tenant, message_id)]
+        assert world.origins == [InteractionOrigin.PRODUCTION]
+        (ingress,) = world.ingresses
+        assert ingress.origin is InteractionOrigin.PRODUCTION
+        assert ingress.identity.inbound_verified is True
+        principal = derive_credit_principal(
+            ingress.identity, TenantBuilder(tenant, uuid4(), True)
+        )
+        assert principal.authenticated is True
+        assert principal.principal_id == f"uazapi:{tenant}"
+        assert _claim_key(ingress, principal) == (None, message_id)
+        world.run_pipeline.assert_awaited_once()
+        world.send.assert_awaited_once()
+        assert _auth_count("enforce", "match") == before + 1
+        (record,) = _auth_records(caplog)
+        assert record.levelname == "INFO"
+        assert {
+            name: getattr(record, name)
+            for name in (
+                "mode",
+                "result",
+                "instance",
+                "token_present",
+                "routed_matches",
+                "provider_matches",
+                "owner_present",
+                "from_me",
+            )
+        } == {
+            "mode": "enforce",
+            "result": "match",
+            "instance": world.instance,
+            "token_present": True,
+            "routed_matches": True,
+            "provider_matches": True,
+            "owner_present": True,
+            "from_me": False,
+        }
+        assert _assert_auth_line_names_its_values(record) == {
+            "mode": "enforce",
+            "result": "match",
+            "instance": world.instance,
+            "token_present": "True",
+            "routed_matches": "True",
+            "provider_matches": "True",
+            "owner_present": "True",
+            "from_me": "False",
+            "base_url_matches": "False",
+        }
+
+    @pytest.mark.parametrize("matching_first", [True, False])
+    def test_a_duplicate_instance_routes_to_the_one_matching_row(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        matching_first: bool,
+    ) -> None:
+        """Two clinics share the instance name; only one holds the envelope's
+        token.  Either insertion order and either UUID order: the turn, its
+        claim, its session and its reply belong to the matching clinic."""
+
+        world = auth_world(True)
+        low, high = sorted([uuid4(), uuid4()])
+        right, wrong = (low, high) if matching_first else (high, low)
+        rows = [
+            (right, _AUTH_SENTINEL, "https://right.uazapi.example"),
+            (wrong, "another-clinic-token", "https://wrong.uazapi.example"),
+        ]
+        for tenant, token, url in rows if matching_first else rows[::-1]:
+            world.seed(tenant, token=token, api_url=url)
+        payload = world.payload(_AUTH_SENTINEL)
+
+        response = world.client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        assert world.flag_reads == [True]
+        assert world.claims == [("uazapi", right, payload["message"]["messageid"])]
+        assert world.rows()[right][0] == 1
+        assert world.rows()[wrong] == (0, 0)
+        (call,) = world.send.await_args_list
+        assert call.args[0] == "https://right.uazapi.example"
+
+    @pytest.mark.parametrize(
+        "presented",
+        [
+            "tökén-ção-😀",
+            "\ud800",
+            7,
+            3.5,
+            True,
+            None,
+            {"token": _AUTH_SENTINEL},
+            [_AUTH_SENTINEL],
+        ],
+        ids=[
+            "non_ascii",
+            "lone_surrogate",
+            "int",
+            "float",
+            "bool",
+            "null",
+            "dict",
+            "list",
+        ],
+    )
+    def test_an_unusual_token_never_raises(
+        self, auth_world: Callable[[bool], _AuthWorld], presented: Any
+    ) -> None:
+        world = auth_world(True)
+        world.seed(uuid4(), token="tökén-ção-😀", api_url="https://u.example")
+
+        response = world.client.post(WEBHOOK_PATH, json=world.payload(presented))
+
+        if presented == "tökén-ção-😀":
+            assert response.status_code == 200, response.text
+            assert len(world.claims) == 1
+        else:
+            assert response.status_code == 401, response.text
+            assert world.claims == []
+
+
+class TestUazapiWebhookAuthShadow:
+    """Shadow (flag absent or false): measured only, served as before."""
+
+    @pytest.mark.parametrize("result", _AUTH_RESULTS)
+    def test_every_result_is_served_exactly_as_without_a_token(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+        result: str,
+    ) -> None:
+        """The token changes nothing: the same request without any token
+        (today's payloads) answers, claims, classifies and replies alike."""
+
+        world = auth_world(False)
+        presented, _ = _seed_auth_case(world, result)
+        before = _auth_count("shadow", result)
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            with_token = world.client.post(WEBHOOK_PATH, json=world.payload(presented))
+        observed = (
+            with_token.status_code,
+            with_token.json(),
+            [(source, tenant) for source, tenant, _ in world.claims],
+            list(world.origins),
+            [ingress.identity.inbound_verified for ingress in world.ingresses],
+            world.run_pipeline.await_count,
+            world.send.await_count,
+        )
+        assert _auth_count("shadow", result) == before + 1
+        (record,) = _auth_records(caplog)
+        assert (record.mode, record.result) == ("shadow", result)  # type: ignore[attr-defined]
+        assert record.levelname == "INFO"
+        for spy in (world.claims, world.origins, world.ingresses):
+            spy.clear()
+        world.run_pipeline.reset_mock()
+        world.send.reset_mock()
+
+        without = world.client.post(WEBHOOK_PATH, json=world.payload())
+
+        assert observed == (
+            without.status_code,
+            without.json(),
+            [(source, tenant) for source, tenant, _ in world.claims],
+            list(world.origins),
+            [ingress.identity.inbound_verified for ingress in world.ingresses],
+            world.run_pipeline.await_count,
+            world.send.await_count,
+        )
+        # Today's answers: routed by instance name, never production.
+        if result == "unknown_instance":
+            assert observed[:3] == (
+                200,
+                {"ok": True, "skipped": "unknown_instance"},
+                [],
+            )
+        else:
+            # An empty stored token was, and is, no reply (no credentials).
+            assert observed[0:2] == (
+                200,
+                (
+                    {"ok": True, "replied": False, "reason": "no_credentials"}
+                    if result == "token_not_configured"
+                    else {"ok": True, "replied": True}
+                ),
+            )
+            assert observed[3] == [InteractionOrigin.UNKNOWN]
+            assert observed[4] == [False]
+        assert world.flag_reads == [False, False]
+
+    def test_a_shadow_duplicate_is_routed_as_before_and_says_so(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Routing stays ``_resolve_tenant_by_credential``'s (its first row);
+        ``routed_matches`` tells whether that row is the matching one."""
+
+        world = auth_world(False)
+        first, second = uuid4(), uuid4()
+        world.seed(first, token="first-clinic-token", api_url="https://a.example")
+        world.seed(second, token=_AUTH_SENTINEL, api_url="https://b.example")
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            response = world.client.post(
+                WEBHOOK_PATH,
+                json=world.payload(_AUTH_SENTINEL, BaseUrl="https://B.example/"),
+            )
+
+        assert response.status_code == 200, response.text
+        assert world.flag_reads == [False]
+        routed = world.claims[0][1]
+        assert routed == first  # SQLite answers the first row inserted
+        (record,) = _auth_records(caplog)
+        assert record.result == "match"  # type: ignore[attr-defined]
+        assert record.routed_matches is False  # type: ignore[attr-defined]
+        # The per-row fields describe the matching row.
+        assert record.base_url_matches is True  # type: ignore[attr-defined]
+        assert world.origins == [InteractionOrigin.UNKNOWN]
+
+    def test_a_shadow_route_resolved_elsewhere_keeps_serving(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``_resolve_tenant_by_credential`` stays the router: patched to a
+        tenant without any row (as the PostgreSQL language suite does), the
+        check logs ``unknown_instance`` and the turn is processed as before
+        (no stored credentials: no reply)."""
+
+        world = auth_world(False)
+        tenant = uuid4()
+        monkeypatch.setattr(
+            webhook_module,
+            "_resolve_tenant_by_credential",
+            AsyncMock(return_value=tenant),
+        )
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            response = world.client.post(
+                WEBHOOK_PATH, json=world.payload(_AUTH_SENTINEL)
+            )
+
+        assert response.json() == {
+            "ok": True,
+            "replied": False,
+            "reason": "no_credentials",
+        }
+        assert world.claims[0][:2] == ("uazapi", tenant)
+        world.run_pipeline.assert_awaited_once()
+        assert world.origins == [InteractionOrigin.UNKNOWN]
+        (record,) = _auth_records(caplog)
+        assert record.result == "unknown_instance"  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "presented", ["tökén-ção-😀", "\ud800", 7, {"token": "x"}, None]
+    )
+    def test_an_unusual_token_never_raises(
+        self, auth_world: Callable[[bool], _AuthWorld], presented: Any
+    ) -> None:
+        world = auth_world(False)
+        world.seed(uuid4(), token="tökén-ção-😀", api_url="https://u.example")
+
+        response = world.client.post(WEBHOOK_PATH, json=world.payload(presented))
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        assert world.origins == [InteractionOrigin.UNKNOWN]
+
+
+class TestUazapiWebhookAuthLogLine:
+    """The ``uazapi_webhook_auth`` line is the per-instance evidence for
+    enforcing: every field reads its own value, and the body-controlled
+    ``instanceName`` cannot forge a line or a field."""
+
+    def test_every_field_is_logged_in_its_opposite_state(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One row, stored token set, provider not ``uazapi``; the callback
+        carries no token, no owner, no ``BaseUrl`` and is the clinic's own
+        message.  Routed (shadow) to that row, which is the row described."""
+
+        world = auth_world(False)
+        tenant = uuid4()
+        _seed_legacy_uazapi_credentials(
+            world.client,
+            tenant,
+            {
+                "whatsapp_provider": "zapi",
+                "uazapi_api_url": "https://uazapi.example.com",
+                "uazapi_instance_name": world.instance,
+                "uazapi_token": _AUTH_SENTINEL,
+            },
+        )
+        payload = world.payload(owner=None)
+        payload["message"]["fromMe"] = True
+        assert "BaseUrl" not in payload and "token" not in payload
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            response = world.client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert world.flag_reads == [False]
+        (record,) = _auth_records(caplog)
+        assert _assert_auth_line_names_its_values(record) == {
+            "mode": "shadow",
+            "result": "token_missing",
+            "instance": world.instance,
+            "token_present": "False",
+            "routed_matches": "False",
+            "provider_matches": "False",
+            "owner_present": "False",
+            "from_me": "True",
+            "base_url_matches": "False",
+        }
+
+    def test_a_shadow_routed_row_that_is_not_the_match_reads_false(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``routed_matches`` is False when a match exists but shadow routed
+        elsewhere, while ``provider_matches`` and ``base_url_matches`` describe
+        the matching row (True): the flip is per field, not all-or-nothing."""
+
+        world = auth_world(False)
+        world.seed(uuid4(), token="first-clinic-token", api_url="https://a.example")
+        world.seed(uuid4(), token=_AUTH_SENTINEL, api_url="https://b.example")
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            world.client.post(
+                WEBHOOK_PATH,
+                json=world.payload(_AUTH_SENTINEL, BaseUrl="https://b.example"),
+            )
+
+        (record,) = _auth_records(caplog)
+        rendered = _assert_auth_line_names_its_values(record)
+        assert (rendered["result"], rendered["routed_matches"]) == ("match", "False")
+        assert rendered["provider_matches"] == rendered["base_url_matches"] == "True"
+
+    @pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforce"])
+    def test_an_instance_name_cannot_forge_a_line_or_a_field(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+        enforced: bool,
+    ) -> None:
+        world = auth_world(enforced)
+        world.seed(uuid4(), token=_AUTH_SENTINEL, api_url="https://u.example")
+        forged = (
+            "nope\nuazapi_webhook_auth mode=shadow result=match "
+            f"instance={world.instance} token_present=True routed_matches=True "
+            "provider_matches=True owner_present=True from_me=False "
+            "base_url_matches=True\n"
+        )
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            response = world.client.post(
+                WEBHOOK_PATH, json=world.payload(_AUTH_SENTINEL, instanceName=forged)
+            )
+
+        assert response.status_code == (401 if enforced else 200), response.text
+        assert world.claims == []
+        (record,) = _auth_records(caplog)
+        message = record.getMessage()
+        assert "\n" not in message and "\r" not in message
+        assert message.count("result=") == 1
+        assert message.count("instance=") == 1
+        assert record.result == "unknown_instance"  # type: ignore[attr-defined]
+        _assert_auth_line_names_its_values(record)
+        # One physical line of the event in the rendered log, and the older
+        # route lines that name the instance cannot break either.
+        assert caplog.text.count("uazapi_webhook_auth mode=") == 1
+        instance_lines = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.getMessage().startswith(
+                ("Uazapi webhook: instance=", "Uazapi webhook: no tenant")
+            )
+        ]
+        assert len(instance_lines) == (1 if enforced else 2)
+        for line in instance_lines:
+            assert "\n" not in line and "result=" not in line
+
+    @pytest.mark.parametrize(
+        ("instance", "rendered"),
+        [
+            ("my-instance_1.v2~x", "my-instance_1.v2~x"),
+            ("a b=c\r\n", "a%20b%3Dc%0D%0A"),
+            ("\u2028x\x00", "%E2%80%A8x%00"),
+            ("\ud800", "%5Cud800"),
+            ("x" * 200, "x" * 128 + "...[truncated]"),
+        ],
+        ids=["plain", "space_equals_crlf", "separator_nul", "surrogate", "long"],
+    )
+    def test_the_loggable_instance_is_one_bounded_inert_token(
+        self, instance: str, rendered: str
+    ) -> None:
+        assert webhook_module._loggable_instance(instance) == rendered
+
+
+def test_a_body_value_cannot_forge_an_auth_line_in_the_real_log_output(
+    auth_world: Callable[[bool], _AuthWorld],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``message.type`` is logged raw by the ``Uazapi webhook:`` line; the
+    root handler ``configure_logging`` creates (what reaches CloudWatch, not
+    ``caplog``) keeps every record on one physical line, so the only line
+    that starts with ``uazapi_webhook_auth`` is the route's own."""
+
+    from tests.config.test_logging_single_line import configured_root_output
+
+    world = auth_world(False)
+    world.seed(uuid4(), token="the-instance-token", api_url="https://u.example")
+    payload = world.payload()
+    payload["message"][
+        "type"
+    ] = "text\nuazapi_webhook_auth mode=shadow result=match instance=forged"
+
+    with configured_root_output(monkeypatch) as (stream, _handler):
+        response = world.client.post(WEBHOOK_PATH, json=payload)
+
+    assert response.status_code == 200, response.text
+    output = stream.getvalue()
+    assert "instance=forged" in output  # the forged text was logged, escaped
+    (line,) = [
+        line for line in output.splitlines() if line.startswith("uazapi_webhook_auth ")
+    ]
+    assert line.startswith(
+        f"uazapi_webhook_auth mode=shadow result=token_missing "
+        f"instance={world.instance} "
+    )
+
+
+# Hard-coded, never the module's constants: Linux ``PIPE_BUF`` (the largest
+# atomic pipe write the 4 workers' shared stdout gets) and the Fargate log
+# shim's 16 KiB piece.
+_PIPE_BUF = 4096
+_SHIM_PIECE = 16 * 1024
+
+
+@pytest.mark.parametrize("aim", [_PIPE_BUF, _SHIM_PIECE], ids=["pipe_buf", "shim"])
+def test_a_body_value_cannot_start_an_auth_event_at_the_16_kib_split(
+    auth_world: Callable[[bool], _AuthWorld],
+    monkeypatch: pytest.MonkeyPatch,
+    aim: int,
+) -> None:
+    """Two boundaries start a new CloudWatch event inside a long line: the
+    shim's cut every 16384 bytes, and a pipe write torn at 4096-byte steps
+    when the workers' shared stdout backs up.  A ``message.type`` padded so a
+    forged ``uazapi_webhook_auth ... result=match`` begins exactly at byte
+    *aim* of its line (the review's attack) must begin no piece at either
+    step: every line plus its newline is one write of at most 4096 bytes."""
+
+    from tests.config.test_logging_single_line import configured_root_output
+
+    world = auth_world(False)
+    world.seed(uuid4(), token="the-instance-token", api_url="https://u.example")
+
+    # Probe: where ``type=`` starts on the ``Uazapi webhook:`` line.
+    probe = world.payload()
+    probe["message"]["type"] = "PROBE"
+    with configured_root_output(monkeypatch) as (stream, _handler):
+        world.client.post(WEBHOOK_PATH, json=probe)
+    (probe_line,) = [
+        line
+        for line in stream.getvalue().splitlines()
+        if line.startswith("Uazapi webhook: instance=")
+    ]
+    prefix = probe_line[: probe_line.index("type=PROBE") + len("type=")]
+
+    head = (
+        f"uazapi_webhook_auth mode=shadow result=match instance={world.instance} "
+        "token_present=True routed_matches=True provider_matches=True "
+        "owner_present=True from_me="
+    )
+    tail = " base_url_matches=True"
+    forged = head + "F" * (_SHIM_PIECE - len(head) - len(tail)) + tail
+    payload = world.payload()
+    payload["message"]["type"] = "x" * (aim - len(prefix.encode())) + forged
+
+    with configured_root_output(monkeypatch) as (stream, _handler):
+        response = world.client.post(WEBHOOK_PATH, json=payload)
+
+    assert response.status_code == 200, response.text
+    lines = [line for line in stream.getvalue().encode("utf-8").split(b"\n") if line]
+    genuine = [line for line in lines if line.startswith(b"uazapi_webhook_auth ")]
+    assert len(genuine) == 1
+    assert genuine[0].startswith(
+        f"uazapi_webhook_auth mode=shadow result=token_missing "
+        f"instance={world.instance} ".encode()
+    )
+    checked = 0
+    for line in lines:
+        for step in (_PIPE_BUF, _SHIM_PIECE):
+            for offset in range(0, len(line), step):
+                if line is genuine[0] and offset == 0:
+                    continue
+                piece = line[offset : offset + step]
+                assert not piece.startswith(b"uazapi_webhook_auth"), (step, offset)
+                checked += 1
+    assert checked >= 2 * len(lines) - 2  # the per-piece check ran
+    for line in lines:
+        assert len(line) + 1 <= _PIPE_BUF
+        assert len(line) < _SHIM_PIECE
+
+
+class TestUazapiWebhookAuthCheckFault:
+    """The instance query fails: shadow serves as before, enforced fails
+    closed (500, nothing routed or created)."""
+
+    @staticmethod
+    def _broken_loader(calls: list[str]) -> Any:
+        from sqlalchemy import text
+
+        async def loader(instance_name: str, *, db: Any, **_kwargs: Any) -> Any:
+            calls.append(instance_name)
+            rollback = db.rollback
+
+            async def spy_rollback() -> None:
+                # PostgreSQL aborts the transaction on the failed statement
+                # (SQLite does not): the route must roll back before routing.
+                calls.append("rollback")
+                await rollback()
+
+            db.rollback = spy_rollback
+            # A real statement error on the request's own session.
+            await db.execute(text("SELECT no_such_column FROM no_such_table"))
+            raise AssertionError("unreachable")
+
+        return loader
+
+    def test_shadow_routes_as_today_and_says_check_error(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        world = auth_world(False)
+        tenant = uuid4()
+        world.seed(tenant, token=_AUTH_SENTINEL, api_url="https://u.example")
+        calls: list[str] = []
+        monkeypatch.setattr(
+            webhook_module, "_load_uazapi_auth_candidates", self._broken_loader(calls)
+        )
+        resolve = webhook_module._resolve_tenant_by_credential
+        routed: list[UUID | None] = []
+
+        async def spy_resolve(*args: Any) -> Any:
+            calls.append("route")
+            found = await resolve(*args)
+            routed.append(found)
+            return found
+
+        monkeypatch.setattr(
+            webhook_module, "_resolve_tenant_by_credential", spy_resolve
+        )
+        payload = world.payload(_AUTH_SENTINEL)
+        before = _auth_count("shadow", "check_error")
+
+        with caplog.at_level(logging.INFO, logger="src.api.routes.webhook"):
+            response = world.client.post(WEBHOOK_PATH, json=payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": True, "replied": True}
+        # The failed query, its rollback, then today's router.
+        assert calls == [world.instance, "rollback", "route"]
+        assert world.flag_reads == [False]
+        assert routed == [tenant]
+        assert world.claims == [("uazapi", tenant, payload["message"]["messageid"])]
+        assert world.origins == [InteractionOrigin.UNKNOWN]
+        assert [i.identity.inbound_verified for i in world.ingresses] == [False]
+        assert world.rows()[tenant][0] == 1
+        world.run_pipeline.assert_awaited_once()
+        world.send.assert_awaited_once()
+        assert _auth_count("shadow", "check_error") == before + 1
+        (record,) = _auth_records(caplog)
+        assert record.levelname == "WARNING"
+        rendered = _assert_auth_line_names_its_values(record)
+        assert (rendered["mode"], rendered["result"]) == ("shadow", "check_error")
+        assert _AUTH_SENTINEL not in caplog.text
+
+    def test_enforced_fails_closed_with_a_500_and_creates_nothing(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        world = auth_world(True)
+        world.seed(uuid4(), token=_AUTH_SENTINEL, api_url="https://u.example")
+        calls: list[str] = []
+        monkeypatch.setattr(
+            webhook_module, "_load_uazapi_auth_candidates", self._broken_loader(calls)
+        )
+        resolver = AsyncMock()
+        monkeypatch.setattr(webhook_module, "_resolve_tenant_by_credential", resolver)
+        before = {
+            result: _auth_count("enforce", result)
+            for result in UAZAPI_WEBHOOK_AUTH_RESULTS
+        }
+
+        payload = world.payload(_AUTH_SENTINEL)
+
+        async def post_as_a_server() -> httpx.Response:
+            # The suite's transport re-raises; a server answers 500 instead.
+            transport = httpx.ASGITransport(
+                app=world.client.application,  # type: ignore[attr-defined]
+                raise_app_exceptions=False,
+            )
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as server:
+                return await server.post(WEBHOOK_PATH, json=payload)
+
+        response = world.client._submit(post_as_a_server())  # type: ignore[attr-defined]
+
+        assert response.status_code == 500
+        with pytest.raises(OperationalError):
+            world.client.post(WEBHOOK_PATH, json=payload)
+
+        # Two requests, each one reading and one query.
+        assert calls == [world.instance, world.instance]
+        assert world.flag_reads == [True, True]
+        resolver.assert_not_awaited()
+        assert world.claims == []
+        assert world.origins == [] and world.ingresses == []
+        assert all(counts == (0, 0) for counts in world.rows().values())
+        world.run_pipeline.assert_not_awaited()
+        world.send.assert_not_awaited()
+        assert {
+            result: _auth_count("enforce", result)
+            for result in UAZAPI_WEBHOOK_AUTH_RESULTS
+        } == before
+
+
+class TestUazapiWebhookAuthNeverLeaks:
+    @pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforce"])
+    @pytest.mark.parametrize("presented", ["match", "mismatch", "no_token"])
+    def test_the_token_reaches_no_log_metric_response_or_exception(
+        self,
+        auth_world: Callable[[bool], _AuthWorld],
+        caplog: pytest.LogCaptureFixture,
+        capfd: pytest.CaptureFixture[str],
+        enforced: bool,
+        presented: str,
+    ) -> None:
+        """The sentinel is the stored token and, for ``match``, the envelope
+        token too; the reply send fails so its traceback is logged."""
+
+        from prometheus_client import REGISTRY, generate_latest
+
+        world = auth_world(enforced)
+        world.seed(uuid4(), token=f" {_AUTH_SENTINEL} ", api_url="https://u.example")
+        world.send.side_effect = RuntimeError("provider down")
+        token = {
+            "match": _AUTH_SENTINEL,
+            "mismatch": _AUTH_SENTINEL[::-1],
+            "no_token": ...,
+        }[presented]
+        loads = webhook_module._load_uazapi_auth_candidates
+        loaded: list[Any] = []
+
+        async def spy(*args: Any, **kwargs: Any) -> Any:
+            candidates = await loads(*args, **kwargs)
+            loaded.append(candidates)
+            return candidates
+
+        with patch.object(webhook_module, "_load_uazapi_auth_candidates", spy):
+            with caplog.at_level(logging.DEBUG):
+                response = world.client.post(WEBHOOK_PATH, json=world.payload(token))
+
+        outputs = {
+            "response": response.text + repr(dict(response.headers)),
+            "logs": caplog.text
+            + "".join(repr(vars(record)) for record in caplog.records),
+            "stdio": "".join(capfd.readouterr()),
+            "metrics": generate_latest(REGISTRY).decode(),
+            "candidates": repr(loaded),
+        }
+        assert loaded and _auth_records(caplog)
+        if enforced and presented != "match":
+            assert response.status_code == 401
+        else:
+            assert response.json()["reason"] == "send_failed"
+            assert "Uazapi send failed" in caplog.text  # the traceback is there
+        for name, text in outputs.items():
+            assert _AUTH_SENTINEL not in text, name
+            assert _AUTH_SENTINEL.strip()[::-1] not in text, name
+
+
+def test_the_mode_is_read_once_before_any_statement_and_outside_a_transaction(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One reading per request, before the instance query, while the route's
+    session holds no transaction; the query is what opens it."""
+
+    from src.repositories.database import get_db_session
+
+    instance = f"auth_once_{uuid4().hex[:8]}"
+    _seed_uazapi_credentials(client, uuid4(), instance, token=_AUTH_SENTINEL)
+    body = _uazapi_text_payload(
+        instance=instance,
+        from_phone="5511977776666",
+        body="Olá",
+        message_id=f"3EB0_once_{uuid4().hex[:8]}",
+    )
+    body["token"] = _AUTH_SENTINEL
+    timeline: list[tuple[str, bool]] = []
+
+    class _Stop(Exception):
+        pass
+
+    class _Request:
+        async def json(self) -> dict[str, Any]:
+            return body
+
+    async def run() -> None:
+        db = get_db_session()
+        try:
+
+            async def mode() -> bool:
+                timeline.append(("mode", db.in_transaction()))
+                return False
+
+            loads = webhook_module._load_uazapi_auth_candidates
+
+            async def candidates(*args: Any, **kwargs: Any) -> Any:
+                timeline.append(("candidates", db.in_transaction()))
+                return await loads(*args, **kwargs)
+
+            async def route(*_args: Any) -> None:
+                timeline.append(("route", db.in_transaction()))
+                raise _Stop
+
+            monkeypatch.setattr(webhook_module, "uazapi_webhook_auth_enforced", mode)
+            monkeypatch.setattr(
+                webhook_module, "_load_uazapi_auth_candidates", candidates
+            )
+            monkeypatch.setattr(webhook_module, "_resolve_tenant_by_credential", route)
+            with pytest.raises(_Stop):
+                await webhook_module.uazapi_webhook(_Request(), db=db)  # type: ignore[arg-type]
+        finally:
+            await db.close()
+
+    client._submit(run())  # type: ignore[attr-defined]
+
+    assert timeline == [("mode", False), ("candidates", False), ("route", True)]

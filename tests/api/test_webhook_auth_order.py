@@ -111,6 +111,12 @@ def trace(monkeypatch: pytest.MonkeyPatch, test_app: Any) -> Iterator[list[str]]
         steps.append(f"route:{key}")
         return await resolve_instance(key, value, session)
 
+    load_uazapi_candidates = webhook._load_uazapi_auth_candidates
+
+    async def uazapi_token_check(*args: Any, **kwargs: Any) -> Any:
+        steps.append("auth:uazapi_token")
+        return await load_uazapi_candidates(*args, **kwargs)
+
     def claim(source: str, tenant_id: UUID, message_id: str) -> bool:
         steps.append(f"claim:{source}")
         return False  # a duplicate: stops before any downstream effect
@@ -120,6 +126,7 @@ def trace(monkeypatch: pytest.MonkeyPatch, test_app: Any) -> Iterator[list[str]]
     monkeypatch.setattr(tenant_identity, "_load_meta_candidates", meta_lookup)
     monkeypatch.setattr(webhook, "_resolve_tenant_by_zapi_digest", zapi_lookup)
     monkeypatch.setattr(webhook, "_resolve_tenant_by_credential", instance_lookup)
+    monkeypatch.setattr(webhook, "_load_uazapi_auth_candidates", uazapi_token_check)
     monkeypatch.setattr(webhook, "_claim_incoming_message", claim)
     with route_probe(test_app, on_entry=lambda: steps.append("route")):
         yield steps
@@ -190,12 +197,18 @@ _ORDER: dict[str, tuple[Callable[[Any, World], Any], int, list[str]]] = {
     "uazapi_known_instance": (
         lambda c, w: c.post("/v1/webhook/uazapi", json=_uazapi_body("credit-uazapi")),
         200,
-        ["switch", "route", "route:uazapi_instance_name", "claim:uazapi"],
+        [
+            "switch",
+            "route",
+            "auth:uazapi_token",
+            "route:uazapi_instance_name",
+            "claim:uazapi",
+        ],
     ),
     "uazapi_unknown_instance": (
         lambda c, w: c.post("/v1/webhook/uazapi", json=_uazapi_body("credit-nope")),
         200,
-        ["switch", "route", "route:uazapi_instance_name"],
+        ["switch", "route", "auth:uazapi_token", "route:uazapi_instance_name"],
     ),
     "evolution_known_instance": (
         lambda c, w: c.post(
@@ -233,6 +246,75 @@ def test_capture_auth_and_claim_order(
     assert trace == expected
     if any(step.startswith("claim:") for step in expected):
         assert response.json() == {"ok": True, "skipped": "duplicate_message"}
+
+
+@pytest.mark.parametrize("effective", [True, False])
+@pytest.mark.parametrize(
+    ("token", "status", "expected"),
+    [
+        (
+            "credit-order-uazapi-token",
+            200,
+            ["switch", "route", "auth:uazapi_token", "claim:uazapi"],
+        ),
+        ("not-the-token", 401, ["switch", "route", "auth:uazapi_token"]),
+        (None, 401, ["switch", "route", "auth:uazapi_token"]),
+    ],
+    ids=["match", "mismatch", "token_missing"],
+)
+def test_enforced_uazapi_checks_the_token_before_the_claim(
+    client: Any,
+    world: World,
+    trace: list[str],
+    force_switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+    token: str | None,
+    status: int,
+    expected: list[str],
+    effective: bool,
+) -> None:
+    """uazapi-webhook-auth, enforced: the envelope token is checked after the
+    entry capture and before the claim; a refusal (401) reaches no claim and
+    an accepted callback is routed by the match alone (no instance lookup)."""
+
+    from sqlalchemy import update
+
+    from src.models.clinic_config_table import ClinicConfigTable
+    from src.repositories.database import get_db_session
+
+    async def store_token() -> None:
+        database = get_db_session()
+        try:
+            await database.execute(
+                update(ClinicConfigTable)
+                .where(ClinicConfigTable.tenant_id == world.uazapi_tenant)
+                .values(
+                    api_credentials={
+                        "uazapi_instance_name": "credit-uazapi",
+                        "uazapi_token": "credit-order-uazapi-token",
+                    }
+                )
+            )
+            await database.commit()
+        finally:
+            await database.close()
+
+    async def enforced() -> bool:
+        return True
+
+    client._submit(store_token())
+    monkeypatch.setattr(webhook, "uazapi_webhook_auth_enforced", enforced)
+    force_switch(effective)
+    body = _uazapi_body("credit-uazapi")
+    if token is not None:
+        body["token"] = token
+
+    response = client.post("/v1/webhook/uazapi", json=body)
+
+    assert response.status_code == status, response.text
+    assert trace == expected
+    if status == 401:
+        assert response.json() == {"error": "invalid_webhook_auth"}
 
 
 def test_instance_routing_reaches_the_claim_unauthenticated(

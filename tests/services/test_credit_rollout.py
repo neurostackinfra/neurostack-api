@@ -1,6 +1,7 @@
 """Group 7 boundary tests for code-only credit rollout readiness."""
 
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -229,3 +230,181 @@ async def test_the_orphan_worker_keeps_one_sweep_state_across_ticks(
     assert len(seen) >= 3
     assert isinstance(seen[0], credit_rollout.OrphanSweepState)
     assert all(state is seen[0] for state in seen)
+
+
+# ---------------------------------------------------------------------------
+# uazapi-webhook-auth: the L10 guard.  ``arm_enforcement`` refuses
+# unconditionally until ``uazapi-credit-enforcement`` removes the guard.
+# ---------------------------------------------------------------------------
+
+_ROOT = Path(__file__).resolve().parents[2]
+_GUARD = "uazapi_enforced_credit_adapter_available"
+_GUARD_MESSAGE = "uazapi has no enforced credit adapter"
+
+
+def _armable(monkeypatch: pytest.MonkeyPatch) -> tuple[CreditRolloutService, Mock]:
+    """A service whose lock and clock pass; every later step is a spy."""
+
+    from src.repositories.credit import CreditRepository
+
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(CreditRepository, "lock_rollout_control", AsyncMock())
+    monkeypatch.setattr(CreditRepository, "database_now", AsyncMock(return_value=now))
+    session = Mock()
+    session.get = AsyncMock()
+    session.flush = AsyncMock()
+    service = CreditRolloutService(session)
+    later = Mock(
+        reconcile_orphans=AsyncMock(),
+        capability_ready=AsyncMock(),
+        cutoff_report=AsyncMock(),
+    )
+    for name in ("reconcile_orphans", "capability_ready", "cutoff_report"):
+        monkeypatch.setattr(service, name, getattr(later, name))
+    return service, later
+
+
+@pytest.mark.asyncio
+async def test_arming_is_refused_without_the_swap_before_anything_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, later = _armable(monkeypatch)
+
+    with pytest.raises(CreditEnforcementRejected, match=f"^{_GUARD_MESSAGE}$"):
+        await service.arm_enforcement(set_by="task", expected_report_digest="a" * 64)
+
+    # Refused before the orphan closures (the first write) and every check.
+    later.reconcile_orphans.assert_not_awaited()
+    later.capability_ready.assert_not_awaited()
+    later.cutoff_report.assert_not_awaited()
+    service.session.get.assert_not_awaited()  # type: ignore[attr-defined]
+    service.session.flush.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_with_the_swap_arming_reaches_the_orphan_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control case: only the predicate stands in the way."""
+
+    from src.services import credit_rollout
+
+    service, later = _armable(monkeypatch)
+    later.reconcile_orphans.return_value = Mock(open_count=1)
+    monkeypatch.setattr(credit_rollout, _GUARD, lambda: True)
+
+    with pytest.raises(CreditEnforcementRejected, match="orphan reconciliation"):
+        await service.arm_enforcement(set_by="task", expected_report_digest="a" * 64)
+    later.reconcile_orphans.assert_awaited_once()
+
+
+def test_the_guard_predicate_is_a_constant_false() -> None:
+    """It reads no environment variable, configuration, flag or row: its
+    body (after the docstring) is ``return False`` and nothing else."""
+
+    import ast
+    import inspect
+
+    from src.services import credit_rollout
+
+    assert credit_rollout.uazapi_enforced_credit_adapter_available() is False
+    (function,) = ast.parse(
+        inspect.getsource(credit_rollout.uazapi_enforced_credit_adapter_available)
+    ).body
+    assert isinstance(function, ast.FunctionDef) and not function.args.args
+    docstring, statement = function.body
+    assert isinstance(docstring, ast.Expr) and isinstance(docstring.value, ast.Constant)
+    assert "uazapi-credit-enforcement" in docstring.value.value
+    assert isinstance(statement, ast.Return)
+    assert isinstance(statement.value, ast.Constant)
+    assert statement.value.value is False
+
+
+def _guard_references(path: Path) -> list[tuple[int, str]]:
+    """Every reference to the predicate in *path*: how it is used."""
+
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    # Docstrings and the ``__all__`` strings are declarations, not usages.
+    declarations = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        )
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in node.targets
+        ):
+            declarations.update(id(inner) for inner in ast.walk(node.value))
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.FunctionDef) and node.name == _GUARD:
+            found.append((line, "def"))
+        elif isinstance(node, ast.Global | ast.Nonlocal) and _GUARD in node.names:
+            found.append((line, "rebind"))
+        elif isinstance(node, ast.alias) and _GUARD in (node.name, node.asname):
+            found.append((line, "import"))
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _GUARD in node.value
+            and id(node) not in declarations
+        ):
+            found.append((line, "string"))
+        elif (isinstance(node, ast.Name) and node.id == _GUARD) or (
+            isinstance(node, ast.Attribute) and node.attr == _GUARD
+        ):
+            parent = parents.get(id(node))
+            called = isinstance(parent, ast.Call) and parent.func is node
+            found.append((line, "call" if called else "other"))
+    return found
+
+
+def test_no_production_code_path_swaps_the_guard() -> None:
+    """Under ``src/``: the ``def`` in ``credit_rollout``, its one call in
+    ``arm_enforcement`` and its one call in the ops ``status`` (plus the
+    ``__all__`` entry and docstrings) -- nothing that assigns, rebinds,
+    imports by name or names it in a string (``setattr`` targets)."""
+
+    usages: dict[str, list[str]] = {}
+    for path in sorted((_ROOT / "src").rglob("*.py")):
+        for _line, kind in _guard_references(path):
+            usages.setdefault(str(path.relative_to(_ROOT)), []).append(kind)
+    assert usages == {
+        "src/services/credit_rollout.py": ["def", "call"],
+        "src/ops/credit_enforcement.py": ["call"],
+    }
+
+
+def test_the_reference_scan_sees_a_swap() -> None:
+    """The scan above is not vacuous: each way to swap the predicate is a
+    usage it reports as something other than a call."""
+
+    import tempfile
+
+    probes = {
+        "assign": f"from src.services import credit_rollout\n"
+        f"credit_rollout.{_GUARD} = lambda: True\n",
+        "setattr": "import src.services.credit_rollout as r\n"
+        f"setattr(r, '{_GUARD}', lambda: True)\n",
+        "import": f"from src.services.credit_rollout import {_GUARD}\n",
+        "global": f"def f():\n    global {_GUARD}\n",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        for name, source in probes.items():
+            path = Path(directory) / f"{name}.py"
+            path.write_text(source, encoding="utf-8")
+            kinds = {kind for _line, kind in _guard_references(path)}
+            assert kinds - {"call"}, (name, kinds)

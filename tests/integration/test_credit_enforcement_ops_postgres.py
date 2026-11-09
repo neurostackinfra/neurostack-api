@@ -59,12 +59,13 @@ from tests.integration.credit_rollout_world import (
     scalar,
     subscribed_builder,
     template,
+    uazapi_enforced_credit_adapter,
 )
 from tests.integration.test_billing_fact_worker_postgres import _Harness
 
 pytestmark = pytest.mark.integration
 
-__all__ = ["clean", "template"]
+__all__ = ["clean", "template", "uazapi_enforced_credit_adapter"]
 
 TASK_ARN = (
     "arn:aws:ecs:us-east-1:123456789012:task/neurostack-staging/"
@@ -330,6 +331,7 @@ async def deleted_tenant_orphan(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_status_reports_the_gate_and_writes_nothing(world: _Harness) -> None:
     covered = await subscribed_builder(world)
     standalone = await make_tenant(world, None)
@@ -645,6 +647,7 @@ async def test_accept_reads_the_row_back_in_a_fresh_session(world: _Harness) -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_arm_arms_once_at_the_database_clock_with_the_task_arn(
     world: _Harness,
 ) -> None:
@@ -691,6 +694,7 @@ async def test_arm_arms_once_at_the_database_clock_with_the_task_arn(
     assert status.document["enforcement"]["set_by"] == TASK_ARN
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_arm_refuses_a_different_digest(world: _Harness) -> None:
     await subscribed_builder(world)
     current = (await report(world))["digest"]
@@ -703,6 +707,7 @@ async def test_arm_refuses_a_different_digest(world: _Harness) -> None:
     assert await state_rows(world) == (0, None, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_arm_refuses_an_uncovered_tenant_until_that_finding_is_accepted(
     world: _Harness,
 ) -> None:
@@ -763,6 +768,7 @@ async def test_arm_refuses_an_uncovered_tenant_until_that_finding_is_accepted(
     assert (await state_rows(world))[0] == 1
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_arm_maps_the_gate_refusals(world: _Harness) -> None:
     """Orphans first, then readiness: each with its own reason."""
 
@@ -810,6 +816,7 @@ async def _rollout_lock_waiters(harness: _Harness) -> int:
     )
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_the_digest_is_confirmed_inside_the_arming_transaction(
     world: _Harness,
 ) -> None:
@@ -875,6 +882,7 @@ async def test_the_digest_is_confirmed_inside_the_arming_transaction(
     assert (await report(world))["findings"] == []
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_two_concurrent_arms_arm_once(world: _Harness) -> None:
     await subscribed_builder(world)
     digest = (await report(world))["digest"]
@@ -896,6 +904,7 @@ async def test_two_concurrent_arms_arm_once(world: _Harness) -> None:
     assert (await state_rows(world))[0] == 1
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_arm_reads_the_row_back_in_a_fresh_session(world: _Harness) -> None:
     """A trigger rewrites ``set_by`` on the way in: the transaction's own
     object still says the task ARN, only a fresh session sees the row."""
@@ -946,6 +955,7 @@ async def _enforced_claim_without_effect(harness: _Harness, covered: Any) -> Non
     )
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize("other_orphan", [False, True], ids=["closable", "blocking"])
 async def test_status_tells_which_orphans_arm_closes_and_arm_agrees(
     world: _Harness, other_orphan: bool
@@ -992,6 +1002,7 @@ async def test_status_tells_which_orphans_arm_closes_and_arm_agrees(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_report_accept_and_arm_evaluate_the_cutoff_at_the_database_clock(
     world: _Harness,
 ) -> None:
@@ -1386,6 +1397,7 @@ async def _closures(harness: _Harness) -> int:
     )
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 @pytest.mark.parametrize("kind", sorted(_CLOSABLE_KINDS))
 async def test_status_and_arm_agree_for_each_deleted_tenant_effect_kind(
     world: _Harness, kind: str
@@ -1420,6 +1432,7 @@ async def test_status_and_arm_agree_for_each_deleted_tenant_effect_kind(
         assert await state_rows(world) == (0, None, None)
 
 
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
 async def test_a_deleted_tenant_effect_of_another_kind_is_not_closed(
     world: _Harness,
 ) -> None:
@@ -1443,3 +1456,108 @@ async def test_a_deleted_tenant_effect_of_another_kind_is_not_closed(
 
     assert outcome.code == 0, outcome.document
     assert await _closures(world) == 0
+
+
+# ---------------------------------------------------------------------------
+# uazapi-webhook-auth: the L10 guard, end to end through ``amain``.
+# ---------------------------------------------------------------------------
+
+GUARD_REASON = "uazapi_enforced_credit_adapter_missing"
+
+
+async def test_the_l10_guard_refuses_an_otherwise_ready_arm_and_status_says_so(
+    world: _Harness,
+) -> None:
+    """Without the swap: a world that arms with it (the control below) is
+    refused with exit 20 and the closed reason -- no ``ValueError`` -- before
+    the deleted tenant's closure (the transaction's first write); ``status``
+    reported it beforehand instead of ``ready_after_arm_closures: true``."""
+
+    covered = await subscribed_builder(world)
+    await deleted_tenant_orphan(world, covered.builder_id)
+
+    status = await run(world, "status")
+
+    assert status.code == 0 and status.document["verdict"] == "ok"
+    assert status.document["reasons"] == [GUARD_REASON]
+    readiness = status.document["readiness"]
+    assert readiness["orphans_after_arm_closures"] == NO_ORPHANS
+    assert readiness["ready_after_arm_closures"] is False
+    digest = status.document["cutoff"]["digest"]
+
+    outcome = await run(world, "arm", "--report-digest", digest)
+
+    assert outcome.code == ops.EXIT_CODES["refused"] == 20, outcome.document
+    assert outcome.document["verdict"] == "refused"
+    assert outcome.document["reasons"] == [GUARD_REASON]
+    assert outcome.log["reasons"] == [GUARD_REASON]
+    assert await state_rows(world) == (0, None, None)
+    assert (
+        await scalar(
+            world,
+            "SELECT count(*) FROM credit_effects WHERE effect_kind = 'deletion_closure'",
+        )
+        == 0
+    )
+
+
+async def test_no_acceptance_clears_the_l10_guard(world: _Harness) -> None:
+    """``accept`` cannot name the guard (not a cutoff reason code: usage),
+    and an acceptance that names it anyway -- through ``accept_cutoff``
+    itself, which takes any non-blank reason, or planted -- leaves ``arm``
+    refused with the same reason."""
+
+    from src.services.credit_rollout import CreditRolloutService
+
+    await subscribed_builder(world)
+    standalone = await make_tenant(world, None)
+    await traffic(world, standalone, None)
+    author = await make_user(world)
+    digest = (await report(world))["digest"]
+    accepted = await run(
+        world, *accept_argv(digest, standalone, None, "standalone", author)
+    )
+    assert accepted.code == 0, accepted.document
+    assert (await report(world))["ready"] is True
+
+    usage = await run(
+        world, *accept_argv(digest, standalone, None, GUARD_REASON, author)
+    )
+    assert (usage.code, usage.document["reasons"]) == (30, ["usage"])
+    async with world.sessions() as session:
+        await CreditRolloutService(session).accept_cutoff(
+            tenant_id=standalone,
+            builder_id=None,
+            reason=GUARD_REASON,
+            report_digest=digest,
+            author_user_id=author,
+        )
+        await session.commit()
+    await plant_acceptance(
+        world, tenant_id=standalone, builder_id=None, reason=GUARD_REASON, digest=digest
+    )
+
+    outcome = await run(world, "arm", "--report-digest", digest)
+
+    assert outcome.code == 20, outcome.document
+    assert outcome.document["reasons"] == [GUARD_REASON]
+    assert await state_rows(world) == (0, None, None)
+
+
+@pytest.mark.usefixtures("uazapi_enforced_credit_adapter")
+async def test_with_the_swap_the_same_world_arms(world: _Harness) -> None:
+    """The control of the guard proof: only the predicate stood in the way."""
+
+    covered = await subscribed_builder(world)
+    await deleted_tenant_orphan(world, covered.builder_id)
+
+    status = await run(world, "status")
+    assert status.document["reasons"] == []
+    assert status.document["readiness"]["ready_after_arm_closures"] is True
+
+    outcome = await run(
+        world, "arm", "--report-digest", status.document["cutoff"]["digest"]
+    )
+
+    assert outcome.code == 0 and outcome.document["verdict"] == "armed"
+    assert (await state_rows(world))[0] == 1

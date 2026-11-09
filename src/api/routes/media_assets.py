@@ -23,7 +23,7 @@ import codecs
 import hashlib
 import hmac
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote
@@ -77,7 +77,11 @@ from src.services.credit_metering import (
     CreditTenantGone,
 )
 from src.services.credit_switch import request_credit_switch
-from src.services.egress_policy import agent_media_send_enabled
+from src.services.egress_policy import (
+    agent_media_send_enabled,
+    uazapi_egress_open,
+    uazapi_webhook_auth_enforced,
+)
 from src.services.media_assets import (
     MEDIA_AUDIO_VIDEO_MAX_BYTES,
     MEDIA_BINDABLE_INTENT_SEQUENCE,
@@ -866,10 +870,13 @@ async def get_media_bindable_intents(
     ``delivery_enabled`` is the promise the Central de Mídias makes: true only
     when the clinic's WhatsApp provider delivers production turns
     (:func:`media_delivery_provider_ready`) and the ``agent_media_send_enabled``
-    flag is effective.  The flag is read only for a ready provider; it never
-    raises (closed on any doubt).  The credentials are revalidated against the
-    authorized target in the same statement, like every media read: a target
-    revoked in between reads no row and answers ``false``.
+    flag is effective.  The flag is read only for a ready provider; for a
+    Uazapi clinic, ``uazapi_webhook_auth_enforced`` and then
+    ``uazapi_egress_enabled`` are read first (each only when the previous one
+    is open).  No read raises (closed on any doubt).  The credentials are
+    revalidated against the authorized target in the same statement, like
+    every media read: a target revoked in between reads no row and answers
+    ``false``.
 
     ``sendable_mime_types`` comes from the same credentials and the senders'
     own set (:func:`sendable_mime_types`), whatever the readiness: the screen
@@ -887,10 +894,22 @@ async def get_media_bindable_intents(
                 )
             )
         ).scalar_one_or_none()
-        # End the read transaction before the flag read (an Agent HTTP call
-        # under APPCONFIG_SOURCE=agent): no connection is held across it.
+        # End the read transaction before the flag reads (an Agent HTTP call
+        # each under APPCONFIG_SOURCE=agent): no connection is held across.
         await _rollback(session)
-        provider_ready = media_delivery_provider_ready(credentials or {})
+        # A Uazapi clinic is ready only with its webhook authentication
+        # enforced and its egress open: read those flags for it alone.
+        uazapi_clinic = (
+            isinstance(credentials, Mapping)
+            and credentials.get("whatsapp_provider") == "uazapi"
+        )
+        uazapi_auth_enforced = uazapi_clinic and await uazapi_webhook_auth_enforced()
+        uazapi_egress_enabled = uazapi_auth_enforced and await uazapi_egress_open()
+        provider_ready = media_delivery_provider_ready(
+            credentials or {},
+            uazapi_auth_enforced=uazapi_auth_enforced,
+            uazapi_egress_enabled=uazapi_egress_enabled,
+        )
         delivery_enabled = provider_ready and await agent_media_send_enabled()
         logger.info(
             "media_bindable_intents",

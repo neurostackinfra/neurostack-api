@@ -2224,6 +2224,54 @@ def test_unknown_contexts_build_an_unknown_trace() -> None:
     )
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_a_uazapi_ingress_carries_the_verification_into_its_principal(
+    verified: bool,
+) -> None:
+    """uazapi-webhook-auth (option C): the route says whether the envelope
+    token matched; the identity carries it, the principal is authenticated
+    only then, and ``principal_id`` / the claim key never change."""
+
+    from src.services.credit_principal import TenantBuilder, derive_credit_principal
+
+    tenant, session = uuid4(), uuid4()
+    context = build_interaction_context(
+        effective_tenant_id=tenant,
+        session_id=session,
+        origin=(
+            InteractionOrigin.PRODUCTION if verified else InteractionOrigin.UNKNOWN
+        ),
+        event_type="message.in",
+    )
+    request = SimpleNamespace(scope={"state": {"credit_switch_effective": True}})
+    built = credit_metering.uazapi_ingress(
+        request,  # type: ignore[arg-type]
+        message={"messageid": "uazapi-m-1"},
+        context=context,
+        inbound_verified=verified,
+    )
+    assert built is not None and built.identity is not None
+    assert built.identity.kind == "uazapi"
+    assert built.identity.inbound_verified is verified
+    principal = derive_credit_principal(
+        built.identity, TenantBuilder(tenant, uuid4(), True)
+    )
+    assert principal.principal_id == f"uazapi:{tenant}"
+    assert principal.authenticated is verified
+    assert credit_metering._claim_key(built, principal) == (None, "uazapi-m-1")
+    assert credit_metering.would_debit_mc(
+        origin=built.origin, authenticated=principal.authenticated, deliverable=True
+    ) == (credit_metering.TRACE_COST_MC if verified else 0)
+    # Without the keyword the ingress is today's: not verified.
+    default = credit_metering.uazapi_ingress(
+        request,  # type: ignore[arg-type]
+        message={"messageid": "uazapi-m-1"},
+        context=context,
+    )
+    assert default is not None and default.identity is not None
+    assert default.identity.inbound_verified is False
+
+
 @pytest.fixture(autouse=True)
 def _no_writer_leak(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Guard: the module slots this suite swaps come back as they were (the

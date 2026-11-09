@@ -77,8 +77,9 @@ _SENDABLE_MIME_TYPES: Final[Mapping[str, frozenset[str]]] = {
     "zapi": frozenset(
         {"image/jpeg", "image/png", "application/pdf", "audio/mpeg", "video/mp4"}
     ),
-    # uazapi and Evolution keep their Group 3 formats; neither is ready for
-    # agent media today (``media_delivery_provider_ready``).
+    # uazapi and Evolution keep their Group 3 formats. Evolution is never
+    # ready for agent media; uazapi only while its verified turns are
+    # production and its egress is open (``media_delivery_provider_ready``).
     "uazapi": frozenset(
         {"image/jpeg", "image/png", "application/pdf", "audio/mpeg", "video/mp4"}
     ),

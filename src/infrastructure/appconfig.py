@@ -29,6 +29,9 @@ SUPPORTED_FLAGS: Final = frozenset(
         "uazapi_egress_enabled",
         # envio-midia-agente: the agent sends Central de Mídias files.
         "agent_media_send_enabled",
+        # uazapi-webhook-auth: a Uazapi callback whose envelope token does not
+        # match is refused (401); closed, the check only measures (shadow).
+        "uazapi_webhook_auth_enforced",
     }
 )
 _MAX_RESPONSE_BYTES: Final = 16 * 1024
@@ -387,6 +390,7 @@ class AppConfigDataFlagReader:
             _flag_value(self._document, "financial_egress_enabled"),
             _flag_value(self._document, "uazapi_egress_enabled"),
             _flag_value(self._document, "agent_media_send_enabled"),
+            _flag_value(self._document, "uazapi_webhook_auth_enforced"),
             self._version_label,
             error_type,
             error_code,
@@ -401,6 +405,7 @@ class AppConfigDataFlagReader:
                 financial_egress_enabled=state[1],
                 uazapi_egress_enabled=state[2],
                 agent_media_send_enabled=state[3],
+                uazapi_webhook_auth_enforced=state[4],
                 version_label=self._version_label,
                 error_type=error_type,
                 error_code=error_code,

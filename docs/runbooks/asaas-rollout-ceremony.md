@@ -627,16 +627,19 @@ operator quorum. It does **not** change the persisted rollout state.
   runtime with the F2 reader (wish `asaas-rollout-opening` Group 4, PR #163
   "feat(billing): read the financial egress flag from AppConfig at runtime
   (F2)"; see the section "AppConfig and opening financial egress" of
-  [`asaas-deployment.md`](./asaas-deployment.md#appconfig-and-opening-financial-egress-follow-up-f2-not-written)).
+  [`asaas-deployment.md`](./asaas-deployment.md#appconfig-and-opening-financial-egress-follow-up-f2)).
   This lever exists only once step L7 has created those resources; before
   L7 there is no AppConfig profile and financial egress already reads
   closed.
 - *Command:* deploy, in AWS AppConfig, a new hosted version of the
   egress-flags profile where `financial_egress_enabled` has
-  `"enabled": false` (keep `uazapi_egress_enabled` and
-  `agent_media_send_enabled` at their current values: a flag left out of the
-  new version reads false, so dropping `agent_media_send_enabled` would also
-  stop agent media in every task), with the profile's no-bake deployment
+  `"enabled": false` (keep `uazapi_egress_enabled`,
+  `agent_media_send_enabled` and `uazapi_webhook_auth_enforced` at their
+  current values: a flag left out of the new version reads false, so
+  dropping `agent_media_send_enabled` would also stop agent media in every
+  task, and dropping `uazapi_webhook_auth_enforced` would return the Uazapi
+  webhook to shadow, with no authentication; see
+  [`uazapi-webhook-auth.md`](./uazapi-webhook-auth.md)), with the profile's no-bake deployment
   strategy, as described in that section. Whoever holds the AWS permission does it on the owner's order;
   this tool takes no part.
 - *Verify:* each task's reader normally closes the flag at its next poll,

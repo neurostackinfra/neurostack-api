@@ -139,8 +139,8 @@ def test_real_registry_and_core_collector_match_the_closed_contract() -> None:
     # billing fact consumer not-ready counter: a turned-away presentation is
     # not an attempt, so it stays out of the closed attempts outcome enum)
     # + 2 envio-midia-agente Group 2 families (agent media selection and
-    # delivery).
-    assert len(METRIC_DIMENSION_CONTRACTS) == 89
+    # delivery) + 1 uazapi-webhook-auth family (the envelope-token check).
+    assert len(METRIC_DIMENSION_CONTRACTS) == 90
     assert observed == set(METRIC_DIMENSION_CONTRACTS)
 
 
@@ -433,3 +433,75 @@ def test_the_agent_media_families_reject_values_outside_their_enum(
 ) -> None:
     with pytest.raises(MetricDimensionContractError, match="rejected value"):
         bounded_metric_labels(family, **labels)
+
+
+# uazapi-webhook-auth: ``neurostack_uazapi_webhook_auth_total{mode,result}``.
+_UAZAPI_AUTH_MODES = frozenset({"shadow", "enforce"})
+_UAZAPI_AUTH_RESULTS = frozenset(
+    {
+        "match",
+        "mismatch",
+        "token_missing",
+        "token_not_configured",
+        "unknown_instance",
+        "ambiguous_instance",
+        "check_error",
+    }
+)
+
+
+def test_the_uazapi_auth_family_is_a_closed_enum_without_identity() -> None:
+    from src.observability import metric_dimensions
+
+    contract = metric_dimension_contract("neurostack_uazapi_webhook_auth")
+    assert contract.labels == ("mode", "result")
+    for policy in contract.policies.values():
+        assert (policy.source, policy.normalizer, policy.fallback) == (
+            "enum",
+            None,
+            None,
+        )
+    assert contract.policies["mode"].vocabulary == _UAZAPI_AUTH_MODES
+    assert contract.policies["result"].vocabulary == _UAZAPI_AUTH_RESULTS
+    # ONE vocabulary: the route imports these Literals, the labels derive
+    # from them; pinned here by value.
+    assert metric_dimensions.UAZAPI_WEBHOOK_AUTH_RESULTS == _UAZAPI_AUTH_RESULTS
+    assert metric_dimensions.UAZAPI_WEBHOOK_AUTH_MODES == _UAZAPI_AUTH_MODES
+    assert "instance" not in contract.labels
+    assert "neurostack_uazapi_webhook_auth_total" not in METRIC_DIMENSION_CONTRACTS
+
+
+def test_the_uazapi_auth_counter_is_registered_and_pre_created() -> None:
+    from prometheus_client import REGISTRY
+
+    from src.observability.metrics import UAZAPI_WEBHOOK_AUTH_TOTAL
+
+    assert UAZAPI_WEBHOOK_AUTH_TOTAL._name == "neurostack_uazapi_webhook_auth"
+    (family,) = [
+        family
+        for family in REGISTRY.collect()
+        if family.name == "neurostack_uazapi_webhook_auth"
+    ]
+    children = {
+        (sample.labels["mode"], sample.labels["result"])
+        for sample in family.samples
+        if sample.name.endswith("_total")
+    }
+    assert children == {
+        (mode, result) for mode in _UAZAPI_AUTH_MODES for result in _UAZAPI_AUTH_RESULTS
+    }
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"mode": "observe", "result": "match"},
+        {"mode": "shadow", "result": "invalid"},
+        {"mode": "enforce", "result": "clinic-instance-1"},
+    ],
+)
+def test_the_uazapi_auth_family_rejects_values_outside_its_enum(
+    labels: dict[str, str],
+) -> None:
+    with pytest.raises(MetricDimensionContractError, match="rejected value"):
+        bounded_metric_labels("neurostack_uazapi_webhook_auth", **labels)
