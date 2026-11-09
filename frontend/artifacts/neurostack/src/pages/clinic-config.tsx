@@ -1125,12 +1125,6 @@ export function ApiCredentialsForm({
                       id={`${capability.id}-${provider.id}`}
                       label={provider.label}
                       sub={provider.sub}
-                      help={capability.id === "multimodal" && provider.id === "openrouter"
-                        ? txt(
-                          "Também usado para entender imagens recebidas no WhatsApp (uazapi, Z-API e Meta). As imagens são enviadas ao OpenRouter com a sua chave.",
-                          "Also used to understand images received on WhatsApp (uazapi, Z-API and Meta). Images are sent to OpenRouter with your key.",
-                        )
-                        : undefined}
                       state={state}
                       badgeLabel={badgeLabel[state]}
                       isExpanded={expanded === key}
