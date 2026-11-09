@@ -10,16 +10,18 @@ traceback can never start a new CloudWatch event.  With ``LOG_FORMAT=console``
 ANSI colours keep working; ESC cannot break a line.  JSON mode (production)
 escapes the full table.
 
-Every rendered line is also at most ``MAX_LINE_BYTES`` (15000) bytes of UTF-8:
-the Fargate log shim cuts a line at 16 KiB and awslogs sends each piece as its
-own event, so a longer line would let a body value start an event.  A longer
-record keeps its first ``HEAD_BYTES`` (8000) and its last ``TAIL_BYTES``
-(6000) bytes, cut on character boundaries before escaping (an escape is never
-split), joined by ``...[N chars elided]...`` where N is the number of
-characters of the formatted record, before escaping, that were dropped.  A
-line under the cap is unchanged by the cap (structlog JSON stays
-byte-identical); one over it is no longer valid JSON.  The work per record is
-bounded by the cap, whatever the record's size.
+Every rendered line is also at most ``MAX_LINE_BYTES`` (4095) bytes of UTF-8,
+so the line and its newline are one pipe write of at most ``PIPE_BUF`` (4096)
+bytes, which the workers sharing stdout cannot tear (see the constant).  A
+longer record keeps its first ``HEAD_BYTES`` (2048) and its last
+``TAIL_BYTES`` (1900) bytes, cut on character boundaries before escaping (no
+escape of this formatter is ever split), joined by ``...[N chars elided]...``
+where N is the number of characters of the formatted record, before escaping,
+that were dropped.  A line under the cap is unchanged by the cap (structlog
+JSON stays byte-identical).  A JSON line over it can no longer be read as the
+original record: it may not parse, or it may parse with the fields between
+the cuts missing (the cut can fall inside one of JSON's own escapes, such as
+``\\"``).  The work per record is bounded by the cap, whatever its size.
 """
 
 import logging
@@ -55,13 +57,25 @@ _CONSOLE_SINGLE_LINE_ESCAPES: Final[dict[int, str]] = {
 _UVICORN_LOGGERS: Final = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
-# The rendered line's bound (UTF-8 bytes, newline excluded), safely under the
-# 16384-byte piece the Fargate log shim cuts a longer line into.
-MAX_LINE_BYTES: Final = 15000
+# The rendered line's bound: UTF-8 bytes, newline excluded, so a record plus
+# its newline is at most 4095 + 1 = 4096 bytes = Linux ``PIPE_BUF``.  The 4
+# uvicorn workers (``Dockerfile`` ``--workers 4``) share one stdout pipe, and
+# the kernel makes a pipe ``write(2)`` atomic only up to ``PIPE_BUF``: a longer
+# record written while the pipe is backed up tears at 4096-byte steps, another
+# worker's line lands inside it, and its rest starts a new line and a new
+# CloudWatch event that a body value can aim.  This relies on
+# ``PYTHONUNBUFFERED=1`` (``Dockerfile`` :21 and :154): each record is then
+# one ``write(2)``; a buffered stdout would flush several records at once and
+# tear again.  The outer bound, the 16384-byte piece the Fargate log shim
+# cuts a longer line into, is therefore never reached.  Pinned by
+# ``tests/config/test_logging_single_line.py`` (not asserted here: macOS has
+# a 512-byte ``PIPE_BUF``).
+MAX_LINE_BYTES: Final = 4095
 # What an elided record keeps: at most this many bytes, escaped, of its start
-# and of its end (the end keeps a traceback's exception line).
-HEAD_BYTES: Final = 8000
-TAIL_BYTES: Final = 6000
+# and of its end (the end keeps a traceback's exception line); with the
+# marker they stay under ``MAX_LINE_BYTES``.
+HEAD_BYTES: Final = 2048
+TAIL_BYTES: Final = 1900
 _ELISION_MARKER: Final = "...[{elided} chars elided]..."
 
 

@@ -6748,20 +6748,28 @@ def test_a_body_value_cannot_forge_an_auth_line_in_the_real_log_output(
     )
 
 
+# Hard-coded, never the module's constants: Linux ``PIPE_BUF`` (the largest
+# atomic pipe write the 4 workers' shared stdout gets) and the Fargate log
+# shim's 16 KiB piece.
+_PIPE_BUF = 4096
+_SHIM_PIECE = 16 * 1024
+
+
+@pytest.mark.parametrize("aim", [_PIPE_BUF, _SHIM_PIECE], ids=["pipe_buf", "shim"])
 def test_a_body_value_cannot_start_an_auth_event_at_the_16_kib_split(
     auth_world: Callable[[bool], _AuthWorld],
     monkeypatch: pytest.MonkeyPatch,
+    aim: int,
 ) -> None:
-    """The Fargate log shim cuts a line every 16384 bytes and awslogs sends
-    each piece as its own event.  A ``message.type`` padded so a forged
-    ``uazapi_webhook_auth ... result=match`` begins exactly at a piece
-    boundary (the review's 33 KB attack) must not begin any piece: every
-    rendered line is at most 15000 bytes, so it is never cut at all."""
+    """Two boundaries start a new CloudWatch event inside a long line: the
+    shim's cut every 16384 bytes, and a pipe write torn at 4096-byte steps
+    when the workers' shared stdout backs up.  A ``message.type`` padded so a
+    forged ``uazapi_webhook_auth ... result=match`` begins exactly at byte
+    *aim* of its line (the review's attack) must begin no piece at either
+    step: every line plus its newline is one write of at most 4096 bytes."""
 
-    from src.config.logging import MAX_LINE_BYTES
     from tests.config.test_logging_single_line import configured_root_output
 
-    chunk = 16 * 1024
     world = auth_world(False)
     world.seed(uuid4(), token="the-instance-token", api_url="https://u.example")
 
@@ -6783,26 +6791,34 @@ def test_a_body_value_cannot_start_an_auth_event_at_the_16_kib_split(
         "owner_present=True from_me="
     )
     tail = " base_url_matches=True"
-    forged = head + "F" * (chunk - len(head) - len(tail)) + tail
+    forged = head + "F" * (_SHIM_PIECE - len(head) - len(tail)) + tail
     payload = world.payload()
-    payload["message"]["type"] = "x" * (chunk - len(prefix.encode())) + forged
+    payload["message"]["type"] = "x" * (aim - len(prefix.encode())) + forged
 
     with configured_root_output(monkeypatch) as (stream, _handler):
         response = world.client.post(WEBHOOK_PATH, json=payload)
 
     assert response.status_code == 200, response.text
-    lines = stream.getvalue().encode("utf-8").split(b"\n")
+    lines = [line for line in stream.getvalue().encode("utf-8").split(b"\n") if line]
     genuine = [line for line in lines if line.startswith(b"uazapi_webhook_auth ")]
     assert len(genuine) == 1
     assert genuine[0].startswith(
         f"uazapi_webhook_auth mode=shadow result=token_missing "
         f"instance={world.instance} ".encode()
     )
+    checked = 0
     for line in lines:
-        assert len(line) <= MAX_LINE_BYTES
-        pieces = [line[i : i + chunk] for i in range(0, max(len(line), 1), chunk)]
-        for piece in pieces[1:]:
-            assert not piece.startswith(b"uazapi_webhook_auth"), piece[:80]
+        for step in (_PIPE_BUF, _SHIM_PIECE):
+            for offset in range(0, len(line), step):
+                if line is genuine[0] and offset == 0:
+                    continue
+                piece = line[offset : offset + step]
+                assert not piece.startswith(b"uazapi_webhook_auth"), (step, offset)
+                checked += 1
+    assert checked >= 2 * len(lines) - 2  # the per-piece check ran
+    for line in lines:
+        assert len(line) + 1 <= _PIPE_BUF
+        assert len(line) < _SHIM_PIECE
 
 
 class TestUazapiWebhookAuthCheckFault:

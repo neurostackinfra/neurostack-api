@@ -174,24 +174,35 @@ that hold, and all are needed:
   lines (`http_request`, `Unhandled exception`,
   `appconfig_egress_flags_changed`) are written through the same handler and
   are unchanged below the cap.
-- **Every line is capped at 15000 bytes.** The Fargate log shim cuts a line
-  longer than 16 KiB into pieces, and `awslogs` sends each piece as its own
-  CloudWatch event (found by the independent review of this change; not
-  measured in this repository). Without a cap, a request of about 33 KB
-  could aim that cut so that a piece started with a forged
-  `uazapi_webhook_auth … result=match`, escaping or not. So every rendered
-  line is capped at `MAX_LINE_BYTES` = 15000 bytes of UTF-8, newline
-  excluded (`src/config/logging.py`), below the shim's 16384-byte cut. The
-  cap applies wherever the escaping applies: the root `SingleLineFormatter`
-  (stdlib lines and the structlog JSON lines, which go through the same
-  handler), the `SingleLineDelegatingFormatter` that wraps uvicorn's own
-  handlers, and the `unformattable log record:` fallback line. Above the
-  cap the middle is removed:
+- **Every line is capped at 4095 bytes.** Two things can cut a long line
+  into pieces, and each piece becomes its own CloudWatch event, so without
+  a cap a request could aim a cut so that a piece started with a forged
+  `uazapi_webhook_auth … result=match`, escaping or not:
+  - **the pipe (the binding bound).** The 4 uvicorn workers write to one
+    shared stdout pipe, and Linux keeps a pipe write atomic only up to
+    `PIPE_BUF`, 4096 bytes. When the pipe is backed up, a longer write can
+    be split at 4096-byte steps and interleaved with another worker's
+    writes; a write of at most 4096 bytes never is. This relies on
+    `PYTHONUNBUFFERED=1` (`Dockerfile`, both stages), under which each
+    record is written with a single `write()`;
+  - **the Fargate log shim (the outer bound).** It cuts a line longer than
+    16 KiB, and `awslogs` sends each piece as its own event (found by the
+    independent review of this change; not measured in this repository).
+
+  So every rendered line is capped at `MAX_LINE_BYTES` = 4095 bytes of
+  UTF-8, newline excluded (`src/config/logging.py`): with its newline a
+  record is at most 4096 bytes, one atomic write. The cap applies wherever
+  the escaping applies: the root `SingleLineFormatter` (stdlib lines and
+  the structlog JSON lines, which go through the same handler), the
+  `SingleLineDelegatingFormatter` that wraps uvicorn's own handlers, and the
+  `unformattable log record:` fallback line. Above the cap the middle is
+  removed:
   - the cut is made on raw characters **before** escaping, so it never
     splits a multi-byte character or an escape such as `\n`;
-  - at most the first `HEAD_BYTES` = 8000 and the last `TAIL_BYTES` = 6000
-    bytes, escaped, are kept, so the line holds at most 14000 bytes plus the
-    marker; the tail keeps a traceback's final exception line;
+  - at most the first `HEAD_BYTES` = 2048 and the last `TAIL_BYTES` = 1900
+    bytes, escaped, are kept, so the line holds at most 3948 bytes plus the
+    marker; the tail keeps a traceback's final exception line, and the
+    middle of a longer traceback is lost;
   - the two parts are joined by the elision marker `...[N chars elided]...`
     (`_ELISION_MARKER`), where `N` is the number of **characters** of the
     formatted record (message plus any traceback or stack text) dropped
@@ -203,14 +214,39 @@ that hold, and all are needed:
   exact leading form the code writes: a fragment embedded inside another
   line never matches. Do not write unanchored variants of these queries.
 
-So a request can still put any text **inside** its own line, but it can
-never **start** a line or a CloudWatch event.
+So a request can still put any text **inside** its own line, but it cannot
+**start** a line or a CloudWatch event, **provided** that:
 
-**What the cap does to the queries.** A `uazapi_webhook_auth` line is a few
-hundred bytes and is never cut. A `Uazapi webhook:` line with a huge `type`
-or `from` keeps its head, where `instance=` is, so Q3 still finds it. A JSON
-line over the cap (an `Unhandled exception` record with a very long
-traceback is the likely one) **can no longer be read as JSON**: depending on
+- the image carries the escaping formatter with the 4095-byte cap;
+- the process runs with `PYTHONUNBUFFERED=1`;
+- the logs are written to a pipe on Linux (the container's stdout).
+
+If an image's environment or entrypoint changes any of these (for example
+drops `PYTHONUNBUFFERED`, or wraps the process so its output is buffered or
+re-chunked before it reaches the pipe), the guarantee lapses for that
+image's lines.
+
+**What the cap does to the queries.** At 4095 bytes many more lines are
+elided than before, for example every structlog JSON line that carries a
+long traceback. Every field an anchored query matches sits in the first
+2048 bytes of its line, so it survives the cut (measured with the real
+formatter on worst-case lines):
+
+- a `uazapi_webhook_auth` line is at most about 1730 bytes even with the
+  longest encoded `instance` (128 four-byte characters), so it is never cut,
+  and Q1, W1, Q4 and W2 see it whole;
+- the `Uazapi webhook:` line writes `instance=` first, before the raw body
+  fields (`from`, `type`, `mediaType`): body content cannot push it past
+  the head, and Q3's matched span ends by about byte 1610 at worst;
+- W3 (`{"endpoint": … "event": "Unhandled exception", `), the
+  `http_request` cross-check and R1 (and the anchored readbacks of
+  [`../agent-media-delivery.md`](../agent-media-delivery.md#the-flag-and-the-kill-switch)
+  and [`asaas-deployment.md`](./asaas-deployment.md)) end within the first
+  550 bytes; no request value comes before their matched fields.
+
+The middle of an elided line is lost: for a traceback, the head and the
+final exception line remain. A JSON line over the cap **can no longer be
+read as JSON**: depending on
 where the cut falls it does not parse at all, or it parses with the middle
 fields gone or merged into one string value. Anything that reads JSON
 fields, such as Logs Insights' discovered fields or a metric filter on
@@ -222,9 +258,14 @@ elision marker is in the middle.
 the escaping formatter with the cap.** Record the time the first such image
 served on `ECS_SERVICE` (`ESCAPING_IMAGE_AT`: the deployment of an image
 whose source commit contains `SingleLineFormatter` in `src/config/logging.py`
-with the 15000-byte cap; the build tag names the commit). **Lines older than
+with `MAX_LINE_BYTES` = 4095, and whose task definition runs it with
+`PYTHONUNBUFFERED=1` writing to the container's stdout; the build tag names
+the commit). An image that later changes its environment or entrypoint so
+that any of these no longer holds ends the period: its lines do not count
+either. **Lines older than
 `ESCAPING_IMAGE_AT` never count toward any evidence of this runbook**,
-including lines of an image that escaped but did not cap: start every period
+including lines of an image that escaped but did not cap, or capped at
+15000 bytes (an earlier draft of this change): start every period
 of the criterion and of the watch at or after it.
 
 Even so, each trigger of the [watch](#the-post-enforce-watch) is
@@ -970,7 +1011,7 @@ foreign-looking refusals and any line that merely contains that text. An
 alarm on it is only a prompt to run the anchored W1, never a trigger by
 itself. The second is a JSON-field pattern: a stdlib line is not JSON, so
 text embedded in one cannot match it, but an `Unhandled exception` line over
-the 15000-byte cap may not parse as JSON either, so the alarm can miss a 500
+the 4095-byte cap may not parse as JSON either, so the alarm can miss a 500
 whose traceback is long. W3 (text, anchored on the head) still finds it.
 
 ## Every hosted version from now on (Decision 11)

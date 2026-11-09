@@ -408,12 +408,71 @@ def test_the_cut_never_splits_an_escape_or_a_character() -> None:
     assert len(line.encode("utf-8")) <= MAX_LINE_BYTES
 
 
+# Hard-coded, never the module's constants: a mutant cap must fail these.
+_LINE_LIMIT = 4095  # bytes, newline excluded: one write of at most PIPE_BUF
+
+
+def test_the_cap_is_one_atomic_pipe_write_under_the_shim_piece() -> None:
+    """The bound the 4 workers' shared stdout pipe and the log shim need,
+    pinned by numbers that do not come from the module."""
+
+    import select
+
+    assert MAX_LINE_BYTES + 1 <= 4096
+    assert MAX_LINE_BYTES < 16384
+    assert MAX_LINE_BYTES == _LINE_LIMIT
+    assert HEAD_BYTES + TAIL_BYTES + len("...[9999999999 chars elided]...") <= 4095
+    if sys.platform.startswith("linux"):
+        assert MAX_LINE_BYTES + 1 == select.PIPE_BUF
+
+
 def test_a_line_under_the_cap_is_unchanged_by_it() -> None:
-    line = "x" * MAX_LINE_BYTES
+    line = "x" * 4095
     assert logging_config._single_line(line) == line
-    escaped = "ç" * (MAX_LINE_BYTES // 2)
-    assert logging_config._single_line(escaped) == escaped
+    two_byte = "ç" * 2047  # 4094 bytes
+    assert logging_config._single_line(two_byte) == two_byte
     assert "elided" in logging_config._single_line(line + "x")
+    assert "elided" in logging_config._single_line(two_byte + "ç")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["\n" * 3000, "\x00" * 1100, "ç" * 3000, "😀" * 1500, "a\u2028" * 1000],
+    ids=["newlines", "nul", "two_byte", "four_byte", "separator"],
+)
+def test_a_record_under_the_cap_in_characters_but_over_it_in_bytes_is_elided(
+    text: str,
+) -> None:
+    """At most 4095 characters, more than 4095 bytes once escaped."""
+
+    assert len(text) <= 4095
+    line = logging_config._single_line(text)
+    assert len(line.encode("utf-8")) <= 4095
+    (marker,) = _ELIDED.finditer(line)
+    assert int(marker.group(1)) > 0
+
+
+def test_the_uvicorn_wrapper_caps_an_ordinary_long_record() -> None:
+    """Not only the error fallback: a long record the inner formatter renders
+    normally is one line of at most 4095 bytes, uvicorn's prefix kept."""
+
+    wrapper = SingleLineDelegatingFormatter(
+        logging.Formatter("%(levelname)s:    %(message)s")
+    )
+    record = logging.LogRecord(
+        "uvicorn.error",
+        logging.ERROR,
+        __file__,
+        1,
+        "Exception in ASGI application %s",
+        ("ç\n" * 5000,),
+        None,
+    )
+    line = wrapper.format(record)
+
+    assert line.startswith("ERROR:    Exception in ASGI application ç\\n")
+    assert "\n" not in line and len(line.encode("utf-8")) <= 4095
+    assert _ELIDED.search(line)
 
 
 def test_a_json_line_over_the_cap_is_elided_under_it_unchanged(

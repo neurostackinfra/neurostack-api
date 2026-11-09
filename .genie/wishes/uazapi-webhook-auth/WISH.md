@@ -613,3 +613,30 @@ Em produção nada muda, e a recusa continua sem escapatória. O desenho aprovad
   - Entram ainda o escape dos surrogates, o pré-corte para limitar a CPU e o caminho rápido para ASCII imprimível.
 - **Disparado:** o fixer do código, com o limite, os surrogates, o desempenho, LOW-1 e LOW-2. Em paralelo, o fixer dos docs, com a seção "Log integrity" e os 5 LOW da re-revisão 2.
 - **Próximos passos:** commit local, rebase sobre a `main`, revalidação, final-gate do branch inteiro e PR.
+- **Limite de linha:** fixer `done`.
+  - `MAX_LINE_BYTES=15000`, com cabeça de 8000 bytes, cauda de 6000 e o marcador `...[N chars elided]...`. N conta caracteres antes do escape.
+  - Surrogates escapados, caminho rápido para ASCII imprimível e trabalho limitado.
+  - 10 testes, entre eles o corte mirado em 16 KiB pela rota real, LOW-1 e LOW-2. Dez provas vermelhas.
+  - Resultado: 1061 testes passaram.
+- **Docs:** fixer `done`. A seção "Log integrity" ganhou o corte do shim em 16 KiB, o limite e o marcador exato. Também entraram os 5 LOW. As provas 2 a 5 passaram, junto com 1513 testes. Ponto observado: uma linha JSON acima do limite pode até dar parse, mas fica sem os campos do meio; o runbook diz isso.
+- **Commits locais** (sem push): `fdb2e710` (código) e `0985c6c4` (docs mais este wish, via `-f`), com o backup `backup/uazapi-webhook-auth-pre-rebase`.
+- **Rebase** sobre `origin/main` `973c2f5f`.
+  - O código entrou sem conflito, com auto-merge em `webhook.py`, `media_assets.py`, `credit_metering.py` e outros.
+  - Os docs tiveram 2 conflitos em `docs/agent-media-delivery.md`. Foram resolvidos com a regra nova da `main` (arquivos com a chave ligada vão nos turnos dos assuntos e em toda saudação e FAQ) mais a frase da flag de autenticação da uazapi.
+  - HEAD passou a ser `09f826ff` (docs) sobre `8d1b8421` (código).
+- **Em andamento:**
+  - validação pós-rebase, completa, sem deselect, com `make format-check` e `make lint` no repo inteiro e as suítes tocadas pelo #210, #212 e #213, inclusive as de Postgres;
+  - re-revisão do logging.
+- **Depois:** final-gate do branch e o PR.
+- **Validação pós-rebase:** `chain_rc=0`, com HEAD `09f826ff` e o limite ainda em 15000.
+  - **Unitários:** 4533 testes passaram, com 1 skip (o smoke opt-in de Docker). Entraram as suítes tocadas pelo #210, #212 e #213 e o diretório `tests/ops` inteiro.
+  - **Postgres:** 474 de 474, com 0 skip, incluindo as suítes de mídia.
+  - **Estáticos:** `make format-check`, `make lint` e `make typecheck` no repo inteiro, todos limpos.
+  - **Log do servidor Postgres:** 58 linhas `ERROR`, todas negativas intencionais. Em `media_assets`: violações de check constraint, um VARCHAR(255) estourado, um byte NUL recusado e um `ADD CONSTRAINT` sobre linha que já violava a regra. Também uma FK de sessão inexistente e locks NOWAIT do clone. O `media_deliveries does not exist` vem de `test_the_flag_on_control_fails_closed_on_the_bridge_less_schema`. As linhas restantes são as de crédito, as mesmas de antes.
+- **Re-revisão do logging:** FIX-FIRST.
+  - **Fechados:** HIGH-1, com o ataque de 33 KB e 5 variantes, inclusive na imagem base de produção; MEDIUM-1; MEDIUM-2, com pior caso de cerca de 3,7 ms; LOW-1; LOW-2. Fuzz com 6000 casos bate com a referência.
+  - **HIGH-2 novo:** o `PIPE_BUF` é de 4096 bytes, e os 4 workers compartilham o pipe do stdout. Um registro de 15000 bytes rasga a cada 4096 bytes quando o pipe está cheio, e foram medidos de 398 a 1325 eventos forjados a cada 1200 registros. Abaixo de 4096 bytes, nunca rasgou.
+  - **LOW-A:** 4 mutantes sobreviveram.
+  - **LOW-C:** a docstring diz "no longer valid JSON".
+- **Decisão do owner (2026-11-09):** "Baixar o limite para 4095 bytes". As constantes ficam `MAX_LINE_BYTES=4095`, `HEAD_BYTES=2048` e `TAIL_BYTES=1900`. Efeito aceito: tracebacks acima de 4 KB perdem os frames do meio.
+- **Disparado:** o fixer do código, com as constantes, o comentário sobre `PIPE_BUF` e `PYTHONUNBUFFERED`, os testes do LOW-A e o LOW-C. Em paralelo, o fixer dos docs, com os números, a explicação do `PIPE_BUF`, as precondições da garantia e a checagem de que os campos ancorados ficam dentro da cabeça de 2048 bytes.
