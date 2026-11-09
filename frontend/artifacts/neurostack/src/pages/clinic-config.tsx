@@ -554,8 +554,8 @@ export const API_CAPABILITIES: readonly {
     id: "multimodal",
     short: "API LLM Fallback Multimodal",
     desc: {
-      pt: "Fallback multimodal para três usos: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal), quando o STT falhar (o modelo ouve o áudio direto) e para entender imagens recebidas no WhatsApp.",
-      en: "Multimodal fallback for three uses: when the primary LLM fails (prompt and history are sent to the multimodal provider), when STT fails (the model listens to the audio directly) and to understand images received on WhatsApp.",
+      pt: "Fallback multimodal para duas contingências: quando o LLM primário falhar (com prompt e histórico enviados ao provedor multimodal) e quando o STT falhar (o modelo ouve o áudio direto).",
+      en: "Multimodal fallback for two contingencies: when the primary LLM fails (prompt and history are sent to the multimodal provider) and when STT fails (the model listens to the audio directly).",
     },
     required: true,
   },
