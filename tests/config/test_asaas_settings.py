@@ -27,9 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def _production_settings(
     _acknowledgement_observed_at: str | None = None, **overrides: object
 ) -> Settings:
-    observed_at = (
-        _acknowledgement_observed_at or datetime.now(timezone.utc).isoformat()
-    )
+    observed_at = _acknowledgement_observed_at or datetime.now(timezone.utc).isoformat()
     challenge_nonce = "settings-test-challenge"
     rules_digest = hashlib.sha256(
         (ROOT / "config/prometheus_rules.yml").read_bytes()

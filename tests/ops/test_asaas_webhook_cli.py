@@ -835,7 +835,6 @@ def test_the_url_pin_is_exactly_the_decided_d3_parameter() -> None:
     assert reasons == ()
 
 
-
 def test_the_production_url_is_allowed_only_in_production() -> None:
     assert cli.WEBHOOK_URL_BY_ENVIRONMENT["production"] == PRODUCTION_URL
     checks, _ = cli.validate_config(

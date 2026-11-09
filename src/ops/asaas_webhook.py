@@ -486,8 +486,7 @@ def validate_config(
         "webhook_url_valid": url_valid,
         "webhook_host_allowed": url_valid
         and urlsplit(config.webhook_url).netloc in ALLOWED_WEBHOOK_HOSTS,
-        "webhook_url_allowed": url_valid
-        and config.webhook_url in ALLOWED_WEBHOOK_URLS
+        "webhook_url_allowed": url_valid and config.webhook_url in ALLOWED_WEBHOOK_URLS
         # Bound to its own environment; an undeployable environment is
         # reported once, by environment_deployable, not here as well.
         and config.webhook_url
