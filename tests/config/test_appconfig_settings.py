@@ -142,11 +142,6 @@ def test_bearer_token_is_redacted_from_settings_representation() -> None:
             "BILLING_OBSERVABILITY_SMOKE_TOKEN is required in production",
         ),
         (
-            {"billing_observability_acknowledgement": ""},
-            ConfigurationError,
-            "fresh authenticated runtime acknowledgement",
-        ),
-        (
             {"billing_alert_receiver_url": "https://127.0.0.1/hook"},
             ValidationError,
             "BILLING_ALERT_RECEIVER_URL must be a non-loopback HTTPS URL",
@@ -158,6 +153,16 @@ def test_complete_appconfig_fixture_does_not_mask_billing_production_gates(
 ) -> None:
     with pytest.raises(error, match=message):
         _production_settings(appconfig_enabled=False, **overrides)
+
+
+def test_missing_billing_acknowledgement_is_a_readiness_input_not_a_startup_gate() -> (
+    None
+):
+    configured = _production_settings(
+        appconfig_enabled=False, billing_observability_acknowledgement=""
+    )
+
+    assert configured.is_billing_runtime_acknowledgement_compatible is False
 
 
 def test_appconfig_source_defaults_to_the_agent() -> None:
