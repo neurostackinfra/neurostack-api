@@ -401,6 +401,10 @@ class TestMetaWebhookTextFlow:
         assert event_arg.payload.content == "Quero agendar uma consulta"
         assert event_arg.payload.metadata["source"] == "meta_cloud"
         assert event_arg.payload.metadata["messageId"] == wamid
+        # A text message records no transcription usage.
+        assert {"whisper_model", "is_audio", "audio_seconds"}.isdisjoint(
+            event_arg.payload.metadata
+        )
 
         # Reply was sent via Graph API
         assert mock_send.await_count == 1
@@ -1342,6 +1346,41 @@ class TestMetaWebhookAudioRealDuration:
             if "Meta Ogg audio without a measurable duration" in message
         ]
         assert len(unmeasured) == (1 if "ogg" in mime_type else 0)
+
+    @pytest.mark.parametrize(
+        ("audio_bytes", "mime_type", "audio_seconds"),
+        [
+            pytest.param(
+                ogg_opus_file(37.6), "audio/ogg; codecs=opus", 37, id="voice_note"
+            ),
+            pytest.param(
+                b"ID3\x04" + bytes(4000), "audio/mpeg", 0, id="mp3_without_duration"
+            ),
+        ],
+    )
+    def test_a_transcribed_audio_records_its_usage_for_the_usage_cards(
+        self,
+        client: TestClient,
+        tenant_id: UUID,
+        caplog: pytest.LogCaptureFixture,
+        audio_bytes: bytes,
+        mime_type: str,
+        audio_seconds: int,
+    ):
+        # The same three keys Z-API records: the trace stats and the builder
+        # dashboard count transcription seconds per model from them. A format
+        # without a measured duration records 0 (the cards count it as 1 s).
+        run = self._run(
+            client, tenant_id, caplog, audio_bytes=audio_bytes, mime_type=mime_type
+        )
+
+        self._assert_transcribed(run, audio_bytes)
+        metadata = run.pipeline.await_args.args[0].payload.metadata
+        assert metadata["is_audio"] is True
+        assert metadata["audio_seconds"] == audio_seconds
+        stt_creds = run.transcribe.await_args.kwargs["creds"]
+        assert metadata["whisper_model"] == webhook_module._resolve_stt_model(stt_creds)
+        assert metadata["whisper_model"] == "whisper-large-v3-turbo"
 
     def test_a_file_over_the_size_ceiling_is_handed_off_before_the_download(
         self,

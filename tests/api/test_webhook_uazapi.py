@@ -613,6 +613,10 @@ class TestUazapiWebhookTextFlow:
         assert event_arg.payload.metadata["source"] == "uazapi"
         assert event_arg.payload.metadata["messageId"] == msg_id
         assert event_arg.payload.metadata["phone"] == "5511988887777"
+        # A text message records no transcription usage.
+        assert {"whisper_model", "is_audio", "audio_seconds"}.isdisjoint(
+            event_arg.payload.metadata
+        )
 
         # Reply was sent via send_uazapi_text with the expected arguments
         assert mock_send.await_count == 1
@@ -3429,6 +3433,7 @@ class TestUazapiGroup4PatientAudioTranscription:
             "audio",
             instance=instance,
             message_id=f"3EB0_fixed_{uuid4().hex[:10]}",
+            seconds_override=42,
         )
         raw_mime = "audio/ogg; codecs=opus"
         audio_bytes = b"OggS_uazapi_fixed_provider"
@@ -3436,9 +3441,11 @@ class TestUazapiGroup4PatientAudioTranscription:
         fixed_adapter = AsyncMock(return_value=transcript)
         legacy_adapter = AsyncMock()
         captured: dict[str, str] = {}
+        metadata: dict[str, object] = {}
 
         async def _capture(self, event_request, session=None, *, context=None):
             captured["content"] = event_request.payload.content
+            metadata.update(event_request.payload.metadata or {})
             return MagicMock(), {}, []
 
         no_reply = SimpleNamespace(
@@ -3480,6 +3487,11 @@ class TestUazapiGroup4PatientAudioTranscription:
         # decision machine the text turns feed, with no translation.
         assert "language" not in kwargs or kwargs["language"] is None
         legacy_adapter.assert_not_awaited()
+        # The usage cards count this transcription: the model STT used and
+        # the payload's own ``content.seconds``, as Z-API records them.
+        assert metadata["whisper_model"] == model_name
+        assert metadata["is_audio"] is True
+        assert metadata["audio_seconds"] == 42
 
     @pytest.mark.parametrize("provider", ["elevenlabs_scribe", "openrouter"])
     def test_fixed_provider_operational_error_runs_multimodal_then_reroutes(
