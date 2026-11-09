@@ -790,11 +790,16 @@ class Settings(BaseSettings):
                     "ALLOWED_ORIGINS should not contain '*' in production for security"
                 )
 
-            if not self.is_billing_observability_compatible:
-                errors.append(
-                    "billing observability requires non-loopback HTTPS receiver, "
-                    "rules/smoke digests, and fresh authenticated runtime acknowledgement"
-                )
+            # Billing observability (receiver, rule/smoke digests and the
+            # receiver-signed runtime acknowledgement) is a READINESS input,
+            # reported by /ready (``billing_observability``), not a startup
+            # condition.  The acknowledgement must be at most 300 s old when
+            # evaluated, so as a startup condition it fails every ECS task
+            # (re)started more than five minutes after the evidence was
+            # issued: a restart, a deployment or a scale-out would take
+            # production down.  The ALB health check is /health, so an
+            # incomplete contract keeps /ready at 503 without stopping
+            # traffic.
             if len(self.billing_operation_receipt_signing_key.get_secret_value()) < 32:
                 errors.append(
                     "BILLING_OPERATION_RECEIPT_SIGNING_KEY must be at least 32 bytes "

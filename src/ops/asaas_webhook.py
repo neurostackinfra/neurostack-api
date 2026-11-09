@@ -181,15 +181,23 @@ MAX_DEADLINE_SECONDS: Final = 600
 DEPLOYABLE_ENVIRONMENTS: Final = frozenset({"staging", "production"})
 PRODUCTION_KEY_PREFIX: Final = "$aact_prod_"
 SANDBOX_KEY_PREFIX: Final = "$aact_hmlg_"
-# Deliberate safety net, not configuration: the only webhook URL this
-# command registers, exactly the owner-decided D3 parameter
-# ``ASAAS_WEBHOOK_URL`` (2026-10-18; ``infra/production/
-# asaas-production-wiring.params.yaml``).  If that parameter ever changes,
-# change this constant in the same reviewed change, or registration stays
+# Deliberate safety net, not configuration: the only webhook URLs this
+# command registers, one per deployed environment.  Staging is the
+# owner-decided D3 parameter ``ASAAS_WEBHOOK_URL`` (2026-10-18;
+# ``infra/production/asaas-production-wiring.params.yaml``); production is
+# the ``ASAAS_WEBHOOK_URL`` of envs/prod/app in neurostack-infra-terraform
+# (2026-11-08, service neurostack-prod-app).  If either changes, change this
+# constant in the same reviewed change, or registration stays
 # ``unconfigured``.  The host set is derived from it.
-ALLOWED_WEBHOOK_URLS: Final = frozenset(
-    {"https://staging.api.neurostack.global/v1/billing/webhook/asaas"}
+# Each URL is bound to its ENVIRONMENT: staging can never register the
+# production URL, nor production the staging one.
+WEBHOOK_URL_BY_ENVIRONMENT: Final = MappingProxyType(
+    {
+        "staging": "https://staging.api.neurostack.global/v1/billing/webhook/asaas",
+        "production": "https://api.neurostack.global/v1/billing/webhook/asaas",
+    }
 )
+ALLOWED_WEBHOOK_URLS: Final = frozenset(WEBHOOK_URL_BY_ENVIRONMENT.values())
 ALLOWED_WEBHOOK_HOSTS: Final = frozenset(
     urlsplit(url).netloc for url in ALLOWED_WEBHOOK_URLS
 )
@@ -478,7 +486,12 @@ def validate_config(
         "webhook_url_valid": url_valid,
         "webhook_host_allowed": url_valid
         and urlsplit(config.webhook_url).netloc in ALLOWED_WEBHOOK_HOSTS,
-        "webhook_url_allowed": url_valid and config.webhook_url in ALLOWED_WEBHOOK_URLS,
+        "webhook_url_allowed": url_valid
+        and config.webhook_url in ALLOWED_WEBHOOK_URLS
+        # Bound to its own environment; an undeployable environment is
+        # reported once, by environment_deployable, not here as well.
+        and config.webhook_url
+        == WEBHOOK_URL_BY_ENVIRONMENT.get(config.environment, config.webhook_url),
         "notification_email_valid": bool(config.notification_email)
         and _accepts(lambda: desired(email=config.notification_email)),
         "environment_deployable": config.environment in DEPLOYABLE_ENVIRONMENTS,
