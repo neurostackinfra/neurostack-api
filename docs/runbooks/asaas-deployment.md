@@ -1494,10 +1494,28 @@ and 2, approved together; see "Known gap" below):
    any image change (`service_not_on_target`), so with the target still 17
    PR-B's deploy is blocked (`rollback_target_not_repinned_before_image_bump`);
    after this step the way back from PR-B is the bridge revision, which keeps
-   the credit switch on.
+   the credit switch on. Done by the re-pin PR of 2026-11-08 (evidence read
+   only that day, `closed_at` 2026-11-08T23:51Z; "History (17 to 18)"): the
+   reviewed manifest is at 18.
 4. Only then merge and deploy the behaviour release (PR-B), rebased on the
    `main` that contains this release, with proof of ancestry.
 5. Open the behaviour release's flag.
+
+**Steps 1 and 2 ran in production on 2026-11-08**, on one "vai" from the
+owner. The bridge image (`build-20261108-7d8f9893-42533757372`, built from
+`main` `7d8f9893`) serves as revision 18, revision 17 with the app image
+alone moved (deployment `ecs-svc/5010307537340605458` `COMPLETED`
+2026-11-08 23:31:45Z, 2/2 running, 0 failed tasks, steady state). Window
+`045` ran on it with the rollback target 17 (migrations revision
+`neurostack-staging-migrations:9`, command `alembic upgrade 045`, the bridge
+image; snapshot `pre-043-045-2026-11-08`; pre-read `read_ok` at `042`, the
+three counts `0`; migration task sent 2026-11-08T23:44:45Z, `applied`, exit
+`0`, exactly `042 -> 043`, `043 -> 044` and `044 -> 045`; post-read
+`verified` at 2026-11-08T23:47:28Z: `alembic_version` `045` and both DML
+privilege rows held). The billing counts read before and after the deploy
+were identical (`[1,1,1,1]`). The OGG/M4A gap below lasted from about
+23:31Z to 23:45Z. Production is at `045`: the window cannot run again (only
+after a snapshot restore, planned with a manifest at 17).
 
 **Known gap between steps 1 and 2: `audio/ogg` and `audio/mp4` uploads
 fail.** The bridge image is built from a `main` that contains #184 and M4A,
@@ -1516,8 +1534,9 @@ with their migration (`043`, `044`) and no window of their own, and the
 bridge adds no upload path. **Every deploy of the current `main` to
 production before window `045` runs has it**, a hotfix deployed before this
 bridge release included; window `045` (`042 -> 043 -> 044 -> 045`) is what
-closes it. Production today is not affected: the service runs revision 17
-(image `build-20261104-fbda835a`), which does not contain #184. Following
+closes it. Before step 1 production was not affected: the service ran
+revision 17 (image `build-20261104-fbda835a`), which does not contain #184.
+Following
 this order, the gap lasts only from the bridge deploy to the window's
 commit, so the remedy is the order itself: run the window right after the
 bridge deploy is stable, and keep the gap short. **Steps 1 and 2 are
@@ -3024,12 +3043,12 @@ new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
 13) it is a starting point, to confirm by running the runbook readers, since
 it depends on how L2c rewrote these tests: in
 `tests/scripts/test_asaas_migration_window.py`,
-`test_the_reviewed_manifest_is_pinned_to_revision_17` and the `MANIFEST`
+`test_the_reviewed_manifest_is_pinned_to_revision_18` and the `MANIFEST`
 line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
 `042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
 in `tests/scripts/test_asaas_production_wiring.py`,
 `test_manifest_and_template_validate`,
-`test_rollback_target_is_re_pinned_to_revision_17_without_a_note`,
+`test_rollback_target_is_re_pinned_to_revision_18_without_a_note`,
 `test_manifest_validator_rejects_an_invalid_rollback_target`,
 `test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
 `test_the_repository_parameters_propose_the_l2a_rows_revision`,
@@ -3120,13 +3139,42 @@ the window `045` reads of the reviewed manifest, and added
 the target on 17 window `045`'s own target check passes on the reviewed
 manifest; a manifest at 16 still refuses it.
 
+**History (17 to 18).** Revision 18 (revision 17 with the app image alone
+moved to the media bridge image containing `045`,
+`build-20261108-7d8f9893-42533757372`, built from `main` `7d8f9893`;
+deployment `COMPLETED` 2026-11-08 23:31:45Z, 2/2 running, 0 failed tasks,
+steady state, no error in the app logs since the deploy) served window `045`
+(migrations revision 9, snapshot `pre-043-045-2026-11-08`, the three
+upgrades `042 -> 043`, `043 -> 044` and `044 -> 045`, post-read verified
+`045` at 23:47:28Z; "Migration 045"). Before the next image change (the
+behaviour release, PR-B, step 4 of that production order), the manifest was
+re-pinned from 17 to the serving bridge revision 18 (step 3) with
+`effective_after: revision_serving_verified_and_observation_closed`, its
+image digest and its `request_sha256` (read only on 2026-11-08: `ACTIVE`,
+exactly one `BILLING_FACT_WORKER_ENABLED` `'true'`, both staged rows
+`'true'`, the complete AppConfig group; revision 18's request with the app
+image set back to revision 17's digest hashes to revision 17's recorded
+`request_sha256`, so the two differ in the app image alone). The owner
+waived its 6 h floor (2026-11-09T05:32Z) and declared the observation closed
+at 2026-11-08T23:51Z, after window `045`'s post-read, the manifest's seventh
+`closed_at` marker. Besides the checklist above it also updated the 10 to 11
+evidence test (one `request_sha256` per re-pin), the context line of
+`test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time` and
+the window `045` reads of the reviewed manifest, and added
+`test_the_17_to_18_re_pin_records_its_request_sha256_and_image_digest`. With
+the target on 18 window `045` refuses the reviewed manifest
+(`rollback_target_not_repinned`); a manifest at 17 still passes its target
+check.
+
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production
 is at `037`; they would run only after a snapshot restore, planned with a
 manifest at 10). Window `042` requires revision 12 by number and by content
 ("Window 042: migrations 038-042"). Window `045` requires revision 17 the
-same way ("Migration 045"); since the re-pin 16 to 17 the reviewed manifest
-is its own target, and only its.
+same way ("Migration 045"); it ran on 2026-11-08, and since the re-pin 17 to
+18 the reviewed manifest is no window's target: production is at `045`, so
+`045` too could run again only after a snapshot restore, planned with a
+manifest at 17.
 
 **The circuit breaker.** ECS rolls a failed deployment back to the last
 completed one. With this order that is the target itself for L2a (11) and

@@ -1910,7 +1910,7 @@ def test_unknown_parameter_is_rejected() -> None:
 def test_manifest_and_template_validate() -> None:
     manifest, parameters, digests = wiring.load_inputs(MANIFEST, PARAMS)
     assert manifest["rollback_target"] == {
-        "revision": 17,
+        "revision": 18,
         "effective_after": wiring.ROLLBACK_EFFECTIVE_SERVING,
     }
     assert "rollback_task_definition_revision" not in manifest["target"]
@@ -2861,23 +2861,23 @@ LIVE_REVISION_9_IMAGE = (
 )
 
 
-def test_rollback_target_is_re_pinned_to_revision_17_without_a_note() -> None:
-    """The reviewed manifest after the re-pin 16 -> 17 to the serving
-    revision (revision 16 with the image of main after the ASAAS
-    sandbox-by-key change) before an image change (the media bridge image,
-    window 045's own target): revision 17 with the generic effective step,
-    no note."""
+def test_rollback_target_is_re_pinned_to_revision_18_without_a_note() -> None:
+    """The reviewed manifest after the re-pin 17 -> 18 to the serving bridge
+    revision (revision 17 with the media bridge image containing 045) once
+    window 045 was verified, before the next image change (the behaviour
+    release of envio-midia-agente): revision 18 with the generic effective
+    step, no note."""
 
     raw = wiring.load_yaml(MANIFEST)
     assert raw["rollback_target"] == {
-        "revision": 17,
+        "revision": 18,
         "effective_after": "revision_serving_verified_and_observation_closed",
     }
     manifest = wiring.validate_manifest(raw)
     assert "repin" not in manifest["rollback_target"]
     pins = _pins()
-    assert pins.rollback_revision == 17
-    assert pins.rollback_task_definition_arn == STAGED_ARNS[17]
+    assert pins.rollback_revision == 18
+    assert pins.rollback_task_definition_arn == STAGED_ARNS[18]
     assert pins.rollback_effective_after == wiring.ROLLBACK_EFFECTIVE_SERVING
     assert pins.rollback_repin_before is None
     # The D3 source stays revision 8: the re-pins move only the rollback target.
@@ -6509,6 +6509,14 @@ REPIN_13_TO_16_EARLIEST_CLOSE = datetime.datetime(2026, 11, 3, 20, 46)
 # minute; nothing is waived.
 REVISION_17_COMPLETED = datetime.datetime(2026, 11, 4, 2, 13, 5)
 REPIN_16_TO_17_EARLIEST_CLOSE = datetime.datetime(2026, 11, 4, 8, 14)
+# Revision 18's deployment (the media bridge image, revision 17 with the app
+# image alone moved) completed at 2026-11-08 23:31:45 UTC, and window 045's
+# post-read verified 045 on it at 23:47:28 UTC. The 6 h floor of the re-pin
+# 17 -> 18 (2026-11-09 05:32) was WAIVED by the owner on 2026-11-08, so its
+# floor is the deployment itself, rounded up to the minute.
+REVISION_18_COMPLETED = datetime.datetime(2026, 11, 8, 23, 31, 45)
+WINDOW_045_POST_READ = datetime.datetime(2026, 11, 8, 23, 47, 28)
+REPIN_17_TO_18_EARLIEST_CLOSE = datetime.datetime(2026, 11, 8, 23, 32)
 # One `# closed_at:` marker per re-pin in the manifest comment, in file order,
 # each with its own floor (the re-pin 12 -> 13 of live step L4 appends its).
 REPIN_CLOSE_FLOORS = (
@@ -6518,6 +6526,7 @@ REPIN_CLOSE_FLOORS = (
     ("12 to 13", REPIN_12_TO_13_EARLIEST_CLOSE),
     ("13 to 16", REPIN_13_TO_16_EARLIEST_CLOSE),
     ("16 to 17", REPIN_16_TO_17_EARLIEST_CLOSE),
+    ("17 to 18", REPIN_17_TO_18_EARLIEST_CLOSE),
 )
 
 
@@ -6611,7 +6620,7 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
         4,
     ]
     # The named pins carry 4 markers; above 13 each later re-pin adds one.
-    assert expected == 4 and len(REPIN_CLOSE_FLOORS) == len(values) == 6
+    assert expected == 4 and len(REPIN_CLOSE_FLOORS) == len(values) == 7
     for (name, floor), value in zip(REPIN_CLOSE_FLOORS, values, strict=True):
         assert _closed_at_is_valid(value, floor), (name, value)
     assert values == [
@@ -6621,6 +6630,7 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
         "2026-11-03T01:16Z",
         "2026-11-04T01:12Z",
         "2026-11-08T14:42Z",
+        "2026-11-08T23:51Z",
     ]
     # In order: each marker follows its own re-pin's text and precedes the
     # field; each later close is after the earlier one.
@@ -6638,6 +6648,8 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
         < positions[4]
         < text.index("Re-pinned from revision 16 to revision 17")
         < positions[5]
+        < text.index("Re-pinned from revision 17 to revision 18")
+        < positions[6]
         < text.index("\nrollback_target:\n")
     )
     closes = [datetime.datetime.strptime(v, "%Y-%m-%dT%H:%MZ") for v in values]
@@ -6652,6 +6664,10 @@ def test_the_manifest_carries_one_closed_at_marker_per_re_pin() -> None:
     assert closes[4] > REVISION_16_COMPLETED
     # The 16 -> 17 close is after revision 17's deployment completed + 6 h.
     assert closes[5] >= REPIN_16_TO_17_EARLIEST_CLOSE > REVISION_17_COMPLETED
+    # The 17 -> 18 close is after revision 18's deployment completed and after
+    # window 045's post-read on it.
+    assert closes[6] >= REPIN_17_TO_18_EARLIEST_CLOSE > REVISION_18_COMPLETED
+    assert closes[6] > WINDOW_045_POST_READ
 
 
 # The read-only evidence of revision 11 the 10 -> 11 re-pin records (the
@@ -6681,6 +6697,16 @@ REVISION_17_REQUEST_SHA256 = (
 REVISION_17_DIGEST = (
     "sha256:8010699afadac09e2966385725437c9ede9b53ca945ebcb2b3b9b3ad294889bf"
 )
+# The read-only evidence of revision 18 the 17 -> 18 re-pin records (the
+# orchestrator's read with the owner's go, 2026-11-08): revision 17 with the
+# app image alone moved to the media bridge image containing 045
+# (build-20261108-7d8f9893-42533757372).
+REVISION_18_REQUEST_SHA256 = (
+    "6d17b39335eeef319f27270aa6fb3a278b19647e8b172c2d3a475b7c64cbb8af"
+)
+REVISION_18_DIGEST = (
+    "sha256:e44e6715704038debb1ae725a3f0b5da70f08b872dd5641ac87108cfd849a8db"
+)
 L2B_DIGEST = "sha256:d7f2ff6f459d0e1adcfc300ee9031bc41556d9417d48fc7c721cdfa71aaaf1de"
 E7B_DIGEST = "sha256:f6603a5ee0f8293abfe290d639cfc241a8ac864fe16d0e31393d20d7f0b4b159"
 
@@ -6703,6 +6729,7 @@ def test_the_10_to_11_re_pin_records_its_request_sha256_and_image_digest() -> No
         REVISION_13_REQUEST_SHA256,
         "0b73cc6970df9cbc672e0fcafa978a8adababeb8f50a0adb4c162c081ca1718f",
         REVISION_17_REQUEST_SHA256,
+        REVISION_18_REQUEST_SHA256,
     ]
     assert re.fullmatch(r"[0-9a-f]{64}", hashes[0])
     # Revisions 11 and 12 (L2a) run the same image: one digest per re-pin.
@@ -6809,6 +6836,48 @@ def test_the_16_to_17_re_pin_records_its_request_sha256_and_image_digest() -> No
     assert "WAIVED" not in section
 
 
+def test_the_17_to_18_re_pin_records_its_request_sha256_and_image_digest() -> None:
+    comment = _manifest_comment()
+    start = comment.index("Re-pinned from revision 17 to revision 18")
+    section = comment[start : comment.index("closed_at: 2026-11-08T23:51Z")]
+    assert re.findall(r"request_sha256 ([0-9a-f]+)\b", section) == [
+        REVISION_18_REQUEST_SHA256
+    ]
+    assert re.fullmatch(r"[0-9a-f]{64}", REVISION_18_REQUEST_SHA256)
+    assert f"app image {REVISION_18_DIGEST}," in section
+    assert section.index(REVISION_18_DIGEST) < section.index(REVISION_18_REQUEST_SHA256)
+    # Revision 18 moved the app image alone: its digest is new to the manifest
+    # (revision 17 ran the image of main after the ASAAS sandbox-by-key
+    # change), and window 045 required the revision before it.
+    assert MANIFEST.read_text(encoding="utf-8").count(REVISION_18_DIGEST) == 1
+    assert REVISION_18_DIGEST not in (REVISION_17_DIGEST, L2B_DIGEST)
+    assert mw.WINDOW_045.rollback_target_revision == 17
+    for phrase in (
+        "revision 18 is revision 17 with the app image alone moved to the media"
+        " bridge image containing migration 045",
+        "build-20261108-7d8f9893-42533757372, built from main 7d8f9893",
+        "deployment ecs-svc/5010307537340605458 COMPLETED 23:31:45Z",
+        "window 045 applied on it (migrations revision 9, snapshot"
+        " pre-043-045-2026-11-08, upgrades 042 to 045, post-read verified 045 at"
+        " 23:47:28Z)",
+        "exactly one BILLING_FACT_WORKER_ENABLED 'true', both staged rows 'true',"
+        " the complete AppConfig group (27acp5a, 36vg56r, ejwxo7u, sdk)",
+        "defined as _sha256(_request_from_response(<DescribeTaskDefinition"
+        " neurostack-staging-app:18 with include TAGS>)) in"
+        " scripts/asaas_production_wiring.py (not the plan's"
+        " rendered_request_sha256)",
+        "With its app image set back to revision 17's digest, revision 18's"
+        " request hashes to the request_sha256 recorded for revision 17 above:"
+        " the two differ in the app image alone.",
+        "The owner WAIVED the 6 hour observation floor of this re-pin (revision"
+        " 18's deployment COMPLETED + 6 h, 2026-11-09T05:32Z) on 2026-11-08",
+        "after window 045's verified post-read and a clean post-deploy check"
+        " (billing counts unchanged, no app error).",
+        "The owner declared the observation closed at the time on the next line.",
+    ):
+        assert phrase in section, phrase
+
+
 def test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time() -> None:
     must = wiring.load_yaml(MANIFEST)["context"]["must"]
     assert (
@@ -6816,7 +6885,7 @@ def test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time() -> No
         " read it from here and it moves one reviewed re-pin at a time, 8 to 9"
         " and 9 to 10 being the safety re-pins (each with its mandatory repin"
         " note while pending), 10 to 11 and later owner re-pins with no note (11,"
-        " 12, 13, 16 and 17 recorded in this manifest), and above 13 any"
+        " 12, 13, 16, 17 and 18 recorded in this manifest), and above 13 any"
         " serving revision with effective_after"
         " revision_serving_verified_and_observation_closed." in must
     )
@@ -6869,7 +6938,7 @@ def test_a_rollback_revision_must_be_spelled_in_plain_decimal(
 
     text = MANIFEST.read_text(encoding="utf-8")
     field = (
-        "rollback_target:\n  revision: 17\n"
+        "rollback_target:\n  revision: 18\n"
         "  effective_after: revision_serving_verified_and_observation_closed\n"
     )
     assert field in text
@@ -7120,8 +7189,9 @@ APPCONFIG = {
 # worker on; the rollback target) and 11 (the E7b image bump), then what the
 # live steps register: 12 the rows (L2a), 13 the image of L1 (L2b), 14 the
 # credit switch (L5), 15 the transport (L6), 16 the AppConfig group (L7),
-# then 17 the image of main after the ASAAS sandbox-by-key change.
-STAGED_ARNS = {n: SOURCE_ARN.rsplit(":", 1)[0] + f":{n}" for n in range(12, 18)}
+# then 17 the image of main after the ASAAS sandbox-by-key change and 18 the
+# media bridge image (window 045).
+STAGED_ARNS = {n: SOURCE_ARN.rsplit(":", 1)[0] + f":{n}" for n in range(12, 19)}
 L1_IMAGE = OTHER_IMAGE
 
 
@@ -9009,11 +9079,11 @@ def test_the_planner_code_names_no_chain_revision_outside_the_pin_table() -> Non
 # its current pin (measured for 11 to 12: each fails then). The runbook's
 # checklist names exactly these (test_the_runbook_documents_the_rollback_target_chain).
 RE_PIN_CHECKLIST = (
-    "test_the_reviewed_manifest_is_pinned_to_revision_17",
+    "test_the_reviewed_manifest_is_pinned_to_revision_18",
     "test_036_037_and_042_refuse_a_rollback_target_not_repinned",
     "test_without_a_manifest_the_tool_reads_the_reviewed_one",
     "test_manifest_and_template_validate",
-    "test_rollback_target_is_re_pinned_to_revision_17_without_a_note",
+    "test_rollback_target_is_re_pinned_to_revision_18_without_a_note",
     "test_manifest_validator_rejects_an_invalid_rollback_target",
     "test_render_taskdef_refuses_the_image_stuck_state_with_its_reason",
     "test_the_repository_parameters_propose_the_l2a_rows_revision",
@@ -9097,16 +9167,33 @@ def test_the_runbook_documents_the_rollback_target_chain() -> None:
         "`036` and `037` keep requiring revision 10, by number only: with the"
         " reviewed manifest past 10 they cannot run again",
         "Window `042` requires revision 12 by number and by content",
-        # The re-pin 16 -> 17 (step 0 of window 045's production order).
-        'Window `045` requires revision 17 the same way ("Migration 045");'
-        " since the re-pin 16 to 17 the reviewed manifest is its own target,"
-        " and only its.",
+        # Window 045 ran on 2026-11-08; since the re-pin 17 -> 18 (step 3 of
+        # its production order) it refuses the reviewed manifest too.
+        'Window `045` requires revision 17 the same way ("Migration 045"); it'
+        " ran on 2026-11-08, and since the re-pin 17 to 18 the reviewed"
+        " manifest is no window's target: production is at `045`, so `045`"
+        " too could run again only after a snapshot restore, planned with a"
+        " manifest at 17.",
         "**History (16 to 17).**",
         "revision 17's request with the app image set back to revision 16's"
         " digest hashes to revision 16's recorded `request_sha256`, so the two"
         " differ in the app image alone",
         "the owner declared the observation closed at 2026-11-08T14:42Z, when"
         " approving the re-pin PR, the manifest's sixth `closed_at` marker",
+        "**History (17 to 18).**",
+        "served window `045` (migrations revision 9, snapshot"
+        " `pre-043-045-2026-11-08`, the three upgrades `042 -> 043`, `043 ->"
+        " 044` and `044 -> 045`, post-read verified `045` at 23:47:28Z;",
+        "revision 18's request with the app image set back to revision 17's"
+        " digest hashes to revision 17's recorded `request_sha256`, so the two"
+        " differ in the app image alone",
+        "The owner waived its 6 h floor (2026-11-09T05:32Z) and declared the"
+        " observation closed at 2026-11-08T23:51Z, after window `045`'s"
+        " post-read, the manifest's seventh `closed_at` marker",
+        "added `test_the_17_to_18_re_pin_records_its_request_sha256_and_image_digest`",
+        "With the target on 18 window `045` refuses the reviewed manifest"
+        " (`rollback_target_not_repinned`); a manifest at 17 still passes its"
+        " target check.",
         "the two diverge only after L4",
         # Each move is reviewed and merged by a human (R20).
         "Each move is its own small reviewed PR of the manifest (an ASAAS"

@@ -572,12 +572,14 @@ def test_rollback_runbook_states_every_rollback_target_phase() -> None:
         "**Revision 8 is unsafe after migration 036**: it reads columns 036"
         " drops, and 036 ran on 2026-10-24",
         "--task-definition neurostack-staging-app:R",
-        "`R` is the rollback target, `17` since the seventh re-pin (to the"
-        " serving revision before the media bridge image; it was `8` until the"
-        " first re-pin merged, `9` until the second, `10` until the third, `11`"
-        " until the fourth, `12` until the fifth, `13` until the sixth and `16`"
-        " until the seventh); never `8`, because migration 036 has run",
-        'Read "revision R" below as the field\'s current value, revision 17',
+        "`R` is the rollback target, `18` since the eighth re-pin (to the"
+        " serving bridge revision after window 045; it was `8` until the first"
+        " re-pin merged, `9` until the second, `10` until the third, `11` until"
+        " the fourth, `12` until the fifth, `13` until the sixth, `16` until the"
+        " seventh and `17` until the eighth); never `8`, because migration 036"
+        " has run",
+        'Read "revision R" below as the field\'s current value, revision 18',
+        "revision 16 until the re-pin to 17 and revision 17 until the re-pin to 18.",
         "After L6 do not roll back by hand to R (13)",
         "`service_on_rollback_target_plan_stuck:<revision 13 ARN>`",
         # The breaker after L6: a safe state, not the documented way back.
@@ -864,12 +866,35 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "1. Deploy the bridge image",
         "2. Run window `045`",
         "3. Re-pin the rollback target from 17 to the bridge revision 18",
+        # Step 3 done by its own manifest PR (the reviewed manifest at 18).
+        "Done by the re-pin PR of 2026-11-08 (evidence read only that day,"
+        ' `closed_at` 2026-11-08T23:51Z; "History (17 to 18)"): the reviewed'
+        " manifest is at 18.",
         "4. Only then merge and deploy the behaviour release (PR-B)",
         "5. Open the behaviour release's flag.",
     ]
     positions = [section.index(step) for step in order]
     assert positions == sorted(positions)
     assert "4. Open the behaviour release's flag." not in section
+    # Steps 1 and 2 as they ran in production (2026-11-08), after the order.
+    ran = [
+        "**Steps 1 and 2 ran in production on 2026-11-08**",
+        "deployment `ecs-svc/5010307537340605458` `COMPLETED` 2026-11-08 23:31:45Z",
+        "migrations revision `neurostack-staging-migrations:9`, command"
+        " `alembic upgrade 045`, the bridge image; snapshot"
+        " `pre-043-045-2026-11-08`; pre-read `read_ok` at `042`, the three"
+        " counts `0`; migration task sent 2026-11-08T23:44:45Z, `applied`,"
+        " exit `0`, exactly `042 -> 043`, `043 -> 044` and `044 -> 045`;"
+        " post-read `verified` at 2026-11-08T23:47:28Z: `alembic_version`"
+        " `045` and both DML privilege rows held",
+        "The billing counts read before and after the deploy were identical"
+        " (`[1,1,1,1]`).",
+        "The OGG/M4A gap below lasted from about 23:31Z to 23:45Z.",
+        "Production is at `045`: the window cannot run again",
+    ]
+    assert positions[-1] < section.index(ran[0])
+    for phrase in ran:
+        assert phrase in section, phrase
     assert "The owner confirms it before this release is merged" not in section
     for phrase in (
         "**Window `045` also applies `043` and `044`.**",
@@ -941,6 +966,8 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "the credit switch stays **on**",
         "the target is re-pinned from 17 to 18 after the window and before"
         " PR-B deploys",
+        "Done: window `045` ran on 2026-11-08 on the bridge revision 18, and the"
+        " target is 18 since the eighth re-pin.",
         "takes the serving image out of the chain.**",
         "its credit switch reads `revision_outside_image_chain` and stays **off**",
         "**The migrations come back only by a restore** of the window's snapshot"

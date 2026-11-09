@@ -36,7 +36,7 @@ context:
     - A revision that only moves the app image to another digest of the same repository (the image bump, from the apply-time parameter app_image_override) is its own owner approval; plan reports it as a register_task_definition change carrying app_image. An image and a worker flag change never share a revision.
     - CREDIT_HOT_PATH_ENABLED and BILLING_FACT_TRANSPORT_ENABLED render their reviewed parameters exactly ('false' or 'true') in every rendering. Their two rows enter together, both 'false', in a revision that changes nothing else, the serving image included (plan change flag_rows_added); afterwards each value flips alone in its own revision (credit_hot_path_flag, transport_flag). A row change, a flag flip and an image change never share a revision.
     - The AppConfig group (task_definition.app_environment_appconfig_group) is rendered all or none, only when its three parameters are set, in a revision that adds it alone (plan change appconfig_group_added); APPCONFIG_ENABLED is always 'true' and APPCONFIG_SOURCE always sdk, written by the planner, never parameters.
-    - The service rollback target is the field rollback_target; code paths read it from here and it moves one reviewed re-pin at a time, 8 to 9 and 9 to 10 being the safety re-pins (each with its mandatory repin note while pending), 10 to 11 and later owner re-pins with no note (11, 12, 13, 16 and 17 recorded in this manifest), and above 13 any serving revision with effective_after revision_serving_verified_and_observation_closed.
+    - The service rollback target is the field rollback_target; code paths read it from here and it moves one reviewed re-pin at a time, 8 to 9 and 9 to 10 being the safety re-pins (each with its mandatory repin note while pending), 10 to 11 and later owner re-pins with no note (11, 12, 13, 16, 17 and 18 recorded in this manifest), and above 13 any serving revision with effective_after revision_serving_verified_and_observation_closed.
     - Keep exactly the containers app and otel; otel keeps an empty environment and no secrets.
     - Never introduce a name listed under task_definition.forbidden_name_prefixes or forbidden_names; the one exception is exactly the complete AppConfig group, in the app environment (APPCONFIG_ORIGIN, APPCONFIG_TOKEN and any other APPCONFIG_ name stay forbidden).
     - Keep financial_egress_enabled closed by absence until the AppConfig group is rendered; opening it is then the AppConfig configuration's value, set outside this manifest under its own owner approval.
@@ -205,11 +205,43 @@ target:
 # The owner declared the observation closed at the time on the next line,
 # when approving the re-pin PR.
 # closed_at: 2026-11-08T14:42Z
+# Re-pinned from revision 17 to revision 18, the serving bridge revision,
+# once window 045 was verified and before the next image change (the
+# behaviour release of envio-midia-agente, PR-B; step 3 of window 045's
+# production order): revision 18 is revision 17 with the app image alone
+# moved to the media bridge image containing migration 045
+# (build-20261108-7d8f9893-42533757372, built from main 7d8f9893), deployed
+# on 2026-11-08 (deployment ecs-svc/5010307537340605458 COMPLETED 23:31:45Z,
+# 2/2 running, 0 failed tasks, steady state; no error in the app logs since
+# the deploy, 8 appconfig_egress_flags_changed lines with poll_ok), then
+# window 045 applied on it (migrations revision 9, snapshot
+# pre-043-045-2026-11-08, upgrades 042 to 045, post-read verified 045 at
+# 23:47:28Z). With the target on 17 the behaviour release's image
+# change is gated (the service does not run the target,
+# service_not_on_target), and the way back from it is the bridge revision,
+# which keeps the credit switch on. Evidence of revision 18 (read only,
+# 2026-11-08): ACTIVE, app
+# image sha256:e44e6715704038debb1ae725a3f0b5da70f08b872dd5641ac87108cfd849a8db,
+# exactly one BILLING_FACT_WORKER_ENABLED 'true', both staged rows 'true',
+# the complete AppConfig group (27acp5a, 36vg56r, ejwxo7u, sdk); request_sha256
+# 6d17b39335eeef319f27270aa6fb3a278b19647e8b172c2d3a475b7c64cbb8af, defined
+# as _sha256(_request_from_response(<DescribeTaskDefinition
+# neurostack-staging-app:18 with include TAGS>)) in
+# scripts/asaas_production_wiring.py (not the plan's rendered_request_sha256).
+# With its app image set back to revision 17's digest, revision 18's request
+# hashes to the request_sha256 recorded for revision 17 above: the two differ
+# in the app image alone.
+# The owner WAIVED the 6 hour observation floor of this re-pin (revision 18's
+# deployment COMPLETED + 6 h, 2026-11-09T05:32Z) on 2026-11-08, after
+# window 045's verified post-read and a clean post-deploy check (billing
+# counts unchanged, no app error). The owner declared the observation
+# closed at the time on the next line.
+# closed_at: 2026-11-08T23:51Z
 # Above 13 any revision may be pinned with effective_after
 # revision_serving_verified_and_observation_closed (a hotfix image during the
 # canary is re-pinned to the serving revision first).
 rollback_target:
-  revision: 17
+  revision: 18
   effective_after: revision_serving_verified_and_observation_closed
 
 secrets:
