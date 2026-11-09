@@ -199,6 +199,29 @@ class PipelineInput(BaseModel):
     prior_episode_context: Optional[dict[str, Any]] = None
 
 
+def _handoff_confirmation_pending(
+    srm_decision: SRMDecisionModel, input_data: PipelineInput
+) -> bool:
+    """Whether this turn's prompt asks the scheduling confirmation question.
+
+    The state patch (this turn's decision) overrides the stored session flag:
+    ``True`` asks, ``False`` (the patient said no, or the handoff fired)
+    never asks, and no patch value falls back to the session flag.
+    """
+    patch_pending = srm_decision.state_patch.flags.get("handoff_confirmation_pending")
+    if patch_pending is True:
+        return True
+    if patch_pending is None:
+        return bool(input_data.flags.get("handoff_confirmation_pending"))
+    return False
+
+
+def _scheduling_link_verification(srm_decision: SRMDecisionModel) -> Optional[str]:
+    """The patient's answer after the scheduling link, when this turn is one."""
+    status = getattr(srm_decision, "handoff_verification_status", None)
+    return status if status in ("concluiu", "nao_concluiu") else None
+
+
 class PipelineResult(BaseModel):
     """Complete result from the cognitive pipeline."""
 
@@ -252,6 +275,14 @@ class PipelineResult(BaseModel):
     # Pause (set by handoff engine when session should be paused)
     should_pause: bool = False
     paused_until: Optional[str] = None  # ISO datetime string or None (permanent)
+
+    # Scheduling-flow steps whose reply must stand alone (no media file goes
+    # with it): the "Posso te encaminhar?" question the prompt asks while the
+    # handoff confirmation is pending, and the check-back after the
+    # scheduling link (``concluiu`` / ``nao_concluiu``), which enriches the
+    # pending scheduling handoff.  Neither is a ``handoff_required`` turn.
+    handoff_confirmation_pending: bool = False
+    scheduling_link_verification: Optional[str] = None
     # Candidate prior_episode_context composed by the pipeline when the turn
     # pauses the session. The event service persists it atomically inside the
     # pause CAS (see src.repositories.session.SessionRepository.pause_effective
@@ -898,14 +929,7 @@ class CognitivePipeline:
         # - patch=False → engine cleared it this turn (user said "não" or handoff fired)
         #                 → do NOT show confirmation prompt, even if session flag was True
         # - patch absent → no change this turn → fall back to stored session flag
-        _patch_pending = srm_decision.state_patch.flags.get(
-            "handoff_confirmation_pending"
-        )
-        if _patch_pending is True:
-            custom_vars["handoff_confirmation_pending"] = True
-        elif _patch_pending is None and input_data.flags.get(
-            "handoff_confirmation_pending"
-        ):
+        if _handoff_confirmation_pending(srm_decision, input_data):
             custom_vars["handoff_confirmation_pending"] = True
         # patch=False → engine explicitly cleared it → leave custom_vars unset
 
@@ -929,10 +953,8 @@ class CognitivePipeline:
             atendimento_tipo
         )
 
-        _verification_status = getattr(
-            srm_decision, "handoff_verification_status", None
-        )
-        if _verification_status in ("concluiu", "nao_concluiu"):
+        _verification_status = _scheduling_link_verification(srm_decision)
+        if _verification_status is not None:
             custom_vars["scheduling_link_verification_status"] = _verification_status
 
         # Collect context sources from non-empty custom_vars
@@ -1387,6 +1409,10 @@ class CognitivePipeline:
             tenant_id=input_data.tenant_id,
             session_id=input_data.session_id,
             response_language=input_data.active_language,
+            handoff_confirmation_pending=_handoff_confirmation_pending(
+                srm_decision, input_data
+            ),
+            scheduling_link_verification=_scheduling_link_verification(srm_decision),
             intent=srm_decision.intent,
             intent_category=srm_decision.intent_category.value,
             funnel_stage=srm_decision.funnel_stage.value,

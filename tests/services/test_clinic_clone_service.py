@@ -514,18 +514,18 @@ def test_media_clones_of_one_source_are_independent_instances() -> None:
     assert first.trigger_intents == ["pedido_preco", "detalhes_servicos"]
     assert first.trigger_intents is not source["trigger_intents"]
     assert first.trigger_intents is not second.trigger_intents
-    first.trigger_intents.append("faq")
+    first.trigger_intents.append("agendar")
     assert second.trigger_intents == ["pedido_preco", "detalhes_servicos"]
     assert source["trigger_intents"] == ["pedido_preco", "detalhes_servicos"]
 
 
 def test_media_clone_copies_the_bound_trigger_intents() -> None:
     assert "trigger_intents" in MEDIA_ASSET_CLONE_FIELDS
-    source = _media_source_row(trigger_intents=["saudacao", "faq"])
+    source = _media_source_row(trigger_intents=["agendar", "pre_atendimento"])
 
     clone = build_media_asset_clone(_AllowlistOnlyRow(source), uuid4())
 
-    assert clone.trigger_intents == ["saudacao", "faq"]
+    assert clone.trigger_intents == ["agendar", "pre_atendimento"]
     assert (
         build_media_asset_clone(
             _media_source_row(trigger_intents=[]), uuid4()

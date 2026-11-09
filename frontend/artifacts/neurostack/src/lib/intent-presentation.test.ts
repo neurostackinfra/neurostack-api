@@ -91,13 +91,23 @@ describe("intent presentation catalog", () => {
 });
 
 // MEDIA_BINDABLE_INTENT_SEQUENCE in packages/neurostack-core/neurostack_core/
-// protocol.py: the Central de Mídias labels "Quando enviar" through this
-// catalog, so each one needs a real PT and EN label, never the raw id.
+// protocol.py: the intents a Central de Mídias file may be bound to. Each one
+// needs a real PT and EN label, never the raw id, wherever it is shown.
 const mediaBindableIntents = [
-  "saudacao", "interesse_tratamento", "pedido_preco", "comparacao_tratamentos",
-  "objecao_vou_pensar", "detalhes_servicos", "pre_atendimento", "faq",
+  "interesse_tratamento", "pedido_preco", "comparacao_tratamentos",
+  "objecao_vou_pensar", "agendar", "detalhes_servicos", "pre_atendimento",
   "cultura_historia", "qualificacao_publico", "informacoes_profissionais",
   "pos_atendimento_duvida",
+];
+
+// MEDIA_TOPIC_SEQUENCE: "Quando enviar" labels one checkbox per topic through
+// this catalog, by the intent id each topic carries. These are the owner's
+// four names, in screen order.
+const mediaTopicLabels: Array<[string, string, string]> = [
+  ["pedido_preco", "Pedido de Preço", "Price Request"],
+  ["agendar", "Solicitação de Agendamento", "Scheduling"],
+  ["interesse_tratamento", "Interesse Tratamento", "Treatment Interest"],
+  ["pos_atendimento_duvida", "Dúvida Pós-Procedimento", "Post-Care Query"],
 ];
 
 describe("media bindable intents", () => {
@@ -108,5 +118,12 @@ describe("media bindable intents", () => {
       expect(label).not.toBe(intentName);
       expect(label.trim()).not.toBe("");
     }
+  });
+});
+
+describe("media topics", () => {
+  it.each(mediaTopicLabels)("labels topic %s as %s and %s", (topic, ptLabel, enLabel) => {
+    expect(getIntentLabel(topic, key => pt[key])).toBe(ptLabel);
+    expect(getIntentLabel(topic, key => en[key])).toBe(enLabel);
   });
 });

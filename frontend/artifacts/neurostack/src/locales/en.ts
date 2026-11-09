@@ -707,13 +707,12 @@ export const en = {
   // Group 7 (envio-midia-agente): {when} and {trigger} are the field labels
   // above, so the rule always names the fields the clinic sees.
   media_trigger_intents_label: "When to send",
-  media_trigger_intents_help: "Select the patient subjects in which this file may be sent.",
+  media_trigger_intents_help: "Select the patient subjects in which this file may be sent. Greetings and frequently asked questions are already included.",
   media_trigger_intents_loading: "Loading subjects…",
   media_trigger_intents_error: "The subjects could not be loaded.",
   media_delivery_inactive: "Automatic sending is not active yet for the clinic's channel.",
   media_delivery_unknown: "It was not possible to check whether automatic sending is active.",
-  media_delivery_rule: "The AI may send this file over WhatsApp when the patient's subject is selected in \"{when}\" and fits the \"{trigger}\" context, at most once every 24 h per patient.",
-  media_alert_no_subject: "No subject selected in \"{when}\": this media will never be sent.",
+  media_delivery_rule: "The AI may send this file over WhatsApp when the conversation fits \"{when}\" and the \"{trigger}\" context, at most once every 24 h per patient.",
   media_alert_too_large: "Too large to send over WhatsApp: the limit for this type is {limit}.",
   media_alert_format_not_sent: "This format is not sent automatically by the clinic's channel.",
   media_upload_action: "Upload media",

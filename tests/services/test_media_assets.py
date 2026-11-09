@@ -1367,16 +1367,16 @@ async def test_lock_phase_failure_or_divergent_owner_rolls_back_before_media(
         await guard.validate_projection(0)
 
 
-# envio-midia-agente Group 2: the media -> intent binding.
+# envio-midia-agente Group 2: the media -> intent binding, the union of the
+# four "Quando enviar" topics (owner, 2026-11-08).
 _BINDABLE = (
-    "saudacao",
     "interesse_tratamento",
     "pedido_preco",
     "comparacao_tratamentos",
     "objecao_vou_pensar",
+    "agendar",
     "detalhes_servicos",
     "pre_atendimento",
-    "faq",
     "cultura_historia",
     "qualificacao_publico",
     "informacoes_profissionais",
@@ -1386,54 +1386,71 @@ _BINDABLE = (
 
 def test_trigger_intents_drop_duplicates_into_the_canonical_order() -> None:
     assert validate_trigger_intents([]) == []
-    assert validate_trigger_intents(["faq", "saudacao", "faq"]) == ["saudacao", "faq"]
+    assert validate_trigger_intents(
+        ["detalhes_servicos", "interesse_tratamento", "detalhes_servicos"]
+    ) == ["interesse_tratamento", "detalhes_servicos"]
     assert validate_trigger_intents(
         ["pos_atendimento_duvida", "pedido_preco", "pedido_preco"]
     ) == ["pedido_preco", "pos_atendimento_duvida"]
     # Every bindable intent at once, in reverse: the canonical order back.
     assert validate_trigger_intents(list(reversed(_BINDABLE))) == list(_BINDABLE)
-    assert media_assets.MEDIA_TRIGGER_INTENTS_MAX_ITEMS == len(_BINDABLE) == 12
+    assert media_assets.MEDIA_TRIGGER_INTENTS_MAX_ITEMS == len(_BINDABLE) == 11
+
+
+def test_trigger_intents_accept_the_scheduling_request_topic() -> None:
+    # The owner opened "Solicitação de Agendamento" to media: agendar binds,
+    # with pre_atendimento, its topic's other intent.
+    assert validate_trigger_intents(["pre_atendimento", "agendar"]) == [
+        "agendar",
+        "pre_atendimento",
+    ]
 
 
 @pytest.mark.parametrize(
     "value",
     [
-        # Scheduling and the out-of-hours handoff: never bindable.
-        "agendar",
+        # Scheduling flows that act on an appointment, and the out-of-hours
+        # handoff: never bindable.
         "reagendar",
         "cancelar",
         "confirmar_presenca",
         "disponibilidade_horarios",
         "fora_do_horario",
+        # A complaint always hands off.
+        "reclamacao",
+        # "Outras" is implied, never stored.
+        "saudacao",
+        "faq",
         # Official, but not informative.
         "pedido_atendente_humano",
         "cobranca_renegociacao",
         # Exact names only: no folding, no trimming.
-        "FAQ",
-        " faq",
-        "faq ",
+        "FAQS",
+        "Pedido_Preco",
+        " pedido_preco",
+        "pedido_preco ",
         "",
-        "faq,saudacao",
+        "pedido_preco,agendar",
         "inexistente",
         None,
         1,
-        ["faq"],
+        ["pedido_preco"],
     ],
 )
 def test_trigger_intents_refuse_any_name_outside_the_allowlist(value: object) -> None:
     with pytest.raises(MediaAssetDomainError) as caught:
-        validate_trigger_intents(["faq", value])
+        validate_trigger_intents(["pedido_preco", value])
     assert caught.value.code == "media_trigger_intent_unknown"
 
 
 def test_trigger_intents_refuse_more_entries_than_bindable_intents() -> None:
     with pytest.raises(MediaAssetDomainError) as caught:
-        validate_trigger_intents([*_BINDABLE, "faq"])
+        validate_trigger_intents([*_BINDABLE, "pedido_preco"])
     assert caught.value.code == "media_metadata_invalid"
     # The count is checked before any name, so an over-long list of unknown
     # names is still the size error.
     with pytest.raises(MediaAssetDomainError) as caught:
-        validate_trigger_intents(["agendar"] * 13)
+        validate_trigger_intents(["reagendar"] * 12)
     assert caught.value.code == "media_metadata_invalid"
 
 

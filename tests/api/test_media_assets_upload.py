@@ -1102,14 +1102,13 @@ async def test_upload_guard_receives_known_size_and_maps_failures_without_insert
 # ---------------------------------------------------------------------------
 
 _BINDABLE_INTENTS = [
-    "saudacao",
     "interesse_tratamento",
     "pedido_preco",
     "comparacao_tratamentos",
     "objecao_vou_pensar",
+    "agendar",
     "detalhes_servicos",
     "pre_atendimento",
-    "faq",
     "cultura_historia",
     "qualificacao_publico",
     "informacoes_profissionais",
@@ -1208,10 +1207,13 @@ async def _post_real_upload(
     ("sent", "stored"),
     [
         ([], []),
-        (["faq"], ["faq"]),
+        (["agendar"], ["agendar"]),
         # Duplicates go; the canonical (allowlist) order stays, whatever the
         # order of the parts.
-        (["faq", "saudacao", "faq"], ["saudacao", "faq"]),
+        (
+            ["pre_atendimento", "agendar", "pre_atendimento"],
+            ["agendar", "pre_atendimento"],
+        ),
         (list(reversed(_BINDABLE_INTENTS)), _BINDABLE_INTENTS),
     ],
 )
@@ -1268,13 +1270,23 @@ async def test_upload_stores_a_mono_ogg_opus_through_the_registered_app(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "unknown",
-    ["agendar", "fora_do_horario", "FAQ", "", "pedido_atendente_humano"],
+    [
+        "reagendar",
+        "fora_do_horario",
+        "reclamacao",
+        # "Outras" is implied, never stored.
+        "saudacao",
+        "faq",
+        "Agendar",
+        "",
+        "pedido_atendente_humano",
+    ],
 )
 async def test_upload_refuses_an_unknown_trigger_intent_before_storing(
     monkeypatch: pytest.MonkeyPatch, unknown: str
 ) -> None:
     response, seen = await _post_real_upload(
-        monkeypatch, {"trigger_intents": ["faq", unknown]}
+        monkeypatch, {"trigger_intents": ["agendar", unknown]}
     )
 
     assert response.status_code == 422, response.text
@@ -1286,10 +1298,10 @@ async def test_upload_refuses_an_unknown_trigger_intent_before_storing(
 @pytest.mark.parametrize(
     "extra",
     [
-        # 13 intent parts beside only two text fields: within the parser's
-        # field budget (16), refused by the route's own per-field bound.
+        # 12 intent parts beside only two text fields: within the parser's
+        # field budget (15), refused by the route's own per-field bound.
         {"trigger_intents": [*_BINDABLE_INTENTS, "faq"]},
-        # Every text field plus 13 parts: above the parser's field budget.
+        # Every text field plus 12 parts: above the parser's field budget.
         {
             "usage_trigger": "x",
             "auto_suggest": "false",

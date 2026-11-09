@@ -13,11 +13,26 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
-# The only application module that reads the bindable-intent allowlist from
-# the core protocol; the media routes and schemas take it from here.
-from neurostack_core.protocol import MEDIA_BINDABLE_INTENT_IDS
+# The only application module that reads the bindable-intent allowlist and
+# the "Quando enviar" topics from the core protocol; the media routes, schemas
+# and selection take them from here (explicit re-exports, hence the noqa).
+from neurostack_core.protocol import (
+    MEDIA_BINDABLE_INTENT_IDS as MEDIA_BINDABLE_INTENT_IDS,
+)
 from neurostack_core.protocol import (
     MEDIA_BINDABLE_INTENT_SEQUENCE as MEDIA_BINDABLE_INTENT_SEQUENCE,
+)
+from neurostack_core.protocol import (  # noqa: F401
+    MEDIA_IMPLICIT_INTENT_IDS as MEDIA_IMPLICIT_INTENT_IDS,
+)
+from neurostack_core.protocol import (  # noqa: F401
+    MEDIA_IMPLICIT_INTENT_SEQUENCE as MEDIA_IMPLICIT_INTENT_SEQUENCE,
+)
+from neurostack_core.protocol import (  # noqa: F401
+    MEDIA_TOPIC_INTENTS as MEDIA_TOPIC_INTENTS,
+)
+from neurostack_core.protocol import (  # noqa: F401
+    MEDIA_TOPIC_SEQUENCE as MEDIA_TOPIC_SEQUENCE,
 )
 from src.models.builder import Builder
 from src.models.media_asset import MediaAsset
@@ -536,8 +551,10 @@ def validate_trigger_intents(values: Iterable[object]) -> list[str]:
     """Normalize the intents a media asset is bound to (``trigger_intents``).
 
     Every value must be one of ``MEDIA_BINDABLE_INTENT_IDS`` exactly (no case
-    folding or trimming): anything else, scheduling intents and
-    ``fora_do_horario`` included, is ``media_trigger_intent_unknown``.
+    folding or trimming): anything else is ``media_trigger_intent_unknown``,
+    among them ``fora_do_horario``, every scheduling intent but ``agendar``,
+    and the implied "Outras" intents (``MEDIA_IMPLICIT_INTENT_IDS``, never
+    stored).
     Duplicates are removed and the result follows the allowlist's canonical
     order (``MEDIA_BINDABLE_INTENT_SEQUENCE``), whatever order the caller
     sent, so the stored list and every response are stable.  More than

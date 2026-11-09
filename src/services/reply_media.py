@@ -14,8 +14,9 @@ The checks run in this order and in no other (WISH Group 5, DESIGN Scope IN
 
 1. ``agent_media_send_enabled`` (AppConfig, fail-closed): ``flag_off``;
 2. the asset, re-read in the turn's tenant -- deleted, of another tenant,
-   no longer sent automatically (``auto_suggest`` off, no
-   ``trigger_intents``), in a format the channel's provider does not send
+   no longer sent automatically (``auto_suggest`` off; an asset bound to no
+   intent is still sent on the implied "Outras" turns), in a format the
+   channel's provider does not send
    (:func:`~src.services.media_send_body.sendable_mime_types`, reason
    ``mime_not_sendable``) or whose first bytes its sender would refuse
    (:func:`~src.services.media_send_body.require_sendable_media` on
@@ -743,14 +744,13 @@ async def _read_asset(
                     MediaAsset.size_bytes,
                     MediaAsset.original_filename,
                     MediaAsset.auto_suggest,
-                    MediaAsset.trigger_intents,
                     func.substring(
                         MediaAsset.payload, 1, REREAD_PREFIX_BYTES, type_=LargeBinary
                     ).label("prefix"),
                 ).where(MediaAsset.id == media_id, MediaAsset.tenant_id == tenant_id)
             )
         ).one_or_none()
-    if row is None or row.auto_suggest is not True or not row.trigger_intents:
+    if row is None or row.auto_suggest is not True:
         return None
     return _Asset(
         category=cast(MediaCategory, row.category),

@@ -55,6 +55,7 @@ from src.api.schemas.media_assets import (
     MediaAssetResponse,
     MediaAssetValidationErrorResponse,
     MediaBindableIntentsResponse,
+    MediaTopic,
     media_category_byte_limits,
 )
 from src.config.logging import get_logger
@@ -83,7 +84,9 @@ from src.services.media_assets import (
     MEDIA_FILE_EXTENSIONS,
     MEDIA_FILE_MAX_BYTES,
     MEDIA_IMAGE_MAX_BYTES,
+    MEDIA_IMPLICIT_INTENT_SEQUENCE,
     MEDIA_PDF_MAX_BYTES,
+    MEDIA_TOPIC_INTENTS,
     MEDIA_TRIGGER_INTENTS_MAX_ITEMS,
     MediaAssetDomainError,
     MediaStorageCapacityExceeded,
@@ -834,6 +837,8 @@ def _clinic_sendable_mime_types(credentials: object) -> list[str]:
     summary="List bindable intents and delivery state",
     description=(
         "Return the intents a media asset may be bound to (trigger_intents), "
+        "the topics that group them on the screen (topics), the intents whose "
+        "turns may send any automatic media (implicit_intents), "
         "whether the agent sends bound media for the effective clinic today "
         "(delivery_enabled), the byte limit of each category and the formats "
         "the clinic's WhatsApp provider sends (sendable_mime_types). Reads no "
@@ -895,6 +900,11 @@ async def get_media_bindable_intents(
         )
         return MediaBindableIntentsResponse(
             intents=list(MEDIA_BINDABLE_INTENT_SEQUENCE),
+            topics=[
+                MediaTopic(id=topic, intents=list(intents))
+                for topic, intents in MEDIA_TOPIC_INTENTS.items()
+            ],
+            implicit_intents=list(MEDIA_IMPLICIT_INTENT_SEQUENCE),
             delivery_enabled=delivery_enabled,
             max_bytes_by_category=media_category_byte_limits(),
             sendable_mime_types=_clinic_sendable_mime_types(credentials),

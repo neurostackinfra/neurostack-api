@@ -346,7 +346,9 @@ def _source_media_asset(source_id: UUID, index: int, payload: bytes) -> MediaAss
         usage_trigger=f"gatilho {index}" if index % 2 == 0 else None,
         auto_suggest=index % 2 == 0,
         # The clone copies the bound intents (envio-midia-agente Group 2).
-        trigger_intents=["detalhes_servicos", "faq"] if index % 2 == 0 else [],
+        trigger_intents=(
+            ["detalhes_servicos", "cultura_historia"] if index % 2 == 0 else []
+        ),
         created_at=_SOURCE_MEDIA_TIMESTAMP,
         updated_at=_SOURCE_MEDIA_TIMESTAMP,
     )

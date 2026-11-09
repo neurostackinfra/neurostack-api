@@ -15,13 +15,16 @@ of the numbered candidates with the ``[[MIDIA:n]]`` marker
 2. the pure turn checks (:func:`media_turn_exclusion`): a known provider
    that sends at least one format (:func:`sendable_mime_types`),
    ``context.origin`` is ``PRODUCTION`` (the only origin source), no
-   deterministic reply, no handoff, no policy block, no safety concern, a
-   bindable intent, and for a ``pedido_preco`` turn a price the prompt may
-   show;
+   deterministic reply, no handoff (nor a pausing turn), not the scheduling
+   confirmation question nor the check-back after the scheduling link, no
+   policy block, no safety concern, a bindable intent or an implied "Outras"
+   one (``saudacao``, ``faq``), and for a ``pedido_preco`` turn a price the
+   prompt may show;
 3. the ``agent_media_send_enabled`` flag, read before any session is opened
    (no database transaction is held across it) and closed on any doubt;
 4. only then the media SQL, on a session of its own: the tenant's
-   ``auto_suggest`` assets bound to the intent, in a format the turn's
+   ``auto_suggest`` assets bound to the intent (on an "Outras" turn, every
+   ``auto_suggest`` asset, whatever it is bound to), in a format the turn's
    provider sends (``mime_type IN`` :func:`sendable_mime_types`, so the LLM
    never sees a file the delivery would refuse), within their category's byte
    limit, not sent to this session in the last 24 hours, price files only
@@ -63,8 +66,9 @@ from src.repositories.media_deliveries import MEDIA_DELIVERY_REPEAT_WINDOW
 from src.services.api_credentials import MEDIA_DELIVERY_PROVIDERS, MediaDeliveryProvider
 from src.services.egress_policy import agent_media_send_enabled
 from src.services.media_assets import (
-    MEDIA_BINDABLE_INTENT_SEQUENCE,
+    MEDIA_BINDABLE_INTENT_IDS,
     MEDIA_CATEGORY_MAX_BYTES,
+    MEDIA_IMPLICIT_INTENT_IDS,
 )
 from src.services.media_send_body import MediaCategory, sendable_mime_types
 from src.services.price_disclosure_policy import turn_can_show_price
@@ -193,8 +197,16 @@ def media_turn_exclusion(
         or result.mode == "handoff"
         or result.handoff_reason is not None
         or result.handoff_summary is not None
+        or result.should_pause
     ):
         return "handoff"
+    # Scheduling steps that hand off without ``handoff_required``: the prompt
+    # asks only the confirmation question, and the check-back after the link
+    # feeds the pending scheduling handoff.  Neither reply carries a file.
+    if result.handoff_confirmation_pending:
+        return "handoff_confirmation"
+    if result.scheduling_link_verification is not None:
+        return "scheduling_link_verification"
     if (
         result.action == "block"
         or result.intent_category == "blocked"
@@ -205,7 +217,10 @@ def media_turn_exclusion(
         return "safety"
     if result.mode == "safety":
         return "safety"
-    if result.intent not in MEDIA_BINDABLE_INTENT_SEQUENCE:
+    if (
+        result.intent not in MEDIA_BINDABLE_INTENT_IDS
+        and result.intent not in MEDIA_IMPLICIT_INTENT_IDS
+    ):
         return "intent_not_bindable"
     if result.intent == PRICE_INTENT and not turn_can_show_price(
         clinic_config, result.atendimento_tipo
@@ -364,7 +379,6 @@ async def _read_candidates(
         .where(
             MediaAsset.tenant_id == tenant_id,
             MediaAsset.auto_suggest.is_(True),
-            literal(intent, Text) == any_(MediaAsset.trigger_intents),
             MediaAsset.mime_type.in_(sorted(sendable)),
             within_category_limit,
             not_(sent_recently),
@@ -372,6 +386,11 @@ async def _read_candidates(
         .order_by(MediaAsset.updated_at.desc(), MediaAsset.id.desc())
         .limit(MEDIA_CANDIDATES_MAX + 1)
     )
+    # "Outras" is implied: its turns read every automatic file, bound or not.
+    if intent not in MEDIA_IMPLICIT_INTENT_IDS:
+        statement = statement.where(
+            literal(intent, Text) == any_(MediaAsset.trigger_intents)
+        )
     if not price_allowed:
         statement = statement.where(
             not_(literal(PRICE_INTENT, Text) == any_(MediaAsset.trigger_intents))

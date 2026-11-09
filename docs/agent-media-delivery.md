@@ -24,7 +24,9 @@ page cites.
 A clinic binds a file to patient subjects ("Quando enviar", the column
 `media_assets.trigger_intents`) and switches "Sugestão Automática por IA" on
 (`auto_suggest`). On a production WhatsApp turn whose intent is one of those
-subjects, the server offers the LLM up to 5 numbered files. The LLM may end
+subjects, or a greeting or FAQ turn (the implied "Outras", which every file
+with the switch on carries), the server offers the LLM up to 5 numbered
+files. The LLM may end
 its reply with `[[MIDIA:n]]` to choose one. The server always strips the
 marker. After the text is accepted by the provider, a background task sends
 the file at most once per session and file in 24 h, charges the egress per
@@ -113,8 +115,16 @@ feeds the senders, the selection SQL and the `sendable_mime_types` field of
 
 ### What the Central de Mídias shows
 
-From `bindable-intents` (`intents`, `delivery_enabled`,
+From `bindable-intents` (`intents`, `topics`, `delivery_enabled`,
 `max_bytes_by_category`, `sendable_mime_types`):
+
+- "Quando enviar" shows one checkbox per entry of `topics`, in its order:
+  "Pedido de Preço", "Solicitação de Agendamento", "Interesse Tratamento",
+  "Dúvida Pós-Procedimento". Checking one binds all of its intents; a topic
+  shows checked when any of its intents is bound, and saving stores the whole
+  topic. "Outras" (`implicit_intents`: `saudacao`, `faq`) has no checkbox: it
+  is always included, and the help line says so ("Saudação e perguntas
+  frequentes já estão incluídas.").
 
 - `delivery_enabled = false`: "Envio automático ainda não ativo para o canal
   da clínica." The card "Sugestão Automática por IA" itself is unchanged.
@@ -122,10 +132,10 @@ From `bindable-intents` (`intents`, `delivery_enabled`,
   ativo." There is no client-side size check, no alert is shown, and nothing
   is unbound.
 - `delivery_enabled = true` and the switch on: the real rule ("A IA pode
-  enviar este arquivo pelo WhatsApp quando o assunto do paciente estiver
-  marcado em "Quando enviar" … no máximo uma vez a cada 24 h por paciente.").
-- Alerts:
-  - switch on and no subject marked: "esta mídia nunca será enviada";
+  enviar este arquivo pelo WhatsApp quando a conversa combinar com "Quando
+  enviar" … no máximo uma vez a cada 24 h por paciente.").
+- Alerts (a file with no subject marked raises none: it still goes on
+  greeting and FAQ turns):
   - file above its category ceiling: "Grande demais para envio pelo
     WhatsApp", with the limit read from `max_bytes_by_category`;
   - format outside `sendable_mime_types`, only while `delivery_enabled` is
@@ -154,10 +164,12 @@ any exclusion, so that case logs nothing at all, not even at debug level.
 | `origin_not_production` | `context.origin` is not `PRODUCTION` (today: every uazapi and Evolution turn) |
 | `identity_mismatch` | the pipeline result's tenant or session differs from the context's |
 | `deterministic_response` | the pipeline already produced a literal reply (scheduling link and similar) |
-| `handoff` | handoff required, handoff mode, or a handoff reason or summary |
+| `handoff` | handoff required, handoff mode, a handoff reason or summary, or a turn that pauses the session |
+| `handoff_confirmation` | the scheduling confirmation question ("Posso te encaminhar?"), which the prompt asks alone |
+| `scheduling_link_verification` | the patient's answer after the scheduling link (`concluiu` / `nao_concluiu`), which feeds the pending handoff |
 | `policy_blocked` | a policy block |
 | `safety` | a safety concern or a safety category other than `none` |
-| `intent_not_bindable` | the turn's intent is not in the allowlist below |
+| `intent_not_bindable` | the turn's intent is neither in the allowlist below nor implied (`saudacao`, `faq`) |
 | `price_hidden` | a `pedido_preco` turn whose prompt may not show a price |
 
 **2. The flag.** `agent_media_send_enabled` is read before any database
@@ -169,14 +181,16 @@ is a candidate when **all** of the following hold:
 
 - it belongs to the turn's tenant;
 - `auto_suggest = true`;
-- the turn's intent is in `trigger_intents`;
+- the turn's intent is in `trigger_intents`, or the turn is a `saudacao` or
+  `faq` one (`MEDIA_IMPLICIT_INTENT_SEQUENCE`), which reads every automatic
+  file whatever it is bound to;
 - its `mime_type` is in the provider's sendable set;
 - its `size_bytes` is within its category ceiling (below);
 - it was **not** sent to this session in the last 24 h
   (`media_deliveries.last_sent_at > now() - 24 h`);
 - if it carries `pedido_preco` in `trigger_intents`, the turn's price policy
   allows a price. This applies **whatever the turn's intent is**: a price
-  file bound to `faq` is still hidden when the price is.
+  file is still hidden on a `faq` turn when the price is.
 
 Rows are ordered newest first (`updated_at DESC, id DESC`). At most 5
 (`MEDIA_CANDIDATES_MAX`) reach the prompt; more than 5 also counts
@@ -185,19 +199,28 @@ this session received in the last 24 h (`MEDIA_RECENTLY_SENT_NAMES_MAX`) go
 with them. The SQL never reads `payload`. Any error from step 2 on reads as
 "no candidates": the selection never breaks a reply.
 
-**The allowlist** (`MEDIA_BINDABLE_INTENT_SEQUENCE`,
-`packages/neurostack-core/neurostack_core/protocol.py`, 12 intents):
-`saudacao`, `interesse_tratamento`, `pedido_preco`,
-`comparacao_tratamentos`, `objecao_vou_pensar`, `detalhes_servicos`,
-`pre_atendimento`, `faq`, `cultura_historia`, `qualificacao_publico`,
-`informacoes_profissionais`, `pos_atendimento_duvida`. Scheduling
-(`agendar`, `reagendar`, `cancelar`, `confirmar_presenca`,
+**The topics and the allowlist** (`MEDIA_TOPIC_INTENTS`,
+`MEDIA_BINDABLE_INTENT_SEQUENCE`,
+`packages/neurostack-core/neurostack_core/protocol.py`):
+
+| Topic (screen) | Intents it binds |
+|---|---|
+| `pedido_preco` "Pedido de Preço" | `pedido_preco` |
+| `agendar` "Solicitação de Agendamento" | `agendar`, `pre_atendimento` |
+| `interesse_tratamento` "Interesse Tratamento" | `interesse_tratamento`, `comparacao_tratamentos`, `objecao_vou_pensar`, `detalhes_servicos`, `cultura_historia`, `qualificacao_publico`, `informacoes_profissionais` |
+| `pos_atendimento_duvida` "Dúvida Pós-Procedimento" | `pos_atendimento_duvida` |
+| "Outras", implied, never stored (`MEDIA_IMPLICIT_INTENT_SEQUENCE`) | `saudacao`, `faq` |
+
+The allowlist is the union of the four topics (11 intents). The owner opened
+`agendar` to media on 2026-11-08; the scheduling gate still runs on the
+reply's text and drops the attachment when it replaces it. The other
+scheduling intents (`reagendar`, `cancelar`, `confirmar_presenca`,
 `disponibilidade_horarios`), safety, handoff (including `fora_do_horario`,
-which enqueues a handoff), billing and patient-data intents are left out on
-purpose. The API refuses any other value in `trigger_intents` (`POST`
-multipart repeated field, `PATCH` JSON list) with
-`422 media_trigger_intent_unknown`. It drops duplicates and stores the list
-in allowlist order.
+which enqueues a handoff, and `reclamacao`, which always hands off), billing
+and patient-data intents are left out on purpose. The API refuses any other
+value in `trigger_intents` (`POST` multipart repeated field, `PATCH` JSON
+list), `saudacao` and `faq` included, with `422 media_trigger_intent_unknown`.
+It drops duplicates and stores the list in allowlist order.
 
 **Category ceilings** (`MEDIA_CATEGORY_MAX_BYTES`, decimal bytes, the same
 values as the upload limits): image 5,000,000; PDF 20,000,000; audio
@@ -336,7 +359,8 @@ one:
    OpusHead locator) and never more. The result is `asset_gone` when the
    asset:
    - was deleted, or is not in the tenant;
-   - is no longer automatic (`auto_suggest` off, or no `trigger_intents`);
+   - is no longer automatic (`auto_suggest` off; a file bound to no subject
+     still goes on the implied "Outras" turns);
    - has a MIME the channel's provider does not send (reason
      `mime_not_sendable`);
    - is refused by the sender's own pre-network check
@@ -640,19 +664,17 @@ back to back.
    for **every clinic whose turns are `PRODUCTION` origin**: today Meta with
    `meta_app_secret` and Z-API with the inbound token; after
    `cloud-readiness`, uazapi and Evolution too, whatever
-   `media_delivery_provider_ready` says. Only files a clinic has bound to a
-   subject with the switch on can go. At the moment PR-B deploys, no row has
-   `trigger_intents` (`045` adds the column empty, with no backfill), so an
-   open right then sends nothing until a clinic binds a file. That stops
-   holding as soon as any clinic binds one, and the Central de Mídias lets a
+   `media_delivery_provider_ready` says. Every file with the switch on can
+   go: on the turns of its subjects, and on every greeting and FAQ turn (the
+   implied "Outras"), whatever it is bound to. The Central de Mídias lets a
    clinic bind subjects and turn the switch on even while it shows "não
-   ativo". From then on, the pre-check count is what an open reaches.
+   ativo", so the pre-check count is what an open reaches.
 
 ### Pre-check before any open
 
 Before **every** open of `agent_media_send_enabled` (the first one, the
-reopen of Decision 12, a reopen after a kill switch), count the bound
-automatic files per provider. Run it read-only
+reopen of Decision 12, a reopen after a kill switch), count the automatic
+files per provider (every one can go on a greeting or FAQ turn). Run it read-only
 (`BEGIN READ ONLY; … ROLLBACK;`) against production:
 
 ```sql
@@ -663,11 +685,10 @@ SELECT
   coalesce(cc.api_credentials->>'uazapi_instance_name', '')      <> '' AS uazapi_route,
   coalesce(cc.api_credentials->>'evolution_instance_name', '')   <> '' AS evolution_route,
   count(DISTINCT ma.tenant_id)                                         AS tenants,
-  count(*)                                                             AS bound_auto_files
+  count(*)                                                             AS auto_files
 FROM media_assets ma
 LEFT JOIN clinic_configs cc ON cc.tenant_id = ma.tenant_id
 WHERE ma.auto_suggest
-  AND cardinality(ma.trigger_intents) > 0
 GROUP BY 1, 2, 3, 4, 5
 ORDER BY 1, 2, 3, 4, 5;
 ```
@@ -721,7 +742,7 @@ global, and the send path checks only that the turn is `PRODUCTION` origin:
 `media_delivery_provider_ready` drives only the screen's promise. So once
 those turns are `PRODUCTION`, **opening the flag for any reason, live QA on
 a test instance included, is the reopen**: it opens media for every uazapi
-and Evolution clinic with bound automatic files, the production customer on
+and Evolution clinic with automatic files, the production customer on
 uazapi among them. It needs the owner's informed "vai" as such.
 
 1. **Close `agent_media_send_enabled` before** the origin switch deploys
@@ -776,7 +797,15 @@ Automática por IA" on.
       candidate. A `deduplicated` line appears only on a
       race between two deliveries of the pair, on `in_flight`, or on an
       outbox recovery; this sequential repeat produces none.
-- [ ] A conversation with no bound media behaves as before.
+- [ ] A conversation in a clinic with no automatic file behaves as before.
+- [ ] A greeting or FAQ question can be offered an automatic file bound to
+      no subject (the implied "Outras"); the LLM picks it only when its
+      "Gatilho de uso" fits.
+- [ ] Scheduling: a file bound to "Solicitação de Agendamento" can go on the
+      scheduling request turn; the confirmation question ("Posso te
+      encaminhar?") and the turn after the scheduling link go without a
+      file; a reply the scheduling gate rewrites goes without its file
+      (selection outcome `dropped`).
 - [ ] The bot's own messages (text, file, notice) do not pause the AI.
 - [ ] Close the flag: no turn sends media, and the Central de Mídias shows
       "Envio automático ainda não ativo para o canal da clínica.".
@@ -889,7 +918,9 @@ Automática por IA" on.
 
 | Constant or name | Value | Where |
 |---|---|---|
-| `MEDIA_BINDABLE_INTENT_SEQUENCE` | 12 intents | `packages/neurostack-core/neurostack_core/protocol.py` |
+| `MEDIA_TOPIC_INTENTS`, `MEDIA_TOPIC_SEQUENCE` | 4 topics | `packages/neurostack-core/neurostack_core/protocol.py` |
+| `MEDIA_BINDABLE_INTENT_SEQUENCE` | 11 intents, the topics' union | `packages/neurostack-core/neurostack_core/protocol.py` |
+| `MEDIA_IMPLICIT_INTENT_SEQUENCE` | `saudacao`, `faq` | `packages/neurostack-core/neurostack_core/protocol.py` |
 | `MEDIA_CATEGORY_MAX_BYTES` | image 5,000,000; PDF 20,000,000; audio and video 16,000,000 | `src/services/media_assets.py` |
 | `_SENDABLE_MIME_TYPES`, `sendable_mime_types`, `require_sendable_media` | per provider | `src/services/media_send_body.py` |
 | `MEDIA_SEND_TIMEOUT` | 60 s, connect 5 s | `src/services/media_send_body.py` |
@@ -910,4 +941,4 @@ Automática por IA" on.
 | `REPLY_MEDIA_DB_SECONDS` | 150 | `src/services/reply_media_runner.py` |
 | `REPLY_MEDIA_OUTER_SECONDS` | Meta 525, others 400 | `src/services/reply_media_runner.py` |
 | `neurostack_agent_media_selection`, `neurostack_agent_media_delivery` | closed vocabularies | `src/observability/metric_dimensions.py`, `src/observability/metrics.py` |
-| `GET /v1/media-assets/bindable-intents` | `intents`, `delivery_enabled`, `max_bytes_by_category`, `sendable_mime_types` | `src/api/routes/media_assets.py` |
+| `GET /v1/media-assets/bindable-intents` | `intents`, `topics`, `implicit_intents`, `delivery_enabled`, `max_bytes_by_category`, `sendable_mime_types` | `src/api/routes/media_assets.py` |

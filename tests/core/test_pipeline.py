@@ -635,6 +635,8 @@ class TestCognitivePipeline:
         assert enrich_result.handoff_required is False
         assert enrich_result.state_patch["flags"]["scheduling_link_sent"] is False
         assert enrich_result.should_pause is True
+        assert enrich_result.scheduling_link_verification == "concluiu"
+        assert enrich_result.handoff_confirmation_pending is False
         assert detail.verification_status == "concluiu"
         assert len(handoffs) == 1
         assert any(
@@ -642,6 +644,126 @@ class TestCognitivePipeline:
             and record.get("handoff_id") == handoff_id
             and record.get("verification_status") == "concluiu"
             for record in log_records
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_confirmation_question_turn_is_marked_and_offers_no_media(
+        self, tenant_id, session_id
+    ):
+        """Step 2 of the scheduling flow is no handoff_required turn, but its
+        prompt asks ONLY "Posso te encaminhar?": no media file may go with it,
+        on an agendar turn ("Solicitação de Agendamento" binds media)."""
+
+        from src.interaction_context import InteractionOrigin, build_interaction_context
+        from src.services.media_selection import media_turn_exclusion
+
+        pipeline = _isolated_pipeline()
+        result = await pipeline.process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="Ana Souza, quero agendar para sexta às 10h",
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=2,
+                flags={"scheduling_interest": True},
+            )
+        )
+
+        assert result.handoff_required is False
+        assert result.state_patch["flags"]["handoff_confirmation_pending"] is True
+        assert result.handoff_confirmation_pending is True
+        assert result.scheduling_link_verification is None
+        context = build_interaction_context(
+            effective_tenant_id=tenant_id,
+            session_id=session_id,
+            origin=InteractionOrigin.PRODUCTION,
+            event_type="message.in",
+        )
+        assert (
+            media_turn_exclusion(result, context, "zapi", None)
+            == "handoff_confirmation"
+        )
+        # An ambiguous answer keeps the question pending: still no media.
+        ambiguous = await pipeline.process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message="hmm talvez",
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=3,
+                flags={
+                    "scheduling_interest": True,
+                    "handoff_confirmation_pending": True,
+                },
+            )
+        )
+        assert ambiguous.handoff_required is False
+        assert ambiguous.handoff_confirmation_pending is True
+        assert (
+            media_turn_exclusion(ambiguous, context, "zapi", None)
+            == "handoff_confirmation"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("message", "verification", "should_pause"),
+        [
+            ("não consegui marcar pelo link", "nao_concluiu", True),
+            ("oi, bom dia", "nao_concluiu", True),
+            ("consegui agendar pelo link", "concluiu", True),
+        ],
+    )
+    async def test_the_scheduling_link_check_back_turn_offers_no_media(
+        self, monkeypatch, tenant_id, session_id, message, verification, should_pause
+    ):
+        """The turn after the scheduling link feeds the pending handoff: no
+        media, whatever its intent (a greeting is an implied "Outras" turn)."""
+
+        from src.interaction_context import InteractionOrigin, build_interaction_context
+        from src.services.media_selection import media_turn_exclusion
+
+        def _no_db():
+            raise RuntimeError("db disabled in unit test")
+
+        monkeypatch.setattr("src.services.handoff_service.get_db_session", _no_db)
+        pipeline = _isolated_pipeline()
+        result = await pipeline.process(
+            PipelineInput(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                message=message,
+                channel="whatsapp",
+                current_funnel_stage="agendamento_solicitado",
+                turn_count=4,
+                flags={"scheduling_link_sent": True},
+                clinic_config=_scheduling_link_config(),
+            )
+        )
+
+        assert result.handoff_required is False
+        assert result.scheduling_link_verification == verification
+        context = build_interaction_context(
+            effective_tenant_id=tenant_id,
+            session_id=session_id,
+            origin=InteractionOrigin.PRODUCTION,
+            event_type="message.in",
+        )
+        assert result.should_pause is should_pause
+        # A pausing turn is already a handoff for the media; the check-back
+        # flag excludes the turn even when the clinic does not pause.
+        assert media_turn_exclusion(result, context, "zapi", None) == (
+            "handoff" if should_pause else "scheduling_link_verification"
+        )
+        assert (
+            media_turn_exclusion(
+                result.model_copy(update={"should_pause": False}),
+                context,
+                "zapi",
+                None,
+            )
+            == "scheduling_link_verification"
         )
 
     @pytest.mark.asyncio

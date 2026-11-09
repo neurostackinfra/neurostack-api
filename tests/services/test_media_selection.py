@@ -376,6 +376,25 @@ def _exclusions() -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
         ("handoff_required", {"handoff_required": True}, {}),
         ("handoff_mode", {"mode": "handoff"}, {}),
         ("handoff_reason", {"handoff_reason": "user_request"}, {}),
+        ("pausing_turn", {"should_pause": True}, {}),
+        # The scheduling confirmation question and the check-back after the
+        # link: no handoff_required, but the reply must stand alone, also on
+        # an implied "Outras" turn.
+        (
+            "handoff_confirmation",
+            {"intent": "agendar", "handoff_confirmation_pending": True},
+            {},
+        ),
+        (
+            "scheduling_link_check_back",
+            {"intent": "agendar", "scheduling_link_verification": "nao_concluiu"},
+            {},
+        ),
+        (
+            "greeting_on_link_check_back",
+            {"intent": "saudacao", "scheduling_link_verification": "concluiu"},
+            {},
+        ),
         ("safety_concern", {"safety_concern": True}, {}),
         ("safety_category", {"safety_category": "clinical_risk"}, {}),
         ("safety_mode", {"mode": "safety"}, {}),
@@ -389,8 +408,13 @@ def _exclusions() -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
             {},
         ),
         ("deterministic", {"deterministic_response": "Acesse o link"}, {}),
-        ("scheduling_intent", {"intent": "agendar"}, {}),
+        ("rescheduling_intent", {"intent": "reagendar"}, {}),
+        ("cancelling_intent", {"intent": "cancelar"}, {}),
+        ("availability_intent", {"intent": "disponibilidade_horarios"}, {}),
         ("after_hours_intent", {"intent": "fora_do_horario"}, {}),
+        # Without its handoff flags too: a complaint is no topic.
+        ("complaint_intent", {"intent": "reclamacao"}, {}),
+        ("no_signal_intent", {"intent": "duvida_generica_sem_contexto"}, {}),
         ("price_hidden", {"intent": "pedido_preco"}, {"config": "hidden"}),
         # A provider whose sender sends no format (none today: the
         # fail-closed shape of a provider switched off in the set).
@@ -500,6 +524,64 @@ async def test_the_flag_is_read_before_any_session_and_the_sql_is_media_only() -
         recently_sent_names=("Tabela antiga",),
         capped=False,
     )
+
+
+async def test_a_scheduling_request_turn_reads_the_files_bound_to_it() -> None:
+    # The owner opened "Solicitação de Agendamento" to media (2026-11-08).
+    request = _request()
+    probe = _Probe(rows=[_row(1)])
+
+    offer = await _select(
+        probe,
+        _result(request, intent="agendar", intent_category="scheduling"),
+        _context(request),
+        clinic_config=_PRICE_OK_CONFIG,
+    )
+
+    assert offer is not None
+    assert "'agendar' = ANY (media_assets.trigger_intents)" in probe.statements[0]
+
+
+@pytest.mark.parametrize("intent", ["saudacao", "faq"])
+async def test_an_outras_turn_reads_every_automatic_file_whatever_it_binds(
+    intent: str,
+) -> None:
+    # "Outras" is implied: a greeting or FAQ turn offers any file with the
+    # switch on, bound or not, under every other filter of the SQL.
+    request = _request()
+    probe = _Probe(rows=[_row(1)])
+
+    offer = await _select(
+        probe,
+        _result(request, intent=intent),
+        _context(request),
+        clinic_config=_PRICE_OK_CONFIG,
+    )
+
+    assert offer is not None
+    candidates_sql = probe.statements[0]
+    assert "= ANY (media_assets.trigger_intents)" not in candidates_sql
+    assert "media_assets.auto_suggest IS true" in candidates_sql
+    assert "media_assets.mime_type IN" in candidates_sql
+    assert "FROM media_deliveries" in candidates_sql
+
+
+async def test_an_outras_turn_still_hides_price_files_when_the_price_is() -> None:
+    request = _request()
+    probe = _Probe()
+
+    await _select(
+        probe,
+        _result(request, intent="faq"),
+        _context(request),
+        clinic_config=_PRICE_HIDDEN_CONFIG,
+    )
+
+    candidates_sql = probe.statements[0]
+    assert "NOT ('pedido_preco' = ANY (media_assets.trigger_intents))" in (
+        candidates_sql
+    )
+    assert "'faq' = ANY" not in candidates_sql
 
 
 async def test_price_files_are_excluded_in_sql_when_the_prompt_holds_the_price() -> (
@@ -893,8 +975,21 @@ async def test_an_unusable_choice_drops_the_file_and_counts_its_outcome(
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize(
+    "turn",
+    [
+        {},
+        # "Solicitação de Agendamento" carries media since 2026-11-08: the
+        # gate still rewrites a confirmation, and the file goes with it.
+        {"intent": "agendar", "intent_category": "scheduling"},
+    ],
+    ids=["informative_turn", "scheduling_request_turn"],
+)
 async def test_a_scheduling_gate_rewrite_drops_the_file(
-    service: EventService, monkeypatch: pytest.MonkeyPatch, entry: str
+    service: EventService,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    turn: dict[str, Any],
 ) -> None:
     _Probe().install(monkeypatch)
     _install_llm(
@@ -903,7 +998,7 @@ async def test_a_scheduling_gate_rewrite_drops_the_file(
     request = _request()
     before = _counts()
 
-    response = await _generate(service, entry, request, _result(request))
+    response = await _generate(service, entry, request, _result(request, **turn))
 
     assert response.attachment is None
     text = response.prompt.suggested_response

@@ -460,6 +460,24 @@ def reasons(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+async def test_an_automatic_asset_bound_to_no_subject_is_still_delivered(
+    database: _Database,
+    world: _World,
+    delivery: _Delivery,
+    flag: list[bool],
+    reasons: list[str],
+) -> None:
+    # "Outras" is implied: a greeting or FAQ turn may pick a file bound to no
+    # subject, so the re-read refuses only a file no longer automatic.
+    payload = _pdf(1_234)
+    media_id = await _asset(database, world.tenant, payload=payload, trigger_intents=())
+
+    assert (await delivery.run(media_id)) == ReplyMediaResult("sent", False)
+    assert reasons == ["sent"]
+    assert delivery.channel.media_calls == [payload]
+    assert await _claims(database, world.tenant) == 1
+
+
 async def test_off_claims_once_and_records_no_credit(
     database: _Database,
     world: _World,
@@ -880,7 +898,6 @@ async def test_a_failed_claim_never_reaches_the_egress_nor_the_sender(
         ("flag_off", "flag_off", "flag_off"),
         ("foreign_tenant", "asset_gone", "asset_gone"),
         ("auto_suggest_off", "asset_gone", "asset_gone"),
-        ("no_trigger_intents", "asset_gone", "asset_gone"),
         ("ogg_on_zapi", "asset_gone", "mime_not_sendable"),
         ("m4a_on_zapi", "asset_gone", "mime_not_sendable"),
         ("stereo_ogg_on_meta", "asset_gone", "ogg_opus_not_mono"),
@@ -910,8 +927,6 @@ async def test_a_refusal_before_the_claim_writes_nothing(
         media_id = await _asset(database, world.foreign)
     elif case == "auto_suggest_off":
         media_id = await _asset(database, world.tenant, auto_suggest=False)
-    elif case == "no_trigger_intents":
-        media_id = await _asset(database, world.tenant, trigger_intents=())
     elif case in ("ogg_on_zapi", "m4a_on_zapi"):
         ogg = case == "ogg_on_zapi"
         media_id = await _asset(
