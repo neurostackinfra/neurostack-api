@@ -22,14 +22,26 @@ from the client.  A JWT ``builder`` reads its own builder's account, through
 its own tenant or, with ``?tenant_id=``, one of its clinics; a JWT
 ``super_admin`` reads the builder of any tenant it selects.  The builder is
 ``tenants.builder_id`` RE-READ for that tenant (a plain read, lock-order step
-0) and, for a builder, must equal its JWT claim.  A clinic of another
-builder and a tenant that does not exist get the same ``403 {"detail":
+0) and, for a builder, must equal its JWT claim.  One exception, the
+builder's own tenant (no clinic named): when that tenant is linked to no
+builder (``tenants.builder_id`` NULL, the usual home tenant of a builder
+user) the account is the JWT claim's, as for ``/v1/billing/*``; an own
+tenant linked to ANOTHER builder is refused.  A clinic of another builder
+(or of none) and a tenant that does not exist get the same ``403 {"detail":
 {"code": "tenant_override_forbidden"}}`` before any credit or billing table
 is read.  API keys and other roles get ``403 {"detail": {"code":
 "credit_scope_forbidden"}}`` before any database work: the account is the
 builder's financial state, which ``main`` only shows to the builder
 (``/v1/billing/*`` requires the builder JWT).  A standalone tenant (no
-builder) has no account: zeros, state ``pending`` (``standalone``).
+builder) read by a super admin -- a clinic of no builder, or a builder
+user's unlinked home tenant -- has no account: zeros, state ``pending``
+(``standalone``).  A builder reading its own unlinked home tenant sees its
+builder's account instead, while a super admin viewing that same tenant
+still sees the standalone zeros.  The fallback re-reads the token's
+``users`` row (it must still be an active ``builder`` of the claimed builder
+and tenant), so a stale token is refused like an absent tenant, and it is
+refused too when a builder user of another builder (or of none) shares that
+tenant (no single builder's home); see :mod:`src.api.helpers.builder_home_tenant`.
 
 ``state`` precedence: ``deletion_due`` > ``suspended`` > ``grace`` (the
 recorded transitions of the open exhaustion episode; episodes exist only
@@ -53,6 +65,7 @@ from fastapi import Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.helpers.builder_home_tenant import builder_home_tenant_account
 from src.api.middleware.auth import (
     TenantContext,
     get_tenant_context,
@@ -149,7 +162,12 @@ _RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": (
             "credit_scope_forbidden (API key or a role other than builder or "
             "super_admin) or tenant_override_forbidden (a clinic of another "
-            "builder, or a tenant that does not exist: the same body)."
+            "builder or of none, the builder's own tenant linked to another "
+            "builder, a stale token on the builder's unlinked own tenant (its "
+            "user deactivated, deleted, no longer a builder, or moved to "
+            "another builder or tenant), that unlinked tenant shared with a "
+            "builder user of another builder (or of none), or a tenant that "
+            "does not exist: the same body)."
         ),
     },
     503: {
@@ -163,7 +181,9 @@ _TENANT_QUERY = Query(
     description=(
         "Builders: one of their clinics (default: their own tenant); super "
         "admins: any tenant. The account read is always the builder that "
-        "tenant belongs to now (tenants.builder_id, re-read)."
+        "tenant belongs to now (tenants.builder_id, re-read); a builder's "
+        "own tenant linked to no builder (and shared with no builder user "
+        "of another builder (or of none)) reads the builder's own account."
     ),
 )
 
@@ -185,7 +205,8 @@ def _no_store(response: Response) -> None:
 
 @dataclass(frozen=True)
 class CreditScope:
-    """The tenant read through and its builder as stored NOW.
+    """The tenant read through and its builder as stored NOW (or, for a
+    builder's own tenant linked to no builder, the builder's JWT claim).
 
     ``tenant_id`` is ``None`` only for a super admin's read of one builder's
     account by its id (:func:`read_builder_snapshot`), never for a scope of
@@ -209,7 +230,14 @@ async def resolve_credit_scope(
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> CreditScope:
     """Builder JWT (own builder) or super admin JWT; refusals before any
-    credit or billing read, a foreign and an absent tenant alike."""
+    credit or billing read, a foreign and an absent tenant alike.
+
+    A builder's own tenant (no override, or ``tenant_id`` equal to the
+    token's) that is linked to no builder reads the token's builder, once
+    the token's ``users`` row confirms it (active, role builder, same
+    builder and tenant) and no builder user of another builder (or of none)
+    shares the tenant.  Linked to another builder it is refused; a clinic override must
+    be linked to the token's builder."""
 
     if (
         tenant.api_key
@@ -225,12 +253,23 @@ async def resolve_credit_scope(
     except HTTPException:
         await session.rollback()
         raise
-    if found is None or (
-        tenant.role == "builder" and found.builder_id != tenant.builder_id
-    ):
+    if found is None:
         await session.rollback()
         raise _refusal(TENANT_FORBIDDEN_CODE)
-    return CreditScope(tenant_id=effective, builder_id=found.builder_id)
+    if tenant.role != "builder" or found.builder_id == tenant.builder_id:
+        return CreditScope(tenant_id=effective, builder_id=found.builder_id)
+    # The builder's own (home) tenant, no clinic named, and that tenant
+    # linked to no builder: the account is the builder's own, the JWT claim
+    # (as for ``/v1/billing/*``) confirmed against the current ``users`` row.
+    # Never a clinic override, never a tenant linked to another builder, never
+    # a stale token (all refused below, before any credit or billing read).
+    home = await builder_home_tenant_account(
+        session, tenant, effective, found.builder_id
+    )
+    if home is not None:
+        return CreditScope(tenant_id=effective, builder_id=home)
+    await session.rollback()
+    raise _refusal(TENANT_FORBIDDEN_CODE)
 
 
 # ---------------------------------------------------------------------------
