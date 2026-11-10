@@ -60,6 +60,18 @@ method the same way and counts its outcomes (``builder``, ``standalone``):
 the existing suites never call a credit read, so their forced runs must
 show none, while the Group 6 suites exercise it under the forced switch.
 
+creditos-cortesia: the courtesy routes also need the schema at ``046``
+(``credit_switch.courtesy_gate_open``, judged on ``credit_switch_reading()``,
+which SQLite never sets).  The plugin forces the reading too
+(``CreditSwitch.reading``) to ``CreditSwitchReading(True, "schema_ready",
+<head of this image's chain>)``, so the forced runs see the courtesy gate
+open; the per-test self-check asserts that
+``courtesy_gate_open(credit_switch_reading())`` is true.
+``tests/services/test_credit_switch.py`` and
+``tests/integration/test_credit_schema_dominance_postgres.py`` read the real
+verdict and are not plugin suites; a test that needs a ``045`` database under
+the plugin must patch ``CreditSwitch.reading``, not publish a reading.
+
 Group 7: the "must show only ``main``" rules above are enforced, not only
 printed.  Every enforced capture, enforced or ``credit_pending`` webhook
 pre-check and enforced inventory mode is attributed to the test file that
@@ -124,6 +136,7 @@ _ORIGINAL_UPLOAD_WRITER: Any = None
 _ORIGINAL_EGRESS_WRITER: Any = None
 _credit_reads: Counter[str] = Counter()
 _ORIGINAL_SNAPSHOT_BOOK: Any = None
+_FORCED_READING: Any = None
 
 
 def _suite_of(item: pytest.Item) -> str:
@@ -159,6 +172,10 @@ def _forced_effective(_self: Any) -> bool:
     global _reads
     _reads += 1
     return True
+
+
+def _forced_reading(_self: Any) -> Any:
+    return _FORCED_READING
 
 
 async def _counted_writer(*args: Any, **kwargs: Any) -> Any:
@@ -249,13 +266,21 @@ async def _counted_snapshot_book(self: Any, *args: Any, **kwargs: Any) -> Any:
 def pytest_configure(config: pytest.Config) -> None:
     global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE, _ORIGINAL_WEBHOOK_PRECHECK
     global _ORIGINAL_MODE, _ORIGINAL_UPLOAD_WRITER, _ORIGINAL_EGRESS_WRITER
-    global _ORIGINAL_SNAPSHOT_BOOK
+    global _ORIGINAL_SNAPSHOT_BOOK, _FORCED_READING
     from src.api.routes import credits
     from src.services import credit_inventory, credit_metering
-    from src.services.credit_switch import CreditSwitch
+    from src.services.credit_switch import (
+        CreditSwitch,
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
 
     patcher = pytest.MonkeyPatch()
     patcher.setattr(CreditSwitch, "effective", _forced_effective)
+    _FORCED_READING = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    patcher.setattr(CreditSwitch, "reading", _forced_reading)
     _ORIGINAL_WRITER = credit_metering.record_observational_trace
     patcher.setattr(credit_metering, "record_observational_trace", _counted_writer)
     _ORIGINAL_CAPTURE = credit_metering.capture_events_enforcement
@@ -345,9 +370,15 @@ def _assert_forced() -> None:
     global _self_checks
     from src.api.routes import credits
     from src.services import credit_inventory, credit_metering
-    from src.services.credit_switch import CreditSwitch, credit_switch_effective
+    from src.services.credit_switch import (
+        CreditSwitch,
+        courtesy_gate_open,
+        credit_switch_effective,
+        credit_switch_reading,
+    )
 
     assert CreditSwitch.effective is _forced_effective, "switch is not forced"
+    assert CreditSwitch.reading is _forced_reading, "switch reading is not forced"
     assert (
         credit_metering.record_observational_trace is _counted_writer
     ), "the observational writer counter was swapped and not restored"
@@ -367,6 +398,9 @@ def _assert_forced() -> None:
     ), "the credit read snapshot counter was swapped and not restored"
     _self_checks += 1
     assert credit_switch_effective() is True, "the forced switch does not read True"
+    assert (
+        courtesy_gate_open(credit_switch_reading()) is True
+    ), "the forced reading does not open the courtesy gate"
 
 
 @pytest.fixture(autouse=True)

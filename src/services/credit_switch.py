@@ -32,7 +32,10 @@ Reusable guards for the credit surfaces of Groups 2-7:
   work -- the dependency alone runs only after FastAPI parsed the body, so a
   malformed body still gets its 422 first);
 * ``run_credit_worker_tick`` (a worker tick that claims nothing when off);
-* ``load_credit_panel`` (the UI degrades: a panel is ``None`` when off).
+* ``load_credit_panel`` (the UI degrades: a panel is ``None`` when off);
+* ``courtesy_gate_open`` (creditos-cortesia: the courtesy routes also need
+  the schema at ``COURTESY_SCHEMA_MIN_REVISION``, judged on the reading the
+  route captured, never by a read of its own).
 
 This module touches no ``credit_*`` table and never reads ``tests/``.
 """
@@ -73,6 +76,10 @@ _T = TypeVar("_T")
 # of their own over this same reading.  tests/services/test_credit_switch.py
 # names that list.
 CREDIT_SCHEMA_MIN_REVISION: Final = "042"
+# The schema the courtesy routes alone require (creditos-cortesia, migration
+# 046), judged by ``courtesy_gate_open`` on the reading the switch already
+# holds; CREDIT_SCHEMA_MIN_REVISION does not move for it.
+COURTESY_SCHEMA_MIN_REVISION: Final = "046"
 # Key of the per-request captured value in the ASGI scope state
 # (``request.state.credit_switch_effective``).
 CREDIT_SWITCH_STATE_KEY: Final = "credit_switch_effective"
@@ -205,6 +212,35 @@ def evaluate_schema_revision(
     if chain.index(revision) < chain.index(minimum):
         return CreditSwitchReading(False, "schema_below_minimum", revision)
     return CreditSwitchReading(True, "schema_ready", revision)
+
+
+def courtesy_gate_open(reading: CreditSwitchReading) -> bool:
+    """Whether the courtesy routes may run on the schema of ``reading``.
+
+    creditos-cortesia, wish Decision 6: the route captures
+    ``credit_switch_reading()`` once at entry and passes it here; this reads
+    nothing else (no database, no capture of its own).  Open only for an
+    effective reading whose revision is at or after
+    ``COURTESY_SCHEMA_MIN_REVISION`` in this image's own chain, by the same
+    pure ``evaluate_schema_revision``.  An absent revision, a reading that is
+    not effective, or any exception (``ImageMigrationChainError`` from
+    ``load_image_migration_chain`` included) is closed: never raises."""
+
+    try:
+        if reading.effective is not True or not reading.revision:
+            return False
+        verdict = evaluate_schema_revision(
+            (reading.revision,),
+            load_image_migration_chain(),
+            COURTESY_SCHEMA_MIN_REVISION,
+        )
+        return verdict.effective is True
+    except Exception as error:
+        logger.error(
+            "credit courtesy gate unreadable; treating it as closed",
+            error_type=type(error).__name__,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +584,7 @@ async def load_credit_panel(
 
 
 __all__ = [
+    "COURTESY_SCHEMA_MIN_REVISION",
     "CREDIT_SCHEMA_MIN_REVISION",
     "CREDIT_SWITCH_EFFECTIVE",
     "CREDIT_SWITCH_STATE_KEY",
@@ -565,6 +602,7 @@ __all__ = [
     "credit_switch_reading",
     "credit_unavailable_exception_handler",
     "credit_unavailable_response",
+    "courtesy_gate_open",
     "evaluate_schema_revision",
     "load_credit_panel",
     "load_image_migration_chain",

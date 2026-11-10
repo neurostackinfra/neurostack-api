@@ -149,6 +149,22 @@ already must for expiries, never from the stored rows alone.
 Group 2 never charges RAG or media maintenance, never opens an exhaustion
 episode and never reads ``tests/``.
 
+Courtesy (creditos-cortesia, migration 046).  A super admin's free
+capacity is a third lot kind, ``courtesy``: no subscription, order or
+payment (``payment_id`` is ``None``), ``paid_at`` the civil date of the
+grant and ``expires_at`` the start of that date + 30 days
+(:func:`courtesy_lot_expires_at`), granted by
+:meth:`LedgerBook.grant_courtesy` under the grant effect
+``courtesy:{event_id}:grant`` exactly like any lot (open debt is settled
+first).  It is spent by the same FEFO (monthly first, then the earliest
+expiry: a courtesy goes before a later-expiring top-up), expires and pays
+debt like the others.  :meth:`LedgerBook.remove_courtesy` takes back part or
+all of what a courtesy lot can still spend, as ``courtesy_removal`` entries
+(effect ``courtesy-removal:{event_id}``, one per removal): funding removed,
+like a reversal, but never debt and never anything consumed, settled or
+expired.  The super-admin service that drives both is
+:mod:`src.services.credit_courtesy`.
+
 Group 4a (RAG and media).  A reservation is a DEBIT (owner decision B,
 2026-10-30): :mod:`src.services.credit_inventory` debits ``target -
 coverage`` of an accounting window through this book, so it has already left
@@ -193,6 +209,8 @@ logger = get_logger(__name__)
 CREDIT_TIMEZONE: Final = ZoneInfo("America/Sao_Paulo")
 MILLICREDITS_PER_CREDIT: Final = 1_000
 TOPUP_VALIDITY_MONTHS: Final = 6
+# A courtesy lot lasts 30 civil days (creditos-cortesia, DESIGN Decision 4).
+COURTESY_VALIDITY_DAYS: Final = 30
 
 # Effect kinds this module writes (``credit_effects.effect_kind``).  Debits
 # carry the caller's kind (``trace``, ``rag`` ... from Group 3 on).
@@ -205,6 +223,9 @@ DEBT_SETTLEMENT_EFFECT: Final = "debt_settlement"
 RELEASE_EFFECT: Final = "release"
 # The release of one debt by a restoration or release (``_release_line_debt``).
 RETURN_EFFECT: Final = "return"
+# A super admin's removal of courtesy credits (``remove_courtesy``); the
+# courtesy grant itself is a ``grant`` effect.
+COURTESY_REMOVAL_EFFECT: Final = "courtesy_removal"
 LEDGER_EFFECT_KINDS: Final = (
     GRANT_EFFECT,
     REVERSAL_EFFECT,
@@ -213,6 +234,7 @@ LEDGER_EFFECT_KINDS: Final = (
     DEBT_SETTLEMENT_EFFECT,
     RELEASE_EFFECT,
     RETURN_EFFECT,
+    COURTESY_REMOVAL_EFFECT,
 )
 
 # How far a writer's clock may stray from the database clock (owner
@@ -234,7 +256,7 @@ def configured_clock_tolerance() -> timedelta:
 CONSUMPTION_DEBT: Final = "consumption"
 REVERSAL_DEBT: Final = "reversal"
 
-LotKind = Literal["monthly", "topup"]
+LotKind = Literal["monthly", "topup", "courtesy"]
 DebitStatus = Literal["applied", "duplicate", "credit_pending"]
 
 
@@ -252,6 +274,36 @@ class LedgerClockAhead(RuntimeError):
     the database clock catches up, and nothing is recorded (fail closed; the
     caller's transaction rolls back).  A writer's own instant is never
     refused (:meth:`CreditLedger.checked_instant` limits it)."""
+
+
+class CourtesyRefused(Exception):
+    """A courtesy grant or removal refused by a rule (nothing is written).
+
+    ``code`` is the stable answer the admin route maps to its response."""
+
+    code: str = "courtesy_refused"
+
+
+class CourtesyLotNotFound(CourtesyRefused):
+    """The lot does not exist, is not a courtesy lot, or belongs to another
+    builder: the same refusal for all three (DESIGN Decision 6)."""
+
+    code = "courtesy_lot_not_found"
+
+
+class CourtesyRemovalExceedsBalance(CourtesyRefused):
+    """The removal asks for more than the lot can still spend, or the lot can
+    spend nothing (expired or already zeroed; DESIGN Decision 5)."""
+
+    code = "courtesy_removal_exceeds_balance"
+
+    def __init__(self, *, requested_mc: int | None, spendable_mc: int) -> None:
+        super().__init__(
+            "courtesy removal exceeds the lot's spendable balance "
+            f"(requested {requested_mc}, spendable {spendable_mc})"
+        )
+        self.requested_mc = requested_mc
+        self.spendable_mc = spendable_mc
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +370,19 @@ def topup_lot_expires_at(paid_at: date) -> datetime:
     return start_of_civil_day(topup_lot_expires_on(paid_at))
 
 
+def courtesy_lot_expires_on(granted_on: date) -> date:
+    """The civil date of the grant + 30 days (DESIGN Decision 4)."""
+
+    return granted_on + timedelta(days=COURTESY_VALIDITY_DAYS)
+
+
+def courtesy_lot_expires_at(granted_on: date) -> datetime:
+    """A courtesy lot expires when its ``expires_on`` day begins
+    (America/Sao_Paulo), the same form as a top-up."""
+
+    return start_of_civil_day(courtesy_lot_expires_on(granted_on))
+
+
 def cumulative_target_mc(granted_mc: int, cents: int, settled_cents: int) -> int:
     """``floor(granted_mc x cents / settled_cents)`` in integers."""
 
@@ -376,6 +441,18 @@ def topup_grant_effect_id(order_id: UUID) -> str:
 
 def expiry_effect_id(lot_id: UUID) -> str:
     return f"expiry:{lot_id}"
+
+
+def courtesy_grant_effect_id(event_id: UUID) -> str:
+    """The grant effect of a courtesy lot (``ck_credit_lots_source``)."""
+
+    return f"courtesy:{event_id}:grant"
+
+
+def courtesy_removal_effect_id(event_id: UUID) -> str:
+    """The effect of one courtesy removal (``ck_credit_ledger_entries_type``)."""
+
+    return f"courtesy-removal:{event_id}"
 
 
 def _line_effect_id(
@@ -480,7 +557,13 @@ def parse_line_effect_id(effect_id: str) -> tuple[str, UUID, int] | None:
 # ---------------------------------------------------------------------------
 
 _LOT_PLUS: Final = ("grant", "settlement_release", "lot_regrant")
-_LOT_MINUS: Final = ("debit", "expiry", "reversal", "debt_settlement")
+_LOT_MINUS: Final = (
+    "debit",
+    "expiry",
+    "reversal",
+    "debt_settlement",
+    "courtesy_removal",
+)
 
 
 @dataclass
@@ -493,7 +576,8 @@ class LotState:
     expires_at: datetime
     granted_mc: int
     grant_effect_id: str
-    payment_id: str = ""
+    # ``None`` only for a courtesy lot (migration 046).
+    payment_id: str | None = None
     subscription_id: UUID | None = None
     cycle_start: date | None = None
     cycle_end: date | None = None
@@ -658,7 +742,7 @@ class GrantSpec:
 
     lot_kind: LotKind
     effect_id: str
-    payment_id: str
+    payment_id: str | None
     paid_at: date
     granted_mc: int
     expires_at: datetime
@@ -950,6 +1034,85 @@ class LedgerBook:
         self._expire_if_due(lot, at)
         self._settle(spec.effect_id, at)
         return lot
+
+    def grant_courtesy(
+        self, event_id: UUID, granted_mc: int, *, at: datetime
+    ) -> LotState:
+        """Grant a courtesy lot of ``granted_mc`` (creditos-cortesia).
+
+        The lot follows :meth:`grant` (open debt is settled first, DESIGN
+        Decision 7): no subscription, order or payment, ``paid_at`` the civil
+        date of the instant the grant acts at and ``expires_at`` the start of
+        that date + 30 days (Decision 4), under the grant effect
+        ``courtesy:{event_id}:grant``.  A non-positive amount is refused
+        before anything is recorded."""
+
+        if type(granted_mc) is not int or granted_mc <= 0:
+            raise ValueError("granted_mc must be a positive integer")
+        at = self._tick(at)
+        granted_on = civil_date(at)
+        return self.grant(
+            GrantSpec(
+                lot_kind="courtesy",
+                effect_id=courtesy_grant_effect_id(event_id),
+                payment_id=None,
+                paid_at=granted_on,
+                granted_mc=granted_mc,
+                expires_at=courtesy_lot_expires_at(granted_on),
+            ),
+            at=at,
+        )
+
+    def remove_courtesy(
+        self,
+        lot_id: UUID,
+        event_id: UUID,
+        *,
+        credits: int | None = None,
+        remove_all: bool = False,
+        at: datetime,
+    ) -> int:
+        """Take funding back from a courtesy lot; returns the removed mc.
+
+        Exactly one form (DESIGN Decision 5): ``credits`` N whole credits,
+        ``1 <= N <= floor(spendable / 1000)``, or ``remove_all`` -- the whole
+        spendable balance, fraction included.  Spendable is judged after the
+        deadline sweep and the start catch-up, at the instant the removal
+        acts at: an expired or zeroed lot spends nothing, so a removal of it
+        is refused, as is any N above the balance
+        (:class:`CourtesyRemovalExceedsBalance`, raised before any entry).
+        A removal never creates debt and never touches what was consumed,
+        settled or expired; it is allowed under a quarantine hold (Decision
+        15).  One ``courtesy_removal`` entry under the effect
+        ``courtesy-removal:{event_id}``."""
+
+        if remove_all is not True and remove_all is not False:
+            raise ValueError("remove_all must be a boolean")
+        if remove_all == (credits is not None):
+            raise ValueError("give exactly one of credits and remove_all")
+        if credits is not None and (type(credits) is not int or credits <= 0):
+            raise ValueError("credits must be a positive integer")
+        at = self._tick(at)
+        lot = self._lots.get(lot_id)
+        if lot is None or lot.lot_kind != "courtesy":
+            raise CourtesyLotNotFound(f"no courtesy lot {lot_id} in this book")
+        self._settle_started_allowances(at)
+        spendable = lot.spendable_mc(at)
+        if remove_all:
+            amount = spendable
+            requested: int | None = None
+        else:
+            assert credits is not None
+            amount = requested = credits * MILLICREDITS_PER_CREDIT
+        if amount <= 0 or amount > spendable:
+            raise CourtesyRemovalExceedsBalance(
+                requested_mc=requested, spendable_mc=spendable
+            )
+        effect_id = courtesy_removal_effect_id(event_id)
+        if not self._ensure_effect(effect_id, COURTESY_REMOVAL_EFFECT):
+            raise LedgerInvariantError("courtesy removal effect already exists")
+        self._entry(effect_id, lot.id, "courtesy_removal", amount, at)
+        return amount
 
     def settle_open_debts(
         self,
@@ -1777,6 +1940,7 @@ class CreditLedger:
         book: LedgerBook,
         *,
         lifecycle_source: Literal["effect", "worker"] | None = "effect",
+        before_lifecycle: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[str, ...]:
         """Insert the book's recorded rows; returns the new effect ids.
 
@@ -1787,7 +1951,9 @@ class CreditLedger:
         reactivation and thresholds.  Inert -- no query, no row -- while the
         book's ``spend_hold`` says ``credit_enforcement_at`` is unset.
         ``lifecycle_source=None`` skips it (the outcome lands on
-        :attr:`lifecycle_outcome`)."""
+        :attr:`lifecycle_outcome`).  ``before_lifecycle`` runs after the
+        rows are inserted and before the evaluation (the courtesy service
+        inserts its event row there); what it raises propagates."""
 
         writes = book.writes
         for model, rows in (
@@ -1810,6 +1976,8 @@ class CreditLedger:
         created = writes.effect_ids
         book.writes = LedgerWrites()
         self.lifecycle_outcome = None
+        if before_lifecycle is not None:
+            await before_lifecycle()
         if lifecycle_source is not None and book.spend_hold.enforced:
             # Lazy import: credit_lifecycle builds on this module.
             from src.services.credit_lifecycle import CreditLifecycle
@@ -1912,6 +2080,8 @@ def _utc(value: datetime) -> datetime:
 
 __all__ = [
     "CONSUMPTION_DEBT",
+    "COURTESY_REMOVAL_EFFECT",
+    "COURTESY_VALIDITY_DAYS",
     "CREDIT_TIMEZONE",
     "DEBT_SETTLEMENT_EFFECT",
     "EXPIRY_EFFECT",
@@ -1922,6 +2092,9 @@ __all__ = [
     "REVERSAL_DEBT",
     "REVERSAL_EFFECT",
     "TOPUP_VALIDITY_MONTHS",
+    "CourtesyLotNotFound",
+    "CourtesyRefused",
+    "CourtesyRemovalExceedsBalance",
     "CreditLedger",
     "DebitResult",
     "DebtState",
@@ -1935,6 +2108,10 @@ __all__ = [
     "SpendHold",
     "add_calendar_months",
     "civil_date",
+    "courtesy_grant_effect_id",
+    "courtesy_lot_expires_at",
+    "courtesy_lot_expires_on",
+    "courtesy_removal_effect_id",
     "cumulative_target_mc",
     "cycle_debt_settlement_effect_id",
     "cycle_start_settlement_effect_id",

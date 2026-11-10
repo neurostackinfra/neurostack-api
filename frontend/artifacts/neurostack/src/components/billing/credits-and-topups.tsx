@@ -251,6 +251,18 @@ const CONSUMPTION_LABELS: Record<string, [string, string]> = {
   maintenance: ["Manutenção", "Maintenance"],
 };
 
+/** Origin label of a lot; courtesy is never shown as a top-up. */
+function lotKindLabel(kind: CreditLot["kind"], txt: Txt): string {
+  switch (kind) {
+    case "monthly":
+      return txt("Franquia mensal", "Monthly allowance");
+    case "topup":
+      return txt("Recarga", "Top-up");
+    case "courtesy":
+      return txt("Cortesia", "Courtesy");
+  }
+}
+
 function BalanceDetails({ summary, locale, txt }: { summary: CreditSummary; locale: Locale; txt: Txt }) {
   const credits = (mc: number) => `${formatCredits(mc, locale)} ${txt("créditos", "credits")}`;
   const { balance, debt, reservations, thresholds, consumption } = summary;
@@ -263,6 +275,7 @@ function BalanceDetails({ summary, locale, txt }: { summary: CreditSummary; loca
       <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
         <CreditMetric label={txt("Franquia mensal", "Monthly allowance")} value={credits(balance.monthly_available_mc)} />
         <CreditMetric label={txt("Recargas", "Top-ups")} value={credits(balance.topup_available_mc)} />
+        <CreditMetric label={txt("Cortesia", "Courtesy")} value={credits(balance.courtesy_available_mc)} />
         <CreditMetric
           label={txt("Dívida", "Debt")}
           value={credits(balance.open_debt_mc)}
@@ -295,10 +308,17 @@ function BalanceDetails({ summary, locale, txt }: { summary: CreditSummary; loca
             <div key={expiry.lot_id} className="flex flex-wrap items-center justify-between gap-x-2 text-xs">
               <span className="flex items-center gap-1.5 text-muted-foreground">
                 <Clock className="h-3 w-3" aria-hidden="true" />
-                {expiry.kind === "monthly" ? txt("Franquia mensal", "Monthly allowance") : txt("Recarga", "Top-up")} ·{" "}
+                {lotKindLabel(expiry.kind, txt)} ·{" "}
                 {formatInstant(expiry.expires_at, locale) ?? unknownDate(txt)}
               </span>
-              <span className="font-semibold tabular-nums">{credits(expiry.available_mc)}</span>
+              <span className="font-semibold tabular-nums">
+                {credits(expiry.available_mc)}
+                {expiry.removed_mc > 0 && (
+                  <span data-testid="credit-expiry-removed" className="ml-1 font-normal text-muted-foreground">
+                    ({txt("retirados", "withdrawn")}: {credits(expiry.removed_mc)})
+                  </span>
+                )}
+              </span>
             </div>
           ))}
         </div>
@@ -517,7 +537,7 @@ function CreditHistory({
                     <td role="cell" className={c.bodyCell}>
                       <span className={c.cellLabel}>{columns[1]}</span>
                       <span className="block text-xs text-foreground">
-                        {lot.kind === "monthly" ? txt("Franquia mensal", "Monthly allowance") : txt("Recarga", "Top-up")}
+                        {lotKindLabel(lot.kind, txt)}
                       </span>
                     </td>
                     <td role="cell" className={c.bodyCell}>
@@ -525,6 +545,11 @@ function CreditHistory({
                       <span className="block text-xs font-semibold tabular-nums text-foreground">
                         {formatCredits(lot.granted_mc, locale)} {txt("créditos", "credits")}
                       </span>
+                      {lot.removed_mc > 0 && (
+                        <span data-testid="credit-lot-removed" className="block text-[11px] tabular-nums text-muted-foreground">
+                          {txt("Retirados", "Withdrawn")}: {formatCredits(lot.removed_mc, locale)} {txt("créditos", "credits")}
+                        </span>
+                      )}
                     </td>
                     <td role="cell" className={c.bodyCell}>
                       <span className={c.cellLabel}>{columns[3]}</span>

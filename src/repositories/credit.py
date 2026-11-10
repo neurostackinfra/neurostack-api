@@ -107,6 +107,16 @@ lease arithmetic and ``lock_timeout`` go through a dialect switch, like
 evaluates the lease against the pinned ``:observed`` and no lock timeout
 exists.
 
+Courtesy (creditos-cortesia, migration 046).  A courtesy lot and its
+``courtesy_removal`` entries are ordinary ledger rows, inserted by
+:meth:`src.services.credit_ledger.CreditLedger.persist`.  The thin pieces of
+:mod:`src.services.credit_courtesy` are here: the builder's activity and a
+lot's identity (plain reads, no lock: step 0 of the lock order, before the
+account lock), the event of an idempotency key (a plain read, repeated
+under the account lock) and the event insert (``ON CONFLICT
+(idempotency_key) DO NOTHING``, after the ledger rows it names: its foreign
+key is ``(builder_id, lot_id)``).  Nothing here writes an ASAAS table.
+
 Enforced webhooks (Group 3b-2).  A Z-API/Meta claim
 (:meth:`~CreditRepository.insert_webhook_claim`,
 ``UNIQUE(tenant_id, source, provider_message_id)``) has the same fences
@@ -144,10 +154,12 @@ from src.models.billing import (
     BillingSubscriptionCycle,
     BillingTopupOrder,
 )
+from src.models.builder import Builder
 from src.models.credit import (
     ENFORCEMENT_STATE_ID,
     LEDGER_ENTRY_TYPES,
     CreditAccount,
+    CreditCourtesyEvent,
     CreditDebt,
     CreditDebtOrigin,
     CreditDebtSettlement,
@@ -169,8 +181,10 @@ from src.repositories.billing import billing_advisory_key
 # Direction of each entry type on a lot's available balance and on the
 # builder's open debt.  ``debt_settlement`` moves both: the settling lot pays
 # the debt.  ``courtesy_removal`` (migration 046) takes millicredits off a
-# courtesy lot; no writer exists until the courtesy service does.  Every type
-# in LEDGER_ENTRY_TYPES appears at least once (tests/models/test_credit_models.py).
+# courtesy lot (src.services.credit_courtesy, the only writer); it is funding
+# removed, never an increase of anything, so LOT_INCREASES does not change
+# and DEBT_* never name it.  Every type in LEDGER_ENTRY_TYPES appears at
+# least once (tests/models/test_credit_models.py).
 LOT_INCREASES: Final = frozenset({"grant", "settlement_release", "lot_regrant"})
 LOT_DECREASES: Final = frozenset(
     {"debit", "expiry", "reversal", "debt_settlement", "courtesy_removal"}
@@ -208,6 +222,32 @@ class DerivedBalance:
     @property
     def lots_total_mc(self) -> int:
         return sum(self.lots.values())
+
+
+@dataclass(frozen=True)
+class CourtesyLotIdentity:
+    """Who a lot belongs to and its kind (a plain read of ``credit_lots``)."""
+
+    lot_id: UUID
+    builder_id: UUID
+    lot_kind: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class CourtesyEventRow:
+    """One ``credit_courtesy_events`` row as read (Core columns, never an
+    ORM entity: the row is append-only and is compared, never changed)."""
+
+    id: UUID
+    builder_id: UUID
+    lot_id: UUID
+    event_kind: str
+    amount_mc: int
+    actor_user_id: UUID
+    idempotency_key: str
+    request_digest: str
+    occurred_at: datetime
 
 
 @dataclass(frozen=True)
@@ -1658,6 +1698,121 @@ class CreditRepository:
             .exists()
         )
         return bool(await self.session.scalar(select(or_(orders, cycles))))
+
+    # -- courtesy (creditos-cortesia, migration 046) -------------------------
+
+    async def builder_is_active(self, builder_id: UUID) -> bool | None:
+        """``None`` when the builder does not exist; otherwise whether it is
+        active (``is_active`` and ``status = 'active'``, DESIGN Decision 14).
+        A plain read, no lock."""
+
+        row = (
+            await self.session.execute(
+                select(Builder.is_active, Builder.status).where(
+                    Builder.id == builder_id
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return bool(row.is_active) and row.status == "active"
+
+    async def lot_identity(self, lot_id: UUID) -> CourtesyLotIdentity | None:
+        """The builder, kind and expiry of a lot, any builder's (a plain
+        read, no lock: the caller locks the owner's account next)."""
+
+        row = (
+            await self.session.execute(
+                select(
+                    CreditLot.id,
+                    CreditLot.builder_id,
+                    CreditLot.lot_kind,
+                    CreditLot.expires_at,
+                ).where(CreditLot.id == lot_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return CourtesyLotIdentity(
+            lot_id=UUID(str(row.id)),
+            builder_id=UUID(str(row.builder_id)),
+            lot_kind=str(row.lot_kind),
+            expires_at=_as_utc(row.expires_at),
+        )
+
+    async def courtesy_event_by_key(
+        self, idempotency_key: str
+    ) -> CourtesyEventRow | None:
+        """The event an idempotency key was written for (keys are global)."""
+
+        event = CreditCourtesyEvent
+        row = (
+            await self.session.execute(
+                select(
+                    event.id,
+                    event.builder_id,
+                    event.lot_id,
+                    event.event_kind,
+                    event.amount_mc,
+                    event.actor_user_id,
+                    event.idempotency_key,
+                    event.request_digest,
+                    event.occurred_at,
+                ).where(event.idempotency_key == idempotency_key)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return CourtesyEventRow(
+            id=UUID(str(row.id)),
+            builder_id=UUID(str(row.builder_id)),
+            lot_id=UUID(str(row.lot_id)),
+            event_kind=str(row.event_kind),
+            amount_mc=int(row.amount_mc),
+            actor_user_id=UUID(str(row.actor_user_id)),
+            idempotency_key=str(row.idempotency_key),
+            request_digest=str(row.request_digest),
+            occurred_at=_as_utc(row.occurred_at),
+        )
+
+    async def insert_courtesy_event(
+        self,
+        *,
+        event_id: UUID,
+        builder_id: UUID,
+        lot_id: UUID,
+        event_kind: str,
+        amount_mc: int,
+        reason: str,
+        actor_user_id: UUID,
+        idempotency_key: str,
+        request_digest: str,
+        occurred_at: datetime,
+    ) -> bool:
+        """Insert one event; ``False`` when its idempotency key already
+        exists (``ON CONFLICT DO NOTHING``: a concurrent writer of the key
+        committed first, and nothing was inserted)."""
+
+        inserted = (
+            await self.session.execute(
+                self._insert(CreditCourtesyEvent)
+                .values(
+                    id=event_id,
+                    builder_id=builder_id,
+                    lot_id=lot_id,
+                    event_kind=event_kind,
+                    amount_mc=amount_mc,
+                    reason=reason,
+                    actor_user_id=actor_user_id,
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                    occurred_at=occurred_at,
+                )
+                .on_conflict_do_nothing(index_elements=["idempotency_key"])
+                .returning(CreditCourtesyEvent.id)
+            )
+        ).scalar_one_or_none()
+        return inserted is not None
 
     # -- fact inbox, revision gaps and the enforcement binding (Group 2) ----
 

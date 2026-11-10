@@ -57,7 +57,7 @@ export interface BillingView {
   contextAlert: ContextAlert | null;
 }
 
-function paymentNotice(state: string, txt: Txt): string | null {
+export function paymentNotice(state: string, txt: Txt): string | null {
   switch (state) {
     case "overdue":
       return txt(

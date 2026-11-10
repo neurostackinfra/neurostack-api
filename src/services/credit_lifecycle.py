@@ -58,7 +58,7 @@ deleted).  It re-arms the thresholds: their arm key carries the number of
 closed episodes.
 
 Thresholds.  50/90/100 % of the usable capacity in force (spendable lots,
-net of reversals) consumed, counting open debt (``used = capacity -
+net of reversals and courtesy removals) consumed, counting open debt (``used = capacity -
 available_trace``); one alert per threshold per arm (closed-episode count
 and accounting window), ``UNIQUE`` in the database.
 
@@ -243,9 +243,18 @@ def lifecycle_state(
 
 
 def _funded_mc(lot: LotState) -> int:
-    """What a lot brought, net of what refunds withdrew from it."""
+    """What a lot brought, net of what refunds withdrew from it and of what a
+    super admin removed from a courtesy lot (creditos-cortesia): a removal is
+    funding removed, like a reversal, never usage, so the thresholds and
+    ``used_mc`` keep measuring consumption only."""
 
-    return max(lot.sums["grant"] + lot.sums["lot_regrant"] - lot.sums["reversal"], 0)
+    return max(
+        lot.sums["grant"]
+        + lot.sums["lot_regrant"]
+        - lot.sums["reversal"]
+        - lot.sums["courtesy_removal"],
+        0,
+    )
 
 
 def capacity_in_force_mc(book: LedgerBook, at: datetime) -> int:

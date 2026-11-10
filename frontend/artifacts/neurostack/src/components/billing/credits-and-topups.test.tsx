@@ -27,6 +27,7 @@ function summary(state: Partial<CreditSummary["state"]> = {}, balance: Partial<C
       monthly_available_mc: 7_000,
       monthly_not_started_mc: 0,
       topup_available_mc: 33_000,
+      courtesy_available_mc: 0,
       available_mc: 40_000,
       open_debt_mc: 0,
       net_available_mc: 40_000,
@@ -61,6 +62,7 @@ function lot(overrides: Partial<CreditLot> = {}): CreditLot {
     consumed_mc: 0,
     reversed_mc: 0,
     expired_mc: 0,
+    removed_mc: 0,
     paid_at: "2026-10-12",
     expires_at: "2027-04-12T03:00:00Z",
     ...overrides,
@@ -489,5 +491,71 @@ describe("<CreditsAndTopups /> top-ups", () => {
     fireEvent.click(screen.getByRole("button", { name: "Top up" }));
     expect(screen.getByRole("group", { name: "Package" })).toHaveTextContent(/500 credits.*valid for 6 months/);
     expect(screen.getByRole("button", { name: "Continue to top-up payment" })).toHaveAccessibleDescription(/Choose a package/);
+  });
+});
+
+describe("<CreditsAndTopups /> courtesy", () => {
+  const courtesyExpiry = (removed_mc: number) => ({
+    lot_id: "courtesy-1",
+    kind: "courtesy" as const,
+    expires_at: "2026-12-01T03:00:00Z",
+    available_mc: 5_000,
+    removed_mc,
+  });
+  // Courtesy is included in available_mc: 7 monthly + 33 top-ups + 5 courtesy.
+  const COURTESY_BALANCE = { courtesy_available_mc: 5_000, available_mc: 45_000, net_available_mc: 45_000 };
+
+  it("shows a Cortesia line in the balance and labels courtesy expiries as Cortesia, never Recarga", () => {
+    const ledger = { ...summary({}, COURTESY_BALANCE), expiries: [courtesyExpiry(2_000)] };
+    renderPanel({ state: { status: "ready", summary: ledger } });
+    expect(screen.getByRole("group", { name: "Cortesia" })).toHaveTextContent("5 créditos");
+    const expiries = screen.getByTestId("credit-expiries");
+    expect(expiries.textContent).toContain("Cortesia");
+    expect(expiries.textContent).not.toContain("Recarga");
+    expect(within(expiries).getByTestId("credit-expiry-removed")).toHaveTextContent("(retirados: 2 créditos)");
+  });
+
+  it("omits the removed value of an expiry when it is zero", () => {
+    const ledger = { ...summary({}, COURTESY_BALANCE), expiries: [courtesyExpiry(0)] };
+    renderPanel({ state: { status: "ready", summary: ledger } });
+    expect(screen.queryByTestId("credit-expiry-removed")).toBeNull();
+  });
+
+  it("labels a courtesy lot as Cortesia in the history with its expiry and removed value only when > 0", () => {
+    renderPanel({
+      history: {
+        status: "ready",
+        lots: [
+          lot({ lot_id: "c1", kind: "courtesy", removed_mc: 3_000, paid_at: "2026-10-20" }),
+          lot({ lot_id: "c2", kind: "courtesy", removed_mc: 0, paid_at: "2026-10-01" }),
+        ],
+      },
+    });
+    const rows = screen.getAllByTestId("credit-history-row");
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.textContent).toContain("Cortesia");
+      expect(row.textContent).not.toContain("Recarga");
+      expect(row.textContent).toContain("Expira em");
+    }
+    expect(within(rows[0]).getByTestId("credit-lot-removed")).toHaveTextContent("Retirados: 3 créditos");
+    expect(within(rows[1]).queryByTestId("credit-lot-removed")).toBeNull();
+  });
+
+  it("speaks English for the courtesy balance, expiry and history labels and the withdrawn amount", () => {
+    const ledger = { ...summary({}, COURTESY_BALANCE), expiries: [courtesyExpiry(2_000)] };
+    renderPanel({
+      locale: "en",
+      state: { status: "ready", summary: ledger },
+      history: { status: "ready", lots: [lot({ lot_id: "c1", kind: "courtesy", removed_mc: 3_000 })] },
+    });
+    expect(screen.getByRole("group", { name: "Courtesy" })).toHaveTextContent("5 credits");
+    const expiries = screen.getByTestId("credit-expiries");
+    expect(expiries).toHaveTextContent("Courtesy");
+    expect(within(expiries).getByTestId("credit-expiry-removed")).toHaveTextContent("(withdrawn: 2 credits)");
+    const [row] = screen.getAllByTestId("credit-history-row");
+    expect(row).toHaveTextContent("Courtesy");
+    expect(row).not.toHaveTextContent("Top-up");
+    expect(within(row).getByTestId("credit-lot-removed")).toHaveTextContent("Withdrawn: 3 credits");
   });
 });

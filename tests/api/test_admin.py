@@ -3,6 +3,8 @@ NeuroStack API - Admin Endpoints Tests
 Tests for super-admin clinic + builder management endpoints.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -482,3 +484,338 @@ class TestAuditExtendedAccess:
             for clinic in listed["clinics"]
         }
         assert flags == {str(plain.id): False, str(extended.id): True}
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/builders/subscriptions (creditos-cortesia Group 3).
+# ---------------------------------------------------------------------------
+
+_LEGACY_KEYS = {
+    "id",
+    "name",
+    "subscription_plan",
+    "subscription_status",
+    "billing_cycle",
+    "updated_at",
+}
+_NEW_KEYS = {"subscription", "subscription_unavailable", "courtesy"}
+
+
+@contextmanager
+def _sql() -> Iterator[list[str]]:
+    """Every SQL statement the application runs inside the block."""
+
+    from sqlalchemy import event
+
+    from src.repositories.database import get_db_engine
+
+    seen: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        seen.append(" ".join(statement.split()).lower())
+
+    engine = get_db_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+class TestBuilderSubscriptions:
+    """Legacy fields kept; ``subscription``, ``subscription_unavailable`` and
+    ``courtesy`` always present; ``courtesy`` only with the credit switch
+    effective and the courtesy gate open, from one statement that never
+    reads ``credit_courtesy_events``."""
+
+    @staticmethod
+    def _switch(
+        monkeypatch: pytest.MonkeyPatch, *, effective: bool, revision: str | None
+    ) -> None:
+        from src.services.credit_switch import CreditSwitch, CreditSwitchReading
+
+        reading = CreditSwitchReading(effective, "schema_ready", revision)
+        monkeypatch.setattr(CreditSwitch, "effective", lambda _self: effective)
+        monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+
+    @staticmethod
+    def _head() -> str:
+        from src.services.credit_switch import load_image_migration_chain
+
+        return load_image_migration_chain()[-1]
+
+    @staticmethod
+    def _below_046() -> str:
+        from src.services.credit_switch import (
+            COURTESY_SCHEMA_MIN_REVISION,
+            load_image_migration_chain,
+        )
+
+        chain = load_image_migration_chain()
+        return chain[chain.index(COURTESY_SCHEMA_MIN_REVISION) - 1]
+
+    @staticmethod
+    def _builders(client: TestClient, count: int) -> list[UUID]:
+        from src.models.builder import Builder
+
+        ids = [uuid4() for _ in range(count)]
+        _seed_entities(
+            client, *(Builder(id=i, name=f"Sub builder {i.hex}") for i in ids)
+        )
+        return ids
+
+    @staticmethod
+    def _courtesy(client: TestClient, builder_id: UUID, credits: int) -> Any:
+        from src.repositories.database import get_db_session
+        from src.services import credit_courtesy
+
+        async def run() -> Any:
+            session = get_db_session()
+            try:
+                async with session.begin():
+                    return await credit_courtesy.grant(
+                        session,
+                        builder_id=builder_id,
+                        credits=credits,
+                        reason="teste",
+                        actor_user_id=uuid4(),
+                        idempotency_key=f"sub-{uuid4()}",
+                    )
+            finally:
+                await session.close()
+
+        return client._submit(run())  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _rows(
+        client: TestClient, headers: dict[str, str], ids: list[UUID]
+    ) -> dict[UUID, dict[str, Any]]:
+        response = client.get("/v1/admin/builders/subscriptions", headers=headers)
+        assert response.status_code == 200, response.text
+        rows = {UUID(row["id"]): row for row in response.json()}
+        for row in rows.values():
+            assert _LEGACY_KEYS | _NEW_KEYS == set(row)
+        return {builder_id: rows[builder_id] for builder_id in ids}
+
+    def test_requires_super_admin(
+        self, client: TestClient, clinic_admin_headers: dict[str, str]
+    ) -> None:
+        response = client.get(
+            "/v1/admin/builders/subscriptions", headers=clinic_admin_headers
+        )
+        assert response.status_code == 403
+        assert client.get("/v1/admin/builders/subscriptions").status_code == 401
+
+    def test_switch_off_keeps_legacy_fields_and_courtesy_null(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=False, revision=None)
+        [builder] = self._builders(client, 1)
+        with _sql() as statements:
+            row = self._rows(client, super_admin_headers, [builder])[builder]
+        assert row["subscription_plan"] is None
+        assert row["subscription_status"] == "trial"
+        assert row["billing_cycle"] == "monthly"
+        assert row["name"] == f"Sub builder {builder.hex}"
+        assert (row["subscription"], row["subscription_unavailable"]) == (None, False)
+        assert row["courtesy"] is None
+        assert [s for s in statements if "credit_" in s] == []
+
+    def test_the_gate_closed_is_courtesy_null_with_the_switch_on(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        [builder] = self._builders(client, 1)
+        self._courtesy(client, builder, 5)
+        for revision in (self._below_046(), None):
+            self._switch(monkeypatch, effective=True, revision=revision)
+            with _sql() as statements:
+                row = self._rows(client, super_admin_headers, [builder])[builder]
+            assert row["courtesy"] is None
+            assert [s for s in statements if "credit_" in s] == []
+
+    def test_the_gate_open_summarizes_the_active_courtesy(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from src.services.credit_ledger import civil_date, courtesy_lot_expires_at
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        rich, plain = self._builders(client, 2)
+        first = self._courtesy(client, rich, 5)
+        self._courtesy(client, rich, 7)
+        rows = self._rows(client, super_admin_headers, [rich, plain])
+        assert rows[plain]["courtesy"] == {"active_expires_at": None, "available_mc": 0}
+        summary = rows[rich]["courtesy"]
+        assert summary["available_mc"] == 12_000
+        # Both lots were granted today: the latest expiry is theirs.
+        assert datetime.fromisoformat(summary["active_expires_at"]) == (
+            courtesy_lot_expires_at(civil_date(first.occurred_at))
+        )
+
+    def test_the_courtesy_part_is_one_statement_without_the_events_table(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        counts = []
+        for size in (2, 6):
+            ids = self._builders(client, size)
+            for builder in ids[:2]:
+                self._courtesy(client, builder, 3)
+            with _sql() as statements:
+                rows = self._rows(client, super_admin_headers, ids)
+            assert all(rows[b]["courtesy"]["available_mc"] == 3_000 for b in ids[:2])
+            assert [s for s in statements if "credit_courtesy_events" in s] == []
+            counts.append(len([s for s in statements if "credit_lots" in s]))
+        assert counts == [1, 1]
+
+    def test_a_failed_subscription_read_marks_only_its_row(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from datetime import date
+
+        from src.api.routes import admin
+        from src.services.billing_read_contract import (
+            BillingReadUnavailable,
+            SubscriptionReadback,
+        )
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        broken, subscribed, plain = self._builders(client, 3)
+        readback = SubscriptionReadback(
+            offer_id="plan_pro_monthly_v1",
+            catalog_version_id="payment-2026-10-03",
+            status="active",
+            amount_cents=265_000,
+            current_period_end=date(2026, 12, 9),
+            payment_state="paid",
+        )
+
+        async def read(_session: Any, *, builder_id: UUID) -> Any:
+            if builder_id == broken:
+                raise BillingReadUnavailable()
+            return readback if builder_id == subscribed else None
+
+        monkeypatch.setattr(admin, "read_current_subscription", read)
+        rows = self._rows(client, super_admin_headers, [broken, subscribed, plain])
+        assert (
+            rows[broken]["subscription"],
+            rows[broken]["subscription_unavailable"],
+        ) == (
+            None,
+            True,
+        )
+        assert rows[subscribed]["subscription_unavailable"] is False
+        assert rows[subscribed]["subscription"] == {
+            "offer_id": "plan_pro_monthly_v1",
+            "catalog_version_id": "payment-2026-10-03",
+            "status": "active",
+            "amount_cents": 265_000,
+            "current_period_end": "2026-12-09",
+            "payment_state": "paid",
+        }
+        assert (
+            rows[plain]["subscription"],
+            rows[plain]["subscription_unavailable"],
+        ) == (
+            None,
+            False,
+        )
+        for row in rows.values():
+            assert row["courtesy"] == {"active_expires_at": None, "available_mc": 0}
+
+    def test_any_failed_subscription_read_marks_only_its_row(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Not only ``BillingReadUnavailable``: a database error or any other
+        exception of one builder's read is that row's
+        ``subscription_unavailable`` (in its own savepoint, so the next read
+        still runs), never a 500; the log names the type, never the message."""
+
+        import structlog
+        from sqlalchemy import text
+
+        from src.api.routes import admin
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        sql_broken, other_broken, plain = self._builders(client, 3)
+        self._courtesy(client, plain, 2)
+
+        async def read(session: Any, *, builder_id: UUID) -> Any:
+            if builder_id == sql_broken:
+                await session.execute(text("SELECT * FROM no_such_table_secret"))
+            if builder_id == other_broken:
+                raise RuntimeError("secret-message")
+            return None
+
+        monkeypatch.setattr(admin, "read_current_subscription", read)
+        with structlog.testing.capture_logs() as records:
+            rows = self._rows(
+                client, super_admin_headers, [sql_broken, other_broken, plain]
+            )
+        for broken in (sql_broken, other_broken):
+            assert (
+                rows[broken]["subscription"],
+                rows[broken]["subscription_unavailable"],
+            ) == (None, True)
+        assert (
+            rows[plain]["subscription"],
+            rows[plain]["subscription_unavailable"],
+        ) == (
+            None,
+            False,
+        )
+        assert rows[plain]["courtesy"]["available_mc"] == 2_000
+        mine = [
+            r
+            for r in records
+            if r["event"].startswith("builder subscription unreadable")
+        ]
+        assert {r["error_type"] for r in mine} >= {"OperationalError", "RuntimeError"}
+        assert "secret" not in repr(records)
+
+    def test_a_failed_courtesy_read_is_courtesy_null_only(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import structlog
+        from sqlalchemy import text
+
+        from src.api.routes import admin
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        [builder] = self._builders(client, 1)
+        self._courtesy(client, builder, 2)
+
+        async def broken(session: Any, _at: datetime) -> Any:
+            await session.execute(text("SELECT * FROM no_such_table_secret"))
+
+        monkeypatch.setattr(admin, "_courtesy_by_builder", broken)
+        with structlog.testing.capture_logs() as records:
+            row = self._rows(client, super_admin_headers, [builder])[builder]
+        assert row["courtesy"] is None
+        assert (row["subscription"], row["subscription_unavailable"]) == (None, False)
+        [logged] = [
+            r for r in records if r["event"].startswith("builder courtesy summary")
+        ]
+        assert logged["error_type"] == "OperationalError"
+        assert "secret" not in repr(records)

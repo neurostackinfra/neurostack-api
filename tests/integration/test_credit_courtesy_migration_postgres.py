@@ -365,10 +365,31 @@ def test_046_revises_045_and_is_the_single_head() -> None:
     assert _MIGRATION.LOCK_TIMEOUT == "SET LOCAL lock_timeout = '5s'"
 
 
+# The files the courtesy release (creditos-cortesia Decision 17) may name the
+# courtesy schema in; empty in the bridge release (Decision 4).
+_COURTESY_FILES = frozenset(
+    {
+        "src/api/routes/admin.py",
+        "src/api/routes/admin_credits.py",
+        "src/api/routes/credits.py",
+        "src/api/schemas/admin_credits.py",
+        "src/api/schemas/credits.py",
+        "src/services/credit_courtesy.py",
+        "src/services/credit_ledger.py",
+        "src/services/credit_lifecycle.py",
+        "src/services/credit_rollout.py",
+    }
+)
+
+
 def test_the_bridge_maps_the_046_schema_and_nothing_writes_or_reads_it() -> None:
     """creditos-cortesia Decision 4: the bridge image's ORM describes 046 (the
     drift suite compares it with this DDL) and no service or route names the
-    courtesy lot kind, the courtesy_removal entry or the event table."""
+    courtesy lot kind, the courtesy_removal entry or the event table, except
+    the files in ``_COURTESY_FILES``.  In the bridge release (PR-A) that
+    allowlist is empty by design; the courtesy release (Decision 17) extends
+    it only with the files that implement the feature, and each of them must
+    exist, so a rename cannot silently weaken the guard."""
 
     import src.models  # noqa: F401  (registers every model on Base.metadata)
     from src.models.credit import LEDGER_ENTRY_TYPES, LOT_KINDS
@@ -380,8 +401,13 @@ def test_the_bridge_maps_the_046_schema_and_nothing_writes_or_reads_it() -> None
         r"credit_courtesy_events|CreditCourtesyEvent|courtesy_removal"
         r"|'courtesy'|\"courtesy\""
     )
+    # PR-A's staged version had no allowlist: every file was scanned.
+    for allowed in _COURTESY_FILES:
+        assert (_ROOT / allowed).is_file(), allowed
     for root in ("src/services", "src/api"):
         for path in sorted((_ROOT / root).rglob("*.py")):
+            if path.relative_to(_ROOT).as_posix() in _COURTESY_FILES:
+                continue
             assert pattern.search(path.read_text(encoding="utf-8")) is None, path
 
 

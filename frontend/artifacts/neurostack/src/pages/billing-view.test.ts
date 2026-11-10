@@ -13,6 +13,7 @@ import {
   creditLedgerStanding,
   deriveBillingView,
   deriveTopupState,
+  paymentNotice,
   planName,
   subscriptionMarker,
 } from "./billing-view";
@@ -501,5 +502,25 @@ describe("deriveTopupState", () => {
       const result = topup({ creditCatalog: { status } });
       expect(result.status === "blocked" && result.reason).toMatch(/pacotes de recarga/);
     }
+  });
+});
+
+describe("paymentNotice", () => {
+  it("keeps its three texts exactly as shipped", () => {
+    const pt = (p: string) => p;
+    const en = (_p: string, e: string) => e;
+    expect(paymentNotice("overdue", pt)).toBe(
+      "Pagamento em atraso: o período pago terminou e a renovação ainda não foi confirmada pelo provedor.",
+    );
+    expect(paymentNotice("reversed", pt)).toBe("O último pagamento da assinatura foi estornado.");
+    expect(paymentNotice("pending", pt)).toBe(
+      "Pagamento pendente: a assinatura só é confirmada depois da leitura do provedor.",
+    );
+    expect(paymentNotice("overdue", en)).toBe(
+      "Payment overdue: the paid period ended and the provider has not confirmed the renewal yet.",
+    );
+    expect(paymentNotice("reversed", en)).toBe("The subscription's latest payment was refunded.");
+    expect(paymentNotice("pending", en)).toBe("Payment pending: the subscription is confirmed only after the provider's readback.");
+    expect(paymentNotice("paid", pt)).toBeNull();
   });
 });

@@ -153,13 +153,17 @@ function creditSummary({
   pending_reasons = [] as string[],
   mode = "observational",
   window = CYCLE,
-  lots = [] as Array<{ lot_id: string; kind: "monthly" | "topup"; available_mc: number; expires_at: string }>,
+  lots = [] as Array<{ lot_id: string; kind: "monthly" | "topup" | "courtesy"; available_mc: number; expires_at: string }>,
   observed = [] as Array<{ kind: string; amount_mc: number }>,
 } = {}) {
   const monthly = lots.filter((lot) => lot.kind === "monthly").reduce((sum, lot) => sum + lot.available_mc, 0);
   const topup = lots.filter((lot) => lot.kind === "topup").reduce((sum, lot) => sum + lot.available_mc, 0);
-  const available = monthly + topup;
-  const expiries = [...lots].sort((a, b) => (a.expires_at < b.expires_at ? -1 : 1));
+  const courtesy = lots.filter((lot) => lot.kind === "courtesy").reduce((sum, lot) => sum + lot.available_mc, 0);
+  // Courtesy is included in available_mc, as the server reports it.
+  const available = monthly + topup + courtesy;
+  const expiries = [...lots]
+    .sort((a, b) => (a.expires_at < b.expires_at ? -1 : 1))
+    .map((lot) => ({ ...lot, removed_mc: 0 }));
   return {
     as_of: AS_OF,
     state: {
@@ -178,6 +182,7 @@ function creditSummary({
       monthly_available_mc: monthly,
       monthly_not_started_mc: 0,
       topup_available_mc: topup,
+      courtesy_available_mc: courtesy,
       available_mc: available,
       open_debt_mc: 0,
       net_available_mc: available,
@@ -230,6 +235,7 @@ const LOTS = {
       consumed_mc: 0,
       reversed_mc: 0,
       expired_mc: 2_500_000,
+      removed_mc: 0,
       paid_at: "2026-09-17",
       expires_at: "2026-10-17T03:00:00Z",
       cycle_start: "2026-09-17",
@@ -244,6 +250,7 @@ const LOTS = {
       consumed_mc: 0,
       reversed_mc: 0,
       expired_mc: 0,
+      removed_mc: 0,
       paid_at: "2026-10-12",
       expires_at: "2027-04-12T03:00:00Z",
     },
@@ -256,6 +263,7 @@ const LOTS = {
       consumed_mc: 0,
       reversed_mc: 0,
       expired_mc: 0,
+      removed_mc: 0,
       paid_at: "2026-10-17",
       expires_at: "2026-11-17T03:00:00Z",
       cycle_start: "2026-10-17",
@@ -278,6 +286,7 @@ const PENDING_LOTS = {
       consumed_mc: 0,
       reversed_mc: 0,
       expired_mc: 500_000,
+      removed_mc: 0,
       paid_at: "2026-03-02",
       expires_at: "2026-09-02T03:00:00Z",
     },
