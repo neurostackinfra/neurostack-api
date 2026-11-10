@@ -44,14 +44,38 @@ client.
 
 The builder is `tenants.builder_id` **re-read** for the tenant (a plain read,
 lock-order step 0, no lock) and, for a builder, must equal its JWT claim (a
-clinic moved to another builder is refused to the old builder's token). A
-clinic of another builder and a tenant that does not exist answer the same
+clinic moved to another builder is refused to the old builder's token). One
+exception: a builder's **own** tenant (no `tenant_id`, or `tenant_id` equal
+to the token's) that is linked to no builder (`tenants.builder_id` NULL, the
+usual home tenant of a builder user) reads the builder's own account, the
+JWT `builder_id` claim, as `/v1/billing/*` does, once the token's `users`
+row is re-read (by the token's `sub`) and still is an active `builder` of
+that builder and that tenant -- a user since deactivated, deleted, demoted,
+moved to another builder or to another tenant is refused like an absent
+tenant, with no `credit_*` or `billing_*` read. The same `users` statement
+also refuses the exception when a builder user of ANOTHER builder (or of
+none) shares that unlinked tenant: it is then no single builder's home, and
+every builder's token on it is refused like an absent tenant (a second user
+of the same builder, or a user of another role such as `clinic_admin`, does
+not block it). An own tenant linked to another builder is still refused. A
+clinic override is never covered by that exception: a clinic of another
+builder (or of none) and a tenant that does not exist answer the same
 `403 {"detail": {"code": "tenant_override_forbidden"}}` -- same status, body
 and headers -- before any `credit_*` or `billing_*` table is read, so before
 any lock, order, ledger, outbox, storage or receipt. Builder finances are
 builder-only, as on `main` (`/v1/billing/*` requires the builder JWT). A
-standalone tenant (no builder) has no account: zeros and state `pending`
-(`standalone`).
+standalone tenant (no builder) read by a super admin -- a clinic of no
+builder, or a builder user's unlinked home tenant -- has no account: zeros
+and state `pending` (`standalone`). A builder reading its own unlinked home
+tenant sees its builder's account instead, while a super admin viewing that
+same tenant still sees the standalone zeros.
+
+`GET /v1/credits/export` applies the same rule to a builder: the tenant's
+stored builder must equal the claim, with the same single fallback (the
+builder's own tenant linked to no builder, confirmed by the `users` row and
+shared with no other builder's user) and the same `403
+tenant_override_forbidden` for everything else. Both use
+`src/api/helpers/builder_home_tenant.py`.
 
 ## Routes
 

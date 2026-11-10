@@ -10,9 +10,17 @@ kept, so no lifecycle rule ever refuses it.
 Authorization is the platform's (``resolve_effective_tenant``): an API key
 exports its own tenant; a JWT ``clinic_admin`` its own; a ``builder`` its own
 or, with ``?tenant_id=``, a clinic of its builder; a ``super_admin`` any
-clinic.  A clinic of another builder and a clinic that does not exist get
-the same ``403 {"code": "tenant_override_forbidden"}``: nothing reveals
-existence, nothing is locked, nothing is written.
+clinic.  For a builder the route then re-reads ``tenants.builder_id``, which
+must equal the JWT claim, with the one fallback of the credit reads
+(:mod:`src.api.helpers.builder_home_tenant`): the builder's OWN tenant (no
+clinic named) linked to no builder is exported once the token's ``users``
+row confirms it (active, role builder, same builder and tenant) and no
+builder user of another builder (or of none) shares that tenant.  A clinic
+of another builder (or of none), an own tenant linked to another builder, a
+stale token, an unlinked tenant shared with a builder user of another
+builder (or of none) and a tenant that does not exist get the same ``403 {"code":
+"tenant_override_forbidden"}``: nothing reveals existence, nothing is
+locked, nothing is written.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.helpers.builder_home_tenant import builder_home_tenant_account
 from src.api.middleware.auth import (
     TenantContext,
     get_tenant_context,
@@ -53,13 +62,28 @@ async def _export_tenant(
     effective = await resolve_effective_tenant(
         request, tenant, requested_tenant_id, session
     )
-    if tenant.role == "builder" and not tenant.api_key and tenant.builder_id is None:
+    builder_jwt = tenant.role == "builder" and not tenant.api_key
+    if builder_jwt and tenant.builder_id is None:
         raise _forbidden()
-    filters = [Tenant.id == effective]
-    if tenant.role == "builder" and not tenant.api_key:
-        filters.append(Tenant.builder_id == tenant.builder_id)
-    found = await session.scalar(select(Tenant.id).where(*filters))
+    found = (
+        await session.execute(
+            select(Tenant.id, Tenant.builder_id).where(Tenant.id == effective)
+        )
+    ).one_or_none()
     if found is None:
+        raise _forbidden()
+    if not builder_jwt or found.builder_id == tenant.builder_id:
+        return effective
+    # The one fallback of the credit reads: the builder's own (home) tenant,
+    # no clinic named, linked to no builder, with a current ``users`` row and
+    # no builder user of another builder (or of none) on it.  Everything else
+    # (a clinic of another builder or of none, an own tenant linked to
+    # another builder, a stale token, a tenant shared with a builder user of
+    # another builder or of none) is the absent tenant's 403.
+    home = await builder_home_tenant_account(
+        session, tenant, effective, found.builder_id
+    )
+    if home is None:
         raise _forbidden()
     return effective
 

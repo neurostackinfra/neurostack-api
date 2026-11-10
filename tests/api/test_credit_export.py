@@ -11,6 +11,15 @@ credit switch forced per test.  Pinned here:
   S3 ``VersionId``;
 * IDOR: another builder's clinic and a clinic that does not exist answer the
   same 403, and no other tenant's item ever appears in an archive;
+* a builder's OWN home tenant linked to no builder (production 2026-11-10)
+  exports that tenant's bytes, and only once the token's ``users`` row is
+  current; an own tenant linked to another builder, a clinic of another
+  builder or of none, an absent tenant and a stale token (the user
+  deactivated, deleted, demoted, moved to another builder or tenant) answer
+  the absent tenant's 403 -- same body and headers, no ``credit_*`` or
+  ``billing_*`` SQL -- also with the platform resolver bypassed; an unlinked
+  tenant shared by builder users of two builders is exported to neither (a
+  second user of the same builder, or a ``clinic_admin`` user, keeps it);
 * export stays available in every lifecycle state (``tests`` in
   ``test_credit_lifecycle.py`` drive the states; here: a suspended builder).
 
@@ -26,6 +35,7 @@ import json
 import secrets
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,15 +44,27 @@ import jwt
 import pytest
 
 from src.api.middleware.auth import pwd_context
+from src.api.routes import credit_export as export_routes
 from src.config.settings import settings
 from src.models.builder import Builder
 from src.models.credit_object_copy import CreditObjectCopy
 from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
+from src.models.user import UserRole
 from src.repositories.database import get_db_session
 from src.services.credit_export import safe_entry_name
 from src.services.credit_switch import CreditSwitch
+from tests.api.test_credit_tenant_boundaries import (
+    STALE,
+    _builder_user,
+    _financial,
+    _headers,
+    _home_tenant,
+    _make_stale,
+    _statements,
+    _users_reads,
+)
 
 EXPORT = "/v1/credits/export"
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
@@ -364,3 +386,261 @@ def test_a_live_copy_under_legal_hold_keeps_its_s3_copy_in_the_manifest(
     assert by_id[str(world.media)]["s3_copy"]["version_id"] == world.copy_version
     # A deleted copy is still never named.
     assert by_id[str(world.document)]["s3_copy"] is None
+
+
+# ---------------------------------------------------------------------------
+# A builder's own (home) tenant linked to no builder: the one fallback of the
+# credit reads, shared (``src/api/helpers/builder_home_tenant.py``).
+# ---------------------------------------------------------------------------
+
+FORBIDDEN = {"detail": {"code": "tenant_override_forbidden"}}
+HOME_PNG = b"\x89PNG\r\n\x1a\n" + b"home-tenant" * 4
+HOME_DOC = "Base de conhecimento do builder (home)"
+
+
+@dataclass(frozen=True)
+class Home:
+    tenant: UUID
+    user: UUID
+    media: UUID
+    document: UUID
+
+    def headers(self, builder_id: UUID) -> dict[str, str]:
+        token = _jwt(
+            self.tenant, role="builder", builder_id=builder_id, subject=self.user
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+
+async def _home_content(tenant_id: UUID) -> tuple[UUID, UUID]:
+    media_id, document_id = uuid4(), uuid4()
+    session = get_db_session()
+    try:
+        async with session.begin():
+            session.add(
+                _media(media_id, tenant_id, HOME_PNG, original_filename="home.png")
+            )
+            session.add(
+                KnowledgeDocument(
+                    id=document_id,
+                    tenant_id=tenant_id,
+                    title="Home",
+                    content=HOME_DOC,
+                    content_type="text",
+                    document_metadata={},
+                )
+            )
+    finally:
+        await session.close()
+    return media_id, document_id
+
+
+def _home(client: Any, user_builder: UUID, tenant_builder: UUID | None) -> Home:
+    """A home tenant linked to ``tenant_builder`` with its own media and
+    knowledge, and a current builder user of ``user_builder`` on it."""
+
+    tenant = client._submit(_home_tenant(tenant_builder))
+    media, document = client._submit(_home_content(tenant))
+    user = client._submit(_builder_user(tenant, user_builder))
+    return Home(tenant=tenant, user=user, media=media, document=document)
+
+
+def _absent(world: World) -> Any:
+    token = _jwt(uuid4(), role="builder", builder_id=world.builder)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _blind(monkeypatch: pytest.MonkeyPatch) -> list[UUID | None]:
+    """Bypass the platform resolver: any requested tenant is accepted."""
+
+    asked: list[UUID | None] = []
+
+    async def blind(
+        _request: Any, tenant: Any, requested: UUID | None, _session: Any
+    ) -> UUID:
+        asked.append(requested)
+        return requested or tenant.tenant_id
+
+    monkeypatch.setattr(export_routes, "resolve_effective_tenant", blind)
+    return asked
+
+
+@pytest.mark.parametrize("own_tenant_param", [False, True])
+def test_a_builder_exports_its_own_home_tenant_linked_to_no_builder(
+    client: Any, world: World, switch: Callable[[bool], None], own_tenant_param: bool
+) -> None:
+    home = _home(client, world.builder, None)
+    params = {"tenant_id": str(home.tenant)} if own_tenant_param else {}
+    archive, manifest = _archive(
+        client.get(EXPORT, params=params, headers=home.headers(world.builder))
+    )
+    # Exactly the home tenant's bytes: nothing of the builder's linked
+    # tenants, nothing of another builder's.
+    assert manifest["tenant_id"] == str(home.tenant)
+    assert manifest["counts"] == {"media": 1, "knowledge": 1}
+    by_id = {item["id"]: item for item in manifest["items"]}
+    assert set(by_id) == {str(home.media), str(home.document)}
+    assert archive.read(by_id[str(home.media)]["path"]) == HOME_PNG
+    assert archive.read(by_id[str(home.document)]["path"]).decode() == HOME_DOC
+    assert sorted(archive.namelist()) == sorted(
+        [*(item["path"] for item in manifest["items"]), "manifest.json"]
+    )
+
+
+@pytest.mark.parametrize("bypass_resolver", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "own_tenant_linked_to_another_builder",
+        "another_builders_tenant",
+        "clinic_linked_to_no_builder",
+        "clinic_linked_to_no_builder_from_linked_tenant",
+        "absent_clinic",
+        "absent_own_tenant",
+    ],
+)
+def test_the_home_tenant_fallback_never_reaches_another_tenant(
+    client: Any,
+    world: World,
+    switch: Callable[[bool], None],
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    bypass_resolver: bool,
+) -> None:
+    """Each refusal is the absent tenant's: same status, body and headers,
+    before any ``credit_*`` or ``billing_*`` read; with the platform
+    resolver bypassed the route's own check still refuses."""
+
+    home = _home(client, world.builder, None)
+    assert client.get(EXPORT, headers=home.headers(world.builder)).status_code == 200
+    unlinked_clinic = _home(client, world.builder, None)
+    params: dict[str, str] = {}
+    if case == "own_tenant_linked_to_another_builder":
+        headers = _home(client, world.builder, world.other_builder).headers(
+            world.builder
+        )
+    elif case == "another_builders_tenant":
+        headers = home.headers(world.builder)
+        params = {"tenant_id": str(world.foreign)}
+    elif case == "clinic_linked_to_no_builder":
+        headers = home.headers(world.builder)
+        params = {"tenant_id": str(unlinked_clinic.tenant)}
+    elif case == "clinic_linked_to_no_builder_from_linked_tenant":
+        headers = world.builder_jwt()
+        params = {"tenant_id": str(unlinked_clinic.tenant)}
+    elif case == "absent_clinic":
+        headers = home.headers(world.builder)
+        params = {"tenant_id": str(uuid4())}
+    else:
+        headers = _absent(world)
+    asked = _blind(monkeypatch) if bypass_resolver else None
+    with _statements() as statements:
+        refused = client.get(EXPORT, params=params, headers=headers)
+        missing = client.get(EXPORT, headers=_absent(world))
+    assert (refused.status_code, refused.json()) == (403, FORBIDDEN)
+    assert (missing.status_code, missing.json()) == (403, FORBIDDEN)
+    assert _headers(refused) == _headers(missing)
+    assert _financial(statements) == []
+    for other in (world.foreign, unlinked_clinic.tenant, world.tenant):
+        assert str(other) not in refused.text
+    if asked is not None:
+        assert asked, "the bypassed resolver was never called"
+
+
+@pytest.mark.parametrize("stale", STALE)
+def test_a_stale_token_never_exports_its_unlinked_home_tenant(
+    client: Any, world: World, switch: Callable[[bool], None], stale: str
+) -> None:
+    home = _home(client, world.builder, None)
+    headers = home.headers(world.builder)
+    _, served = _archive(client.get(EXPORT, headers=headers))
+    assert served["tenant_id"] == str(home.tenant)
+    client._submit(
+        _make_stale(
+            home.user, stale, builder_id=world.other_builder, tenant_id=world.tenant
+        )
+    )
+    with _statements() as statements:
+        refused = client.get(EXPORT, headers=headers)
+        own = client.get(
+            EXPORT, params={"tenant_id": str(home.tenant)}, headers=headers
+        )
+        missing = client.get(EXPORT, headers=_absent(world))
+    for response in (refused, own, missing):
+        assert (response.status_code, response.json()) == (403, FORBIDDEN)
+    assert _headers(refused) == _headers(own) == _headers(missing)
+    assert _users_reads(statements)
+    assert _financial(statements) == []
+
+
+def test_a_builder_export_of_a_linked_tenant_never_reads_users(
+    client: Any, world: World, switch: Callable[[bool], None]
+) -> None:
+    with _statements() as statements:
+        _, own = _archive(client.get(EXPORT, headers=world.builder_jwt()))
+    assert own["tenant_id"] == str(world.tenant)
+    assert _users_reads(statements) == []
+
+
+def test_an_unlinked_tenant_shared_by_two_builders_is_exported_to_neither(
+    client: Any, world: World, switch: Callable[[bool], None]
+) -> None:
+    home = _home(client, world.builder, None)
+    own = home.headers(world.builder)
+    _, served = _archive(client.get(EXPORT, headers=own))
+    assert served["tenant_id"] == str(home.tenant)
+    other_user = client._submit(_builder_user(home.tenant, world.other_builder))
+    other = Home(home.tenant, other_user, home.media, home.document).headers(
+        world.other_builder
+    )
+    with _statements() as statements:
+        missing = client.get(EXPORT, headers=_absent(world))
+        refused = [
+            client.get(EXPORT, params=params, headers=headers)
+            for headers in (own, other)
+            for params in ({}, {"tenant_id": str(home.tenant)})
+        ]
+    assert (missing.status_code, missing.json()) == (403, FORBIDDEN)
+    for response in refused:
+        assert (response.status_code, response.json()) == (403, FORBIDDEN)
+        assert _headers(response) == _headers(missing)
+        assert str(home.media) not in response.text
+    assert _financial(statements) == []
+    # One users statement per refused request (token row + shared EXISTS).
+    assert len(_users_reads(statements)) == len(refused)
+
+
+def test_a_builder_user_of_no_builder_on_the_unlinked_tenant_blocks_the_export(
+    client: Any, world: World, switch: Callable[[bool], None]
+) -> None:
+    """A builder-role user with ``builder_id`` NULL on the tenant blocks the
+    fallback (``IS DISTINCT FROM``, never a plain ``!=``)."""
+
+    home = _home(client, world.builder, None)
+    headers = home.headers(world.builder)
+    _, served = _archive(client.get(EXPORT, headers=headers))
+    assert served["tenant_id"] == str(home.tenant)
+    client._submit(_builder_user(home.tenant, None))
+    with _statements() as statements:
+        refused = client.get(EXPORT, headers=headers)
+        missing = client.get(EXPORT, headers=_absent(world))
+    assert (refused.status_code, refused.json()) == (403, FORBIDDEN)
+    assert _headers(refused) == _headers(missing)
+    assert str(home.media) not in refused.text
+    assert _financial(statements) == []
+
+
+def test_a_second_same_builder_user_or_a_clinic_admin_keeps_the_export(
+    client: Any, world: World, switch: Callable[[bool], None]
+) -> None:
+    home = _home(client, world.builder, None)
+    second_user = client._submit(_builder_user(home.tenant, world.builder))
+    client._submit(_builder_user(home.tenant, None, UserRole.clinic_admin))
+    second = Home(home.tenant, second_user, home.media, home.document)
+    for headers in (home.headers(world.builder), second.headers(world.builder)):
+        _, manifest = _archive(client.get(EXPORT, headers=headers))
+        assert manifest["tenant_id"] == str(home.tenant)
+        assert {item["id"] for item in manifest["items"]} == {
+            str(home.media),
+            str(home.document),
+        }
