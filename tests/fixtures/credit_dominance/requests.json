@@ -1,6 +1,6 @@
 {
   "schema_version": "credit_dominance_corpus.v1",
-  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at the credit-ready head (039), with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run. Group 3b-2 appends a Meta file attachment (its fixed ack, free) and the patient's forward-on-request reply, a Meta file handoff: before the enforcement they answer like main; in the enforced run the Z-API and Meta decisions -- the file handoff included -- are claimed and charged once each, with the same answers. Group 4a appends a knowledge text upload (JSON), a media upload (multipart) and a download of a seeded media asset -- answered like main config on or off, measured observationally before the enforcement and reserved/charged in the enforced run -- and the multipart DOCX/PDF knowledge upload, a credit surface ('credit_surface': 503 credit_unavailable while the switch is not effective, 201 with it). 'multipart' builds a multipart/form-data body from 'fields' and 'files' (each file's bytes read from 'fixture', a path under tests/fixtures); an item without 'json' or 'multipart' has no body. Group 6 appends the credit read API (GET /v1/credits/*, credit surfaces: 503 credit_unavailable while the switch is not effective) read by the builder's JWT ('auth' jwt_builder/<tenant>: role builder, the seeded builder's builder_id claim), the same read of a tenant outside the builder (the standalone jwt_tenant) and of an absent tenant (the seeded media asset's id) -- the same 403 -- and an API key's read (403 credit_scope_forbidden); they come last, so in the enforced run they read the debt the corpus charged.",
+  "description": "Fixed ingress corpus of the credit dominance oracle (neurostack-credit-system Group 1b; Groups 3-7 append their surfaces). Replayed in order against the real app on PostgreSQL at 037 and at the credit-ready head (039), with the credit switch config off and on; status and body must match the config-off run, and the stored events must match by content, once the server-generated values are masked ('masked_fields' by key; any UUID the world did not seed and any instant by value). '{name}' placeholders resolve to the oracle's seeded world (tenants, sessions, instance names, capability tokens), generated per run and never committed. 'auth' names the credential: api_key/<tenant>, jwt/<tenant>, jwt_invalid, meta/<tenant>, meta_bad_signature, none. Group 3a appends the metered ingresses; an optional 'headers' map adds request headers (Idempotency-Key). Group 3b-1 appends POST /v1/events cases with an Idempotency-Key -- a decision, its retry and a synchronous phase 1 handoff on a session of its own -- that run like main before the enforcement and are charged once each in the enforced run. Group 3b-2 appends a Meta file attachment (its fixed ack, free) and the patient's forward-on-request reply, a Meta file handoff: before the enforcement they answer like main; in the enforced run the Z-API and Meta decisions -- the file handoff included -- are claimed and charged once each, with the same answers. Group 4a appends a knowledge text upload (JSON), a media upload (multipart) and a download of a seeded media asset -- answered like main config on or off, measured observationally before the enforcement and reserved/charged in the enforced run -- and the multipart DOCX/PDF knowledge upload, a credit surface ('credit_surface': 503 credit_unavailable while the switch is not effective, 201 with it). 'multipart' builds a multipart/form-data body from 'fields' and 'files' (each file's bytes read from 'fixture', a path under tests/fixtures); an item without 'json' or 'multipart' has no body. Group 6 appends the credit read API (GET /v1/credits/*, credit surfaces: 503 credit_unavailable while the switch is not effective) read by the builder's JWT ('auth' jwt_builder/<tenant>: role builder, the seeded builder's builder_id claim), the same read of a tenant outside the builder (the standalone jwt_tenant) and of an absent tenant (the seeded media asset's id) -- the same 403 -- and an API key's read (403 credit_scope_forbidden); they come last, so in the enforced run they read the debt the corpus charged. creditos-cortesia appends the three courtesy routes of the credit admin API (POST /v1/admin/credits/courtesy-grants, POST .../{lot_id}/removals, GET ?builder_id=), credit surfaces that also need the schema at 046: called by the builder's JWT and an API key, never a super admin, so they write nothing -- 503 credit_unavailable while the switch is not effective, with it (head is 046, the courtesy gate open on the real reading) 403 super_admin_jwt_required / jwt_required.",
   "masked_fields": [
     "event_id",
     "timestamp",
@@ -716,6 +716,34 @@
       "method": "GET",
       "path": "/v1/credits/balance",
       "auth": "api_key/api_tenant",
+      "credit_surface": true
+    },
+    {
+      "id": "credits-courtesy-grant-builder",
+      "ingress": "jwt",
+      "method": "POST",
+      "path": "/v1/admin/credits/courtesy-grants",
+      "auth": "jwt_builder/api_tenant",
+      "headers": {"Idempotency-Key": "dominance-courtesy-grant"},
+      "json": {"builder_id": "{builder}", "credits": 5, "reason": "dominance"},
+      "credit_surface": true
+    },
+    {
+      "id": "credits-courtesy-removal-api-key",
+      "ingress": "api_key",
+      "method": "POST",
+      "path": "/v1/admin/credits/courtesy-grants/{media_asset}/removals",
+      "auth": "api_key/api_tenant",
+      "headers": {"Idempotency-Key": "dominance-courtesy-removal"},
+      "json": {"remove_all": true, "reason": "dominance"},
+      "credit_surface": true
+    },
+    {
+      "id": "credits-courtesy-read-builder",
+      "ingress": "jwt",
+      "method": "GET",
+      "path": "/v1/admin/credits/courtesy-grants?builder_id={builder}",
+      "auth": "jwt_builder/api_tenant",
       "credit_surface": true
     }
   ]

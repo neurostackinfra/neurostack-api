@@ -178,6 +178,12 @@ class BindingCoverage:
     quarantined: bool = False
     identity_conflict: bool = False
     reconciliation_failure: bool = False
+    # creditos-cortesia (DESIGN Decision 11): an unexpired courtesy lot with
+    # a positive swept balance.  It feeds ONLY :attr:`covered` (the cutoff
+    # report of the enforcement): never :attr:`usable` nor
+    # ``reconciliation_failure``, so a courtesy never hides an ASAAS
+    # quarantine, conflict or divergence and the enforced path is unchanged.
+    usable_courtesy: bool = False
 
     @property
     def usable(self) -> bool:
@@ -199,7 +205,7 @@ class BindingCoverage:
         return (
             not self.quarantined
             and not self.identity_conflict
-            and (self.monthly_binding or self.usable_topup)
+            and (self.monthly_binding or self.usable_topup or self.usable_courtesy)
         )
 
 
@@ -471,6 +477,7 @@ class CreditRolloutService:
         *,
         at: datetime | None = None,
         quarantine_checked: bool = False,
+        include_courtesy: bool = False,
     ) -> BindingCoverage:
         """Read the only capacity sources an enforced request may use.
 
@@ -494,6 +501,13 @@ class CreditRolloutService:
         identity conflict, a current cycle with no usable binding outside the
         previous binding's grace, or an unreconciled top-up source.  An ASAAS
         quarantine also blocks both source classes.
+
+        ``usable_courtesy`` (creditos-cortesia) is reported for the cutoff's
+        :attr:`BindingCoverage.covered` only; it changes neither ``usable``
+        nor ``reconciliation_failure``.  It is read ONLY with
+        ``include_courtesy=True`` (the cutoff report and the admin binding
+        status): an enforced request reads ``usable`` alone and so pays no
+        extra statement.
         """
 
         instant = at or datetime.now(timezone.utc)
@@ -710,11 +724,41 @@ class CreditRolloutService:
             or (unbound_current and not monthly and not usable_topup)
             or (has_unreconciled_topup_source and not monthly and not usable_topup)
         )
+        # A courtesy is capacity a super admin granted, not an ASAAS source:
+        # no order, fact or ack to reconcile, so only the lot and its swept
+        # ledger balance count.  It is read after ``reconciliation_failure``
+        # and never enters it (nor ``usable``).  ``credit_lots`` and
+        # ``credit_ledger_entries`` exist below 046, so this reads nothing
+        # the 045 schema lacks (and finds no courtesy lot there).
+        usable_courtesy = include_courtesy and bool(
+            (
+                await self.session.execute(
+                    select(CreditLot.id)
+                    .outerjoin(
+                        CreditLedgerEntry,
+                        and_(
+                            CreditLedgerEntry.builder_id == CreditLot.builder_id,
+                            CreditLedgerEntry.lot_id == CreditLot.id,
+                        ),
+                    )
+                    .where(
+                        CreditLot.builder_id == builder_id,
+                        CreditLot.lot_kind == "courtesy",
+                        CreditLot.expires_at > instant,
+                    )
+                    .group_by(CreditLot.id)
+                    .having(lot_balance > 0)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            is not None
+        )
         return BindingCoverage(
             monthly_binding=monthly,
             usable_topup=usable_topup,
             identity_conflict=identity_conflict,
             reconciliation_failure=reconciliation_failure,
+            usable_courtesy=usable_courtesy,
         )
 
     async def capability_ready(
@@ -926,7 +970,11 @@ class CreditRolloutService:
             assert builder_id is None or isinstance(builder_id, UUID)
             if builder_id is None:
                 findings.append(CutoffFinding(tenant_id, None, "standalone"))
-            elif not (await self.binding_coverage(builder_id, at=instant)).covered:
+            elif not (
+                await self.binding_coverage(
+                    builder_id, at=instant, include_courtesy=True
+                )
+            ).covered:
                 findings.append(
                     CutoffFinding(tenant_id, builder_id, "builder_without_coverage")
                 )

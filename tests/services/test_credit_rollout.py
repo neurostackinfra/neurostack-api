@@ -408,3 +408,18 @@ def test_the_reference_scan_sees_a_swap() -> None:
             path.write_text(source, encoding="utf-8")
             kinds = {kind for _line, kind in _guard_references(path)}
             assert kinds - {"call"}, (name, kinds)
+
+
+def test_a_courtesy_counts_for_the_cutoff_coverage_only() -> None:
+    """creditos-cortesia, DESIGN Decision 11: ``usable_courtesy`` feeds
+    ``covered`` (the cutoff report) and nothing else -- a quarantine or an
+    identity conflict still blocks, and ``usable`` never depends on it."""
+
+    courtesy = BindingCoverage(usable_courtesy=True)
+    assert courtesy.covered
+    assert courtesy.usable == BindingCoverage().usable
+    assert not BindingCoverage(usable_courtesy=True, quarantined=True).covered
+    assert not BindingCoverage(usable_courtesy=True, identity_conflict=True).covered
+    failing = BindingCoverage(usable_courtesy=True, reconciliation_failure=True)
+    assert not failing.usable
+    assert failing.usable == BindingCoverage(reconciliation_failure=True).usable

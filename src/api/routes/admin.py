@@ -7,9 +7,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from passlib.context import CryptContext
-from sqlalchemy import cast, func, select
+from sqlalchemy import and_, case, cast, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -53,11 +53,17 @@ from src.api.schemas.admin import (
     UpdateBuilderRequest,
     UpdateClinicRequest,
 )
-from src.api.schemas.billing import CouponResponse, CreateCouponRequest
+from src.api.schemas.billing import (
+    BillingSubscriptionSummaryResponse,
+    CouponResponse,
+    CreateCouponRequest,
+)
+from src.config.logging import get_logger
 from src.config.settings import settings
 from src.models.builder import Builder
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.coupon import Coupon
+from src.models.credit import CreditLedgerEntry, CreditLot
 from src.models.event import Event
 from src.models.tenant import Tenant
 from src.models.transaction import Transaction
@@ -70,6 +76,7 @@ from src.repositories.billing import (
     BillingStateUnavailable,
     BillingTransitionRejected,
 )
+from src.repositories.credit import LOT_DECREASES, LOT_INCREASES
 from src.services.billing_capability import (
     BillingCapabilityRejected,
     BillingTopupCapabilityService,
@@ -80,7 +87,16 @@ from src.services.billing_operations import (
     BillingOperationRejected,
     OperationMaterial,
 )
+from src.services.billing_read_contract import (
+    SubscriptionReadback,
+    read_current_subscription,
+)
 from src.services.billing_rollout import BillingRolloutOperationService
+from src.services.credit_switch import (
+    courtesy_gate_open,
+    credit_switch_reading,
+    request_credit_switch,
+)
 from src.services.media_assets import (
     MediaOwnerTransition,
     MediaStorageCapacityExceeded,
@@ -98,6 +114,7 @@ from src.services.tenant_classification import (
 from src.services.user_email import email_in_use
 
 router = APIRouter()
+logger = get_logger(__name__)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 
 
@@ -837,20 +854,122 @@ async def create_builder(
     return {"ok": True, "id": str(builder_id)}
 
 
+def _courtesy_shown(request: Request) -> bool:
+    """creditos-cortesia (wish Decision 7): the courtesy column exists only
+    with the credit switch this request captured effective AND the courtesy
+    gate open (schema at 046): with the courtesy routes closed, the
+    "Créditos" action would only open dialogs that fail.  The switch reading
+    is read once; anything that fails is "not shown", never a 500."""
+
+    if not request_credit_switch(request):
+        return False
+    try:
+        return courtesy_gate_open(credit_switch_reading())
+    except Exception:
+        return False
+
+
+async def _courtesy_by_builder(
+    session: AsyncSession, at: datetime
+) -> dict[UUID, dict[str, Any]]:
+    """The active courtesy of every builder in ONE statement.
+
+    Reads only ``credit_lots`` and ``credit_ledger_entries`` (never
+    ``credit_courtesy_events``): per unexpired courtesy lot its ledger
+    balance, kept when positive, then per builder the latest ``expires_at``
+    and the sum.  A builder absent from the map has no active courtesy."""
+
+    balance = func.coalesce(
+        func.sum(
+            case(
+                (
+                    CreditLedgerEntry.entry_type.in_(LOT_INCREASES),
+                    CreditLedgerEntry.amount_mc,
+                ),
+                (
+                    CreditLedgerEntry.entry_type.in_(LOT_DECREASES),
+                    -CreditLedgerEntry.amount_mc,
+                ),
+                else_=0,
+            )
+        ),
+        0,
+    )
+    active_lots = (
+        select(
+            CreditLot.builder_id.label("builder_id"),
+            CreditLot.expires_at.label("expires_at"),
+            balance.label("balance_mc"),
+        )
+        .outerjoin(
+            CreditLedgerEntry,
+            and_(
+                CreditLedgerEntry.builder_id == CreditLot.builder_id,
+                CreditLedgerEntry.lot_id == CreditLot.id,
+            ),
+        )
+        .where(CreditLot.lot_kind == "courtesy", CreditLot.expires_at > at)
+        .group_by(CreditLot.id, CreditLot.builder_id, CreditLot.expires_at)
+        .having(balance > 0)
+        .subquery()
+    )
+    rows = await session.execute(
+        select(
+            active_lots.c.builder_id,
+            func.max(active_lots.c.expires_at),
+            func.sum(active_lots.c.balance_mc),
+        ).group_by(active_lots.c.builder_id)
+    )
+    summary: dict[UUID, dict[str, Any]] = {}
+    for builder_id, expires_at, available_mc in rows.all():
+        if expires_at.tzinfo is None:  # SQLite drops the zone; it stored UTC.
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        summary[UUID(str(builder_id))] = {
+            "active_expires_at": expires_at.astimezone(timezone.utc).isoformat(),
+            "available_mc": int(available_mc),
+        }
+    return summary
+
+
+def _subscription_row(subscription: SubscriptionReadback | None) -> Any:
+    if subscription is None:
+        return None
+    return BillingSubscriptionSummaryResponse(
+        offer_id=subscription.offer_id,
+        catalog_version_id=subscription.catalog_version_id,
+        status=subscription.status,
+        amount_cents=subscription.amount_cents,
+        current_period_end=subscription.current_period_end,
+        payment_state=subscription.payment_state,
+    ).model_dump(mode="json")
+
+
 @router.get(
     "/builders/subscriptions",
     summary="Builder Subscription Overview",
-    description="Subscription status for all builders. Super admin only.",
+    description=(
+        "Subscription status for all builders. Super admin only. Each row "
+        "keeps the legacy builders fields (subscription_plan, "
+        "subscription_status, billing_cycle) and always carries: "
+        "`subscription`, the builder's current ASAAS subscription as /billing "
+        "reads it (or null); `subscription_unavailable`, true when that read "
+        "failed for this builder only; and `courtesy`, null while the credit "
+        "switch is not effective or the courtesy routes are closed (schema "
+        "below 046), else {active_expires_at, available_mc} of the active "
+        "courtesy lots (active_expires_at null when there is none)."
+    ),
     response_model=None,
 )
 async def builder_subscriptions(
+    request: Request,
     tenant: TenantContext = Depends(require_super_admin),
     session: AsyncSession = Depends(get_db_session_dependency),
 ) -> list[dict[str, Any]]:
     stmt = select(Builder).order_by(Builder.name)
     result = await session.execute(stmt)
-    builders = result.scalars().all()
-    return [
+    # Plain values before any savepoint: a rolled-back savepoint must never
+    # leave an expired ORM attribute to lazy-load in async.
+    builders = [
         {
             "id": str(b.id),
             "name": b.name,
@@ -859,8 +978,56 @@ async def builder_subscriptions(
             "billing_cycle": b.billing_cycle,
             "updated_at": b.updated_at.isoformat() if b.updated_at else None,
         }
-        for b in builders
+        for b in result.scalars().all()
     ]
+    courtesy: dict[UUID, dict[str, Any]] | None = None
+    if _courtesy_shown(request):
+        try:
+            # A savepoint: a failed read never poisons the outer transaction
+            # the subscription reads below still use.
+            async with session.begin_nested():
+                courtesy = await _courtesy_by_builder(
+                    session, datetime.now(timezone.utc)
+                )
+        except Exception as error:
+            logger.warning(
+                "builder courtesy summary unreadable; courtesy is null",
+                error_type=type(error).__name__,
+            )
+            courtesy = None
+    rows: list[dict[str, Any]] = []
+    for row in builders:
+        builder_id = UUID(row["id"])
+        # One read per builder (DESIGN Risk 8: N+1 accepted at this size); a
+        # failed read -- of any kind -- marks only its own row, inside its own
+        # savepoint so the next builder's read still runs.
+        try:
+            async with session.begin_nested():
+                subscription = _subscription_row(
+                    await read_current_subscription(session, builder_id=builder_id)
+                )
+            unavailable = False
+        except Exception as error:
+            logger.warning(
+                "builder subscription unreadable; row marked unavailable",
+                error_type=type(error).__name__,
+            )
+            subscription, unavailable = None, True
+        rows.append(
+            {
+                **row,
+                "subscription": subscription,
+                "subscription_unavailable": unavailable,
+                "courtesy": (
+                    None
+                    if courtesy is None
+                    else courtesy.get(
+                        builder_id, {"active_expires_at": None, "available_mc": 0}
+                    )
+                ),
+            }
+        )
+    return rows
 
 
 @router.get(

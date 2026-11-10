@@ -150,3 +150,95 @@ def test_the_checkout_the_ui_calls_accepts_no_price_quantity_or_builder(
     catalog = schema["components"]["schemas"]["CreditCatalogResponse"]["properties"]
     items = catalog["subscription_payment_methods"]["items"]
     assert items.get("enum", [items.get("const")]) == ["credit_card"]
+
+
+# ---------------------------------------------------------------------------
+# creditos-cortesia: the courtesy routes of the credit admin API.
+# ---------------------------------------------------------------------------
+
+_COURTESY = "/v1/admin/credits/courtesy-grants"
+
+
+def test_the_courtesy_routes_are_documented(schema: dict[str, Any]) -> None:
+    grants = schema["paths"][_COURTESY]
+    removals = schema["paths"][f"{_COURTESY}/{{lot_id}}/removals"]
+    assert set(grants) == {"get", "post"}
+    assert set(removals) == {"post"}
+    for operation, created, refusals in (
+        (grants["post"], "201", {"401", "403", "404", "409", "422", "503"}),
+        (removals["post"], "201", {"401", "403", "404", "409", "422", "503"}),
+        (grants["get"], "200", {"401", "403", "404", "422", "503"}),
+    ):
+        assert operation["tags"] == ["Credits Admin"]
+        assert operation["summary"] and operation["description"]
+        assert set(operation["responses"]) == {created} | refusals
+        for status in refusals - {"401", "422"}:
+            body = operation["responses"][status]["content"]["application/json"]
+            assert body["schema"] == {"$ref": _ref("RefusalResponse")}, status
+    for operation in (grants["post"], removals["post"]):
+        # The app adds its global headers (X-API-Key, X-Request-ID) to every
+        # operation; the courtesy routes add only the Idempotency-Key.
+        [header] = [
+            p for p in operation["parameters"] if p["name"] == "Idempotency-Key"
+        ]
+        assert header["in"] == "header"
+        assert header["required"] is True
+        assert (header["schema"]["minLength"], header["schema"]["maxLength"]) == (
+            1,
+            200,
+        )
+    assert "credit_clock_ahead" in grants["post"]["responses"]["503"]["description"]
+    [query] = [p for p in grants["get"]["parameters"] if p["in"] == "query"]
+    assert (query["name"], query["in"], query["required"]) == (
+        "builder_id",
+        "query",
+        True,
+    )
+
+
+def test_the_courtesy_bodies_are_closed_and_bounded(schema: dict[str, Any]) -> None:
+    components = schema["components"]["schemas"]
+    grant = components["CourtesyGrantCreate"]
+    assert grant["additionalProperties"] is False
+    assert set(grant["required"]) == {"builder_id", "credits", "reason"}
+    credits = grant["properties"]["credits"]
+    assert (credits["type"], credits["minimum"], credits["maximum"]) == (
+        "integer",
+        1,
+        100_000,
+    )
+    reason = grant["properties"]["reason"]
+    assert (reason["minLength"], reason["maxLength"]) == (1, 500)
+    removal = components["CourtesyRemovalCreate"]
+    assert removal["additionalProperties"] is False
+    assert removal["required"] == ["reason"]
+    assert set(removal["properties"]) == {"credits", "remove_all", "reason"}
+    read = components["CourtesyGrantsResponse"]
+    assert set(read["properties"]) == {"as_of", "lots", "events"}
+    lot = components["CourtesyLotItem"]
+    assert set(lot["properties"]) == {
+        "lot_id",
+        "kind",
+        "status",
+        "granted_mc",
+        "available_mc",
+        "consumed_mc",
+        "removed_mc",
+        "expired_mc",
+        "paid_at",
+        "expires_at",
+    }
+    for field in ("granted_mc", "available_mc", "consumed_mc", "removed_mc"):
+        assert lot["properties"][field]["type"] == "integer", field
+
+
+def test_the_builder_read_documents_courtesy(schema: dict[str, Any]) -> None:
+    components = schema["components"]["schemas"]
+    for name in ("CreditLot", "CreditExpiry", "CreditNextExpiry"):
+        assert "removed_mc" in components[name]["required"], name
+        kinds = components[name]["properties"]["kind"]["enum"]
+        assert kinds == ["monthly", "topup", "courtesy"], name
+    balance = components["CreditBalanceResponse"]
+    assert "courtesy_available_mc" in balance["required"]
+    binding = components["CreditBindingStatus"]
+    assert "usable_courtesy" in binding["required"]

@@ -185,10 +185,21 @@ def _no_store(response: Response) -> None:
 
 @dataclass(frozen=True)
 class CreditScope:
-    """The tenant read through and its builder as stored NOW."""
+    """The tenant read through and its builder as stored NOW.
 
-    tenant_id: UUID
+    ``tenant_id`` is ``None`` only for a super admin's read of one builder's
+    account by its id (:func:`read_builder_snapshot`), never for a scope of
+    :func:`resolve_credit_scope`; with a builder set the tenant is never
+    read."""
+
+    tenant_id: UUID | None
     builder_id: UUID | None
+
+    def __post_init__(self) -> None:
+        # A scope with neither would read nobody's account: a programming
+        # error, refused at construction rather than as an empty snapshot.
+        if self.tenant_id is None and self.builder_id is None:
+            raise ValueError("a credit scope needs a tenant or a builder")
 
 
 async def resolve_credit_scope(
@@ -515,13 +526,17 @@ class CreditSnapshot:
                 monthly_available_mc=0,
                 monthly_not_started_mc=0,
                 topup_available_mc=0,
+                courtesy_available_mc=0,
                 available_mc=0,
                 open_debt_mc=0,
                 net_available_mc=0,
                 reserved_mc=reserved,
             )
+        # Every lot kind of the ledger has its line, so ``available_mc`` (all
+        # the book can spend) is exactly monthly + top-up + courtesy.
         monthly = [lot for lot in book.lots if lot.lot_kind == "monthly"]
         topups = [lot for lot in book.lots if lot.lot_kind == "topup"]
+        courtesies = [lot for lot in book.lots if lot.lot_kind == "courtesy"]
         expiries = self.expiries_of(book, as_of)
         return CreditBalanceResponse(
             as_of=as_of,
@@ -530,6 +545,7 @@ class CreditSnapshot:
                 lot.available_mc(as_of) for lot in monthly if _not_started(lot, as_of)
             ),
             topup_available_mc=sum(lot.spendable_mc(as_of) for lot in topups),
+            courtesy_available_mc=sum(lot.spendable_mc(as_of) for lot in courtesies),
             available_mc=book.available_mc(as_of),
             open_debt_mc=book.open_debt_mc,
             net_available_mc=book.available_trace_mc(as_of),
@@ -549,6 +565,7 @@ class CreditSnapshot:
                 kind=cast(LotKind, lot.lot_kind),
                 expires_at=lot.expires_at,
                 available_mc=lot.available_mc(as_of),
+                removed_mc=removed_mc(lot),
             )
             for lot in holding
         ]
@@ -562,23 +579,7 @@ class CreditSnapshot:
         as_of = await self.as_of()
         if book is None:
             return []
-        return [
-            CreditLot(
-                lot_id=lot.id,
-                kind=cast(LotKind, lot.lot_kind),
-                status=_lot_status(lot, as_of),
-                granted_mc=lot.granted_mc,
-                available_mc=lot.available_mc(as_of),
-                consumed_mc=max(lot.consumed_mc, 0),
-                reversed_mc=max(lot.sums["reversal"] - lot.sums["lot_regrant"], 0),
-                expired_mc=lot.sums["expiry"],
-                paid_at=lot.paid_at,
-                expires_at=lot.expires_at,
-                cycle_start=lot.cycle_start,
-                cycle_end=lot.cycle_end,
-            )
-            for lot in book.lots
-        ]
+        return [lot_view(lot, as_of) for lot in book.lots]
 
     async def debt(self) -> CreditDebtResponse:
         book = await self.book()
@@ -713,6 +714,8 @@ def _not_started(lot: LotState, at: datetime) -> bool:
 
 
 def _lot_status(lot: LotState, at: datetime) -> LotStatus:
+    # No status of its own for a courtesy lot zeroed by removals: it is
+    # ``exhausted``, and ``removed_mc`` says why (creditos-cortesia).
     if lot.expired(at):
         return "expired"
     if _not_started(lot, at):
@@ -720,6 +723,34 @@ def _lot_status(lot: LotState, at: datetime) -> LotStatus:
     if lot.available_mc(at) <= 0:
         return "exhausted"
     return "active"
+
+
+def removed_mc(lot: LotState) -> int:
+    """What a super admin took back from a courtesy lot (``courtesy_removal``
+    entries; 0 for the other kinds, which never carry one)."""
+
+    return lot.sums["courtesy_removal"]
+
+
+def lot_view(lot: LotState, as_of: datetime) -> CreditLot:
+    """One lot of a swept book as ``/v1/credits/lots`` shows it (also read by
+    the super admin's ``GET /v1/admin/credits/courtesy-grants``)."""
+
+    return CreditLot(
+        lot_id=lot.id,
+        kind=cast(LotKind, lot.lot_kind),
+        status=_lot_status(lot, as_of),
+        granted_mc=lot.granted_mc,
+        available_mc=lot.available_mc(as_of),
+        consumed_mc=max(lot.consumed_mc, 0),
+        reversed_mc=max(lot.sums["reversal"] - lot.sums["lot_regrant"], 0),
+        removed_mc=removed_mc(lot),
+        expired_mc=lot.sums["expiry"],
+        paid_at=lot.paid_at,
+        expires_at=lot.expires_at,
+        cycle_start=lot.cycle_start,
+        cycle_end=lot.cycle_end,
+    )
 
 
 def _used_percent(capacity: int, available: int, used: int) -> int:
@@ -767,6 +798,18 @@ async def _read(
         return await build(CreditSnapshot(session, scope))
     finally:
         await session.rollback()
+
+
+async def read_builder_snapshot(
+    session: AsyncSession,
+    builder_id: UUID,
+    build: Callable[[CreditSnapshot], Awaitable[_T]],
+) -> _T:
+    """:func:`_read` for one builder's account named by its id: the super
+    admin's courtesy read (``GET /v1/admin/credits/courtesy-grants``), the
+    same read-only snapshot and swept book as ``/v1/credits/*``."""
+
+    return await _read(session, CreditScope(None, builder_id), build)
 
 
 def _get(
@@ -866,9 +909,11 @@ async def credit_summary(
     "/balance",
     summary="Credit balance by origin",
     description=(
-        "Usable capacity of the monthly allowance and of the top-ups, the "
-        "allowance granted before its cycle starts, open debt, capacity net "
-        "of debt, what the window's reservations debited and the next expiry."
+        "Usable capacity of the monthly allowance, of the top-ups and of the "
+        "courtesy credits a super admin granted (all three summed in "
+        "available_mc), the allowance granted before its cycle starts, open "
+        "debt, capacity net of debt, what the window's reservations debited "
+        "and the next expiry."
     ),
     model=CreditBalanceResponse,
 )
@@ -883,8 +928,9 @@ async def credit_balance(
     "/lots",
     summary="Credit lots",
     description=(
-        "Every grant (monthly allowances and top-ups) with what it holds, "
-        "consumed, lost to refunds and expired, and its expiry."
+        "Every grant (monthly allowances, top-ups and courtesies) with what "
+        "it holds, consumed, lost to refunds, removed by a super admin (a "
+        "courtesy only) and expired, and its expiry."
     ),
     model=CreditLotsResponse,
 )
@@ -1006,6 +1052,9 @@ __all__ = [
     "TENANT_FORBIDDEN_CODE",
     "CreditScope",
     "CreditSnapshot",
+    "lot_view",
+    "read_builder_snapshot",
+    "removed_mc",
     "resolve_credit_scope",
     "router",
 ]

@@ -30,6 +30,9 @@ import {
 } from "@/components/ui/alert-dialog";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
+import { CourtesyCreditsDialog } from "@/components/admin/courtesy-credits-dialog";
+import { formatCivilDate, type Locale, type Txt } from "@/components/billing/format";
+import { paymentNotice, planName, subscriptionMarker } from "./billing-view";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -175,14 +178,142 @@ interface Transaction {
   created_at: string | null;
 }
 
+/** `subscription` of a `/v1/admin/builders/subscriptions` row: the builder's
+ * `SubscriptionReadback` (`read_current_subscription`), the same record
+ * `/billing` reads for the builder. */
+interface AdminSubscriptionReadback {
+  offer_id: string;
+  status: string;
+  payment_state: string;
+  /** Calendar date `YYYY-MM-DD`, or `null` when no cycle was ever paid. */
+  current_period_end: string | null;
+}
+
+/** `courtesy` of a row: `null` while the credit switch is not effective or the
+ * courtesy routes are closed (schema below `046`). */
+interface AdminCourtesySummary {
+  /** The latest `expires_at` among the active courtesy lots, `null` when none. */
+  active_expires_at: string | null;
+  available_mc: number;
+}
+
 interface BuilderSubscription {
   id: string;
   name: string;
+  // Legacy fields: still sent (the ASAAS rollout runbook checks them) but
+  // never shown -- the legacy `subscription_status` default "trial" is not a
+  // state (DESIGN creditos-cortesia, decision 12).
   subscription_plan: string | null;
   subscription_status: string;
   billing_cycle: string;
   updated_at: string | null;
+  subscription?: AdminSubscriptionReadback | null;
+  subscription_unavailable?: boolean;
+  courtesy?: AdminCourtesySummary | null;
 }
+
+type SubscriptionTone = "active" | "cancelled" | "pending" | "courtesy" | "none" | "unavailable";
+
+interface SubscriptionRowState {
+  plan: string;
+  status: { label: string; tone: SubscriptionTone };
+  /** The `/billing` payment notice of states a and b (overdue / reversed), if any. */
+  notice: string | null;
+  /** The extra "Cortesia, expira em dd/mm" badge of states a, b, c and f. */
+  courtesyBadge: string | null;
+}
+
+/** An instant shown as `dd/mm` (`mm/dd` in English) in America/Sao_Paulo. */
+function formatDayMonth(value: string, locale: Locale): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return new Intl.DateTimeFormat(locale === "en" ? "en-US" : "pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone: "America/Sao_Paulo",
+  }).format(date);
+}
+
+/**
+ * The "Plano" and "Status" cells of a row, by DESIGN creditos-cortesia
+ * decision 12, through the very functions of `/billing` (`planName`,
+ * `subscriptionMarker`, `paymentNotice`) -- never a second rule:
+ *
+ * - f) `subscription_unavailable` (or a row without the field: an older
+ *   server, fail closed): "Indisponível";
+ * - a) marker `current`, status not `cancelled`: "Ativo" + the payment notice;
+ * - b) marker `current`, status `cancelled`: "Cancelado, vale até {end}" +
+ *   the same payment notice (owner decision 2026-11-10, over decision 12);
+ * - c) marker `pending`: "Pendente";
+ * - d) no subscription, active courtesy: "Cortesia, expira em dd/mm";
+ * - e) no subscription, no courtesy: "Sem plano".
+ *
+ * In a, b, c and f an active courtesy adds the "Cortesia, expira em dd/mm"
+ * badge. The legacy `subscription_status` is never read.
+ */
+function subscriptionRowState(row: BuilderSubscription, txt: Txt, locale: Locale): SubscriptionRowState {
+  const activeExpiresAt = row.courtesy?.active_expires_at ?? null;
+  const courtesyLabel = activeExpiresAt
+    ? txt(
+        `Cortesia, expira em ${formatDayMonth(activeExpiresAt, locale)}`,
+        `Courtesy, expires on ${formatDayMonth(activeExpiresAt, locale)}`,
+      )
+    : null;
+  const subscription = row.subscription ?? null;
+  const plan = subscription ? planName(subscription.offer_id) : "-";
+  if (row.subscription_unavailable === true || row.subscription === undefined) {
+    return {
+      plan,
+      status: { label: txt("Indisponível", "Unavailable"), tone: "unavailable" },
+      notice: null,
+      courtesyBadge: courtesyLabel,
+    };
+  }
+  if (subscription) {
+    if (subscriptionMarker(subscription) === "pending") {
+      return {
+        plan,
+        status: { label: txt("Pendente", "Pending"), tone: "pending" },
+        notice: null,
+        courtesyBadge: courtesyLabel,
+      };
+    }
+    // States a and b only: the marker is `current`, so `payment_state` is in
+    // the confirmed allowlist and a `pending` notice cannot reach this line.
+    const notice = paymentNotice(subscription.payment_state, txt);
+    if (subscription.status === "cancelled") {
+      const end = formatCivilDate(subscription.current_period_end, locale) ?? "-";
+      return {
+        plan,
+        status: {
+          label: txt(`Cancelado, vale até ${end}`, `Cancelled, valid until ${end}`),
+          tone: "cancelled",
+        },
+        notice,
+        courtesyBadge: courtesyLabel,
+      };
+    }
+    return {
+      plan,
+      status: { label: txt("Ativo", "Active"), tone: "active" },
+      notice,
+      courtesyBadge: courtesyLabel,
+    };
+  }
+  if (courtesyLabel) {
+    return { plan, status: { label: courtesyLabel, tone: "courtesy" }, notice: null, courtesyBadge: null };
+  }
+  return { plan, status: { label: txt("Sem plano", "No plan"), tone: "none" }, notice: null, courtesyBadge: null };
+}
+
+const SUBSCRIPTION_TONE_CLASSES: Record<SubscriptionTone, string> = {
+  active: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
+  cancelled: "bg-slate-500/15 text-slate-300 border-slate-500/30",
+  pending: "bg-amber-500/15 text-amber-400 border-amber-500/30",
+  courtesy: "bg-violet-500/15 text-violet-400 border-violet-500/30",
+  none: "bg-transparent text-slate-400 border-slate-600",
+  unavailable: "bg-rose-500/15 text-rose-400 border-rose-500/30",
+};
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 
@@ -634,6 +765,7 @@ const DEMO_DASHBOARD: AdminDashboardData = {
 
 export default function MasterAdmin() {
   const { t, locale } = useI18n();
+  const txt: Txt = (pt, en) => (locale === "en" ? en : pt);
   const { isSuperAdmin, isInvestor, setViewingClinicId } = useAuth();
   const [, navigate] = useLocation();
   const token = useAdminToken();
@@ -695,6 +827,7 @@ export default function MasterAdmin() {
   // Transactions state
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [builderSubscriptions, setBuilderSubscriptions] = useState<BuilderSubscription[]>([]);
+  const [courtesyTarget, setCourtesyTarget] = useState<{ id: string; name: string } | null>(null);
   const [transactionsLoaded, setTransactionsLoaded] = useState(false);
   const [showTransactionsSection, setShowTransactionsSection] = useState(false);
 
@@ -2185,38 +2318,60 @@ export default function MasterAdmin() {
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Builder</th>
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Plano</th>
                           <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Status</th>
-                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Ciclo</th>
-                          <th className="text-left pb-2 font-medium text-muted-foreground">Atualizado</th>
+                          <th className="text-left pb-2 pr-4 font-medium text-muted-foreground">Atualizado</th>
+                          <th className="pb-2"><span className="sr-only">{txt("Ações", "Actions")}</span></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {builderSubscriptions.map((s) => (
-                          <tr key={s.id} className="border-b border-border/30 last:border-0">
-                            <td className="py-2 pr-4 font-medium">{s.name}</td>
-                            <td className="py-2 pr-4">
-                              <Badge className="bg-indigo-500/15 text-indigo-400 border-indigo-500/30 text-[10px]">
-                                {s.subscription_plan ?? "-"}
-                              </Badge>
-                            </td>
-                            <td className="py-2 pr-4">
-                              {s.subscription_status === "active" ? (
-                                <Badge className="bg-emerald-500/15 text-emerald-400 border-emerald-500/30 text-[10px]">
-                                  <CheckCircle2 className="h-3 w-3 mr-1" /> Ativo
-                                </Badge>
-                              ) : s.subscription_status === "trial" ? (
-                                <Badge className="bg-amber-500/15 text-amber-400 border-amber-500/30 text-[10px]">Trial</Badge>
-                              ) : (
-                                <Badge variant="outline" className="text-slate-400 border-slate-600 text-[10px]">
-                                  {s.subscription_status}
-                                </Badge>
-                              )}
-                            </td>
-                            <td className="py-2 pr-4 text-muted-foreground capitalize">{s.billing_cycle}</td>
-                            <td className="py-2 text-muted-foreground">
-                              {s.updated_at ? relativeTime(s.updated_at, locale) : "-"}
-                            </td>
-                          </tr>
-                        ))}
+                        {builderSubscriptions.map((s) => {
+                          const rowState = subscriptionRowState(s, txt, locale as Locale);
+                          return (
+                            <tr key={s.id} className="border-b border-border/30 last:border-0">
+                              <td className="py-2 pr-4 font-medium">{s.name}</td>
+                              <td className="py-2 pr-4">
+                                {rowState.plan === "-" ? (
+                                  <span className="text-muted-foreground">-</span>
+                                ) : (
+                                  <Badge className="bg-indigo-500/15 text-indigo-400 border-indigo-500/30 text-[10px]">
+                                    {rowState.plan}
+                                  </Badge>
+                                )}
+                              </td>
+                              <td className="py-2 pr-4">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <Badge className={`${SUBSCRIPTION_TONE_CLASSES[rowState.status.tone]} text-[10px]`}>
+                                    {rowState.status.tone === "active" && <CheckCircle2 className="h-3 w-3 mr-1" />}
+                                    {rowState.status.label}
+                                  </Badge>
+                                  {rowState.courtesyBadge && (
+                                    <Badge className={`${SUBSCRIPTION_TONE_CLASSES.courtesy} text-[10px]`}>
+                                      {rowState.courtesyBadge}
+                                    </Badge>
+                                  )}
+                                </div>
+                                {rowState.notice && (
+                                  <p className="mt-1 text-[11px] text-amber-400 max-w-xs">{rowState.notice}</p>
+                                )}
+                              </td>
+                              <td className="py-2 pr-4 text-muted-foreground">
+                                {s.updated_at ? relativeTime(s.updated_at, locale) : "-"}
+                              </td>
+                              <td className="py-2 text-right">
+                                {s.courtesy != null && (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    aria-label={txt(`Créditos de ${s.name}`, `${s.name} credits`)}
+                                    onClick={() => setCourtesyTarget({ id: s.id, name: s.name })}
+                                  >
+                                    {txt("Créditos", "Credits")}
+                                  </Button>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -2448,6 +2603,17 @@ export default function MasterAdmin() {
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+
+    {courtesyTarget && (
+      <CourtesyCreditsDialog
+        open
+        onOpenChange={(open) => { if (!open) setCourtesyTarget(null); }}
+        builderId={courtesyTarget.id}
+        builderName={courtesyTarget.name}
+        token={token}
+        onChanged={() => void fetchTransactions()}
+      />
+    )}
     </>
   );
 }

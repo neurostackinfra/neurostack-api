@@ -791,6 +791,7 @@ function creditSummary(overrides: Record<string, unknown> = {}) {
       monthly_available_mc: 10_000,
       monthly_not_started_mc: 25_000,
       topup_available_mc: 496_000,
+      courtesy_available_mc: 0,
       available_mc: 506_000,
       open_debt_mc: 0,
       net_available_mc: 506_000,
@@ -799,8 +800,8 @@ function creditSummary(overrides: Record<string, unknown> = {}) {
       ...((overrides.balance as Record<string, unknown>) ?? {}),
     },
     expiries: (overrides.expiries as unknown[] | undefined) ?? [
-      { lot_id: "lot-1", kind: "monthly", expires_at: "2026-11-25T03:00:00Z", available_mc: 10_000 },
-      { lot_id: "lot-2", kind: "topup", expires_at: "2027-04-20T03:00:00Z", available_mc: 496_000 },
+      { lot_id: "lot-1", kind: "monthly", expires_at: "2026-11-25T03:00:00Z", available_mc: 10_000, removed_mc: 0 },
+      { lot_id: "lot-2", kind: "topup", expires_at: "2027-04-20T03:00:00Z", available_mc: 496_000, removed_mc: 0 },
     ],
     debt: {
       as_of: AS_OF,
@@ -854,6 +855,7 @@ function lot(overrides: Record<string, unknown> = {}) {
     consumed_mc: 4_000,
     reversed_mc: 0,
     expired_mc: 0,
+    removed_mc: 0,
     paid_at: "2026-10-20",
     expires_at: "2027-04-20T03:00:00Z",
     cycle_start: null,
@@ -1031,6 +1033,7 @@ describe("Billing credits", () => {
               monthly_available_mc: 0,
               monthly_not_started_mc: 0,
               topup_available_mc: 0,
+              courtesy_available_mc: 0,
               available_mc: 0,
               net_available_mc: 0,
               reserved_mc: 0,
@@ -1114,6 +1117,39 @@ describe("Billing credits", () => {
     // Internal identifiers never reach the DOM, and nothing paginates.
     expect(document.body.innerHTML).not.toContain("0f0e0d0c-0000-4000-8000");
     expect(screen.queryByRole("button", { name: /próxima|anterior|carregar mais|ver mais/i })).not.toBeInTheDocument();
+  });
+
+  it("shows courtesy as Cortesia in the balance, expiries and history, with the removed value only when > 0", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () =>
+        response(
+          creditSummary({
+            balance: { courtesy_available_mc: 50_000, available_mc: 556_000, net_available_mc: 556_000 },
+            expiries: [
+              { lot_id: "lot-c", kind: "courtesy", expires_at: "2026-12-10T03:00:00Z", available_mc: 50_000, removed_mc: 20_000 },
+            ],
+          }),
+        ),
+      [`GET ${CREDIT_LOTS}`]: () =>
+        response(
+          creditLots([
+            lot({ lot_id: "0f0e0d0c-0000-4000-8000-00000000c001", kind: "courtesy", granted_mc: 70_000, available_mc: 50_000, removed_mc: 20_000, paid_at: "2026-10-29", expires_at: "2026-12-10T03:00:00Z" }),
+            lot({ lot_id: "0f0e0d0c-0000-4000-8000-00000000c002", kind: "courtesy", granted_mc: 10_000, removed_mc: 0, paid_at: "2026-10-01", expires_at: "2026-12-01T03:00:00Z" }),
+          ]),
+        ),
+    });
+    renderBilling();
+    const expiries = await screen.findByTestId("credit-expiries");
+    expect(screen.getByRole("group", { name: "Cortesia" })).toHaveTextContent("50 créditos");
+    expect(expiries).toHaveTextContent(/Cortesia.*50 créditos.*retirados: 20 créditos/);
+    expect(expiries).not.toHaveTextContent("Recarga");
+    const table = await screen.findByRole("table", { name: "Histórico de créditos" });
+    const rows = within(table).getAllByTestId("credit-history-row");
+    expect(rows[0]).toHaveTextContent(/Cortesia.*70 créditos.*Retirados: 20 créditos.*Expira em.*10\/12\/2026/);
+    expect(rows[1]).toHaveTextContent(/Cortesia/);
+    expect(within(rows[1]).queryByTestId("credit-lot-removed")).toBeNull();
+    for (const row of rows) expect(row).not.toHaveTextContent("Recarga");
   });
 
   it("shows a failed history read as an error with a retry, not as an empty history", async () => {

@@ -110,9 +110,11 @@ export interface CreditStateInfo {
 
 export interface CreditExpiry {
   lot_id: string;
-  kind: "monthly" | "topup";
+  kind: "monthly" | "topup" | "courtesy";
   expires_at: string;
   available_mc: number;
+  /** Millicredits removed from the lot (e.g. a courtesy revocation); >= 0. */
+  removed_mc: number;
 }
 
 export interface CreditBalance {
@@ -120,6 +122,8 @@ export interface CreditBalance {
   monthly_available_mc: number;
   monthly_not_started_mc: number;
   topup_available_mc: number;
+  /** Courtesy credits; already included in `available_mc`. */
+  courtesy_available_mc: number;
   available_mc: number;
   open_debt_mc: number;
   net_available_mc: number;
@@ -178,13 +182,14 @@ export interface CreditSummary {
  */
 export interface CreditLot {
   lot_id: string;
-  kind: "monthly" | "topup";
+  kind: "monthly" | "topup" | "courtesy";
   status: "active" | "not_started" | "exhausted" | "expired";
   granted_mc: number;
   available_mc: number;
   consumed_mc: number;
   reversed_mc: number;
   expired_mc: number;
+  removed_mc: number;
   /** Calendar date `YYYY-MM-DD`. */
   paid_at: string;
   expires_at: string;
@@ -343,7 +348,7 @@ export function isCheckoutSession(value: unknown): value is CheckoutSession {
 }
 
 const CREDIT_STATES = new Set(["active", "pending", "grace", "suspended", "deletion_due"]);
-const LOT_KINDS = new Set(["monthly", "topup"]);
+const LOT_KINDS = new Set(["monthly", "topup", "courtesy"]);
 const LOT_STATUSES = new Set(["active", "not_started", "exhausted", "expired"]);
 
 function isStringList(value: unknown): value is string[] {
@@ -371,7 +376,8 @@ function isCreditExpiry(value: unknown): value is CreditExpiry {
     typeof value.kind === "string" &&
     LOT_KINDS.has(value.kind) &&
     typeof value.expires_at === "string" &&
-    isInteger(value.available_mc)
+    isInteger(value.available_mc) &&
+    isInteger(value.removed_mc)
   );
 }
 
@@ -379,6 +385,7 @@ const BALANCE_KEYS = [
   "monthly_available_mc",
   "monthly_not_started_mc",
   "topup_available_mc",
+  "courtesy_available_mc",
   "available_mc",
   "open_debt_mc",
   "net_available_mc",
@@ -412,6 +419,10 @@ export function isCreditSummary(value: unknown): value is CreditSummary {
     typeof value.as_of === "string" &&
     isCreditState(value.state) &&
     hasIntegers(value.balance, BALANCE_KEYS) &&
+    isRecord(value.balance) &&
+    (value.balance.next_expiry === undefined ||
+      value.balance.next_expiry === null ||
+      isCreditExpiry(value.balance.next_expiry)) &&
     Array.isArray(value.expiries) &&
     value.expiries.every(isCreditExpiry) &&
     isRecord(debt) &&
@@ -441,7 +452,7 @@ function isCreditLot(value: unknown): value is CreditLot {
     LOT_KINDS.has(value.kind) &&
     typeof value.status === "string" &&
     LOT_STATUSES.has(value.status) &&
-    hasIntegers(value, ["granted_mc", "available_mc", "consumed_mc", "reversed_mc", "expired_mc"]) &&
+    hasIntegers(value, ["granted_mc", "available_mc", "consumed_mc", "reversed_mc", "expired_mc", "removed_mc"]) &&
     typeof value.paid_at === "string" &&
     typeof value.expires_at === "string"
   );

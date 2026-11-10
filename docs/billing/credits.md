@@ -73,6 +73,22 @@ no-store`. They are documented in the OpenAPI under the `Credits` tag.
 | `/v1/credits/consumption` | the window's consumption by effect kind, `charged` (ledger) and `observed` (never charged) |
 | `/v1/credits/export` | Group 5: the ZIP of the tenant's bytes (available in every state) |
 
+The courtesy routes (creditos-cortesia, see [Cortesia](#cortesia)) are
+super-admin admin routes, not builder reads:
+
+| Route | Answer |
+|---|---|
+| `POST /v1/admin/credits/courtesy-grants` | `201`: grants a builder a courtesy lot (`{"builder_id", "credits", "reason"}`, header `Idempotency-Key`) |
+| `POST /v1/admin/credits/courtesy-grants/{lot_id}/removals` | `201`: removes `credits` whole credits or, with `remove_all: true`, the lot's whole spendable balance (`{"credits"}` or `{"remove_all": true}`, plus `"reason"`; header `Idempotency-Key`) |
+| `GET /v1/admin/credits/courtesy-grants?builder_id=` | the builder's courtesy lots (granted, available, consumed, `removed_mc`, expired, status and expiry) and every grant and removal with its actor and reason (super admins only); `404 builder_not_found` |
+
+Balance and lot fields added by creditos-cortesia: `/v1/credits/balance`
+carries `courtesy_available_mc` (the courtesy lots' spendable balance,
+**already included** in `available_mc`, never added on top); every lot of
+`/v1/credits/lots` and every entry of `/v1/credits/expiries` carries
+`removed_mc` (what a super admin took back; `0` for monthly and top-up lots),
+and a lot's `kind` may be `courtesy`.
+
 ### How the figures are computed
 
 - Read-only: the stored rows of the builder (lots, per-lot entry sums,
@@ -123,6 +139,74 @@ code never creates an order.
   inbox and its grant was applied to the ledger. A checkout return, a PIX QR
   code, a pending payment or a forged callback never changes a figure.
 
+## Cortesia
+
+Courtesy credits are credits a super admin gives a builder for free
+(creditos-cortesia). They are a ledger lot of kind `courtesy`; nothing about
+them touches ASAAS, a subscription, an order, the catalog,
+`topup_commercial_enabled` or any billing table, and the builder pays
+nothing.
+
+- **Who grants**: a JWT `super_admin` only, through the master-admin
+  "Créditos" action of the "Assinaturas por Builder" table (dialog "Dar
+  cortesia" / "Tirar créditos") or the `courtesy-grants` API above. Any
+  other caller is `403` (`jwt_required`, `super_admin_jwt_required`) before
+  any credit SQL. The builder must exist (`404 builder_not_found`) and be
+  active to receive a grant (`409 builder_inactive`); a removal stays
+  allowed for an inactive builder.
+- **Cap**: 1 to 100,000 whole credits per grant, a free amount; the dialog
+  offers shortcuts of 5,000, 15,000 and 35,000 credits. A reason is
+  required.
+- **Validity**: fixed: the lot expires at the start of the civil day
+  (America/Sao_Paulo) of the grant's civil date + 30 days, the same form as
+  a top-up; "Expira em" shows that day. It is not configurable and is never
+  extended (to extend, grant another courtesy).
+- **Removal**: partial (`credits`, at most the lot's whole spendable
+  credits) or total (`remove_all: true`, which also removes the millicredit
+  fraction a partial removal cannot name). Only what the lot can still
+  spend is removed, never what was consumed; an expired or zeroed lot
+  refuses `remove_all` (both are `409 courtesy_removal_exceeds_balance`).
+  A removal **reduces the funded capacity**: it is never counted as usage,
+  so `used_mc` does not move and the lot shows the amount in `removed_mc`
+  (a lot zeroed by removals is `exhausted`). `used_percent` is consumption
+  over the reduced capacity: with nothing consumed it stays where it was;
+  with consumption it rises (10,000 granted, 6,000 removed, 1,000 consumed
+  reads 25 %), and a removal can cross the 50/90/100 % thresholds.
+- **Capacity, thresholds and FEFO**: a courtesy lot adds to the capacity in
+  force and to `available_mc` like any funded lot, so the 50/90/100 %
+  thresholds are computed over it. Consumption spends the monthly lot first,
+  then the other lots by earliest expiry (FEFO): a courtesy lot is spent
+  after the monthly allowance and before a top-up that expires later.
+- **L10 coverage**: the cutoff report counts a builder whose only coverage
+  is a usable courtesy lot (`usable_courtesy`: unexpired, positive balance)
+  as `covered`, unless it is quarantined or in an identity conflict, like
+  any source. It never feeds `usable` nor `reconciliation_failure`
+  (`usable`, the absence of a quarantine, an identity conflict or a
+  reconciliation failure, is unchanged), so a courtesy never hides an ASAAS
+  divergence. `GET /v1/admin/credits/rollout/bindings/{builder_id}` reports
+  `usable_courtesy`. Courtesy never changes the enforcement instant.
+- **Idempotency**: every POST requires an `Idempotency-Key` (1 to 200
+  characters), unique across **every** builder. The request's digest covers
+  the operation, the builder, the lot of a removal and the whole body: the
+  same key with the same request returns the recorded result (`201`,
+  nothing written again); the same key on another operation, builder, lot
+  or body is `409 idempotency_key_reused`. Refusals write nothing.
+- **Gate and deployment order**: the routes answer `503 credit_unavailable`
+  unless the credit switch is effective **and** the database is at `046`
+  (a database at `045` keeps them closed with no SQL). The order is: the
+  bridge image (contains `046`, writes no courtesy) → window `046` → the
+  courtesy release. Never the reverse: window `046` under an image whose
+  chain ends at `045` turns the whole credit switch off
+  (`revision_outside_image_chain`) until an image containing `046` serves.
+  See
+  [`asaas-deployment.md`](../runbooks/asaas-deployment.md) ("Migration 046")
+  and [`asaas-rollback.md`](../runbooks/asaas-rollback.md).
+- **Do not grant courtesy before the new frontend is live**: an older
+  `/billing` contract guard accepts only the `monthly` and `topup` lot
+  kinds (it ignores the new fields), so a builder holding a courtesy lot
+  would see a failed credit read.
+- Operations: [`credit-courtesy.md`](../runbooks/credit-courtesy.md).
+
 ## UI
 
 The billing page is `frontend/artifacts/neurostack/src/pages/billing.tsx`
@@ -166,7 +250,9 @@ refusals. What may be shown or bought is derived in
   aplica" under `pending` and is a hold under any other state.
 - **History**: the lots are the only history source (date, origin, credits,
   status, "Expira em"), newest first, unpaginated; `lot_id` is never
-  rendered.
+  rendered. A courtesy lot reads origin "Cortesia" (never a top-up) and,
+  when something was removed, "Retirados"; the balance shows a "Cortesia"
+  line (`courtesy_available_mc`).
 - **Top-ups** (`deriveTopupState`): `Recarregar` exists only when
   `GET /v1/billing/summary` read back `topup_commercial_enabled: true`, the
   credit summary answered, the ledger is not on hold, no checkout is live

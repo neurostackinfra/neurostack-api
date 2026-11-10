@@ -198,6 +198,7 @@ function creditSummary(state: Record<string, unknown> = {}) {
       monthly_available_mc: 0,
       monthly_not_started_mc: 0,
       topup_available_mc: 0,
+      courtesy_available_mc: 0,
       available_mc: 0,
       open_debt_mc: 0,
       net_available_mc: 0,
@@ -228,6 +229,7 @@ function lot(overrides: Record<string, unknown> = {}) {
     consumed_mc: 1_000,
     reversed_mc: 0,
     expired_mc: 0,
+    removed_mc: 0,
     paid_at: "2026-10-25",
     expires_at: "2026-11-25T03:00:00Z",
     ...overrides,
@@ -314,5 +316,25 @@ describe("readCredits", () => {
     expect(await readCredits("/v1/credits/lots", "tok", isCreditLots)).toEqual({ status: "error" });
     fetchMock.mockResolvedValueOnce({ status: 503, json: async () => Promise.reject(new SyntaxError("html")) } as Response);
     expect(await readCredits("/v1/credits/lots", "tok", isCreditLots)).toEqual({ status: "error" });
+  });
+});
+
+describe("courtesy credit contract", () => {
+  it("accepts courtesy lots and expiries with removed_mc and rejects an unknown kind", () => {
+    expect(isCreditLots({ as_of: "t", lots: [lot({ kind: "courtesy", removed_mc: 1_000 })] })).toBe(true);
+    expect(isCreditLots({ as_of: "t", lots: [lot({ kind: "bonus" })] })).toBe(false);
+    expect(isCreditLots({ as_of: "t", lots: [{ ...lot(), removed_mc: undefined }] })).toBe(false);
+    const expiry = { lot_id: "x", kind: "courtesy", expires_at: "t", available_mc: 1, removed_mc: 0 };
+    expect(isCreditSummary({ ...creditSummary(), expiries: [expiry] })).toBe(true);
+    expect(isCreditSummary({ ...creditSummary(), expiries: [{ ...expiry, removed_mc: 1.5 }] })).toBe(false);
+  });
+
+  it("requires courtesy_available_mc in the balance and validates next_expiry with removed_mc", () => {
+    const base = creditSummary();
+    const { courtesy_available_mc: _omit, ...withoutCourtesy } = base.balance;
+    expect(isCreditSummary({ ...base, balance: withoutCourtesy })).toBe(false);
+    const next = { lot_id: "x", kind: "courtesy", expires_at: "t", available_mc: 1, removed_mc: 2 };
+    expect(isCreditSummary({ ...base, balance: { ...base.balance, next_expiry: next } })).toBe(true);
+    expect(isCreditSummary({ ...base, balance: { ...base.balance, next_expiry: { ...next, removed_mc: "2" } } })).toBe(false);
   });
 });

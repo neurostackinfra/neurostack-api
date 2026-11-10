@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 CreditMode = Literal["observational", "enforced"]
 CreditState = Literal["active", "pending", "grace", "suspended", "deletion_due"]
 PendingReason = Literal["quarantine", "standalone", "reconciliation"]
-LotKind = Literal["monthly", "topup"]
+LotKind = Literal["monthly", "topup", "courtesy"]
 LotStatus = Literal["active", "not_started", "exhausted", "expired"]
 ReservationCategory = Literal["rag", "media", "egress"]
 WindowKind = Literal["cycle", "continuation", "calendar"]
@@ -113,23 +113,33 @@ class CreditNextExpiry(_Frozen):
     kind: LotKind
     expires_at: datetime
     available_mc: int
+    removed_mc: int = Field(
+        ...,
+        description=(
+            "What a super admin removed from this courtesy lot (0 for a "
+            "monthly allowance or a top-up)."
+        ),
+    )
 
 
 class CreditBalanceResponse(_Frozen):
     """Usable capacity by origin, from the ledger swept at ``as_of``.
 
-    ``available_mc = monthly_available_mc + topup_available_mc``; a monthly
-    allowance granted before its cycle starts counts only in
-    ``monthly_not_started_mc``; ``net_available_mc`` is the available
-    capacity net of ``open_debt_mc``.  ``reserved_mc`` is what the current
-    window's RAG/media/egress reservations already debited (a reservation is
-    a debit: it is not subtracted again).
+    ``available_mc = monthly_available_mc + topup_available_mc +
+    courtesy_available_mc``; a monthly allowance granted before its cycle
+    starts counts only in ``monthly_not_started_mc``; ``net_available_mc`` is
+    the available capacity net of ``open_debt_mc``.  ``reserved_mc`` is what
+    the current window's RAG/media/egress reservations already debited (a
+    reservation is a debit: it is not subtracted again).
+    ``courtesy_available_mc`` is what the courtesy lots a super admin granted
+    still hold (creditos-cortesia): capacity like a top-up, never money.
     """
 
     as_of: datetime
     monthly_available_mc: int
     monthly_not_started_mc: int
     topup_available_mc: int
+    courtesy_available_mc: int
     available_mc: int
     open_debt_mc: int
     net_available_mc: int
@@ -138,7 +148,10 @@ class CreditBalanceResponse(_Frozen):
 
 
 class CreditLot(_Frozen):
-    """One grant: a monthly allowance or a top-up, with its own expiry."""
+    """One grant: a monthly allowance, a top-up or a courtesy, with its own
+    expiry.  ``removed_mc`` is what a super admin took back from a courtesy
+    lot (0 for the others); a courtesy lot zeroed by removals is
+    ``exhausted``, and ``removed_mc`` says why."""
 
     lot_id: UUID
     kind: LotKind
@@ -147,6 +160,7 @@ class CreditLot(_Frozen):
     available_mc: int
     consumed_mc: int
     reversed_mc: int
+    removed_mc: int
     expired_mc: int
     paid_at: date
     expires_at: datetime
@@ -164,6 +178,7 @@ class CreditExpiry(_Frozen):
     kind: LotKind
     expires_at: datetime
     available_mc: int
+    removed_mc: int
 
 
 class CreditExpiriesResponse(_Frozen):

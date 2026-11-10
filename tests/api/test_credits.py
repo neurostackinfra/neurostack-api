@@ -498,6 +498,8 @@ def test_the_balance_is_discriminated_by_origin(
         "monthly_not_started_mc": 10_000,
         # 500 000 - 2 000 (trace) - 2 000 (RAG reservation).
         "topup_available_mc": 496_000,
+        # creditos-cortesia: no courtesy lot here.
+        "courtesy_available_mc": 0,
         "available_mc": 496_000,
         "open_debt_mc": 0,
         "net_available_mc": 496_000,
@@ -506,6 +508,7 @@ def test_the_balance_is_discriminated_by_origin(
     }
     assert balance["next_expiry"]["kind"] == "monthly"
     assert balance["next_expiry"]["available_mc"] == 10_000
+    assert balance["next_expiry"]["removed_mc"] == 0
 
 
 def test_lots_carry_their_status_and_expiry(
@@ -596,6 +599,7 @@ def test_a_builder_without_any_credit_row_reads_zeros(
             "monthly_available_mc",
             "monthly_not_started_mc",
             "topup_available_mc",
+            "courtesy_available_mc",
             "available_mc",
             "open_debt_mc",
             "net_available_mc",
@@ -1059,3 +1063,17 @@ def test_client_values_never_reach_the_figures(
     )
 
     assert _without_as_of(tampered) == _without_as_of(clean)
+
+
+def test_a_credit_scope_needs_a_tenant_or_a_builder() -> None:
+    """creditos-cortesia: ``tenant_id`` may be ``None`` only for the super
+    admin's read of one builder by id; a scope with neither is refused at
+    construction, never served as an empty snapshot."""
+
+    from src.api.routes.credits import CreditScope
+
+    with pytest.raises(ValueError, match="needs a tenant or a builder"):
+        CreditScope(tenant_id=None, builder_id=None)
+    builder = uuid4()
+    assert CreditScope(None, builder).builder_id == builder
+    assert CreditScope(uuid4(), None).builder_id is None

@@ -84,6 +84,14 @@ store crosses runs, and every run starts from a clone of one seeded template.
   migration itself) and off again after the downgrade, each within one
   interval, while requests keep answering.
 
+* creditos-cortesia: the corpus ends with the three courtesy routes of the
+  credit admin API, called by the builder's JWT and an API key: 503
+  ``credit_unavailable`` while the switch is not effective, 403 with it (the
+  head is 046, so the courtesy gate opens on the real reading).  No super
+  admin calls them here, so the corpus writes no courtesy; the gate on a
+  045 database and a super admin's writes are
+  ``tests/integration/test_credit_courtesy_http_postgres.py``.
+
 Groups 3-7 append their surfaces to the corpus and to these runs, always
 also below the image's credit minimum.
 """
@@ -180,19 +188,37 @@ _CATEGORY_GATED = (
     "knowledge-files-upload",
 )
 # Group 4a: the credit surface of the corpus, outside the on/off comparison.
-_CREDIT_SURFACES = frozenset(
-    {"knowledge-files-upload", "credits-export", "credits-admin-purge"}
-) | frozenset(
-    {
-        # Group 6: the credit read API.
-        "credits-summary-builder",
-        "credits-lots-builder",
-        "credits-catalog-builder",
-        "credits-summary-foreign-tenant",
-        "credits-summary-absent-tenant",
-        "credits-balance-api-key",
-    }
+_CREDIT_SURFACES = (
+    frozenset({"knowledge-files-upload", "credits-export", "credits-admin-purge"})
+    | frozenset(
+        {
+            # Group 6: the credit read API.
+            "credits-summary-builder",
+            "credits-lots-builder",
+            "credits-catalog-builder",
+            "credits-summary-foreign-tenant",
+            "credits-summary-absent-tenant",
+            "credits-balance-api-key",
+        }
+    )
+    | frozenset(
+        {
+            # creditos-cortesia: the courtesy routes of the credit admin API.
+            "credits-courtesy-grant-builder",
+            "credits-courtesy-removal-api-key",
+            "credits-courtesy-read-builder",
+        }
+    )
 )
+# creditos-cortesia: called by a builder JWT and an API key, never a super
+# admin, so the corpus writes no courtesy (the no-write and observational
+# checks stay as they are); with the switch effective the head (046) opens
+# the courtesy gate on the real reading and the refusal is the authority's.
+_COURTESY_CASES = {
+    "credits-courtesy-grant-builder": {"detail": {"code": "super_admin_jwt_required"}},
+    "credits-courtesy-removal-api-key": {"detail": {"code": "jwt_required"}},
+    "credits-courtesy-read-builder": {"detail": {"code": "super_admin_jwt_required"}},
+}
 _GROUP6_READS = (
     "credits-summary-builder",
     "credits-lots-builder",
@@ -1502,6 +1528,9 @@ async def test_the_corpus_exercises_real_answers(oracle: _Oracle) -> None:
     # Group 6: so is the credit read API, whoever asks.
     for case in (*_GROUP6_READS, *_GROUP6_FOREIGN, "credits-balance-api-key"):
         assert (status[case], body[case]) == (503, {"code": "credit_unavailable"})
+    # creditos-cortesia: and the courtesy routes.
+    for case in _COURTESY_CASES:
+        assert (status[case], body[case]) == (503, {"code": "credit_unavailable"})
 
 
 async def test_the_comparison_catches_a_real_difference(oracle: _Oracle) -> None:
@@ -1752,6 +1781,28 @@ async def test_group5_surfaces_exist_only_with_the_switch_effective(
     if export == 503:
         assert answers["credits-export"]["body"] == {"code": "credit_unavailable"}
         assert answers["credits-admin-purge"]["body"] == {"code": "credit_unavailable"}
+
+
+@pytest.mark.parametrize(
+    ("schema", "enabled", "effective"),
+    [(_BELOW, True, False), (_READY, False, False), (_READY, True, True)],
+)
+async def test_the_courtesy_routes_refuse_everyone_but_a_super_admin(
+    oracle: _Oracle, schema: str, enabled: bool, effective: bool
+) -> None:
+    """creditos-cortesia: not effective, 503 ``credit_unavailable`` for every
+    caller (no SQL, asserted by the run's statement listener); effective at
+    head (046, the courtesy gate open on the real reading), the builder JWT
+    and the API key are refused by the authority -- nothing written, which
+    the no-write check of the effective run proves."""
+
+    run = await oracle.run(schema, enabled=enabled)
+    answers = {r["id"]: r for r in run["responses"]}
+    for case, refusal in _COURTESY_CASES.items():
+        expected = (
+            (403, refusal) if effective else (503, {"code": "credit_unavailable"})
+        )
+        assert (answers[case]["status"], answers[case]["body"]) == expected, case
 
 
 _GROUP6_CASES = (*_GROUP6_READS, *_GROUP6_FOREIGN, "credits-balance-api-key")
