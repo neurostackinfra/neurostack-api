@@ -1508,7 +1508,12 @@ and 2, approved together; see "Known gap" below):
    only that day, `closed_at` 2026-11-08T23:51Z; "History (17 to 18)"): the
    reviewed manifest is at 18.
 4. Only then merge and deploy the behaviour release (PR-B), rebased on the
-   `main` that contains this release, with proof of ancestry.
+   `main` that contains this release, with proof of ancestry. Done on
+   2026-11-09: the behaviour release (`build-20261109-83d7094f-42540518012`,
+   built from `main` `83d7094f`) serves as revision 19, revision 18 with the
+   app image alone moved (deployment `ecs-svc/7245450629757675711`
+   `COMPLETED` 2026-11-09 00:40:55Z); the target then moved from 18 to 19
+   ("History (18 to 19)").
 5. Open the behaviour release's flag.
 
 **Steps 1 and 2 ran in production on 2026-11-08**, on one "vai" from the
@@ -1666,7 +1671,9 @@ changed: report and stop.
   contains `045` too, so the chain keeps the revision and the credit switch
   stays **on**; it maps neither object, so the rows the behaviour release
   wrote stay, unread. It is the rollback target once step 3 above re-pins
-  the target from 17 to the bridge revision 18, before PR-B deploys.
+  the target from 17 to the bridge revision 18, before PR-B deploys. Since
+  the re-pin 18 to 19 the target is the behaviour release's revision 19
+  itself, and the bridge revision 18 stays this way back from it.
 - **The bridge image back to the rollback target (revision 17) after the
   window.** Only while the bridge serves and the target is still 17 (before
   step 3). The schema stays valid for it (the column has a default, the
@@ -3053,12 +3060,12 @@ new target. For L2c (11 to 12) the list below was measured; for L4 (12 to
 13) it is a starting point, to confirm by running the runbook readers, since
 it depends on how L2c rewrote these tests: in
 `tests/scripts/test_asaas_migration_window.py`,
-`test_the_reviewed_manifest_is_pinned_to_revision_18` and the `MANIFEST`
+`test_the_reviewed_manifest_is_pinned_to_revision_19` and the `MANIFEST`
 line of `test_036_037_and_042_refuse_a_rollback_target_not_repinned` (for
 `042` at 12), and `test_without_a_manifest_the_tool_reads_the_reviewed_one`;
 in `tests/scripts/test_asaas_production_wiring.py`,
 `test_manifest_and_template_validate`,
-`test_rollback_target_is_re_pinned_to_revision_18_without_a_note`,
+`test_rollback_target_is_re_pinned_to_revision_19_without_a_note`,
 `test_manifest_validator_rejects_an_invalid_rollback_target`,
 `test_render_taskdef_refuses_the_image_stuck_state_with_its_reason`,
 `test_the_repository_parameters_propose_the_l2a_rows_revision`,
@@ -3176,15 +3183,49 @@ the target on 18 window `045` refuses the reviewed manifest
 (`rollback_target_not_repinned`); a manifest at 17 still passes its target
 check.
 
+**History (18 to 19).** Revision 19 (revision 18 with the app image alone
+moved to the behaviour release of envio-midia-agente,
+`build-20261109-83d7094f-42540518012`, built from `main` `83d7094f`;
+deployment `ecs-svc/7245450629757675711` `COMPLETED` 2026-11-09 00:40:55Z,
+2/2 running, 0 failed tasks, steady state through 2026-11-10 00:42Z) serves
+(step 4 of "Migration 045"). Before the next image change (the bridge image
+of creditos-cortesia, its live step L1), the manifest was re-pinned from 18
+to the serving revision 19 (that wish's live step L0b) with
+`effective_after: revision_serving_verified_and_observation_closed`, its
+image digest and its `request_sha256` (read only on 2026-11-10: `ACTIVE`,
+exactly one `BILLING_FACT_WORKER_ENABLED` `'true'`, both staged rows
+`'true'`, the complete AppConfig group; revision 19's request with the app
+image set back to revision 18's digest hashes to revision 18's recorded
+`request_sha256`, so the two differ in the app image alone). Its 6 h floor
+(2026-11-09T06:41Z) has passed, so nothing is waived. The owner's
+observation statement, limited to what the orchestrator verified on ECS:
+Revision 19 is ACTIVE; deployment `ecs-svc/7245450629757675711` is
+`COMPLETED` (2026-11-09T00:40:55Z); 2 of 2 tasks running, 0 failed tasks;
+ECS reported a steady state every 6 hours since the deploy (06:41Z, 12:41Z
+and 18:41Z on 2026-11-09, 00:42Z on 2026-11-10). Observed by a read-only ECS
+read on 2026-11-10 at 03:13Z, authorized by the owner; a read-only `plan` of
+this manifest on 2026-11-10 at 03:42Z showed
+`service_deployment:rollback_target_active_and_digest_pinned` as compliant.
+Application logs and billing counts were not inspected. The owner declared
+the observation closed at 2026-11-10T03:43Z, when approving the re-pin PR,
+the manifest's eighth `closed_at` marker. Besides the checklist above it
+also updated the 10 to 11 evidence test (one `request_sha256` per re-pin), the context line
+of `test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time`
+and the window reads of the reviewed manifest, and added
+`test_the_18_to_19_re_pin_records_its_request_sha256_and_image_digest`. With
+the target on 19 every window, `045` included, refuses the reviewed manifest
+(`rollback_target_not_repinned`); a manifest at 17 still passes window
+`045`'s target check.
+
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production
 is at `037`; they would run only after a snapshot restore, planned with a
 manifest at 10). Window `042` requires revision 12 by number and by content
 ("Window 042: migrations 038-042"). Window `045` requires revision 17 the
 same way ("Migration 045"); it ran on 2026-11-08, and since the re-pin 17 to
-18 the reviewed manifest is no window's target: production is at `045`, so
-`045` too could run again only after a snapshot restore, planned with a
-manifest at 17.
+18 (and the re-pin 18 to 19 after it) the reviewed manifest is no window's
+target: production is at `045`, so `045` too could run again only after a
+snapshot restore, planned with a manifest at 17.
 
 **The circuit breaker.** ECS rolls a failed deployment back to the last
 completed one. With this order that is the target itself for L2a (11) and

@@ -68,8 +68,10 @@ and never offers OGG or M4A. After the window:
   while the behaviour release serves: the target is re-pinned from 17 to 18
   after the window and before PR-B deploys (the planner blocks PR-B's image
   change while the target is still 17). Done: window `045` ran on
-  2026-11-08 on the bridge revision 18, and the target is 18 since the
-  eighth re-pin.
+  2026-11-08 on the bridge revision 18, and the target was 18 from the
+  eighth re-pin. The behaviour release serves as revision 19 since
+  2026-11-09, and the target is 19 since the ninth re-pin; the bridge
+  revision 18 stays the way back from the behaviour release.
 - **The bridge image back to the revision it replaced (revision 17, the
   rollback target while the bridge serves, before that re-pin) takes the
   serving image out of the chain.** That image's chain
@@ -227,13 +229,14 @@ re-pins the target to the serving revision (any revision above 13), by a
 manifest PR alone.
 
 **Revision 8 is unsafe after migration 036**: it reads columns 036 drops,
-and 036 ran on 2026-10-24, so roll back to the field's revision (18 since
-the eighth re-pin, to the serving bridge revision after window 045), never
-to 8. Read "revision R" below as the field's current value, revision 18
-(check with `plan`, `rollback_target`); it was revision 8 in phase 1,
-revision 9 in phase 2, revision 10 in phase 3, revision 11 until L2c,
-revision 12 until L4, revision 13 until the re-pin to 16, revision 16
-until the re-pin to 17 and revision 17 until the re-pin to 18. A
+and 036 ran on 2026-10-24, so roll back to the field's revision (19 since
+the ninth re-pin, to the serving revision of the behaviour release before
+the next image change), never to 8. Read "revision R" below as the field's
+current value, revision 19 (check with `plan`, `rollback_target`); it was
+revision 8 in phase 1, revision 9 in phase 2, revision 10 in phase 3,
+revision 11 until L2c, revision 12 until L4, revision 13 until the re-pin to
+16, revision 16 until the re-pin to 17, revision 17 until the re-pin to 18
+and revision 18 until the re-pin to 19. A
 failed post-deploy webhook registration (`DEPLOYED_WEBHOOK_PENDING`) is an alert, never a
 reason to roll back.
 
@@ -267,11 +270,12 @@ reason to roll back.
     --services neurostack-staging-app
   ```
 
-  `R` is the rollback target, `18` since the eighth re-pin (to the serving
-  bridge revision after window 045; it was `8` until the first re-pin
-  merged, `9` until the second, `10` until the third, `11` until the
-  fourth, `12` until the fifth, `13` until the sixth, `16` until the
-  seventh and `17` until the eighth); never `8`,
+  `R` is the rollback target, `19` since the ninth re-pin (to the serving
+  revision of the behaviour release before the next image change; it was
+  `8` until the first re-pin merged, `9` until the second, `10` until the
+  third, `11` until the fourth, `12` until the fifth, `13` until the sixth,
+  `16` until the seventh, `17` until the eighth and `18` until the ninth);
+  never `8`,
   because migration 036 has run. After L6 do not roll back by hand to R
   (13): the rendering is then R plus two flips, a dead end of more than one
   kind of change for `plan`
