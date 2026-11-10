@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Pure run tooling for the production migration windows 035, 036, 037, 042 and 045.
+"""Pure run tooling for the production migration windows 035, 036, 037, 042, 045
+and 046.
 
-Five windows, each run only on its own explicit owner instruction, each with
+Six windows, each run only on its own explicit owner instruction, each with
 one entry in ``WINDOWS`` (the single source of truth; the planner
 ``scripts/asaas_production_wiring.py`` validates the manifest steps and
 renders the migrations task definition from the same table):
@@ -14,6 +15,7 @@ window   baked command              before  after  RDS snapshot
 ``037``  ``alembic upgrade 037``    036     037    ``pre-037-<date>``
 ``042``  ``alembic upgrade 042``    037     042    ``pre-038-042-<date>``
 ``045``  ``alembic upgrade 045``    042     045    ``pre-043-045-<date>``
+``046``  ``alembic upgrade 046``    045     046    ``pre-046-<date>``
 =======  =========================  ======  =====  ========================
 
 Window ``045`` also applies ``043`` and ``044`` (the media category/MIME
@@ -50,8 +52,8 @@ always the system clock (no ``--now``).
 ``plan-post-read`` / ``render-post-read`` / ``verify-post-read``
                               ``alembic_version`` read back after the run; it
                               must be exactly the window's ``after`` (037 also
-                              reads the dropped tables gone, 045 the
-                              application role's privileges on what 045
+                              reads the dropped tables gone, 045 and 046 the
+                              application role's privileges on what each
                               adds).
 
 ``scripts/asaas_rollout_readback.py`` reuses the read machinery (program,
@@ -136,10 +138,11 @@ RULE_ZERO_COUNTS = "zero_counts"
 RULE_VERDICT_OK = "verdict_ok"
 RULE_RELATIONS_GONE = "relations_gone"
 # Every row names one object and reads true when the reading role holds every
-# privilege the next release needs on it (window 045's post-read).
+# privilege the next release needs on it (the post-reads of windows 045 and
+# 046).
 RULE_PRIVILEGES_HELD = "privileges_held"
 # 035: the service may still run the tagged revision 8 (expand-only window);
-# the migrations revision carries the bridge image. 036, 037, 042 and 045
+# the migrations revision carries the bridge image. 036, 037, 042, 045 and 046
 # (every window after the first; the table guard below refuses anything
 # else): the image containing the migration runs on every service task and is the
 # migrations revision's image, by digest, and the manifest's rollback_target
@@ -158,7 +161,10 @@ RULE_PRIVILEGES_HELD = "privileges_held"
 #   replaced comes from the planner's L2b gate (the service on the target)
 #   and the runbook's stop rule, not from this check. 045 the same way, with
 #   revision 17 (the revision serving before the media bridge image; the
-#   owner confirmed it on 2026-11-07) and the service on the bridge image.
+#   owner confirmed it on 2026-11-07) and the service on the bridge image;
+#   046 too, with revision 19 (the revision serving before the courtesy
+#   bridge image; the owner confirmed it on 2026-11-09) and the service on
+#   that bridge image.
 IMAGE_RULE_BRIDGE = "migrations_revision_on_bridge_image"
 IMAGE_RULE_DEPLOYED = "service_runs_the_migrations_image"
 ROLLBACK_LAST_SAFETY_PIN = 10
@@ -291,6 +297,18 @@ PRIVILEGES_045 = (
     "dml on public.media_deliveries",
     "dml on public.media_assets.trigger_intents",
 )
+# Window 046 (creditos-cortesia, the courtesy credit bridge release): the table
+# 046 creates counted when it already exists, the three credit CHECKs it
+# rewrites counted when they are not 045's exactly, and credit_lots.payment_id
+# counted when it is not NOT NULL as at 045 (a test keeps the SQL lists equal
+# to the migration's constants); then, after the run, the application role's
+# privileges on the append-only table 046 creates (RULE_PRIVILEGES_HELD).
+PREFLIGHT_046 = (
+    "046 tables present",
+    "credit checks not at 045",
+    "credit lot payment_id nullable",
+)
+PRIVILEGES_046 = ("select and insert on public.credit_courtesy_events",)
 
 WINDOW_035 = MigrationWindow(
     name="035",
@@ -502,10 +520,70 @@ WINDOW_045 = MigrationWindow(
         ("post_read", "S30"),
     ),
 )
+# The courtesy credit bridge release of creditos-cortesia (Group 1, PR-A):
+# migration 046 widens ck_credit_lots_kind, ck_credit_lots_source (payment_id
+# NOT NULL becomes part of it) and ck_credit_ledger_entries_type, and creates
+# the append-only table credit_courtesy_events. The bridge image maps that
+# schema in its ORM but writes and reads none of it, so it serves on either
+# schema. It runs after the bridge image serves (IMAGE_RULE_DEPLOYED: the
+# credit switch reads the schema revision against the image's own chain, and
+# an image whose chain ends at 045 turns credit off at 046), and the release
+# that writes courtesy deploys only after it. The pre-read, as the
+# application role, requires every count 0; the post-read requires the
+# revision and SELECT and INSERT (the table is append-only) on the new table,
+# as that same role (the migrations carry no GRANT).
+WINDOW_046 = MigrationWindow(
+    name="046",
+    manifest_step="migrations_046",
+    before="045",
+    after="046",
+    chain=("045", "046"),
+    command=("alembic", "upgrade", "046"),
+    snapshot_prefix="pre-046-",
+    image_rule=IMAGE_RULE_DEPLOYED,
+    # The revision serving on 2026-11-09, read on ECS (us-east-1, live step
+    # L0 of creditos-cortesia); the courtesy bridge image replaces it. The
+    # owner confirmed revision 19 on 2026-11-09 (creditos-cortesia Decision
+    # 8); the reviewed manifest is pinned to it since the re-pin 18 -> 19.
+    rollback_target_revision=19,
+    started_by="neurostack-migration-window-046",
+    pre_read=ReadSpec(
+        phase="pre",
+        sql_file="scripts/migration_046_preflight.sql",
+        rule=RULE_ZERO_COUNTS,
+        checks=PREFLIGHT_046,
+        role=READ_ROLE_APP,
+        expected_version="045",
+    ),
+    post_read=ReadSpec(
+        phase="post",
+        sql_file="scripts/migration_046_post_read.sql",
+        rule=RULE_PRIVILEGES_HELD,
+        checks=PRIVILEGES_046,
+        role=READ_ROLE_APP,
+        expected_version="046",
+    ),
+    # S31-S33 continue the numbering after window 045's S28-S30.
+    plan_steps=(
+        ("register", "S31"),
+        ("snapshot", "S31"),
+        ("pre_read", "S32"),
+        ("run", "S32"),
+        ("verify", "S33"),
+        ("post_read", "S33"),
+    ),
+)
 WINDOWS: Mapping[str, MigrationWindow] = MappingProxyType(
     {
         window.name: window
-        for window in (WINDOW_035, WINDOW_036, WINDOW_037, WINDOW_042, WINDOW_045)
+        for window in (
+            WINDOW_035,
+            WINDOW_036,
+            WINDOW_037,
+            WINDOW_042,
+            WINDOW_045,
+            WINDOW_046,
+        )
     }
 )
 # The window the VPS deploy pin (scripts/deploy-vps.sh APPROVED_ALEMBIC_REVISION)
@@ -531,7 +609,7 @@ def _assert_window_table() -> None:
 
     rows = list(WINDOWS.values())
     _require(
-        [row.name for row in rows] == ["035", "036", "037", "042", "045"]
+        [row.name for row in rows] == ["035", "036", "037", "042", "045", "046"]
         and PINNED_WINDOW in WINDOWS,
         "window_table_names",
     )
@@ -1719,13 +1797,13 @@ def _rollback_target(
     checks: hook._Checks,
     manifest: Path | None,
 ) -> dict[str, Any]:
-    """036, 037, 042 and 045: the manifest's rollback_target re-pinned,
+    """036, 037, 042, 045 and 046: the manifest's rollback_target re-pinned,
     revision ACTIVE.
 
     Read through the planner (its strict loader and full manifest validation),
     imported here only: the planner imports this module's window table.
-    Above the last safety pin (042 and 045) the target is also checked by
-    content against the service revision (_rollback_target_replaced).
+    Above the last safety pin (042, 045 and 046) the target is also checked
+    by content against the service revision (_rollback_target_replaced).
     """
 
     window = context.window
@@ -1920,9 +1998,10 @@ _READ_HEADER = re.compile(
 # labelled with the window whose schema it reads and a phase of its own. A
 # program labelled ``rollout`` is recognized only with one of these windows:
 # 037 (the schema until window 042 runs, live step L3), 042 (after it, until
-# window 045 runs) and 045 (after the media bridge window); the readback
-# names one explicitly, never by default.
-ROLLOUT_READ_WINDOWS = ("037", "042", "045")
+# window 045 runs), 045 (after the media bridge window, until window 046 runs)
+# and 046 (after the courtesy credit bridge window); the readback names one
+# explicitly, never by default.
+ROLLOUT_READ_WINDOWS = ("037", "042", "045", "046")
 ROLLOUT_READ_PHASE = "rollout"
 
 

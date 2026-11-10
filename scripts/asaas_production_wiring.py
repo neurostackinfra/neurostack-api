@@ -9,8 +9,8 @@ JSON diff: what would change, what is already compliant and what blocks.
 live D3 source revision, with secrets as ARN references only, the otel image
 pinned by digest and ``ManagedBy=manual``. ``check`` runs the existing rollout
 evidence validators against that request. ``render-migrations-taskdef
---window 035|036|037|042|045 --purpose migrate|read`` (both required, no
-default)
+--window 035|036|037|042|045|046 --purpose migrate|read`` (both required,
+no default)
 prints a new ``neurostack-staging-migrations`` revision that bakes exactly
 that window's ``alembic upgrade <window>`` (``migrate``) or, for window 037
 only, its SELECT-only readback program run as the migration role (``read``);
@@ -332,17 +332,18 @@ ADDED_ENVIRONMENT: dict[str, tuple[str, str]] = {
 ADDED_SECRETS = tuple(row[0] for row in SECRET_REFERENCES)
 FORBIDDEN_NAME_PREFIXES = ("ABACATEPAY_", "APPCONFIG_")
 FORBIDDEN_NAMES = frozenset({"SPA_ENABLED", "SPA_DIST_DIR"})
-# Five production migration windows, each its own separately approved step:
+# Six production migration windows, each its own separately approved step:
 # the window table of scripts/asaas_migration_window.py is the single source
 # (command, alembic_version before and after, snapshot name, readback, image
 # prerequisite). Each window bakes exactly ``alembic upgrade <window>``, never
 # the head, so 036 and 037 only ever run on their own owner instruction, 036
 # before 037, after a fresh SELECT showing zero legacy rows, and 042 (the
 # credit schema, 038 to 042 in one window) only after the image containing
-# 042 serves (asaas-rollout-opening, live steps L2 then L3), and 045 (the
+# 042 serves (asaas-rollout-opening, live steps L2 then L3), 045 (the
 # media bridge of envio-midia-agente, with 043 and 044, the media
 # category/MIME invariant widened for audio/ogg and audio/mp4, in one window)
-# only after the bridge image serves.
+# only after the bridge image serves, and 046 (the courtesy credit schema of
+# creditos-cortesia) only after its own bridge image serves.
 MIGRATION_WINDOWS = migration_window.WINDOWS
 STEPS: tuple[tuple[str, str], ...] = (
     ("secret_access_stack", "d3_apply"),
@@ -357,6 +358,7 @@ STEPS: tuple[tuple[str, str], ...] = (
     (migration_window.WINDOW_037.manifest_step, "separate_approval"),
     (migration_window.WINDOW_042.manifest_step, "separate_approval"),
     (migration_window.WINDOW_045.manifest_step, "separate_approval"),
+    (migration_window.WINDOW_046.manifest_step, "separate_approval"),
     ("rollout_transitions", "separate_approval"),
 )
 # What each window leaves to a later window (printed by plan).
@@ -383,7 +385,12 @@ MIGRATIONS_EXCLUDED: Mapping[str, str] = {
         "serves"
     ),
     "045": (
-        "046 and later: none is written; a later revision needs its own "
+        "046 (the courtesy credit schema of creditos-cortesia): its own window "
+        "(migrations_046), on its own explicit owner instruction after the "
+        "bridge image containing 046 serves"
+    ),
+    "046": (
+        "047 and later: none is written; a later revision needs its own "
         "window in the table"
     ),
 }

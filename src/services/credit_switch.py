@@ -7,7 +7,8 @@ both of (Decision 20):
 * ``alembic_version`` holding exactly one row whose revision belongs to this
   image's own migration chain (the ``alembic/versions`` shipped next to
   ``src``, parsed without importing it) at or after
-  ``CREDIT_SCHEMA_MIN_REVISION``, the highest credit revision of the wish.
+  ``CREDIT_SCHEMA_MIN_REVISION`` (042, the last neurostack-credit-system
+  migration; it rises only by explicit decision, see the constant).
 
 The schema is read at start-up (``src/api/main.py`` lifespan) and again every
 ``credit_switch_refresh_seconds`` by a background task, so request code never
@@ -62,8 +63,15 @@ logger = get_logger(__name__)
 
 _T = TypeVar("_T")
 
-# Highest credit migration the wish defines; every group that adds a credit
-# migration raises it (with the head pins of Group 1a's convention).
+# The oldest schema the credit code of this image runs on: 042, the last
+# migration of neurostack-credit-system.  It rises only by an explicit,
+# recorded decision, never just because a credit migration is added: with
+# the credit switch on in production, a higher minimum turns all of credit
+# off (schema_below_minimum) from the image change until the window that
+# applies it.  Credit migrations that deliberately do not raise it: 046
+# (creditos-cortesia), whose routes alone require 046 through a revision gate
+# of their own over this same reading.  tests/services/test_credit_switch.py
+# names that list.
 CREDIT_SCHEMA_MIN_REVISION: Final = "042"
 # Key of the per-request captured value in the ASGI scope state
 # (``request.state.credit_switch_effective``).

@@ -1,11 +1,12 @@
-"""Five production migration windows, each applying exactly its own revision.
+"""Six production migration windows, each applying exactly its own revision.
 
 ``035`` (migrations 033-035), ``036``, ``037``, ``042`` (migrations
-038-042, asaas-rollout-opening live step L3) and ``045`` (migrations 043-045:
+038-042, asaas-rollout-opening live step L3), ``045`` (migrations 043-045:
 the media category/MIME invariant widened for audio/ogg and audio/mp4, then
-the media bridge of envio-midia-agente) are separate manifest steps, each run only on its own
-explicit owner instruction, 036 before 037, after a fresh SELECT showing zero
-legacy rows, 042 after 037 and 045 after 042. The window table of
+the media bridge of envio-midia-agente) and ``046`` (the courtesy credit
+schema of creditos-cortesia) are separate manifest steps, each run only on
+its own explicit owner instruction, 036 before 037, after a fresh SELECT
+showing zero legacy rows, 042 after 037, 045 after 042 and 046 after 045. The window table of
 ``scripts/asaas_migration_window.py`` is the single source: one constant per
 window, each baking ``alembic upgrade <window>``. ``alembic upgrade head`` in
 any artifact that describes a production window would apply every later
@@ -90,6 +91,11 @@ RUNBOOK_WINDOW_SECTIONS = {
         "subcommands are `scripts/asaas_migration_window.py --window 045`",
         r"^### Rollback$",
     ),
+    "046": (
+        "Order (each step stops on any divergence and returns to the owner; the\n"
+        "subcommands are `scripts/asaas_migration_window.py --window 046`",
+        r"^### Rollback \(window 046\)$",
+    ),
 }
 
 
@@ -120,12 +126,13 @@ def test_no_production_migration_artifact_says_upgrade_head() -> None:
 
 
 def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
-    assert list(windows.WINDOWS) == ["035", "036", "037", "042", "045"]
+    assert list(windows.WINDOWS) == ["035", "036", "037", "042", "045", "046"]
     assert windows.WINDOWS["035"] is windows.WINDOW_035
     assert windows.WINDOWS["036"] is windows.WINDOW_036
     assert windows.WINDOWS["037"] is windows.WINDOW_037
     assert windows.WINDOWS["042"] is windows.WINDOW_042
     assert windows.WINDOWS["045"] is windows.WINDOW_045
+    assert windows.WINDOWS["046"] is windows.WINDOW_046
     assert wiring.MIGRATION_WINDOWS is windows.WINDOWS
     for name, window in windows.WINDOWS.items():
         assert window.command == ("alembic", "upgrade", name)
@@ -136,6 +143,7 @@ def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
         ("036", "037"),
         ("037", "042"),
         ("042", "045"),
+        ("045", "046"),
     ]
     assert [w.snapshot_pattern for w in windows.WINDOWS.values()] == [
         "pre-033-035-<date>",
@@ -143,6 +151,7 @@ def test_one_constant_per_window_and_the_planner_uses_that_table() -> None:
         "pre-037-<date>",
         "pre-038-042-<date>",
         "pre-043-045-<date>",
+        "pre-046-<date>",
     ]
 
 
@@ -160,7 +169,7 @@ def test_runbook_migrations_gate_pins_035_and_reads_back_alembic_version() -> No
         assert phrase in flat, phrase
 
 
-@pytest.mark.parametrize("name", ["036", "037", "042", "045"])
+@pytest.mark.parametrize("name", ["036", "037", "042", "045", "046"])
 def test_runbook_gate_of_the_later_windows_pins_their_own_revision(name: str) -> None:
     window = windows.WINDOWS[name]
     flat = " ".join(_runbook_window(name).split())
@@ -192,6 +201,11 @@ def test_runbook_gate_of_the_later_windows_pins_their_own_revision(name: str) ->
             " `044 -> 045`" in flat
         )
         assert "and both privilege rows `true`" in flat
+    elif name == "046":
+        assert "`alembic_version` == `045`, read as the application role" in flat
+        assert "every count `0` with `alembic_version` == `045`" in flat
+        assert "exactly the one upgrade line `045 -> 046`" in flat
+        assert "and the privilege row `true`" in flat
     else:
         assert "never the application role" in flat and "eleven `ok`" in flat
 
@@ -251,7 +265,7 @@ def test_deploy_vps_pin_is_the_first_window() -> None:
         assert wiring._UNPINNED_UPGRADE.search(text) is None, name
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045", "046"])
 def test_each_window_text_names_only_its_own_revision(name: str) -> None:
     window = windows.WINDOWS[name]
     texts = {
@@ -700,7 +714,7 @@ def test_runbook_migration_sections_record_036_and_037_as_applied() -> None:
     # The image smoke names the head of main, which is the tree's own head.
     flat = " ".join(raw.split())
     head = _alembic_head()
-    assert head == "045"
+    assert head == "046"
     assert flat.count("on `main` today") == flat.count(f"`{head}` on `main` today")
     assert flat.count(f"`{head}` on `main` today") == 2
 
@@ -954,8 +968,11 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "It is the rollback target once step 3 above re-pins the target from 17"
         " to the bridge revision 18, before PR-B deploys.",
         "Since the re-pin 18 to 19 the target is the behaviour release's"
-        " revision 19 itself, and the bridge revision 18 stays this way back"
-        " from it.",
+        " revision 19 itself, the way back from the courtesy credit bridge"
+        ' only until window `046` runs ("Migration 046"); after it neither 19'
+        " nor the bridge revision 18 is, since both images' chains end at"
+        " `045` and either would turn credit off: the way back is a forward"
+        " fix to the courtesy credit bridge image.",
         "**The bridge image back to the rollback target (revision 17) after the"
         " window.**",
         "reads `revision_outside_image_chain` and stays **off**",
@@ -981,8 +998,12 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "Done: window `045` ran on 2026-11-08 on the bridge revision 18, and the"
         " target was 18 from the eighth re-pin.",
         "The behaviour release serves as revision 19 since 2026-11-09, and the"
-        " target is 19 since the ninth re-pin; the bridge revision 18 stays the"
-        " way back from the behaviour release.",
+        " target is 19 since the ninth re-pin. Revision 19 is the way back from"
+        " the courtesy credit bridge only until window `046` runs"
+        ' ("Migration 046" below); after it neither 19 nor the bridge revision'
+        " 18 is, since both images' chains end at `045` and either would turn"
+        " credit off: the way back is a forward fix to the courtesy credit"
+        " bridge image.",
         "takes the serving image out of the chain.**",
         "its credit switch reads `revision_outside_image_chain` and stays **off**",
         "**The migrations come back only by a restore** of the window's snapshot"
@@ -991,3 +1012,85 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "`044`'s and `043`'s fail while an `audio/mp4` or `audio/ogg` asset" " exists",
     ):
         assert phrase in text, phrase
+
+
+def test_runbooks_state_the_046_bridge_order_and_both_rollbacks() -> None:
+    """Migration 046 ships in a bridge release (creditos-cortesia Decision
+    2): its section gives the production order (re-pin 18 -> 19, bridge
+    image, window with the pre-046 snapshot, re-pin to the bridge revision,
+    only then PR-B), the confirmed revision 19, and the rollbacks in both
+    runbooks: PR-B back to the bridge keeps credit on (and what the bridge
+    does with courtesy rows); the bridge back after the window turns it off
+    (revision_outside_image_chain); the way back is a forward fix; the last
+    resort is restoring pre-046-<date> by owner decision; never an Alembic
+    downgrade in production, the 55000 refusal being only a dev/test
+    guard."""
+
+    raw = _text(RUNBOOK)
+    section = " ".join(_section(raw, "## Migration 046: ", r"^## ").split())
+    order = [
+        "0. Read production, read only (live step L0)",
+        "1. Re-pin the manifest's rollback target from 18 to the serving"
+        " revision 19",
+        "2. Deploy the bridge image (live step L1)",
+        "3. Run window `046` (below) on that image, with the rollback target 19",
+        "4. Re-pin the rollback target from 19 to the bridge revision",
+        "5. Only then deploy the courtesy release (PR-B, live step L4).",
+    ]
+    positions = [section.index(step) for step in order]
+    assert positions == sorted(positions)
+    for phrase in (
+        "**The bridge image maps that schema in its ORM**",
+        "**but no code of it writes or reads courtesy**",
+        "`revision_outside_image_chain`, and the switch turns **off**",
+        "`CREDIT_SCHEMA_MIN_REVISION` stays `042`",
+        "**Revision 19 is confirmed**",
+        "`rollback_target_not_repinned_before_image_bump`",
+        "the manual RDS snapshot `pre-046-<date>`",
+        "bounds each lock **wait**, not a statement or the run",
+        "SQLSTATE `55P03` (lock timeout) or `40P01` (deadlock) means nothing"
+        " changed",
+        "`credit checks not at 045` is `3` minus the number of the CHECKs",
+        "`has_table_privilege` with a list (`'SELECT,INSERT'`) is true when"
+        " **any** of them is held",
+        "`read_privilege_not_held:<check>`",
+    ):
+        assert phrase in section, phrase
+    rollback = " ".join(_section(raw, "### Rollback (window 046)\n", r"^## ").split())
+    for phrase in (
+        "**Before the window (after step 2, before step 3): the bridge image"
+        " back to revision 19.**",
+        "**The courtesy release (PR-B) back to the bridge image: credit stays" " on.**",
+        "the bridge's `_funded_mc` does not subtract a `courtesy_removal`",
+        "`/v1/credits/summary` (the read `/billing` makes)",
+        "**The bridge image back to revision 19 after the window: credit turns"
+        " off.**",
+        "reads `revision_outside_image_chain` and stays **off**",
+        "**The way back is a forward fix**",
+        "**Never an Alembic downgrade in production.**",
+        "that refusal is a dev and test guard, not a production way back",
+        "restoring the snapshot `pre-046-<date>` (taken at `045`), an owner"
+        " decision of last resort",
+    ):
+        assert phrase in rollback, phrase
+    text = " ".join(_text(ROLLBACK_RUNBOOK).split())
+    assert "Never downgrade the schema as part of a rollback" in text
+    rollback_046 = " ".join(
+        _section(_text(ROLLBACK_RUNBOOK), "## Migration 046: ", r"^## ").split()
+    )
+    for phrase in (
+        "## Migration 046: the courtesy credit bridge release and the courtesy"
+        " release",
+        "**Rolling PR-B back to the bridge image keeps credit on.**",
+        "the credit switch stays **on**",
+        "**Rolling the bridge back after the window turns credit off.**",
+        "reads `revision_outside_image_chain` and stays **off**",
+        "**The way back is a forward fix**",
+        "the window's snapshot `pre-046-<date>` (taken at `045`)",
+        "by owner decision, as a last resort",
+        "**Never an Alembic downgrade in production**",
+        "is only a dev and test guard",
+        "the bridge's `_funded_mc` does not subtract a `courtesy_removal`",
+        "`/v1/credits/summary` (the read `/billing` makes)",
+    ):
+        assert phrase in rollback_046, phrase

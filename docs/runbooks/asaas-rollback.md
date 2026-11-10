@@ -70,8 +70,12 @@ and never offers OGG or M4A. After the window:
   change while the target is still 17). Done: window `045` ran on
   2026-11-08 on the bridge revision 18, and the target was 18 from the
   eighth re-pin. The behaviour release serves as revision 19 since
-  2026-11-09, and the target is 19 since the ninth re-pin; the bridge
-  revision 18 stays the way back from the behaviour release.
+  2026-11-09, and the target is 19 since the ninth re-pin. Revision 19 is
+  the way back from the courtesy credit bridge only until window `046`
+  runs ("Migration 046" below); after it neither 19 nor the bridge revision
+  18 is, since both images' chains end at `045` and either would turn
+  credit off: the way back is a forward fix to the courtesy credit bridge
+  image.
 - **The bridge image back to the revision it replaced (revision 17, the
   rollback target while the bridge serves, before that re-pin) takes the
   serving image out of the chain.** That image's chain
@@ -89,6 +93,55 @@ and never offers OGG or M4A. After the window:
   production (with nothing changed, `045`'s refuses while `media_deliveries`
   holds a row or a media asset has trigger intents, and `044`'s and `043`'s
   fail while an `audio/mp4` or `audio/ogg` asset exists).
+
+## Migration 046: the courtesy credit bridge release and the courtesy release
+
+Migration `046` (creditos-cortesia) ships in a bridge release of its own:
+its image contains `046` and its ORM describes the courtesy schema (the
+`courtesy` lot kind, the `courtesy_removal` ledger entry and the table
+`credit_courtesy_events`), but no code of it writes or reads courtesy.
+Window `046` applies it once that image serves, and only then is the
+courtesy release (PR-B, the image whose admin routes grant and remove
+courtesy credits) deployed ([`asaas-deployment.md`](./asaas-deployment.md),
+"Migration 046").
+
+Before the window (the bridge image serving on `045`), the bridge image back
+to the revision it replaced (revision 19, the rollback target since the
+ninth re-pin) is an ordinary image rollback: the schema did
+not change, `045` is in both images' chains, and the credit switch stays
+**on**. After the window:
+
+- **Rolling PR-B back to the bridge image keeps credit on.** The bridge
+  image contains `046`, so its migration chain keeps the database's revision
+  and the credit switch stays **on**. It is the rollback target while PR-B
+  serves: the target is re-pinned from 19 to the bridge revision after the
+  window and before PR-B deploys (the planner blocks PR-B's image change
+  while the target is still 19). The courtesy rows PR-B wrote stay
+  (append-only, valid under the `046` CHECKs), and the bridge image does not
+  know them: for a builder holding a courtesy lot, its
+  `/v1/credits/summary` (the read `/billing` makes), `/v1/credits/balance`,
+  `/v1/credits/lots` and `/v1/credits/expiries` fail (the bridge's `LotKind`
+  refuses the `courtesy` kind). For a builder with courtesy removals, the
+  bridge's `_funded_mc` does not subtract a `courtesy_removal`, so the
+  capacity in force, `used_percent` and the 50/90/100 thresholds count an
+  amount removed as still funded, and debits can consume it (a
+  10,000-credit lot with 6,000 removed reads 10,000 again). Builders without
+  a courtesy lot are unaffected. Give no courtesy while the bridge serves,
+  and prefer going forward to a fixed courtesy release.
+- **Rolling the bridge back after the window turns credit off.** The bridge
+  image back to revision 19 (the rollback target while the bridge serves,
+  before that re-pin) takes the serving image out of the chain: that image's
+  chain ends at `045` while the database reads `046`, so its credit switch
+  reads `revision_outside_image_chain` and stays **off** (credit routes
+  answer 503 `credit_unavailable`) until an image containing `046` serves
+  again. **The way back is a forward fix**: the bridge image again, or a
+  corrected image that contains `046`.
+- **The migration comes back only by a restore**, by owner decision, as a
+  last resort: the window's snapshot `pre-046-<date>` (taken at `045`), as
+  after every window; it loses every write made after it. **Never an
+  Alembic downgrade in production**: the `046` downgrade's refusal (SQLSTATE
+  `55000`, nothing changed, while any courtesy lot, `courtesy_removal` entry
+  or event exists) is only a dev and test guard.
 
 ## Current state (2026-10-25)
 

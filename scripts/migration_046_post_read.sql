@@ -1,0 +1,18 @@
+-- SELECT-only readback after the courtesy credit migration (window 046).
+--
+-- scripts/asaas_migration_window.py (render-post-read --window 046) runs it
+-- in a read task, as the application role, inside a REPEATABLE READ, READ
+-- ONLY transaction that is always rolled back; the same task reads
+-- alembic_version, which must be 046.  The migrations carry no GRANT: the
+-- application role reaches a new table through the migration role's default
+-- privileges.  So, after the run, the row asks whether the role this read
+-- runs as (the DML application role of the read family) holds every
+-- privilege the courtesy release needs on the one table 046 creates:
+-- SELECT and INSERT on credit_courtesy_events (append-only by trigger, so
+-- neither UPDATE nor DELETE is needed).  One call per privilege, joined with
+-- AND: has_table_privilege with a list of privileges ('SELECT,INSERT') is
+-- true when ANY of them is held.  The table is looked up by OID, so a table
+-- that does not exist reads NULL instead of failing the read.  The row must
+-- read held = true, or stop and return to the owner before the courtesy
+-- release.  docs/runbooks/asaas-deployment.md ("Migration 046").
+SELECT 'select and insert on public.credit_courtesy_events' AS check_name, has_table_privilege(current_user, to_regclass('public.credit_courtesy_events'), 'SELECT') AND has_table_privilege(current_user, to_regclass('public.credit_courtesy_events'), 'INSERT') AS held;

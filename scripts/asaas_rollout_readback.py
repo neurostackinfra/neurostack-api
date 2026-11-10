@@ -5,8 +5,8 @@ The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one
 read of the production database after the final deploy: ``alembic_version``
 is the chosen window's revision (``--window 037`` until the 038-042 window
 has run, live step L3 of asaas-rollout-opening, ``--window 042`` after it
-until window 045 has run, ``--window 045`` after that; required, no
-default); every row of ``billing_rollout_control`` (the four environments)
+until window 045 has run, ``--window 045`` after that until window 046 has
+run, ``--window 046`` after that; required, no default); every row of ``billing_rollout_control`` (the four environments)
 is ``disabled`` with ``topup_commercial_enabled`` false; the four tables and
 ten functions migration 037 dropped are absent; ``billing_subscriptions``
 and ``billing_checkout_sessions`` are empty. It shows that state at the
@@ -36,7 +36,7 @@ requests and verifies results. There is no ``--now``: ``plan`` and
 read the clock at all, it judges every time against the recorded reads'
 ``captured_at_utc`` and the task's own timestamps.
 
-Every subcommand takes ``--window 037|042|045`` (required, given once): the
+Every subcommand takes ``--window 037|042|045|046`` (required, given once): the
 program carries it as its label, the read must see exactly that revision, and
 a request, task or file rendered for another window never verifies.
 
@@ -96,8 +96,8 @@ CLIENT_TOKEN_PREFIX = "rollout-readback-"
 # readback's own phase (scripts/asaas_migration_window.py recognizes these
 # pairs, and only these, as a read program). The window is always chosen
 # explicitly (``--window``, required): 037 until window 042 has run (live
-# step L3), 042 after it until window 045 has run, 045 after that. Nothing
-# here defaults to any of them.
+# step L3), 042 after it until window 045 has run, 045 after it until window
+# 046 has run, 046 after that. Nothing here defaults to any of them.
 READ_WINDOWS: Mapping[str, mw.MigrationWindow] = MappingProxyType(
     {name: mw.WINDOWS[name] for name in mw.ROLLOUT_READ_WINDOWS}
 )
@@ -209,7 +209,8 @@ def _require(condition: bool, reason: str) -> None:
 
 
 def read_window(value: Any) -> mw.MigrationWindow:
-    """The window the readback was explicitly chosen for (037, 042 or 045)."""
+    """The window the readback was explicitly chosen for (037, 042, 045 or
+    046)."""
 
     _require(isinstance(value, str) and value in READ_WINDOWS, "read_window_unknown")
     return READ_WINDOWS[str(value)]
@@ -952,8 +953,8 @@ def _parser() -> mw._Parser:
         sub = subparsers.add_parser(name)
         add = sub.add_argument
         # Required, no default, given once: 037 before window 042 ran, 042
-        # after it until window 045 ran, 045 after that, always the
-        # operator's explicit choice.
+        # after it until window 045 ran, 045 after it until window 046 ran,
+        # 046 after that, always the operator's explicit choice.
         add("--window", required=True, choices=tuple(READ_WINDOWS), action=mw._Once)
         add("--readback-file", type=Path, required=True, action=mw._Once)
         add("--service-task-definition", required=True, action=mw._Once)

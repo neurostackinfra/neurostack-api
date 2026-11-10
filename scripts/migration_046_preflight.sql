@@ -1,0 +1,33 @@
+-- SELECT-only preflight before migration window 046 (courtesy credit).
+--
+-- scripts/asaas_migration_window.py (render-pre-read --window 046) runs it in
+-- a read task, as the application role, inside a REPEATABLE READ, READ ONLY
+-- transaction that is always rolled back, right before the window; the same
+-- task reads alembic_version, which must be 045.  Migration 046 rewrites
+-- three credit CHECKs, relaxes one NOT NULL and creates one table, so the
+-- start state is the 045 schema exactly where it touches it, and every count
+-- must be 0, or stop and return to the owner:
+--
+-- * '046 tables present' counts the tables 046 creates (CREATED_TABLES) that
+--   already exist;
+-- * 'credit checks not at 045' is 3 minus the number of the CHECKs 046
+--   rewrites (REWRITTEN_CHECKS) that exist, validated, with the definition
+--   045 has (written by 038), as pg_get_constraintdef prints it on
+--   PostgreSQL 16 (production runs RDS PostgreSQL 16) byte for byte: 046
+--   drops and re-creates each wider, so no row the 045 CHECKs admit can stop
+--   it, but a missing one fails its DROP (42704) and a drifted one is
+--   silently replaced, or fails the new one's validation (23514);
+-- * 'credit lot payment_id nullable' is 0 only when credit_lots.payment_id
+--   (RELAXED_COLUMNS) exists and is NOT NULL, as at 045 (046 relaxes it into
+--   a per-kind CHECK).
+--
+-- The rows count catalog objects, not table rows, so row-level security
+-- cannot hide one.  Every name is schema-qualified.
+-- docs/runbooks/asaas-deployment.md ("Migration 046") shows this query byte
+-- for byte below these comment lines; tests/scripts/test_asaas_migration_window.py
+-- keeps the two equal and every list equal to the migration's constants, and
+-- tests/integration/test_credit_courtesy_migration_postgres.py reads 0 with it
+-- at 045 and not 0 once the start state is not 045's.
+SELECT '046 tables present' AS check_name, count(*) AS found FROM unnest(ARRAY['public.credit_courtesy_events']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT 'credit checks not at 045', 3 - count(*) FROM (VALUES ('public.credit_lots', 'ck_credit_lots_kind', 'CHECK (((lot_kind)::text = ANY ((ARRAY[''monthly''::character varying, ''topup''::character varying])::text[])))'), ('public.credit_lots', 'ck_credit_lots_source', 'CHECK (((((lot_kind)::text = ''monthly''::text) AND (subscription_id IS NOT NULL) AND (cycle_start IS NOT NULL) AND (cycle_end IS NOT NULL) AND (cycle_start < cycle_end) AND (order_id IS NULL)) OR (((lot_kind)::text = ''topup''::text) AND (order_id IS NOT NULL) AND (subscription_id IS NULL) AND (cycle_start IS NULL) AND (cycle_end IS NULL))))'), ('public.credit_ledger_entries', 'ck_credit_ledger_entries_type', 'CHECK (((entry_type)::text = ANY ((ARRAY[''grant''::character varying, ''debit''::character varying, ''expiry''::character varying, ''reversal''::character varying, ''debt''::character varying, ''debt_settlement''::character varying, ''debt_release''::character varying, ''settlement_release''::character varying, ''lot_regrant''::character varying])::text[])))')) AS expected(relation, name, definition) JOIN pg_catalog.pg_constraint AS con ON con.conrelid = to_regclass(expected.relation) AND con.conname = expected.name WHERE con.contype = 'c' AND con.convalidated AND pg_catalog.pg_get_constraintdef(con.oid) = expected.definition
+UNION ALL SELECT 'credit lot payment_id nullable', 1 - count(*) FROM (VALUES ('public.credit_lots', 'payment_id')) AS relaxed(relation, name) JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = to_regclass(relaxed.relation) AND attribute.attname = relaxed.name WHERE attribute.attnum > 0 AND NOT attribute.attisdropped AND attribute.attnotnull;

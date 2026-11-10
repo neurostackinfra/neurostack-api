@@ -88,8 +88,9 @@ def test_036_revises_035_and_037_follows_it(migration: ModuleType) -> None:
     # Group 4b: 040 (additional object copies) follows 039; Group 5: 041
     # (lifecycle, legal hold, purge and roles) follows 040; 043 (audio/ogg) and
     # 044 (audio/mp4) widen the media category/MIME invariant;
-    # envio-midia-agente: 045 (the media bridge) follows 044 and is the head.
-    assert current_head() == "045"
+    # envio-midia-agente: 045 (the media bridge) follows 044;
+    # creditos-cortesia: 046 (courtesy credit) follows 045 and is the head.
+    assert current_head() == "046"
 
 
 def test_frozen_file_is_pinned_rendered_and_outside_versions(

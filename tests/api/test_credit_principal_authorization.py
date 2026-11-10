@@ -695,8 +695,10 @@ def test_the_credit_tables_exist_in_this_database(client: Any) -> None:
     """The row-count probe is not vacuous: every credit table is there."""
 
     # 15 of migration 038, three 039 inventory, three 040 copy tables,
-    # thirteen 041 lifecycle/hold/purge/role tables, and the immutable
-    # cutoff-acceptance table added by 042 (Group 7).
-    assert len(_CREDIT_TABLES) == 35
+    # thirteen 041 lifecycle/hold/purge/role tables, the immutable
+    # cutoff-acceptance table added by 042 (Group 7), and the append-only
+    # courtesy event table added by 046 (creditos-cortesia).
+    assert len(_CREDIT_TABLES) == 36
     assert "credit_cutoff_acceptances" in _CREDIT_TABLES
+    assert "credit_courtesy_events" in _CREDIT_TABLES
     assert client._submit(_credit_row_counts()) == dict.fromkeys(_CREDIT_TABLES, 0)

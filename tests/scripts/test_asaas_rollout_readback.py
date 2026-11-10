@@ -6,9 +6,10 @@ a database. The read program output the verifier classifies is real:
 rendered program printed against a disposable PostgreSQL 16 cluster (at 036,
 at 037, row-level security on, one row opened to ``general``; and, for the
 windows the readback is chosen for, ``--window 037`` before the 038-042
-window, ``--window 042`` after it and ``--window 045`` after the media
-bridge window, each program on its neighbour's schema and the 042 and 045
-programs on their own).
+window, ``--window 042`` after it, ``--window 045`` after the media bridge
+window and ``--window 046`` after the courtesy credit bridge window, each
+program on its neighbour's schema and the 042, 045 and 046 programs on their
+own).
 """
 
 from __future__ import annotations
@@ -190,6 +191,7 @@ GOOD_RUN = {
     "037": "rollout_at_037",
     "042": "rollout_042_at_042",
     "045": "rollout_045_at_045",
+    "046": "rollout_046_at_046",
 }
 
 
@@ -511,7 +513,7 @@ def _sql_tokens(sql: str) -> list[str]:
     return re.findall(r"[A-Za-z_][A-Za-z0-9_]*|::|\S", text)
 
 
-@pytest.mark.parametrize("window", ["037", "042", "045"])
+@pytest.mark.parametrize("window", ["037", "042", "045", "046"])
 def test_the_rendered_program_is_select_only_and_read_only(
     tmp_path: Path, window: str
 ) -> None:
@@ -626,7 +628,7 @@ def test_the_expected_table_is_the_criterion() -> None:
     ]
     # One spec per window, the same SQL, rule, checks and role: only the
     # revision the read must see differs, and it is the window's "after".
-    assert tuple(rr.READ_WINDOWS) == tuple(rr.SPECS) == ("037", "042", "045")
+    assert tuple(rr.READ_WINDOWS) == tuple(rr.SPECS) == ("037", "042", "045", "046")
     for name, spec in rr.SPECS.items():
         assert rr.READ_WINDOWS[name] is mw.WINDOWS[name]
         assert spec.expected_version == mw.WINDOWS[name].after == name
@@ -648,14 +650,14 @@ def test_the_fixture_was_captured_with_this_payload() -> None:
         assert (begin["window"], begin["phase"]) == (window, "rollout"), name
 
 
-def test_the_rollout_label_is_recognized_only_with_windows_037_042_045() -> None:
+def test_the_rollout_label_is_recognized_only_with_windows_037_042_045_046() -> None:
     program = rr.read_program(rr.READ_WINDOWS["037"])
     assert mw.normalized_read_command(["python", "-c", program]) is not None
     for window in ("035", "036"):
         relabelled = program.replace("W='037'", f"W='{window}'", 1)
         assert mw.normalized_read_command(["python", "-c", relabelled]) is None
     # The programs differ in that label alone.
-    for window in ("042", "045"):
+    for window in ("042", "045", "046"):
         other = rr.read_program(rr.READ_WINDOWS[window])
         assert other == program.replace("W='037'", f"W='{window}'", 1) != program
         assert mw.normalized_read_command(["python", "-c", other]) is not None
@@ -798,7 +800,7 @@ def test_the_window_is_an_explicit_required_option(
     for name, sub in subparsers.choices.items():
         (window,) = [a for a in sub._actions if "--window" in a.option_strings]
         assert window.required is True and window.default is None, name
-        assert tuple(window.choices) == ("037", "042", "045"), name
+        assert tuple(window.choices) == ("037", "042", "045", "046"), name
     args = World().args(tmp_path)
     without = args[2:]
     assert args[:2] == ["--window", "037"]
@@ -807,6 +809,7 @@ def test_the_window_is_an_explicit_required_option(
         ["plan", "--window", "036", *without],
         ["plan", "--window", "038", *without],
         ["plan", "--window", "044", *without],
+        ["plan", "--window", "047", *without],
         ["plan", *args, "--window", "042"],
     ):
         code, out, err = run_cli(argv, capsys)
@@ -1282,6 +1285,21 @@ def test_verify_on_the_045_capture_is_verified(tmp_path: Path) -> None:
     assert "Read in that transaction: alembic_version 045. " in result["verdict"]
 
 
+def test_verify_on_the_046_capture_is_verified(tmp_path: Path) -> None:
+    """After window 046 (the courtesy credit bridge) only --window 046
+    verifies: 045's program there stops on the revision (test below), and
+    046 changes none of the facts the readback reads."""
+
+    result = recorded(tmp_path, window="046").verify(tmp_path)
+    assert result["outcome"] == "verified", result["reasons"]
+    assert result["reasons"] == [] and result["alert"] is False
+    assert result["window"] == "046"
+    assert result["expected_alembic_version"] == "046"
+    assert result["alembic_version"] == ["046"]
+    assert result["facts"] == recorded(tmp_path).verify(tmp_path)["facts"]
+    assert "Read in that transaction: alembic_version 046. " in result["verdict"]
+
+
 @pytest.mark.parametrize(
     "window,run,version",
     [
@@ -1289,14 +1307,16 @@ def test_verify_on_the_045_capture_is_verified(tmp_path: Path) -> None:
         ("037", "rollout_037_at_042", ["042"]),
         ("045", "rollout_045_at_042", ["042"]),
         ("042", "rollout_042_at_045", ["045"]),
+        ("046", "rollout_046_at_045", ["045"]),
+        ("045", "rollout_045_at_046", ["046"]),
     ],
 )
 def test_each_window_stops_on_the_other_schema(
     tmp_path: Path, window: str, run: str, version: list[str]
 ) -> None:
     """Real runs: each program, on a neighbouring window's schema, stops on
-    the revision alone (every other fact reads the same at 037, 042 and
-    045)."""
+    the revision alone (every other fact reads the same at 037, 042, 045
+    and 046)."""
 
     result = recorded(tmp_path, _lines(run), window=window).verify(tmp_path)
     _stopped_with(result, "read_alembic_version_mismatch")
@@ -2074,11 +2094,15 @@ def test_the_runbook_section_matches_the_tool() -> None:
         "billing_checkout_sessions_not_empty",
         "tests/integration/test_rollout_readback_postgres.py",
         # The window is chosen explicitly, in the commands too.
-        "**Three windows, chosen explicitly.** Every subcommand requires "
+        "**Four windows, chosen explicitly.** Every subcommand requires "
         "`--window`, given once and with no default",
         "and `045` once window `045` (the media bridge release, "
         '"Migration 045") has run',
         "for `--window 045`, which runs only after window `045`, the revision "
+        "serving then",
+        "and `046` once window `046` (the courtesy credit bridge release, "
+        '"Migration 046") has run',
+        "for `--window 046`, which runs only after window `046`, the revision "
         "serving then",
         'args=(--window "$W"',
         # The serving revision is a variable: :11 before L2a, the L2b
@@ -2104,8 +2128,10 @@ def test_the_runbook_section_matches_the_tool() -> None:
         assert fragment in flat, fragment
     assert "--service-task-definition arn:" not in flat
     assert "A file, a RunTask or a task rendered for one window" not in flat
-    # The superseded two-window paragraph (window 045 had no readback).
+    # The superseded two- and three-window paragraphs (windows 045 and 046
+    # had no readback at first).
     assert "**Two windows, chosen explicitly.**" not in flat
+    assert "**Three windows, chosen explicitly.**" not in flat
     # The superseded claim that the system clock judges every subcommand.
     assert "(the system clock judges freshness)" not in flat
     for check, subject, value in rr.EXPECTED_TABLE:

@@ -168,10 +168,13 @@ from src.repositories.billing import billing_advisory_key
 
 # Direction of each entry type on a lot's available balance and on the
 # builder's open debt.  ``debt_settlement`` moves both: the settling lot pays
-# the debt.  Every type in LEDGER_ENTRY_TYPES appears at least once
-# (tests/models/test_credit_models.py).
+# the debt.  ``courtesy_removal`` (migration 046) takes millicredits off a
+# courtesy lot; no writer exists until the courtesy service does.  Every type
+# in LEDGER_ENTRY_TYPES appears at least once (tests/models/test_credit_models.py).
 LOT_INCREASES: Final = frozenset({"grant", "settlement_release", "lot_regrant"})
-LOT_DECREASES: Final = frozenset({"debit", "expiry", "reversal", "debt_settlement"})
+LOT_DECREASES: Final = frozenset(
+    {"debit", "expiry", "reversal", "debt_settlement", "courtesy_removal"}
+)
 DEBT_INCREASES: Final = frozenset({"debt"})
 DEBT_DECREASES: Final = frozenset({"debt_settlement", "debt_release"})
 

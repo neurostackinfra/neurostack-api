@@ -127,15 +127,45 @@ def test_the_image_chain_is_this_repository_s_linear_chain() -> None:
     assert chain.index("037") + 5 == chain.index(CREDIT_SCHEMA_MIN_REVISION)
 
 
-def test_the_minimum_is_the_highest_credit_revision_of_the_wish() -> None:
-    credit_revisions = [
+# Credit migrations that deliberately do NOT raise CREDIT_SCHEMA_MIN_REVISION
+# (creditos-cortesia, Decision 5): with the credit switch on in production, a
+# higher minimum would turn all of credit off from the image change until the
+# window that applies it, so such a migration gates only its own routes, on
+# the same switch reading.  A new credit migration either joins this list or
+# raises the minimum: both are explicit decisions, never a silent "fix".
+CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM = ("046",)
+
+
+def test_the_minimum_is_042_and_rises_only_by_explicit_decision() -> None:
+    """Rewritten on purpose (creditos-cortesia, Decision 5) from
+    ``test_the_minimum_is_the_highest_credit_revision_of_the_wish``, whose
+    rule ("every credit migration raises the minimum") 046 retires: the
+    minimum stays 042 with head 046, every credit migration above it is named
+    in CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM, and the minimum is still the
+    highest credit revision outside that list."""
+
+    credit_revisions = {
         revision
         for name, (revision, _down) in migration_revisions().items()
         if "_credit_" in name
-    ]
+    }
     assert credit_revisions
     chain = load_image_migration_chain()
-    assert CREDIT_SCHEMA_MIN_REVISION == max(credit_revisions, key=chain.index)
+    assert CREDIT_SCHEMA_MIN_REVISION == "042"
+    assert current_head() == "046"
+    above = sorted(
+        (
+            revision
+            for revision in credit_revisions
+            if chain.index(revision) > chain.index(CREDIT_SCHEMA_MIN_REVISION)
+        ),
+        key=chain.index,
+    )
+    assert tuple(above) == CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM
+    assert CREDIT_SCHEMA_MIN_REVISION == max(
+        credit_revisions - set(CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM),
+        key=chain.index,
+    )
 
 
 def _script(revision: str, down: str | None) -> str:
@@ -219,11 +249,15 @@ def test_schema_verdict_matrix(
     assert (reading.effective, reading.reason) == (effective, reason)
 
 
-def test_revision_045_under_the_bridge_image_chain_is_on() -> None:
-    """Window 045 (envio-midia-agente, the media bridge, with 043 and 044)
-    runs only after the image containing 045 serves: on this repository's own
-    chain, a database at 045 keeps the credit switch on (the minimum stays
-    042)."""
+@pytest.mark.parametrize("revision", ["045", "046"])
+def test_revision_046_under_the_bridge_image_chain_is_on(revision: str) -> None:
+    """Rewritten on purpose (creditos-cortesia, Decision 5) from
+    ``test_revision_045_under_the_bridge_image_chain_is_on``: the bridge
+    image of creditos-cortesia (PR-A) carries 046, so its chain ends at 046,
+    and the credit switch stays on with the database at 045 (before window
+    046) and at 046 (after it).  Rolling the code release back to this
+    bridge image after the window therefore keeps credit on (the minimum
+    stays 042)."""
 
     chain = load_image_migration_chain()
     assert chain[chain.index(CREDIT_SCHEMA_MIN_REVISION) :] == (
@@ -231,9 +265,26 @@ def test_revision_045_under_the_bridge_image_chain_is_on() -> None:
         "043",
         "044",
         "045",
+        "046",
     )
-    reading = evaluate_schema_revision(("045",), chain, CREDIT_SCHEMA_MIN_REVISION)
-    assert (reading.effective, reading.reason) == (True, "schema_ready")
+    assert chain[-1] == "046"
+    reading = evaluate_schema_revision((revision,), chain, CREDIT_SCHEMA_MIN_REVISION)
+    assert reading == CreditSwitchReading(True, "schema_ready", revision)
+
+
+def test_revision_046_under_an_image_chain_without_046_is_off() -> None:
+    """The forbidden order of creditos-cortesia (DESIGN Decision 17): window
+    046 run under an image whose chain ends before 046 (today's serving
+    image, or the bridge image rolled back to it after the window) takes the
+    database outside that image's chain and turns all of credit off."""
+
+    chain = load_image_migration_chain()
+    without_046 = chain[: chain.index("046")]
+    assert without_046[-1] == "045" and "046" not in without_046
+    reading = evaluate_schema_revision(
+        ("046",), without_046, CREDIT_SCHEMA_MIN_REVISION
+    )
+    assert reading == CreditSwitchReading(False, "revision_outside_image_chain", "046")
 
 
 @pytest.mark.parametrize("last", ["042", "043", "044"])

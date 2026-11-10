@@ -917,7 +917,7 @@ restored guards refuse what they refused.
 
 ## Migration windows: the run tooling
 
-Five production migration windows, each its own manifest step and each run
+Six production migration windows, each its own manifest step and each run
 only on its own explicit owner instruction, in this order. The window table
 of `scripts/asaas_migration_window.py` (`WINDOWS`) is the only source: the
 planner validates the manifest steps against it and renders each window's
@@ -930,6 +930,7 @@ migrations revision from it.
 | `037` | `migrations_037` | S23-S24 | `alembic upgrade 037` | `036`, `037` | `pre-037-<date>` | `scripts/migration_037_readback.sql`, **migration role**, on the window's read revision | as for 036, with the image containing 037, carried by both the read and the migrate revision; `rollback_target` revision 10, `ACTIVE` (by number) |
 | `042` | `migrations_038_042` | S25-S27 | `alembic upgrade 042` | `037`, `042` | `pre-038-042-<date>` | `scripts/migration_038_042_preflight.sql`, application role | as for 036, with the image containing 042 (live step L2b of asaas-rollout-opening), carried by the migrate revision; `rollback_target` revision 12 (L2a's, re-pinned in L2c), `ACTIVE`, and by content: the worker `'true'` exactly once, and the service revision (L2b's) differing from it in the app image alone |
 | `045` | `migrations_043_045` | S28-S30 | `alembic upgrade 045` | `042`, `045` | `pre-043-045-<date>` | `scripts/migration_043_045_preflight.sql`, application role | as for 042, with the media bridge image containing 045 (envio-midia-agente Group 1; the window also applies 043 and 044, the media category/MIME invariant widened for `audio/ogg` and `audio/mp4`, which have no window of their own), carried by the migrate revision; `rollback_target` revision 17 (the revision the bridge image replaces), `ACTIVE`, and by the same content: the worker `'true'` exactly once, and the service revision (the bridge revision) differing from it in the app image alone |
+| `046` | `migrations_046` | S31-S33 | `alembic upgrade 046` | `045`, `046` | `pre-046-<date>` | `scripts/migration_046_preflight.sql`, application role | as for 045, with the courtesy credit bridge image containing 046 (creditos-cortesia Group 1), carried by the migrate revision; `rollback_target` revision 19 (the revision the bridge image replaces), `ACTIVE`, and by the same content: the worker `'true'` exactly once, and the service revision (the bridge revision) differing from it in the app image alone |
 
 History: windows `036` and `037` actually ran with `rollback_target`
 revision 9; the requirement of revision 10 in the table applies to any later
@@ -937,16 +938,19 @@ use of the tooling. Since the re-pin from 10 to 11 (asaas-rollout-opening
 Group 5b) the reviewed manifest satisfies neither: production is at `037`,
 so they could run again only after a snapshot restore, planned with a
 manifest at 10 (a fact, not a pending item). Window `042` requires revision
-12 by number and by content (below), never the number alone, and window
-`045` revision 17 the same way ("Migration 045" below).
+12 by number and by content (below), never the number alone, window `045`
+revision 17 the same way ("Migration 045" below), and window `046`
+revision 19 the same way ("Migration 046" below).
 
 After the run every window reads back `alembic_version` as the application
 role; it must be exactly the window's "after" (window `037` also reads
 `scripts/migration_037_post_read.sql`: the four legacy tables gone; window
 `045` also reads `scripts/migration_043_045_post_read.sql`: the application
-role's privileges on what 045 adds). Window `042` is described in "Window
+role's privileges on what 045 adds; window `046` also reads
+`scripts/migration_046_post_read.sql`: the application role's `SELECT` and
+`INSERT` on `credit_courtesy_events`). Window `042` is described in "Window
 042: migrations 038-042" below, window `045` (migrations 043-045) in
-"Migration 045" after it.
+"Migration 045" after it, and window `046` in "Migration 046" after that.
 `windows` prints this table.
 
 There is **no default window**: every subcommand of the tool, and the
@@ -999,10 +1003,10 @@ reads run on, is a spelling backstop, not the guarantee.
   ECS allows). The revision to use is `neurostack-staging-consulta:28`
   (below). Their SQL is row counts and the revision read: no ownership
   or privilege check, so the application role answers them as the migration
-  would (reproduced on PostgreSQL 16 in the T8 capture). The one exception
-  is window `045`'s post-read, a privilege check on purpose: it asks about
-  the reading role itself, the application role the behaviour release runs
-  as, so that role is the one that must answer it. Dropping the
+  would (reproduced on PostgreSQL 16 in the T8 capture). The exceptions are
+  the post-reads of windows `045` and `046`, privilege checks on purpose:
+  each asks about the reading role itself, the application role the next
+  release runs as, so that role is the one that must answer it. Dropping the
   override there would start the family's own baked command, so that
   command, its entry point and its environment must not mention the
   migration tool: `plan-pre-read`, `plan-post-read`, `verify-*-read` and
@@ -1076,13 +1080,13 @@ every freshness window is judged against the system clock.
 
 ```bash
 tool=scripts/asaas_migration_window.py
-args=(--window "$W"                                   # 035, 036, 037, 042 or 045: the owner's order
+args=(--window "$W"                                   # 035, 036, 037, 042, 045 or 046: the owner's order
       --readback-file "$workdir/window-readback.json"
       --service-task-definition "$SERVICE_TD"         # the revision the service runs
       --migrations-task-definition "$MIGRATIONS_TD"   # registered for this window (> :3)
       --read-task-definition "$READ_TD"               # neurostack-staging-consulta:28
       --snapshot-id "$SNAPSHOT_ID")                   # printed by render-snapshot-requests
-# window 037 only (required there, refused for 035, 036, 042 and 045):
+# window 037 only (required there, refused for 035, 036, 042, 045 and 046):
 args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read revision
 ```
 
@@ -1090,14 +1094,14 @@ args+=(--migrations-read-task-definition "$READ_REVISION_TD")  # --purpose read 
 `plan-*` and `plan` list the reads still missing as `next_requests`, with
 status `incomplete`: send them, record the responses, run them again):
 
-| Phase | Plan step (035 / 036 / 037 / 042 / 045) | Subcommands, in order | Done when |
+| Phase | Plan step (035 / 036 / 037 / 042 / 045 / 046) | Subcommands, in order | Done when |
 |---|---|---|---|
-| register | S10 / S20 / S23 / S25 / S28 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
-| snapshot | S11 / S20 / S23 / S25 / S28 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
-| pre-read | S12 / S21 / S24 / S26 / S29 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
-| run | S12 / S21 / S24 / S26 / S29 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
-| verify | S13 / S22 / S24 / S27 / S30 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
-| post-read | S13 / S22 / S24 / S27 / S30 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" (and, for `037` and `045`, every row of its post-read file passes) |
+| register | S10 / S20 / S23 / S25 / S28 / S31 | planner `render-migrations-taskdef --window W --purpose migrate` (window `037` also `--purpose read`, a second, separate revision); the orchestrator registers each printed request (or reuses the revision named by `already registered`, exit 3) | the revision's ARN is `$MIGRATIONS_TD` (and, for `037`, the read revision's is `$READ_REVISION_TD`) |
+| snapshot | S11 / S20 / S23 / S25 / S28 / S31 | `plan-snapshot` (the deploy state `plan` requires, minus the snapshot and the pre-read: service, images, this window's revisions, single flight, rollback target) **before** any `CreateDBSnapshot`; `render-snapshot-requests`; only then send `CreateDBSnapshot`, then the `DescribeDBSnapshots` poll every 30 s, recording the response | `Status` is `available`; `$SNAPSHOT_ID` is the printed identifier |
+| pre-read | S12 / S21 / S24 / S26 / S29 / S32 | `plan-pre-read`; `render-pre-read`; send the RunTask and record it as `pre_read`; `render-verify-reads --target pre-read`; read every log page; `verify-pre-read` | exit 0, `read_ok`: `alembic_version` is the window's "before" and every check passes |
+| run | S12 / S21 / S24 / S26 / S29 / S32 | capture the plan reads; `plan`; `render-run-task`; send the RunTask exactly as printed and record it as `migration` | `plan` exit 0, `ready` |
+| verify | S13 / S22 / S24 / S27 / S30 / S33 | `render-verify-reads --target migration`; every log page; `verify-result`, polling every 15 s while it exits 3 | exit 0, `applied`: container exit 0 and exactly the window's upgrade lines |
+| post-read | S13 / S22 / S24 / S27 / S30 / S33 | `plan-post-read`; `render-post-read`; send and record as `post_read`; `render-verify-reads --target post-read`; `verify-post-read` | exit 0, `verified`: `alembic_version` is the window's "after" (and, for `037`, `045` and `046`, every row of its post-read file passes) |
 
 **Snapshot order.** `plan-snapshot` runs, and exits 0, **before**
 `CreateDBSnapshot` is sent: it is the check that the deploy state allows
@@ -1140,7 +1144,8 @@ inferred, and a label whose step differs is renamed here and in the window
 table together. Window `042`'s S25-S27 continue that numbering for live step
 L3 of asaas-rollout-opening and map no step of the 2026-10-19 plan; window
 `045`'s S28-S30 continue it for the media bridge window of
-envio-midia-agente.
+envio-midia-agente, and window `046`'s S31-S33 for the courtesy credit
+bridge window of creditos-cortesia.
 
 **Same-day snapshot retry: a known limitation.** The snapshot name is
 `pre-<span>-<date>` (owner decision 2026-10-19 b) and has no second slot for
@@ -1158,7 +1163,7 @@ pending, Fargate, private awsvpc; `ListTasks` of the service listing exactly
 `desiredCount` tasks, each `RUNNING` on `$SERVICE_TD` with the `app`
 container on the expected image digest, and no task told to stop still
 running (`desiredStatus` `STOPPED` listing all `STOPPED`); the expected digest
-is, for 036, 037, 042 and 045, the migrations revision's image, which must equal the
+is, for 036, 037, 042, 045 and 046, the migrations revision's image, which must equal the
 service revision's `app` image exactly, and for 035 the service revision's
 own image (a tag resolved through `ecr:DescribeImages`); the migrations
 revision of this window: family `neurostack-staging-migrations`, revision
@@ -1179,7 +1184,8 @@ differing from revision 12 in the app image alone, the planner's
 (`rollback_target_is_the_revision_the_service_revision_replaced`), else
 `rollback_target_not_repinned`; for 045 revision 17, by number and by the
 same content (the service revision being the bridge revision, the one
-running the image containing 045); for 037 the read revision (baked readback,
+running the image containing 045); for 046 revision 19, the
+same way, the service revision being the courtesy bridge revision; for 037 the read revision (baked readback,
 no mention of the migration tool, same image as the migrate revision) and the
 migrate revision never swapped; the recorded pre-read verified `read_ok`,
 stopped within the last 15 minutes and created at or after the snapshot; no
@@ -1673,7 +1679,11 @@ changed: report and stop.
   wrote stay, unread. It is the rollback target once step 3 above re-pins
   the target from 17 to the bridge revision 18, before PR-B deploys. Since
   the re-pin 18 to 19 the target is the behaviour release's revision 19
-  itself, and the bridge revision 18 stays this way back from it.
+  itself, the way back from the courtesy credit bridge only until window
+  `046` runs ("Migration 046"); after it neither 19 nor the bridge revision
+  18 is, since both images' chains end at `045` and either would turn
+  credit off: the way back is a forward fix to the courtesy credit bridge
+  image.
 - **The bridge image back to the rollback target (revision 17) after the
   window.** Only while the bridge serves and the target is still 17 (before
   step 3). The schema stays valid for it (the column has a default, the
@@ -1690,6 +1700,234 @@ changed: report and stop.
   back only by restoring the snapshot (`pre-043-045-<date>`, taken at
   `042`, so it undoes `043` and `044` too), an owner decision of last resort
   that loses every write made after it.
+
+## Migration 046: courtesy credit (the courtesy credit bridge release)
+
+Migration `046` (creditos-cortesia, Group 1) is the schema of the super
+admin's courtesy credits, shipped in a release of its own, the **bridge
+release** (PR-A), before the release that grants, removes and shows
+courtesy (PR-B). It only widens rules and adds:
+
+- `credit_lots`: `ck_credit_lots_kind` accepts `courtesy`, and
+  `ck_credit_lots_source` a third branch for it (no `subscription_id`,
+  `order_id`, `cycle_start` or `cycle_end`, no `payment_id`, and a
+  `grant_effect_id` of the form `courtesy:{event_id}:grant`); `payment_id`
+  loses its `NOT NULL`, which becomes part of that CHECK (required for
+  `monthly` and `topup`, absent for `courtesy`); `paid_at` stays `NOT NULL`
+  (for a courtesy lot, the civil date of the grant);
+- `credit_ledger_entries`: `ck_credit_ledger_entries_type` accepts the entry
+  `courtesy_removal`, whose effect id is `courtesy-removal:{event_id}`;
+- the table `credit_courtesy_events` (`id`, `builder_id`, `lot_id`,
+  `event_kind` `grant` or `removal`, `amount_mc` above 0, `reason`,
+  `actor_user_id`, `idempotency_key` unique across every builder,
+  `request_digest`, `occurred_at`, `created_at`), append-only by the trigger
+  every credit history table uses (`reject_credit_history_mutation()`), its
+  lot referenced inside one builder (`fk_credit_courtesy_events_lot`).
+
+Every row the `045` schema admits stays admitted, so no existing row can
+stop it. **The bridge image maps that schema in its ORM** (the drift suite
+`tests/integration/test_credit_orm_ddl_drift_postgres.py` requires it)
+**but no code of it writes or reads courtesy**: no service or route names
+the kind, the entry or the table, and the `045` CHECKs would refuse such a
+row anyway. It serves on `045` (before the window) and on `046` (after it).
+
+**The window briefly blocks credit reads and writes.** One transaction
+(`alembic/env.py` does not set `transaction_per_migration`), and
+`lock_timeout` (5 s, `SET LOCAL` by `046`) bounds each lock **wait**, not a
+statement or the run:
+
+1. `ALTER TABLE credit_lots` takes `ACCESS EXCLUSIVE` on `credit_lots` (from
+   then on every read and write of lots waits) and validates both CHECKs in
+   one scan;
+2. `ALTER TABLE credit_ledger_entries` takes `ACCESS EXCLUSIVE` on the
+   ledger and scans it once;
+3. `CREATE TABLE credit_courtesy_events` references `credit_lots`, already
+   held.
+
+Lots before ledger entries is the order the ledger writers insert in. Worst
+case, lots and ledger entries are unreadable and unwritable for about 10 s
+(two waits of up to 5 s) plus the two scans and the DDL; normally the run
+takes well under a second. SQLSTATE `55P03` (lock timeout) or `40P01`
+(deadlock) means nothing changed: the transaction rolled back and the
+revision stays `045`. Report it, and the window can be retried from the
+pre-read on the owner's instruction.
+
+**Why a bridge release** (creditos-cortesia Decision 2):
+
+1. The window tool requires, for every window after the first, the image
+   containing the migration on every service task (`IMAGE_RULE_DEPLOYED`).
+2. The credit switch reads `alembic_version` against the serving image's own
+   migration chain: a database at `046` under an image whose chain ends at
+   `045` is `revision_outside_image_chain`, and the switch turns **off**
+   (every credit surface). So the image that contains `046` serves before
+   the window runs.
+3. `CREDIT_SCHEMA_MIN_REVISION` stays `042`: a minimum of `046` would turn
+   credit off from the image change until the window
+   (`schema_below_minimum`). Only the courtesy routes of PR-B require `046`,
+   through a revision gate of their own (`503 credit_unavailable` below
+   it), so PR-B may merge before or after the window; it deploys after it.
+
+With schema and code in one release, going back from the code after the
+window would mean an image without `046`: credit off. With the bridge, the
+code release goes back to the bridge image, which contains `046`, and the
+credit switch stays on (see "Rollback (window 046)" for what the bridge does
+with courtesy rows).
+
+**Production order** (the live sequence of creditos-cortesia; each step on
+its own "vai" from the owner, conducted by the orchestrator):
+
+0. Read production, read only (live step L0): `alembic_version` (`045`:
+   window `045` ran on 2026-11-08), the serving revision, the manifest's
+   rollback target and the count of `credit_lots`. If the serving revision
+   is not the one window `046` names (revision 19), stop: a reviewed PR
+   corrects `WINDOW_046` first. Done on 2026-11-09: revision 19 serves, the
+   owner confirmed it, and the database is at `045`.
+1. Re-pin the manifest's rollback target from 18 to the serving revision 19,
+   by its own manifest PR (live step L0b; "Re-pinning the rollback target
+   along the live chain"), merged before this release is committed: the
+   planner's image gate refuses an image change otherwise
+   (`rollback_target_not_repinned_before_image_bump`). Done: the re-pin
+   merged on 2026-11-10 (#216; "History (18 to 19)").
+2. Deploy the bridge image (live step L1): one revision, the serving one
+   with the app image alone moved, built from a `main` that contains this
+   release and everything already serving. Its chain ends at `046`; with
+   the database at `045` the credit switch stays **on** and no route is
+   new.
+3. Run window `046` (below) on that image, with the rollback target 19
+   (live step L3): the manual RDS snapshot `pre-046-<date>`, the pre-read,
+   one RunTask, the post-read.
+4. Re-pin the rollback target from 19 to the bridge revision, by its own
+   manifest PR, once window `046` is verified and the bridge revision serves
+   (live step L3b).
+5. Only then deploy the courtesy release (PR-B, live step L4).
+
+Never the reverse: window `046` run before the bridge image serves takes
+the database outside the serving image's chain, and credit is off until the
+bridge image serves (DESIGN Decision 17). The window tool refuses it
+(`migrations_image_differs_from_deployed_image`), and
+`tests/services/test_credit_switch.py` pins the verdict
+(`revision_outside_image_chain` for `046` under a chain that ends at `045`).
+
+**Preconditions.** Window `045` applied and verified. The bridge image
+deployed and running on every service task, by digest, and carried by the
+window's migrations revision (`migrations_image_differs_from_deployed_image`,
+`service_task_image_digest_mismatch` otherwise). `rollback_target` revision
+19 with no pending re-pin, `ACTIVE`, by digest, and, by content, exactly one
+`BILLING_FACT_WORKER_ENABLED` row in it, `'true'`, and the service revision
+(the bridge revision) differing from it in the app image alone
+(`rollback_target_not_repinned` otherwise). **Revision 19 is confirmed**:
+the revision serving on 2026-11-09, read on ECS at live step L0 and
+confirmed by the owner that day (creditos-cortesia Decision 8); the
+reviewed manifest is pinned to it since the re-pin 18 to 19 (live step
+L0b).
+
+**Preflight (SELECT only, immediately before the run)**, as the application
+role on the read family: `scripts/migration_046_preflight.sql`, byte for
+byte below (its comment lines aside). The same task reads
+`alembic_version`, which must be `045`. Every count must be `0`, or stop and
+return to the owner:
+
+- `046 tables present` counts the tables `046` creates (`CREATED_TABLES`)
+  that already exist;
+- `credit checks not at 045` is `3` minus the number of the CHECKs `046`
+  rewrites (`ck_credit_lots_kind`, `ck_credit_lots_source`,
+  `ck_credit_ledger_entries_type`) that exist, validated, with their `045`
+  definition (written by `038`) as `pg_get_constraintdef` prints it on
+  PostgreSQL 16 (production runs RDS PostgreSQL 16), byte for byte. `046` is
+  a widening, so no row can stop it, but a missing CHECK fails its `DROP`
+  (SQLSTATE `42704`), and a drifted one is silently replaced or fails the
+  new one's validation (SQLSTATE `23514`), so the preflight stops first;
+- `credit lot payment_id nullable` is `0` only when `credit_lots.payment_id`
+  exists and is `NOT NULL`, as at `045`.
+
+The real runs on PostgreSQL 16
+(`tests/fixtures/asaas_migration_window/read_runs.json`): at `045` every
+count `0` (`read_ok`); at `046` the revision and every count stop it (`1`,
+`3`, `1`).
+
+```sql
+SELECT '046 tables present' AS check_name, count(*) AS found FROM unnest(ARRAY['public.credit_courtesy_events']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT 'credit checks not at 045', 3 - count(*) FROM (VALUES ('public.credit_lots', 'ck_credit_lots_kind', 'CHECK (((lot_kind)::text = ANY ((ARRAY[''monthly''::character varying, ''topup''::character varying])::text[])))'), ('public.credit_lots', 'ck_credit_lots_source', 'CHECK (((((lot_kind)::text = ''monthly''::text) AND (subscription_id IS NOT NULL) AND (cycle_start IS NOT NULL) AND (cycle_end IS NOT NULL) AND (cycle_start < cycle_end) AND (order_id IS NULL)) OR (((lot_kind)::text = ''topup''::text) AND (order_id IS NOT NULL) AND (subscription_id IS NULL) AND (cycle_start IS NULL) AND (cycle_end IS NULL))))'), ('public.credit_ledger_entries', 'ck_credit_ledger_entries_type', 'CHECK (((entry_type)::text = ANY ((ARRAY[''grant''::character varying, ''debit''::character varying, ''expiry''::character varying, ''reversal''::character varying, ''debt''::character varying, ''debt_settlement''::character varying, ''debt_release''::character varying, ''settlement_release''::character varying, ''lot_regrant''::character varying])::text[])))')) AS expected(relation, name, definition) JOIN pg_catalog.pg_constraint AS con ON con.conrelid = to_regclass(expected.relation) AND con.conname = expected.name WHERE con.contype = 'c' AND con.convalidated AND pg_catalog.pg_get_constraintdef(con.oid) = expected.definition
+UNION ALL SELECT 'credit lot payment_id nullable', 1 - count(*) FROM (VALUES ('public.credit_lots', 'payment_id')) AS relaxed(relation, name) JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = to_regclass(relaxed.relation) AND attribute.attname = relaxed.name WHERE attribute.attnum > 0 AND NOT attribute.attisdropped AND attribute.attnotnull;
+```
+
+**Post-read: the privileges the courtesy release needs.** The migrations
+carry no `GRANT`: the application role reaches a new table only through the
+migration role's default privileges. So, after the run, the post-read
+`scripts/migration_046_post_read.sql`, as the application role on the read
+family, reads `alembic_version` (`046`) and one row, `select and insert on
+public.credit_courtesy_events`, `true` only when that role holds both
+`SELECT` and `INSERT` on `credit_courtesy_events` (append-only, so neither
+`UPDATE` nor `DELETE` is needed). Each privilege is asked on its own and
+joined with `AND`, because `has_table_privilege` with a list
+(`'SELECT,INSERT'`) is true when **any** of them is held. A row that is not
+`true` is `read_privilege_not_held:<check>` and stops before the courtesy
+release; the remedy (a grant, or default privileges on the migration role)
+is an owner decision. The real runs: at `046` with the DML role `true`
+(`verified`); with default privileges granting `SELECT` alone `false`; at
+`045` `NULL` (the table is looked up by OID, so the read does not fail) with
+`post_read_version_is_before_nothing_applied`.
+
+The post-read does not read the CHECKs again: `alembic_version` reads `046`
+only once the transaction that rewrote them committed, and `verify-result`
+requires exactly the upgrade line `045 -> 046` in the run's log.
+
+Order (each step stops on any divergence and returns to the owner; the
+subcommands are `scripts/asaas_migration_window.py --window 046`, with the
+arguments of "Files" above and no `--migrations-read-task-definition`):
+
+1. Register the window's migrations revision with `render-migrations-taskdef
+   --window 046 --purpose migrate` (the deployed bridge image digest, the
+   command baked to exactly `alembic upgrade 046`).
+2. `plan-snapshot`, then `render-snapshot-requests`: the manual RDS snapshot
+   named `pre-046-<date>`, `available` and recent.
+3. `plan-pre-read`, `render-pre-read`, `verify-pre-read`: `read_ok`, every
+   count `0` with `alembic_version` == `045`, read as the application role.
+4. `plan`, then `render-run-task`, and the RunTask exactly as printed.
+5. `render-verify-reads --target migration`, then `verify-result`:
+   `applied`, exactly the one upgrade line `045 -> 046` (the real run is in
+   `tests/fixtures/asaas_migration_window/alembic_runs.json`, `success_046`).
+6. `plan-post-read`, `render-post-read`, `verify-post-read`. **Verify**
+   `alembic_version` == `046` and the privilege row `true`;
+   `post_read_version_is_before_nothing_applied` means it still reads `045`.
+
+### Rollback (window 046)
+
+None from the window; SQLSTATE `55P03`, `40P01` or `55000` means nothing
+changed: report and stop.
+
+- **Before the window (after step 2, before step 3): the bridge image back
+  to revision 19.** An ordinary image rollback: the schema did not change,
+  `045` is in both images' chains, and the credit switch stays **on**.
+- **The courtesy release (PR-B) back to the bridge image: credit stays
+  on.** The bridge image contains `046`, so its chain keeps the database's
+  revision and the credit switch stays **on**. It is the rollback target
+  once step 4 above re-pins the target from 19 to the bridge revision,
+  before PR-B deploys. What it does with the courtesy rows PR-B wrote (they
+  stay: append-only, valid under the `046` CHECKs): it does not know the
+  kind, so for a builder holding a courtesy lot its `/v1/credits/summary`
+  (the read `/billing` makes), `/v1/credits/balance`, `/v1/credits/lots` and
+  `/v1/credits/expiries` fail (the bridge's `LotKind` refuses `courtesy`).
+  For a builder with courtesy removals, the bridge's `_funded_mc` does not
+  subtract a `courtesy_removal`, so the capacity in force, `used_percent`
+  and the 50/90/100 thresholds count an amount removed as still funded, and
+  debits can consume it (a 10,000-credit lot with 6,000 removed reads
+  10,000 again). Builders without a courtesy lot are unaffected. Give no
+  courtesy while the bridge serves, and prefer going forward.
+- **The bridge image back to revision 19 after the window: credit turns
+  off.** Only while the bridge serves and the target is still 19 (before
+  step 4). That image's chain ends at `045` while the database reads `046`:
+  its credit switch reads `revision_outside_image_chain` and stays **off**
+  (every credit route answers 503 `credit_unavailable`) until an image
+  containing `046` serves again. **The way back is a forward fix**: the
+  bridge image again, or a corrected image that contains `046`.
+- **The schema.** **Never an Alembic downgrade in production.** The `046`
+  downgrade refuses with SQLSTATE `55000` (nothing changed) while any
+  courtesy lot, `courtesy_removal` entry or event exists; that refusal is a
+  dev and test guard, not a production way back. As after every window,
+  the schema goes back only by restoring the snapshot `pre-046-<date>`
+  (taken at `045`), an owner decision of last resort that loses every write
+  made after it.
 
 ## Post-deploy rollout readback
 
@@ -1711,14 +1949,16 @@ task, one JSON line per result), the read family contract of
 `neurostack-staging-consulta:28` (application role), the RunTask hardening,
 the log reader, the exposure scan and the output guard. The program carries
 the labels window `<W>`, phase `rollout` (the window tool recognizes these
-three pairs, and only them, as a read program besides the windows' own).
+four pairs, and only them, as a read program besides the windows' own).
 
-**Three windows, chosen explicitly.** Every subcommand requires `--window`,
+**Four windows, chosen explicitly.** Every subcommand requires `--window`,
 given once and with no default: `037` while the production schema is at
 `037` (before window `042`, live step L3 of asaas-rollout-opening), `042`
 after it while the schema is at `042`, and `045` once window `045` (the
-media bridge release, "Migration 045") has run; that window also applies
-`043` and `044`, which have no window and so no readback of their own. The window is the program's
+media bridge release, "Migration 045") has run, while the schema is at
+`045` (that window also applies `043` and `044`, which have no window and
+so no readback of their own), and `046` once window `046` (the courtesy
+credit bridge release, "Migration 046") has run. The window is the program's
 label and the revision the read must see; nothing else differs (the SQL,
 the payload digest, the table and the judge are the same). The readback file carries no window (the window is
 `--window`'s; a file with a `window` key is `readback_file_shape_invalid`).
@@ -1728,15 +1968,15 @@ revision stop it (`read_request_not_rendered_by_this_tool`,
 `read_task_command_mismatch`, `read_begin_mismatch`), and the program of one
 window on another window's schema stops on the revision alone
 (`read_alembic_version_mismatch`): neither the 038 to 042 window nor window
-`045` (with `043` and `044`) changes any of the facts it reads (after window `045`, `--window 042`
-stops there, so name `045`). `readback_window_mismatch` guards the Python
+`045` (with `043` and `044`) nor window `046` changes any of the facts it
+reads (after window `046`, `--window 045` stops there, so name `046`). `readback_window_mismatch` guards the Python
 API (a readback loaded for one window passed with the context of another);
 from
 the command line it cannot fire.
 
 **What it reads** (`scripts/asaas_rollout_readback.sql`, verbatim in the
 program): `alembic_version`, which must be exactly the chosen window (`037`,
-`042` or `045`), and one row per
+`042`, `045` or `046`), and one row per
 fact, `check_name`, `subject`, `value`. `verify` requires exactly this
 table of 25 rows (4 + 4 + 4 + 10 + 3), no row missing, none added or
 repeated. Rows are judged by `check_name` and `subject`, so their order is
@@ -1781,7 +2021,7 @@ that no transition to `canary_allowlist` or `general` ever happened; the
 ```bash
 tool=scripts/asaas_rollout_readback.py
 workdir="$(mktemp -d)" && chmod 700 "$workdir"; umask 077
-args=(--window "$W"                                   # 037 before window 042, 042 after it, 045 after window 045
+args=(--window "$W"                                   # 037 before window 042, 042 after it, 045 after window 045, 046 after window 046
       --readback-file "$workdir/rollout-readback.json"
       --service-task-definition "$SERVICE_TD"            # the revision serving now (see below)
       --read-task-definition arn:aws:ecs:us-east-1:388460142431:task-definition/neurostack-staging-consulta:28)
@@ -1801,7 +2041,10 @@ before L2a; the L2a or L2b revision until L3); for `--window 042`, which
 runs only after L2a and L2b, the revision L2b registered and the service
 serves; for `--window 045`, which runs only after window `045`, the
 revision serving then: the bridge revision (18), or the behaviour release's
-revision once PR-B is deployed (the read itself is the same on both). With `:11` once the service runs a later revision, `plan` blocks on
+revision once PR-B is deployed (the read itself is the same on both); for
+`--window 046`, which runs only after window `046`, the revision serving
+then: the courtesy credit bridge revision, or the courtesy release's
+revision once it is deployed (the read is the same on both). With `:11` once the service runs a later revision, `plan` blocks on
 the service check (`service_task_definition_mismatch`); the verdict names
 it. Running the three commands in
 sequence before the RunTask is sent is harmless: the tool itself sends
@@ -1899,13 +2142,16 @@ captured on 2026-10-31, window `042`'s program at 037 and at 042 and window
 `037`'s at 042; window `037`'s program at 037 printed the earlier capture
 again, byte for byte; and, captured on 2026-11-07, window `045`'s program
 at 042 and at 045 and window `042`'s at 045; window `042`'s program at 042
-printed the earlier capture again, byte for byte); the server log of those captures shows each read
+printed the earlier capture again, byte for byte; and, captured on
+2026-11-09, window `046`'s program at 045 and at 046 and window `045`'s at
+046; window `045`'s program at 045 printed the earlier capture again, byte
+for byte); the server log of those captures shows each read
 session running only `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, the
 `SET LOCAL` settings, the two SELECTs and `ROLLBACK`.
 `tests/integration/test_rollout_readback_postgres.py`, in the
 release-candidate PostgreSQL suites CI runs
 (`asaas_release_candidate_postgres_suites`), migrates a fresh database to
-036, 037, 042 and 045 and runs every window's program as the superuser and as a
+036, 037, 042, 045 and 046 and runs every window's program as the superuser and as a
 throwaway non-superuser login role at each (each passes only on its own
 revision; row-level security is not bypassed for the non-superuser).
 
@@ -1944,7 +2190,7 @@ python scripts/asaas_production_wiring.py check          --params "$params"
 python scripts/asaas_production_wiring.py render-migrations-taskdef --window 035 --purpose migrate --params "$params"
 ```
 
-`render-migrations-taskdef` requires `--window` (`035`, `036`, `037`, `042` or `045`) and
+`render-migrations-taskdef` requires `--window` (`035`, `036`, `037`, `042`, `045` or `046`) and
 `--purpose` (`migrate`, or `read` for window `037` only); neither has a
 default. `migrate` bakes exactly the window's own upgrade; `read` bakes
 window `037`'s SELECT-only readback program on the same image, roles and
@@ -3213,9 +3459,9 @@ also updated the 10 to 11 evidence test (one `request_sha256` per re-pin), the c
 of `test_the_context_says_the_target_moves_one_reviewed_re_pin_at_a_time`
 and the window reads of the reviewed manifest, and added
 `test_the_18_to_19_re_pin_records_its_request_sha256_and_image_digest`. With
-the target on 19 every window, `045` included, refuses the reviewed manifest
-(`rollback_target_not_repinned`); a manifest at 17 still passes window
-`045`'s target check.
+the target on 19 every window but `046` (whose target it is), `045`
+included, refuses the reviewed manifest (`rollback_target_not_repinned`); a
+manifest at 17 still passes window `045`'s target check.
 
 **The windows.** `036` and `037` keep requiring revision 10, by number
 only: with the reviewed manifest past 10 they cannot run again (production
@@ -3223,9 +3469,13 @@ is at `037`; they would run only after a snapshot restore, planned with a
 manifest at 10). Window `042` requires revision 12 by number and by content
 ("Window 042: migrations 038-042"). Window `045` requires revision 17 the
 same way ("Migration 045"); it ran on 2026-11-08, and since the re-pin 17 to
-18 (and the re-pin 18 to 19 after it) the reviewed manifest is no window's
+18 (and the re-pin 18 to 19 after it) the reviewed manifest is not its
 target: production is at `045`, so `045` too could run again only after a
-snapshot restore, planned with a manifest at 17.
+snapshot restore, planned with a manifest at 17. Window `046` requires
+revision 19 the same way ("Migration 046"): since the re-pin 18 to 19
+(creditos-cortesia live step L0b), before the courtesy credit bridge image
+deploys, the reviewed manifest is window `046`'s target and no other
+window's.
 
 **The circuit breaker.** ECS rolls a failed deployment back to the last
 completed one. With this order that is the target itself for L2a (11) and
@@ -4182,8 +4432,8 @@ poetry run python scripts/production_image_smoke.py --expected-head <head of the
 ```
 
 `--expected-head` is the head of the migrations CONTAINED in the image, that
-is of `alembic/versions` in the checkout being built: `045` on `main` today
-(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041, enforcement 042, the media `audio/ogg` widening 043, the media `audio/mp4` widening 044 and the media bridge 045 are merged). It is not the production
+is of `alembic/versions` in the checkout being built: `046` on `main` today
+(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041, enforcement 042, the media `audio/ogg` widening 043, the media `audio/mp4` widening 044, the media bridge 045 and the courtesy credit 046 are merged). It is not the production
 migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
 checked offline as `032:035` whatever the image's head is.
 
@@ -4213,7 +4463,7 @@ signer factories build their clients (no KMS call);
 `billing_fact_bundle_digest()` and the consumer pin both return the pinned
 digest; `alembic heads` prints
 exactly one line, `<expected head> (head)`, the head of the migrations in
-the image given with `--expected-head` (`045` on `main` today);
+the image given with `--expected-head` (`046` on `main` today);
 `/app/spa/index.html` exists; and `alembic upgrade
 032:035 --sql` emits the production migration window, which stays `032:035`
 whatever the image's head, as one transaction. The window

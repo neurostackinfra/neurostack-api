@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from uuid import uuid4
@@ -166,6 +167,10 @@ _LATER_TABLES = {
     "credit_purge_receipts",
     # Group 7, migration 042: immutable tenant cutoff acceptances.
     "credit_cutoff_acceptances",
+    # creditos-cortesia, migration 046 (pinned by
+    # tests/integration/test_credit_courtesy_migration_postgres.py and the
+    # drift suite).
+    "credit_courtesy_events",
 }
 
 
@@ -208,9 +213,10 @@ def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     # Group 4b: 040 follows 039; Group 5: 041 follows 040; Group 7: 042
     # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg) and 044
     # (audio/mp4) widen the media category/MIME invariant; envio-midia-agente:
-    # 045 (the media bridge, not a credit migration) follows 044 and is the
-    # head.
-    assert current_head() == "045"
+    # 045 (the media bridge, not a credit migration) follows 044;
+    # creditos-cortesia: 046 (courtesy lots, removals and events) follows 045
+    # and is the head.
+    assert current_head() == "046"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 
@@ -440,11 +446,33 @@ def test_enumerations_are_the_wish_values() -> None:
         )
         return str(constraint.sqltext)
 
-    assert "('monthly', 'topup')" in check("credit_lots", "ck_credit_lots_kind")
+    # Migration 046 (creditos-cortesia) widened both: the courtesy lot kind
+    # and the courtesy_removal entry (its effect id pinned to
+    # courtesy-removal:{event_id}); payment_id is required by kind instead.
+    assert "('monthly', 'topup', 'courtesy')" in check(
+        "credit_lots", "ck_credit_lots_kind"
+    )
     assert (
         "('grant', 'debit', 'expiry', 'reversal', 'debt', 'debt_settlement', "
-        "'debt_release', 'settlement_release', 'lot_regrant')"
+        "'debt_release', 'settlement_release', 'lot_regrant', 'courtesy_removal')"
     ) in check("credit_ledger_entries", "ck_credit_ledger_entries_type")
+    assert (
+        "(entry_type <> 'courtesy_removal' OR effect_id LIKE 'courtesy-removal:%')"
+        in check("credit_ledger_entries", "ck_credit_ledger_entries_type")
+    )
+    source = check("credit_lots", "ck_credit_lots_source")
+    assert "AND payment_id IS NOT NULL) OR (lot_kind = 'topup'" in source
+    # Rendered: the source escapes the colon before "grant" (unescaped,
+    # SQLAlchemy would read it as a bind parameter), the DDL has a plain one.
+    assert (
+        "OR (lot_kind = 'courtesy' AND subscription_id IS NULL "
+        "AND cycle_start IS NULL AND cycle_end IS NULL "
+        "AND order_id IS NULL AND payment_id IS NULL "
+        "AND grant_effect_id LIKE 'courtesy:%:grant')"
+    ) in source
+    lots = _credit_tables()["credit_lots"]
+    assert lots.columns["payment_id"].nullable is True
+    assert lots.columns["paid_at"].nullable is False
     assert "('events', 'zapi', 'meta', 'uazapi', 'evolution')" in check(
         "credit_ingress_claims", "ck_credit_ingress_claims_source"
     )
@@ -536,6 +564,123 @@ def test_fold_ledger_reference_vector() -> None:
         lots={monthly: 0, topup: 400_000}, debt_mc=1_500
     )
     assert fold_ledger([]) == DerivedBalance()
+
+
+def test_fold_ledger_takes_a_courtesy_removal_off_its_lot() -> None:
+    """Migration 046: a courtesy_removal lowers its lot's balance, never
+    another lot's and never the debt (no writer exists yet; the direction is
+    in place before one does)."""
+
+    courtesy, monthly = uuid4(), uuid4()
+    movements = [
+        LedgerMovement("grant", 10_000_000, courtesy),
+        LedgerMovement("grant", 5_000_000, monthly),
+        LedgerMovement("courtesy_removal", 6_000_000, courtesy),
+        LedgerMovement("debit", 1_000_000, courtesy),
+    ]
+    assert fold_ledger(movements) == DerivedBalance(
+        lots={courtesy: 3_000_000, monthly: 5_000_000}, debt_mc=0
+    )
+    with pytest.raises(ValueError, match="name a lot"):
+        fold_ledger([LedgerMovement("courtesy_removal", 1, None)])
+
+
+async def test_sqlite_courtesy_rows_fold_like_the_reference() -> None:
+    """The SQLite metadata (what the test suite builds) carries the 046
+    CHECKs: a courtesy lot without payment, its removal entry, and the SQL
+    derived balance equal to fold_ledger; a top-up without a payment, and a
+    courtesy lot with a payment, an order or another effect id, are refused."""
+
+    from src.models.credit import CreditEffect, CreditLedgerEntry, CreditLot
+
+    _patch_jsonb_for_sqlite()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, class_=AsyncSession)
+        builder_id, event_id, removal_id, lot_id = uuid4(), uuid4(), uuid4(), uuid4()
+        grant_effect = f"courtesy:{event_id}:grant"
+        removal_effect = f"courtesy-removal:{removal_id}"
+        now = datetime(2026, 11, 9, 15, 0, tzinfo=timezone.utc)
+        async with sessions() as session:
+            repository = CreditRepository(session)
+            account_id = await repository.ensure_account(builder_id)
+            for effect in (grant_effect, removal_effect):
+                session.add(
+                    CreditEffect(
+                        builder_id=builder_id, effect_id=effect, effect_kind="test"
+                    )
+                )
+            lot = CreditLot(
+                id=lot_id,
+                builder_id=builder_id,
+                account_id=account_id,
+                lot_kind="courtesy",
+                payment_id=None,
+                paid_at=now.date(),
+                granted_mc=10_000_000,
+                expires_at=now + timedelta(days=30),
+                grant_effect_id=grant_effect,
+            )
+            session.add(lot)
+            await session.flush()
+            for effect, entry_type, amount in (
+                (grant_effect, "grant", 10_000_000),
+                (removal_effect, "courtesy_removal", 6_000_000),
+            ):
+                session.add(
+                    CreditLedgerEntry(
+                        builder_id=builder_id,
+                        account_id=account_id,
+                        effect_id=effect,
+                        lot_id=lot_id,
+                        entry_type=entry_type,
+                        amount_mc=amount,
+                        occurred_at=now,
+                    )
+                )
+            await session.commit()
+            assert await repository.derived_balance(builder_id) == fold_ledger(
+                [
+                    LedgerMovement("grant", 10_000_000, lot_id),
+                    LedgerMovement("courtesy_removal", 6_000_000, lot_id),
+                ]
+            )
+            assert (await repository.derived_balance(builder_id)).lots == {
+                lot_id: 4_000_000
+            }
+        # Each differs from an admitted row in one field only.
+        valid_topup = {"lot_kind": "topup", "order_id": uuid4(), "payment_id": "p"}
+        valid_courtesy = {"lot_kind": "courtesy", "payment_id": None}
+        refused = (
+            {**valid_topup, "payment_id": None},
+            {**valid_courtesy, "payment_id": "pay_1"},
+            {**valid_courtesy, "order_id": uuid4()},
+            {**valid_courtesy, "grant_effect_id": f"grant:{uuid4()}"},
+        )
+        for index, fields in enumerate((valid_topup, *refused)):
+            row = {"grant_effect_id": f"courtesy:{uuid4()}:grant", **fields}
+            if row["lot_kind"] == "topup":
+                row["order_id"] = uuid4()
+            async with sessions() as session:
+                session.add(
+                    CreditLot(
+                        builder_id=builder_id,
+                        account_id=account_id,
+                        paid_at=now.date(),
+                        granted_mc=1_000,
+                        expires_at=now,
+                        **row,
+                    )
+                )
+                if index == 0:
+                    await session.commit()
+                    continue
+                with pytest.raises(sa.exc.IntegrityError, match="CHECK constraint"):
+                    await session.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.parametrize(

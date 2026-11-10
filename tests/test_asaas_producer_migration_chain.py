@@ -43,6 +43,7 @@ def test_asaas_producer_migrations_extend_026_through_037_linearly() -> None:
     # retention revision (041) follows 040; Group 7's enforcement cutoff
     # acceptances (042) follow 041; 043 (audio/ogg) and 044 (audio/mp4) in the
     # media category/MIME invariant follow 042; envio-midia-agente's media
-    # bridge (045, not an ASAAS producer migration either) follows 044 and is
-    # head.
-    assert heads(revisions) == ["045"]
+    # bridge (045, not an ASAAS producer migration either) follows 044;
+    # creditos-cortesia's courtesy credit (046, a credit migration, not an
+    # ASAAS producer one) follows 045 and is head.
+    assert heads(revisions) == ["046"]

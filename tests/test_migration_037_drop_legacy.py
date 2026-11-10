@@ -106,8 +106,9 @@ def test_037_revises_036_and_038_follows_it(migration: ModuleType) -> None:
     # (lifecycle, legal hold, purge and roles) follows 040; Group 7: 042
     # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg) and 044
     # (audio/mp4) widen the media category/MIME invariant; envio-midia-agente:
-    # 045 (the media bridge) follows 044 and is the head.
-    assert current_head() == "045"
+    # 045 (the media bridge) follows 044; creditos-cortesia: 046 (courtesy
+    # credit) follows 045 and is the head.
+    assert current_head() == "046"
 
 
 def test_scope_is_the_four_legacy_tables_and_their_ten_functions(

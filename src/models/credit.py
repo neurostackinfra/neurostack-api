@@ -1,15 +1,19 @@
 """Credit ledger, metering, ingress and enforcement rows.
 
 Migration 038 (``alembic/versions/20261026_000001_038_credit_system.py``) is
-the schema authority; these mappers mirror it column for column, constraint
-for constraint (``tests/integration/test_credit_orm_ddl_drift_postgres.py``).
+the schema authority, as widened by migration 046 (courtesy lots, the
+``courtesy_removal`` entry and ``credit_courtesy_events``,
+``alembic/versions/20261109_000001_046_credit_courtesy.py``); these mappers
+mirror the head column for column, constraint for constraint
+(``tests/integration/test_credit_orm_ddl_drift_postgres.py``).
 The fact inbox lives in :mod:`src.models.credit_fact_inbox`; the consumer's
 ack is the existing ASAAS model ``BillingFactAck``.
 
 Rules the schema enforces (see the migration docstring):
 
 * history rows (accounts, effects, lots, ledger, debts, debt origins,
-  settlements, readiness, observational effects) are append-only by trigger;
+  settlements, readiness, observational effects, courtesy events) are
+  append-only by trigger;
   a correction is a new row;
 * history keeps ``builder_id``/``tenant_id`` without a foreign key to
   ``builders``/``tenants``; only ``credit_ingress_claims`` and
@@ -51,7 +55,8 @@ from src.models.base import Base, TimestampMixin
 
 SHA256_PATTERN: Final = "^[0-9a-f]{64}$"
 EFFECT_ID_MAX_LENGTH: Final = 512
-LOT_KINDS: Final = ("monthly", "topup")
+# ``courtesy`` and ``courtesy_removal``: migration 046 (creditos-cortesia).
+LOT_KINDS: Final = ("monthly", "topup", "courtesy")
 LEDGER_ENTRY_TYPES: Final = (
     "grant",
     "debit",
@@ -62,7 +67,18 @@ LEDGER_ENTRY_TYPES: Final = (
     "debt_release",
     "settlement_release",
     "lot_regrant",
+    "courtesy_removal",
 )
+COURTESY_EVENT_KINDS: Final = ("grant", "removal")
+COURTESY_REASON_MAX_LENGTH: Final = 500
+COURTESY_IDEMPOTENCY_KEY_MAX_LENGTH: Final = 200
+# The effect ids of a courtesy grant (``courtesy:{event_id}:grant``, the
+# lot's grant effect) and of a removal (``courtesy-removal:{event_id}``), as
+# the CHECKs of migration 046 pin them.  In CHECK text the colon before
+# ``grant`` is written ``\:``: SQLAlchemy would otherwise read ``:grant`` as
+# a bind parameter, even inside a quoted literal.
+_COURTESY_GRANT_EFFECT_LIKE: Final = r"courtesy:%\:grant"
+_COURTESY_REMOVAL_EFFECT_LIKE: Final = "courtesy-removal:%"
 INGRESS_SOURCES: Final = ("events", "zapi", "meta", "uazapi", "evolution")
 INGRESS_MODES: Final = ("observational", "enforced")
 OBSERVATIONAL_EFFECT_KINDS: Final = ("trace", "rag", "media", "egress", "maintenance")
@@ -149,7 +165,9 @@ class CreditEffect(Base):
 
 class CreditLot(Base):
     """A grant of millicredits with its own expiry: one monthly lot per
-    subscription cycle, one top-up lot per order."""
+    subscription cycle, one top-up lot per order, and (migration 046) a
+    courtesy lot per super-admin grant, with no subscription, order or
+    payment (``payment_id`` NULL only for it, required for the other two)."""
 
     __tablename__ = "credit_lots"
     __table_args__ = (
@@ -157,10 +175,15 @@ class CreditLot(Base):
         CheckConstraint(
             "(lot_kind = 'monthly' AND subscription_id IS NOT NULL "
             "AND cycle_start IS NOT NULL AND cycle_end IS NOT NULL "
-            "AND cycle_start < cycle_end AND order_id IS NULL) "
+            "AND cycle_start < cycle_end AND order_id IS NULL "
+            "AND payment_id IS NOT NULL) "
             "OR (lot_kind = 'topup' AND order_id IS NOT NULL "
             "AND subscription_id IS NULL AND cycle_start IS NULL "
-            "AND cycle_end IS NULL)",
+            "AND cycle_end IS NULL AND payment_id IS NOT NULL) "
+            "OR (lot_kind = 'courtesy' AND subscription_id IS NULL "
+            "AND cycle_start IS NULL AND cycle_end IS NULL "
+            "AND order_id IS NULL AND payment_id IS NULL "
+            f"AND grant_effect_id LIKE '{_COURTESY_GRANT_EFFECT_LIKE}')",
             name="ck_credit_lots_source",
         ),
         CheckConstraint("granted_mc > 0", name="ck_credit_lots_granted_mc"),
@@ -199,7 +222,7 @@ class CreditLot(Base):
     cycle_start: Mapped[date | None] = mapped_column(Date, nullable=True)
     cycle_end: Mapped[date | None] = mapped_column(Date, nullable=True)
     order_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
-    payment_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    payment_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     paid_at: Mapped[date] = mapped_column(Date, nullable=False)
     granted_mc: Mapped[int] = mapped_column(BigInteger, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(
@@ -220,7 +243,9 @@ class CreditLedgerEntry(Base):
     __tablename__ = "credit_ledger_entries"
     __table_args__ = (
         CheckConstraint(
-            _in("entry_type", LEDGER_ENTRY_TYPES),
+            f"{_in('entry_type', LEDGER_ENTRY_TYPES)} "
+            "AND (entry_type <> 'courtesy_removal' "
+            f"OR effect_id LIKE '{_COURTESY_REMOVAL_EFFECT_LIKE}')",
             name="ck_credit_ledger_entries_type",
         ),
         CheckConstraint("amount_mc > 0", name="ck_credit_ledger_entries_amount"),
@@ -692,5 +717,66 @@ class CreditObservationalEffect(Base):
     would_debit_mc: Mapped[int] = mapped_column(BigInteger, nullable=False)
     decision_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CreditCourtesyEvent(Base):
+    """One super-admin grant or removal of courtesy credits (migration 046).
+
+    Append-only by trigger.  ``lot_id`` names the courtesy lot inside the
+    same builder; ``amount_mc`` is positive; ``idempotency_key`` is unique
+    across every builder and ``request_digest`` is the SHA-256 of the
+    request it was written for.  ``reason`` is for super admins only and is
+    never logged.
+    """
+
+    __tablename__ = "credit_courtesy_events"
+    __table_args__ = (
+        CheckConstraint(
+            _in("event_kind", COURTESY_EVENT_KINDS),
+            name="ck_credit_courtesy_events_kind",
+        ),
+        CheckConstraint("amount_mc > 0", name="ck_credit_courtesy_events_amount"),
+        CheckConstraint("length(reason) > 0", name="ck_credit_courtesy_events_reason"),
+        CheckConstraint(
+            "length(idempotency_key) > 0",
+            name="ck_credit_courtesy_events_idempotency_key",
+        ),
+        _postgresql_check(
+            _sha256("request_digest"),
+            name="ck_credit_courtesy_events_request_digest",
+        ),
+        ForeignKeyConstraint(
+            ["builder_id", "lot_id"],
+            ["credit_lots.builder_id", "credit_lots.id"],
+            ondelete="RESTRICT",
+            name="fk_credit_courtesy_events_lot",
+        ),
+        UniqueConstraint(
+            "idempotency_key", name="uq_credit_courtesy_events_idempotency_key"
+        ),
+        Index("ix_credit_courtesy_events_builder_lot", "builder_id", "lot_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    builder_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    lot_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    event_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    amount_mc: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reason: Mapped[str] = mapped_column(
+        String(COURTESY_REASON_MAX_LENGTH), nullable=False
+    )
+    actor_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(COURTESY_IDEMPOTENCY_KEY_MAX_LENGTH), nullable=False
+    )
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
