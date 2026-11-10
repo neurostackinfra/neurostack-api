@@ -11,7 +11,7 @@
 #   plan             read-only AWS readback compared with this manifest
 #   render-taskdef   the proposed task definition (secrets as references only)
 #   check            the existing evidence validators against that rendering
-#   render-migrations-taskdef --window 035|036|037|042|045 --purpose migrate|read
+#   render-migrations-taskdef --window 035|036|037|042|045|046 --purpose migrate|read
 #                    a new one-off migrations revision with that window's
 #                    pinned upgrade (migrate), or window 037's SELECT-only
 #                    readback (read); no default window or purpose
@@ -21,10 +21,10 @@
 # webhook_exposure_and_registration).
 #
 # scripts/asaas_migration_window.py (pure, readback files only) holds the
-# window table (035, 036, 037, 042, 045) and plans, renders and verifies each
-# window's snapshot, SELECT-only readbacks and one-off migration task (steps
-# migrations_033_035, migrations_036, migrations_037, migrations_038_042 and
-# migrations_043_045).
+# window table (035, 036, 037, 042, 045, 046) and plans, renders and verifies
+# each window's snapshot, SELECT-only readbacks and one-off migration task
+# (steps migrations_033_035, migrations_036, migrations_037,
+# migrations_038_042, migrations_043_045 and migrations_046).
 schema_version: asaas_production_wiring_manifest.v1
 context:
   arch: additive IAM grant and one new secret through a reviewed CloudFormation stack, then one task definition revision derived from the D3 source revision and, per migration window, one migrations revision baking that window's pinned upgrade; the post-deploy hook (scripts/asaas_deploy_hook.py) renders the webhook registration task and scripts/asaas_migration_window.py runs the windows; the rollback target is the field rollback_target; financial egress stays closed by the absence of any AppConfig name until the AppConfig group (source sdk) is rendered in a revision of its own
@@ -402,7 +402,7 @@ task_definition:
 # render-migrations-taskdef --window <W> --purpose migrate registers a new
 # revision per window whose command is exactly that window's upgrade (the
 # window table of scripts/asaas_migration_window.py), on the reviewed image
-# (parameters.app_image_override; for 036, 037, 042 and 045 the image
+# (parameters.app_image_override; for 036, 037, 042, 045 and 046 the image
 # deployed on the service, which contains the migration). --purpose read (window 037 only,
 # listed under read_revisions) registers a separate read-only revision on the
 # same image, role and secret whose baked command is the window's SELECT-only
@@ -414,7 +414,7 @@ migrations_task_definition:
   database_secret_name: neurostack/staging/database-url-migrations
   image: app_image_override
   command: per_window_exact_upgrade
-  windows: ['035', '036', '037', '042', '045']
+  windows: ['035', '036', '037', '042', '045', '046']
   read_revisions: ['037']
   # OWNER CONFIRMED on 2026-10-20 (see task_definition.tag_overrides).
   tag_overrides:
@@ -647,6 +647,20 @@ steps:
     verification:
       - verify-result reports exactly the three upgrade lines 042 -> 043 -> 044 -> 045; then the post-read (scripts/migration_043_045_post_read.sql, application role) must read back alembic_version == 045 and every privilege the behaviour release needs held by that role (SELECT, INSERT, UPDATE and DELETE on media_deliveries; SELECT, INSERT and UPDATE on media_assets.trigger_intents).
     rollback: none from this step; the service may go back to the rollback target on the 045 schema (it maps neither object), but that image does not contain 045, so its credit switch reads revision_outside_image_chain and stays off until an image containing 045 serves again; the 045 downgrade refuses while media_deliveries holds a row or a media asset has trigger intents (and the 044 and 043 downgrades fail while an audio/mp4 or audio/ogg asset exists), and in production the way back for the schema is restoring the snapshot, an owner decision of last resort (it loses every write made after it); SQLSTATE 55P03, 40P01 or 55000 means nothing changed, report and stop
+
+  - id: migrations_046
+    scope: separate_approval
+    approval: separate owner approval required for this window alone (creditos-cortesia Group 1, the courtesy credit bridge release; the run needs the owner's explicit order at the time); not performed by this manifest
+    why: migration 046 widens ck_credit_lots_kind and ck_credit_lots_source for the courtesy lot (no subscription, cycle, order or payment; credit_lots.payment_id NOT NULL becomes part of that CHECK, required for monthly and topup), ck_credit_ledger_entries_type for the courtesy_removal entry, and creates the append-only table credit_courtesy_events; every row the 045 schema admits stays admitted. The bridge image's ORM describes that schema but no code of it writes or reads courtesy, so the image deployed before the window stays valid on either schema; the release that writes courtesy is deployed only after this window
+    preconditions:
+      - Window 045 applied and verified first; read back the exact revision with the window's SELECT-only pre-read (scripts/migration_046_preflight.sql, application role) and continue only if alembic_version == 045 and every count is 0 (the table credit_courtesy_events does not exist yet, ck_credit_lots_kind, ck_credit_lots_source and ck_credit_ledger_entries_type are exactly 045's, the CHECKs 046 rewrites, and credit_lots.payment_id is still NOT NULL).
+      - The bridge image containing 046 is deployed and running on every service task, by digest (its own revision, the serving revision with the app image alone moved); the window's migrations revision carries that same digest. Run before that image serves, 046 would take the serving image out of its own revision chain and the credit switch would turn off (revision_outside_image_chain).
+      - rollback_target is revision 19 with no pending re-pin (the revision the bridge image replaces, re-pinned from 18 by its own reviewed PR before the bridge deploy), ACTIVE, its app image pinned by digest, with exactly one BILLING_FACT_WORKER_ENABLED row, 'true', and differing from the revision the service runs (the bridge revision) in the app image alone.
+      - Manual RDS snapshot pre-046-<date> available and recent before the run.
+    change: register the window's neurostack-staging-migrations revision with render-migrations-taskdef --window 046 --purpose migrate (the deployed bridge image digest, the command baked to exactly `alembic upgrade 046`) and run it once through scripts/asaas_migration_window.py --window 046 (plan, render-run-task, verify-result), with no command override and no propagateTags
+    verification:
+      - verify-result reports exactly the one upgrade line 045 -> 046; then the post-read (scripts/migration_046_post_read.sql, application role) must read back alembic_version == 046 and both privileges the courtesy release needs held by that role (SELECT and INSERT on credit_courtesy_events, which is append-only).
+    rollback: none from this step; the release that writes courtesy back to the bridge image keeps credit on (that image contains 046), but the bridge image back to the rollback target after the window takes the serving image out of its chain, so its credit switch reads revision_outside_image_chain and stays off until an image containing 046 serves again, and the way back is a forward fix; never an Alembic downgrade in production (the 046 downgrade refuses with SQLSTATE 55000 while any courtesy lot, courtesy_removal entry or event exists, a dev and test guard only); restoring the window's snapshot (taken at 045) is an owner decision of last resort (it loses every write made after it); SQLSTATE 55P03, 40P01 or 55000 means nothing changed, report and stop
 
   - id: rollout_transitions
     scope: separate_approval

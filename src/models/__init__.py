@@ -56,6 +56,7 @@ from src.models.coupon import Coupon
 from src.models.credit import (
     CreditAccount,
     CreditCapabilityReadiness,
+    CreditCourtesyEvent,
     CreditDebt,
     CreditDebtOrigin,
     CreditDebtSettlement,
@@ -147,6 +148,8 @@ __all__ = [
     "CreditEnforcementBinding",
     "CreditObservationalEffect",
     "CreditCutoffAcceptance",
+    # Credit courtesy events (creditos-cortesia, migration 046)
+    "CreditCourtesyEvent",
     # Credit inventory (neurostack-credit-system Group 4a, migration 039)
     "CreditInventoryVersion",
     "CreditAllocation",

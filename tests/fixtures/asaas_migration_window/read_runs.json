@@ -1,5 +1,5 @@
 {
- "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app). Window 042's runs (pre_042_at_036, pre_042_at_037, post_042_at_037, success_042, pre_042_at_042, post_042_at_042) were captured on 2026-10-31 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 036, then 037, then 042 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT through default privileges set before the migrations); the server statement log showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK. Window 045's runs (pre_045_at_042, post_045_at_042, success_045, pre_045_at_045, post_045_at_045, post_045_privileges_red) were captured on 2026-11-07 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 042, then to 045 in one run (043, 044 and 045) by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT, INSERT, UPDATE and DELETE through default privileges set before the migrations, the DML application role); post_045_privileges_red in a second database where those default privileges grant SELECT only; the server statement log (log_statement='all' for neurostack_app in those two databases only) showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK.",
+ "provenance": "Captured on 2026-10-21 from a disposable PostgreSQL 16 cluster (TCP only) with this tree's alembic CLI (console script, alembic.ini logging) and the read program rendered by scripts/asaas_migration_window.py; migrations as neurostack_owner, reads as neurostack_app unless the case says otherwise. Interpreter, standard library and tree paths rewritten to the production image layout (/usr/local/lib/python3.11/site-packages, /app). Window 042's runs (pre_042_at_036, pre_042_at_037, post_042_at_037, success_042, pre_042_at_042, post_042_at_042) were captured on 2026-10-31 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 036, then 037, then 042 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT through default privileges set before the migrations); the server statement log showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK. Window 045's runs (pre_045_at_042, post_045_at_042, success_045, pre_045_at_045, post_045_at_045, post_045_privileges_red) were captured on 2026-11-07 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 042, then to 045 in one run (043, 044 and 045) by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT, INSERT, UPDATE and DELETE through default privileges set before the migrations, the DML application role); post_045_privileges_red in a second database where those default privileges grant SELECT only; the server statement log (log_statement='all' for neurostack_app in those two databases only) showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK. Window 046's runs (pre_046_at_045, post_046_at_045, success_046, pre_046_at_046, post_046_at_046, post_046_privileges_red) were captured on 2026-11-09 from a disposable PostgreSQL 16.15 cluster (TCP only, unix_socket_directories=''): one database owned by neurostack_owner, upgraded to 045, then to 046 by this tree's alembic console script as neurostack_owner; reads as neurostack_app (a non-superuser LOGIN role with SELECT, INSERT, UPDATE and DELETE through default privileges set before the migrations, the DML application role); post_046_privileges_red in a second database where those default privileges grant SELECT only; the server statement log (log_statement='all' for neurostack_app in those two databases only) showed each read session running only BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, the SET LOCAL settings, the SELECTs and ROLLBACK.",
  "runs": {
   "post_035_at_035": {
    "exit_code": 0,
@@ -89,6 +89,33 @@
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"dml on public.media_deliveries\",false]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"dml on public.media_assets.trigger_intents\",false]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"end\",\"status\":\"ok\",\"rows\":2}"
+   ]
+  },
+  "post_046_at_045": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"046\",\"phase\":\"post\",\"payload_sha256\":\"aecccd26b16e737e0e1fd5d726dc56b6d1006d1906d512c6deadb91c96752772\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"045\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"select and insert on public.credit_courtesy_events\",null]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"end\",\"status\":\"ok\",\"rows\":1}"
+   ]
+  },
+  "post_046_at_046": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"046\",\"phase\":\"post\",\"payload_sha256\":\"aecccd26b16e737e0e1fd5d726dc56b6d1006d1906d512c6deadb91c96752772\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"046\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"select and insert on public.credit_courtesy_events\",true]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"end\",\"status\":\"ok\",\"rows\":1}"
+   ]
+  },
+  "post_046_privileges_red": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"046\",\"phase\":\"post\",\"payload_sha256\":\"aecccd26b16e737e0e1fd5d726dc56b6d1006d1906d512c6deadb91c96752772\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"046\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"select and insert on public.credit_courtesy_events\",false]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"end\",\"status\":\"ok\",\"rows\":1}"
    ]
   },
   "pre_035_at_032": {
@@ -285,6 +312,28 @@
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"045 tables present\",1]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"045 columns present\",1]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"media mime check not at 042\",1]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"end\",\"status\":\"ok\",\"rows\":3}"
+   ]
+  },
+  "pre_046_at_045": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"046\",\"phase\":\"pre\",\"payload_sha256\":\"1c48303099520e92c12fd00689d658b91c7e696d537292cc88369129199aeb7e\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"045\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"046 tables present\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"credit checks not at 045\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"credit lot payment_id nullable\",0]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"end\",\"status\":\"ok\",\"rows\":3}"
+   ]
+  },
+  "pre_046_at_046": {
+   "exit_code": 0,
+   "lines": [
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":0,\"kind\":\"begin\",\"window\":\"046\",\"phase\":\"pre\",\"payload_sha256\":\"1c48303099520e92c12fd00689d658b91c7e696d537292cc88369129199aeb7e\"}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":1,\"kind\":\"version\",\"values\":[\"046\"]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":2,\"kind\":\"row\",\"values\":[\"046 tables present\",1]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":3,\"kind\":\"row\",\"values\":[\"credit checks not at 045\",3]}",
+    "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":4,\"kind\":\"row\",\"values\":[\"credit lot payment_id nullable\",1]}",
     "{\"schema\":\"asaas_migration_window_read.v1\",\"seq\":5,\"kind\":\"end\",\"status\":\"ok\",\"rows\":3}"
    ]
   }

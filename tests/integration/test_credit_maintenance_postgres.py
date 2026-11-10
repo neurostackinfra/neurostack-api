@@ -112,7 +112,7 @@ async def harness() -> AsyncIterator[_Harness]:
         async with engine.connect() as connection:
             assert (
                 await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "045"
+                == "046"
             )
         yield _Harness(
             engine=engine,

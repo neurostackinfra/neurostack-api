@@ -239,11 +239,14 @@ async def at_045(baseline: _Baseline) -> AsyncIterator[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_045_revises_044_and_is_the_single_head() -> None:
+def test_045_revises_044_and_only_046_follows_it() -> None:
     assert (_MIGRATION.revision, _MIGRATION.down_revision) == ("045", "044")
     revisions = migration_revisions()
     assert revisions[_MIGRATION_PATH.name] == ("045", "044")
-    assert heads(revisions) == ["045"]
+    # creditos-cortesia: 046 (courtesy credit, window 046) is the one child
+    # of 045 and the head.
+    assert heads(revisions) == ["046"]
+    assert [rev for rev, down in revisions.values() if down == "045"] == ["046"]
     # The window's chain: 043 and 044 (the media widenings) below 045.
     parents = dict(revisions.values())
     assert (parents["045"], parents["044"], parents["043"]) == ("044", "043", "042")

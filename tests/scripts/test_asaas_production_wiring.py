@@ -2382,12 +2382,14 @@ def test_migration_windows_pin_each_exact_upgrade() -> None:
         "037": ("036", "037", ("alembic", "upgrade", "037")),
         "042": ("037", "042", ("alembic", "upgrade", "042")),
         "045": ("042", "045", ("alembic", "upgrade", "045")),
+        "046": ("045", "046", ("alembic", "upgrade", "046")),
     }
     assert mw.WINDOW_035.verification == "read back alembic_version == 035"
     assert mw.WINDOW_036.verification == "read back alembic_version == 036"
     assert mw.WINDOW_037.verification == "read back alembic_version == 037"
     assert mw.WINDOW_042.verification == "read back alembic_version == 042"
     assert mw.WINDOW_045.verification == "read back alembic_version == 045"
+    assert mw.WINDOW_046.verification == "read back alembic_version == 046"
     assert set(wiring.MIGRATIONS_EXCLUDED) == set(mw.WINDOWS)
     window_steps = [w.manifest_step for w in mw.WINDOWS.values()]
     assert window_steps == [
@@ -2396,20 +2398,23 @@ def test_migration_windows_pin_each_exact_upgrade() -> None:
         "migrations_037",
         "migrations_038_042",
         "migrations_043_045",
+        "migrations_046",
     ]
     assert [s for s, _scope in wiring.STEPS if s.startswith("migrations")] == (
         window_steps
     )
     # The 038-042 window comes after the deploy of the image containing 042
     # (live step L2) and the 037 window; the 045 window (the media bridge)
-    # after it, and both before any rollout transition.
+    # after it, the 046 window (the courtesy credit bridge) after that, and
+    # all before any rollout transition.
     order = [step for step, _scope in wiring.STEPS]
     assert (
         order.index("service_deployment")
         < order.index("migrations_037")
         < order.index("migrations_038_042")
         == order.index("migrations_043_045") - 1
-        == order.index("rollout_transitions") - 2
+        == order.index("migrations_046") - 2
+        == order.index("rollout_transitions") - 3
     )
     # The whole sentence: its every clause (the image prerequisite included)
     # is what plan prints for the 037 window.
@@ -2425,9 +2430,17 @@ def test_migration_windows_pin_each_exact_upgrade() -> None:
         "own explicit owner instruction after the bridge image containing 045 "
         "serves"
     )
+    assert wiring.MIGRATIONS_EXCLUDED["045"] == (
+        "046 (the courtesy credit schema of creditos-cortesia): its own window "
+        "(migrations_046), on its own explicit owner instruction after the "
+        "bridge image containing 046 serves"
+    )
     assert "043" in wiring.MIGRATIONS_EXCLUDED["042"]
     assert "044" in wiring.MIGRATIONS_EXCLUDED["042"]
     assert "046" in wiring.MIGRATIONS_EXCLUDED["045"]
+    # The frontier: no revision past the last window is written yet.
+    assert "047" in wiring.MIGRATIONS_EXCLUDED["046"]
+    assert "none is written" in wiring.MIGRATIONS_EXCLUDED["046"]
     assert all(
         scope == "separate_approval"
         for step, scope in wiring.STEPS
@@ -3508,7 +3521,7 @@ def test_migrations_render_refuses_a_widened_window_table(
         _pins()
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045", "046"])
 def test_a_window_outside_the_table_is_refused(name: str) -> None:
     """Only the table's own entries render: an equal-looking copy with any
     field changed is not a window."""
@@ -4064,7 +4077,7 @@ def test_an_equal_newest_revision_of_this_family_is_reported(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045"])
+@pytest.mark.parametrize("name", ["035", "036", "037", "042", "045", "046"])
 def test_each_window_renders_only_its_own_baked_upgrade(name: str) -> None:
     window = mw.WINDOWS[name]
     status, rendered = _migrations(window=window)
@@ -4085,7 +4098,7 @@ def test_each_window_renders_only_its_own_baked_upgrade(name: str) -> None:
     "name,command",
     [
         (name, command)
-        for name in ("035", "036", "037", "042", "045")
+        for name in ("035", "036", "037", "042", "045", "046")
         for command in (
             ("alembic", "upgrade", "head"),
             ("alembic", "upgrade", "heads"),
@@ -4095,7 +4108,7 @@ def test_each_window_renders_only_its_own_baked_upgrade(name: str) -> None:
             ("alembic", "upgrade", "044"),
             *[
                 ("alembic", "upgrade", other)
-                for other in ("035", "036", "037", "042", "045")
+                for other in ("035", "036", "037", "042", "045", "046")
                 if other != name
             ],
         )
@@ -4129,14 +4142,17 @@ def _registered_for(window: Any, arn: str = MIGRATIONS_NEXT_ARN) -> Any:
         ("036", "037", "would_register"),
         ("037", "042", "would_register"),
         ("042", "045", "would_register"),
+        ("045", "046", "would_register"),
         ("036", "035", "migrations_newest_revision_is_a_later_window"),
         ("037", "035", "migrations_newest_revision_is_a_later_window"),
         ("037", "036", "migrations_newest_revision_is_a_later_window"),
         ("042", "037", "migrations_newest_revision_is_a_later_window"),
         ("045", "042", "migrations_newest_revision_is_a_later_window"),
+        ("046", "045", "migrations_newest_revision_is_a_later_window"),
         ("036", "036", "registered"),
         ("042", "042", "registered"),
         ("045", "045", "registered"),
+        ("046", "046", "registered"),
     ],
 )
 def test_the_newest_revision_of_another_window_is_never_reused(
@@ -4184,7 +4200,7 @@ def test_cli_render_migrations_taskdef_requires_an_explicit_window(
     snapshot = FakeAws(applied=True).snapshot(tmp_path / "readback.json")
     params = _write_params(tmp_path, app_image_override=OVERRIDE_IMAGE)
     base = ["--params", str(params), "--readback-file", str(snapshot)]
-    for window in (None, "", "head", "034", "038", "041", "043", "035:037"):
+    for window in (None, "", "head", "034", "038", "041", "043", "047", "035:037"):
         argv = ["render-migrations-taskdef", *base]
         if window is not None:
             argv += ["--window", window]
@@ -4192,7 +4208,7 @@ def test_cli_render_migrations_taskdef_requires_an_explicit_window(
             wiring.main(argv)
         assert raised.value.code == 2
         assert capsys.readouterr().out == ""
-    for name in ("035", "036", "037", "042", "045"):
+    for name in ("035", "036", "037", "042", "045", "046"):
         code, out, err = _run(
             [
                 "render-migrations-taskdef",
@@ -4256,7 +4272,7 @@ def _window_step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     "name,mutate",
     [
         (name, mutate)
-        for name in ("036", "037", "042", "045")
+        for name in ("036", "037", "042", "045", "046")
         for mutate in (
             lambda s, n: s.__setitem__(
                 "change",
@@ -4269,7 +4285,7 @@ def _window_step(manifest: dict[str, Any], name: str) -> dict[str, Any]:
                 "change",
                 (
                     s["change"] + " then `alembic upgrade 037`"
-                    if n in ("036", "042", "045")
+                    if n in ("036", "042", "045", "046")
                     else s["change"] + " then `alembic upgrade 036`"
                 ),
             ),
@@ -4324,6 +4340,7 @@ def test_manifest_window_steps_say_their_own_upgrade_exactly_once() -> None:
         "037",
         "042",
         "045",
+        "046",
     ]
     assert manifest["migrations_task_definition"]["read_revisions"] == ["037"]
 
@@ -4358,7 +4375,7 @@ def test_the_037_read_revision_bakes_only_the_readback() -> None:
     }
 
 
-@pytest.mark.parametrize("name", ["035", "036", "042", "045"])
+@pytest.mark.parametrize("name", ["035", "036", "042", "045", "046"])
 def test_only_window_037_has_a_read_revision(
     name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -9243,9 +9260,15 @@ def test_the_runbook_documents_the_rollback_target_chain() -> None:
         # its production order) it refuses the reviewed manifest too.
         'Window `045` requires revision 17 the same way ("Migration 045"); it'
         " ran on 2026-11-08, and since the re-pin 17 to 18 (and the re-pin 18"
-        " to 19 after it) the reviewed manifest is no window's target:"
-        " production is at `045`, so `045` too could run again only after a"
-        " snapshot restore, planned with a manifest at 17.",
+        " to 19 after it) the reviewed manifest is not its target: production"
+        " is at `045`, so `045` too could run again only after a snapshot"
+        " restore, planned with a manifest at 17.",
+        # Since the re-pin 18 -> 19 the reviewed manifest is window 046's own
+        # target (creditos-cortesia), and no other window's.
+        'Window `046` requires revision 19 the same way ("Migration 046"):'
+        " since the re-pin 18 to 19 (creditos-cortesia live step L0b), before"
+        " the courtesy credit bridge image deploys, the reviewed manifest is"
+        " window `046`'s target and no other window's.",
         "**History (16 to 17).**",
         "revision 17's request with the app image set back to revision 16's"
         " digest hashes to revision 16's recorded `request_sha256`, so the two"
@@ -9278,9 +9301,10 @@ def test_the_runbook_documents_the_rollback_target_chain() -> None:
         f" {REPIN_18_TO_19_CLOSED_AT}, when approving the re-pin PR, the"
         " manifest's eighth `closed_at` marker",
         "added `test_the_18_to_19_re_pin_records_its_request_sha256_and_image_digest`",
-        "With the target on 19 every window, `045` included, refuses the"
-        " reviewed manifest (`rollback_target_not_repinned`); a manifest at 17"
-        " still passes window `045`'s target check.",
+        "With the target on 19 every window but `046` (whose target it is),"
+        " `045` included, refuses the reviewed manifest"
+        " (`rollback_target_not_repinned`); a manifest at 17 still passes"
+        " window `045`'s target check.",
         "the two diverge only after L4",
         # Each move is reviewed and merged by a human (R20).
         "Each move is its own small reviewed PR of the manifest (an ASAAS"

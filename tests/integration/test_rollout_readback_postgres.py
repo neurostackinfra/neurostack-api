@@ -5,13 +5,14 @@ One of the release-candidate PostgreSQL suites
 run by CI); it needs ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback
 cluster, as every PostgreSQL suite here). It migrates a fresh database with
 this tree's migrations and runs the exact programs
-``scripts/asaas_rollout_readback.py`` renders for its three windows
+``scripts/asaas_rollout_readback.py`` renders for its four windows
 (``--window 037`` before the 038-042 window, ``--window 042`` after it,
-``--window 045`` after the media bridge window), as the cluster
+``--window 045`` after the media bridge window, ``--window 046`` after the
+courtesy credit bridge window), as the cluster
 superuser and as a throwaway non-superuser login role (its own password,
 ``SELECT`` through default privileges set before the migrations, as the
 application role gets it): at 036 both judges stop on the revision and on
-every legacy object of migration 037; at each of 037, 042 and 045 only that
+every legacy object of migration 037; at each of 037, 042, 045 and 046 only that
 window's judge accepts the table and the others stop on the revision alone;
 the reads changed nothing; with row-level security on, the non-superuser is not exempt
 (its rows are hidden), while the superuser sees them and only the RLS row
@@ -172,7 +173,7 @@ async def test_each_window_passes_only_on_its_own_revision(database: _Database) 
             assert sum(r.startswith("legacy_function_present:") for r in reasons) == 10
             assert len(reasons) == 15, reasons
 
-    assert tuple(rr.READ_WINDOWS) == ("037", "042", "045")
+    assert tuple(rr.READ_WINDOWS) == ("037", "042", "045", "046")
     for revision in rr.READ_WINDOWS:
         await _run_alembic(database.superuser, "upgrade", revision)
         before = await _rollout_rows(database.superuser)
@@ -197,7 +198,7 @@ async def test_each_window_passes_only_on_its_own_revision(database: _Database) 
         assert await _rollout_rows(database.superuser) == before
 
 
-@pytest.mark.parametrize("window", ["037", "042", "045"])
+@pytest.mark.parametrize("window", ["037", "042", "045", "046"])
 async def test_row_level_security_is_not_bypassed_for_the_application_role(
     database: _Database, window: str
 ) -> None:

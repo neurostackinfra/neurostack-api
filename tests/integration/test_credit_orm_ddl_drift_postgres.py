@@ -6,7 +6,8 @@ credit models in a scratch schema: columns (type, nullability, server default,
 identity), primary key, foreign keys (target, columns, ON DELETE/ON UPDATE),
 unique constraints, CHECK constraints (name and PostgreSQL's own rendering)
 and plain indexes.  Both sides are reflected from PostgreSQL, so a difference
-is a real drift between migration 038 and ``src/models/credit*.py``.
+is a real drift between the credit migrations (038 to 042, and 046's
+courtesy lot, removal entry and event table) and ``src/models/credit*.py``.
 
 Needs ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback cluster, database
 ``postgres``); without it the module skips, and only
@@ -73,6 +74,8 @@ _EXPECTED_TABLES = {
     "credit_purge_receipts",
     # Group 7, migration 042.
     "credit_cutoff_acceptances",
+    # creditos-cortesia, migration 046.
+    "credit_courtesy_events",
 }
 
 
@@ -201,7 +204,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "045"
+    assert version == "046"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 

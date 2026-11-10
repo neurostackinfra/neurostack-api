@@ -1,7 +1,7 @@
 """The 24-hour media delivery claim and the bridge mappings on real PostgreSQL.
 
-envio-midia-agente Group 2.  One database at ``alembic upgrade head`` (045:
-``media_assets.trigger_intents`` and ``media_deliveries``), shared by the
+envio-midia-agente Group 2.  One database at ``alembic upgrade head`` (046;
+045 added ``media_assets.trigger_intents`` and ``media_deliveries``), shared by the
 module; every test seeds its own tenant, sessions and media assets.  Pinned
 here:
 
