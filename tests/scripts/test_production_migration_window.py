@@ -572,14 +572,16 @@ def test_rollback_runbook_states_every_rollback_target_phase() -> None:
         "**Revision 8 is unsafe after migration 036**: it reads columns 036"
         " drops, and 036 ran on 2026-10-24",
         "--task-definition neurostack-staging-app:R",
-        "`R` is the rollback target, `18` since the eighth re-pin (to the"
-        " serving bridge revision after window 045; it was `8` until the first"
-        " re-pin merged, `9` until the second, `10` until the third, `11` until"
-        " the fourth, `12` until the fifth, `13` until the sixth, `16` until the"
-        " seventh and `17` until the eighth); never `8`, because migration 036"
+        "`R` is the rollback target, `19` since the ninth re-pin (to the"
+        " serving revision of the behaviour release before the next image"
+        " change; it was `8` until the first re-pin merged, `9` until the"
+        " second, `10` until the third, `11` until the fourth, `12` until the"
+        " fifth, `13` until the sixth, `16` until the seventh, `17` until the"
+        " eighth and `18` until the ninth); never `8`, because migration 036"
         " has run",
-        'Read "revision R" below as the field\'s current value, revision 18',
-        "revision 16 until the re-pin to 17 and revision 17 until the re-pin to 18.",
+        'Read "revision R" below as the field\'s current value, revision 19',
+        "revision 16 until the re-pin to 17, revision 17 until the re-pin to 18"
+        " and revision 18 until the re-pin to 19.",
         "After L6 do not roll back by hand to R (13)",
         "`service_on_rollback_target_plan_stuck:<revision 13 ARN>`",
         # The breaker after L6: a safe state, not the documented way back.
@@ -871,6 +873,13 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         ' `closed_at` 2026-11-08T23:51Z; "History (17 to 18)"): the reviewed'
         " manifest is at 18.",
         "4. Only then merge and deploy the behaviour release (PR-B)",
+        # Step 4 as it ran in production (revision 19), then the re-pin 18 -> 19.
+        "Done on 2026-11-09: the behaviour release"
+        " (`build-20261109-83d7094f-42540518012`, built from `main` `83d7094f`)"
+        " serves as revision 19, revision 18 with the app image alone moved"
+        " (deployment `ecs-svc/7245450629757675711` `COMPLETED` 2026-11-09"
+        ' 00:40:55Z); the target then moved from 18 to 19 ("History (18 to'
+        ' 19)").',
         "5. Open the behaviour release's flag.",
     ]
     positions = [section.index(step) for step in order]
@@ -944,6 +953,9 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "the credit switch stays **on**",
         "It is the rollback target once step 3 above re-pins the target from 17"
         " to the bridge revision 18, before PR-B deploys.",
+        "Since the re-pin 18 to 19 the target is the behaviour release's"
+        " revision 19 itself, and the bridge revision 18 stays this way back"
+        " from it.",
         "**The bridge image back to the rollback target (revision 17) after the"
         " window.**",
         "reads `revision_outside_image_chain` and stays **off**",
@@ -967,7 +979,10 @@ def test_runbooks_state_the_045_bridge_order_and_both_rollbacks() -> None:
         "the target is re-pinned from 17 to 18 after the window and before"
         " PR-B deploys",
         "Done: window `045` ran on 2026-11-08 on the bridge revision 18, and the"
-        " target is 18 since the eighth re-pin.",
+        " target was 18 from the eighth re-pin.",
+        "The behaviour release serves as revision 19 since 2026-11-09, and the"
+        " target is 19 since the ninth re-pin; the bridge revision 18 stays the"
+        " way back from the behaviour release.",
         "takes the serving image out of the chain.**",
         "its credit switch reads `revision_outside_image_chain` and stays **off**",
         "**The migrations come back only by a restore** of the window's snapshot"
