@@ -163,6 +163,28 @@ code never creates an order.
   inbox and its grant was applied to the ledger. A checkout return, a PIX QR
   code, a pending payment or a forged callback never changes a figure.
 
+## Per-builder mode
+
+cobranca-credito-por-builder: an operator can charge a chosen builder (the wish
+scopes one; the code does not limit it) for real
+before the global enforcement, with the one-off command `credit_charge_mark`
+([`credit-charge-mark.md`](../runbooks/credit-charge-mark.md)). No route
+writes a mark.
+
+- The **effective mode** of a builder is the global `credit_enforcement_at`
+  if set, else the builder's latest event of `credit_enforcement_marks` when
+  it is a `mark` (from its `occurred_at`), else observational
+  (`CreditRepository.effective_enforcement`).
+- `mode` (summary, state, consumption) is computed from the account's builder,
+  `scope.builder_id`, which since #219 also covers the builder's home tenant
+  with no `builder_id`: `enforced` for a marked builder while the global is
+  unset.
+- `GET /v1/admin/builders/subscriptions` carries a read-only `charging` per
+  row: `{"marked_at": <UTC ISO 8601>}` when the builder's latest event is a
+  `mark`, else `null`; `null` on every row while the credit switch is off,
+  the database is below `047` or the marks read failed. It means "operator
+  mark", not "being charged" (master-admin badge "Cobrança ativa").
+
 ## Cortesia
 
 Courtesy credits are credits a super admin gives a builder for free

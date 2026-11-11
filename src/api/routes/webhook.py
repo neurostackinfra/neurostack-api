@@ -3782,20 +3782,29 @@ async def _process_zapi_authenticated_body(
     )
 
     media = _inline_media(request, _ZAPI_MEDIA_PROVIDER)
-    outcome = await _run_pipeline_transactionally(
-        service=service,
-        event_request=event_request,
-        db=db,
-        context=context,
-        metering=(
-            None
-            if request is None or enforcement is not None
-            else zapi_ingress(request, body=body, context=context)
-        ),
-        enforcement=enforcement,
-        reply=_ReplyTarget("zapi", phone, patient_audio_input),
-        media=media,
-    )
+    try:
+        outcome = await _run_pipeline_transactionally(
+            service=service,
+            event_request=event_request,
+            db=db,
+            context=context,
+            metering=(
+                None
+                if request is None or enforcement is not None
+                else zapi_ingress(request, body=body, context=context)
+            ),
+            enforcement=enforcement,
+            reply=_ReplyTarget("zapi", phone, patient_audio_input),
+            media=media,
+        )
+    except CreditEnforcementUnavailable:
+        # cobranca-credito-por-builder: the enforced claim found the tenant
+        # relinked since the pre-check -- nothing written; the pre-check's 503
+        # (the message is lost: main's replay claim is spent).
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
     if isinstance(outcome, dict):
         # Enforced: claimed, charged and its reply sent from the outbox.
         return outcome
@@ -6010,7 +6019,7 @@ async def _meta_file_handoff(
     metering: Optional[ObservationalIngress],
     enforcement: Optional[WebhookEnforcement],
     clear_pending_review: bool,
-) -> Optional[dict[str, Any]]:
+) -> Optional[dict[str, Any] | Response]:
     """The file handoff decision of every call site: forward-on-request and
     ``audio_too_long``, on Meta, Z-API and Uazapi.  ``None``: the handoff is
     committed, the route sends the patient's text as today.  A dict: the 200 body to answer with,
@@ -6075,6 +6084,15 @@ async def _meta_file_handoff(
             note=note,
             initiate=initiate,
             before_commit=before_commit,
+        )
+    except CreditEnforcementUnavailable:
+        # cobranca-credito-por-builder: the captured mark re-checked under the
+        # account lock changed (or became unreadable) -- rolled back, nothing
+        # written; answered like the pre-check's 503, which loses the message
+        # (main's replay claim is spent).
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
         )
     finally:
         # After the transaction's end only: a rolled-back record is dropped.
@@ -6985,16 +7003,27 @@ async def meta_webhook(
             )
 
             media = _inline_media(request, _META_MEDIA_PROVIDER)
-            outcome = await _run_pipeline_transactionally(
-                service=service,
-                event_request=event_request,
-                db=db,
-                context=context,
-                metering=metering,
-                enforcement=enforcement,
-                reply=_ReplyTarget("meta", from_phone, input_was_audio),
-                media=media,
-            )
+            try:
+                outcome = await _run_pipeline_transactionally(
+                    service=service,
+                    event_request=event_request,
+                    db=db,
+                    context=context,
+                    metering=metering,
+                    enforcement=enforcement,
+                    reply=_ReplyTarget("meta", from_phone, input_was_audio),
+                    media=media,
+                )
+            except CreditEnforcementUnavailable:
+                # cobranca-credito-por-builder: the enforced claim found the
+                # tenant relinked since the pre-check -- nothing written; the
+                # pre-check's 503 (the message is lost, as there).
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE
+                    },
+                )
             if isinstance(outcome, dict):
                 # Enforced: claimed, charged and its reply sent from the outbox.
                 return outcome

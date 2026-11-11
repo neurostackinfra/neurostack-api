@@ -32,9 +32,11 @@ The checks run in this order and in no other (WISH Group 5, DESIGN Scope IN
    ``deduplicated`` in silence, before any wait and with no write (see "In
    flight" below);
 5. the credit mode, read without a ``Request``
-   (:func:`~src.services.credit_inventory.read_credit_mode_without_request`)
-   and, when enforced, the builder's suspension -- unavailable or suspended:
-   ``credit_refused``;
+   (:func:`~src.services.credit_inventory.read_credit_mode_without_request`;
+   per builder -- the tenant's builder's effective enforcement -- only on
+   Meta and Z-API, :data:`PER_BUILDER_PROVIDERS`, the global alone on Uazapi
+   and Evolution) and, when enforced, the builder's suspension --
+   unavailable or suspended: ``credit_refused``;
 6. the 24-hour claim -- taken within the window: ``deduplicated``, in
    silence;
 7. the egress: off records nothing; observational records what it WOULD
@@ -185,6 +187,11 @@ def _request_seconds(timeout: httpx.Timeout) -> float:
     return timeout.connect + timeout.write + timeout.read
 
 
+# cobranca-credito-por-builder (wish Decision 12): the delivery channels on
+# which a marked builder is charged -- the ones with an enforced adapter.
+# On Uazapi and Evolution its outgoing media keeps the GLOBAL read (like its
+# text): observational, recorded, never charged nor gated by its mark.
+PER_BUILDER_PROVIDERS: Final[frozenset[str]] = frozenset({"meta", "zapi"})
 # How many ``MEDIA_SEND_TIMEOUT`` requests one media send makes: Meta
 # uploads, then sends; the others post one request.
 _MEDIA_SEND_REQUESTS: Final[Mapping[str, int]] = MappingProxyType(
@@ -690,8 +697,16 @@ async def _deliver_with_permit(
     session_factory: Callable[[], AsyncSession],
     credit_switch_on: bool | None,
 ) -> Mapping[str, object]:
-    # 5. The credit mode (and, enforced, the suspension).
-    mode = await _credit_mode(session_factory, tenant_id, credit_switch_on)
+    # 5. The credit mode (and, enforced, the suspension).  Per builder
+    # (cobranca-credito-por-builder) only on a channel a marked builder is
+    # charged on (Meta, Z-API); Uazapi and Evolution keep the global read, so
+    # a marked builder's file there stays observational like its text.
+    mode = await _credit_mode(
+        session_factory,
+        tenant_id,
+        credit_switch_on,
+        per_builder=channel.provider in PER_BUILDER_PROVIDERS,
+    )
     # 6. The claim, committed before anything else happens.
     claimed = await _step(
         "claim", _claim(session_factory, tenant_id, session_id, media_id)
@@ -777,14 +792,20 @@ async def _credit_mode(
     session_factory: Callable[[], AsyncSession],
     tenant_id: UUID,
     credit_switch_on: bool | None,
+    *,
+    per_builder: bool,
 ) -> CreditMode:
     # Opening and closing the session are inside the ``try`` too: the
     # delivery never raises (a cancellation is not an ``Exception``).
     try:
         async with session_factory() as session:
             try:
+                # The tenant (its builder's effective enforcement) only for a
+                # per-builder channel; else the global alone.
                 mode = await credit_inventory.read_credit_mode_without_request(
-                    session, switch_on=credit_switch_on
+                    session,
+                    switch_on=credit_switch_on,
+                    tenant_id=tenant_id if per_builder else None,
                 )
             except CreditEnforcementUnavailable:
                 raise _Refused(
@@ -865,6 +886,7 @@ async def _egress(
                 # One delivery per send (owner decision F): never the claim's
                 # row id, which every send of the pair shares.
                 delivery_id=uuid4(),
+                captured=mode.captured,
             )
             if charged.status == "credit_pending":
                 await session.rollback()
@@ -874,6 +896,10 @@ async def _egress(
         raise
     except CreditTenantGone:
         raise _Refused("asset_gone", "tenant_gone") from None
+    except CreditEnforcementUnavailable:
+        # The captured mark changed under the lock (or became unreadable):
+        # nothing charged, the file is not sent (cobranca-credito-por-builder).
+        raise _Refused("credit_refused", "credit_enforcement_unavailable") from None
     except Exception as error:
         raise _Refused(
             "credit_refused", f"egress_failed:{type(error).__name__}"
@@ -943,6 +969,7 @@ __all__ = [
     "AGENT_MEDIA_PERMIT_WAIT_SECONDS",
     "MEDIA_DELIVERY_PROVIDERS",
     "NOTICE_OUTCOMES",
+    "PER_BUILDER_PROVIDERS",
     "REPLY_MEDIA_MAX_SECONDS",
     "REPLY_MEDIA_NOTICES",
     "REPLY_MEDIA_NOTICE_TIMEOUT_SECONDS",

@@ -742,6 +742,18 @@ async def _process_enforced_event(
         leased = await credit_metering.acquire_events_claim(
             db, enforcement, takeover=verdict
         )
+    except CreditEnforcementUnavailable:
+        # cobranca-credito-por-builder: the pre-check re-reads a captured
+        # mark under the account lock; a changed one (the tenant relinked, the
+        # builder unmarked) or an unreadable one is 503 before any write --
+        # rolled back before the claim is inserted or taken over, so a retry
+        # with the same key decides again (wish Decision 6).  The slot stays
+        # consumed.
+        await db.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"code": CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
     except CreditTenantGone:
         return await _session_mismatch(http_request, tenant, db)
     except Exception as error:

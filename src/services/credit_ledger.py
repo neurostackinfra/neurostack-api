@@ -1863,11 +1863,17 @@ class CreditLedger:
 
     async def spend_hold(self, builder_id: UUID) -> SpendHold:
         """The builder's quarantine hold (read-only; exposed before the
-        enforcement too, when it does not act)."""
+        enforcement too, when it does not act).  ``enforced`` is the
+        builder's effective enforcement (cobranca-credito-por-builder: the
+        global ``credit_enforcement_at``, else the builder's mark), so the
+        hold, the lifecycle of :meth:`persist` and the window opening of
+        :meth:`debit` act for a marked builder and for no other one while
+        the global is unset."""
 
         return SpendHold(
             quarantined=await self.repository.quarantine_hold(builder_id),
-            enforced=await self.repository.enforcement_at() is not None,
+            enforced=(await self.repository.effective_enforcement(builder_id)).at
+            is not None,
         )
 
     async def open_book(
@@ -1949,7 +1955,9 @@ class CreditLedger:
         (:meth:`src.services.credit_lifecycle.CreditLifecycle.evaluate`):
         episode opening, grace shortening, the 72 h / 30 d transitions,
         reactivation and thresholds.  Inert -- no query, no row -- while the
-        book's ``spend_hold`` says ``credit_enforcement_at`` is unset.
+        book's ``spend_hold`` says the builder's effective enforcement is
+        unset (cobranca-credito-por-builder: neither the global
+        ``credit_enforcement_at`` nor a mark of the builder).
         ``lifecycle_source=None`` skips it (the outcome lands on
         :attr:`lifecycle_outcome`).  ``before_lifecycle`` runs after the
         rows are inserted and before the evaluation (the courtesy service

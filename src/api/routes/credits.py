@@ -50,6 +50,10 @@ quarantined ASAAS order or cycle, a standalone tenant, or -- once enforced --
 a binding coverage that is not usable: ``reconciliation``) > ``active``.
 ``mode`` is ``observational`` until ``credit_enforcement_at``: nothing is
 charged then, and the consumption shows what WOULD have been debited.
+cobranca-credito-por-builder: the instant is the account's builder's
+effective enforcement (``scope.builder_id``: the global, else that
+builder's mark), so ``mode`` is ``enforced`` for a marked builder only while
+the global is unset.
 """
 
 from __future__ import annotations
@@ -409,8 +413,18 @@ class CreditSnapshot:
     # -- state -----------------------------------------------------------
 
     async def enforcement_at(self) -> datetime | None:
+        """The effective enforcement instant of the account read
+        (cobranca-credito-por-builder, wish Decision 15): of
+        ``scope.builder_id`` -- the builder of the account, also for a
+        builder reading through its unlinked home tenant (#219) -- the global
+        ``credit_enforcement_at``, else that builder's mark; a scope without
+        a builder only ever sees the global.  ``mode`` (summary, state,
+        consumption) and ``state.enforcement_at`` follow it."""
+
         async def load() -> datetime | None:
-            return _optional_utc(await self.repository.enforcement_at())
+            return _optional_utc(
+                (await self.repository.effective_enforcement(self.scope.builder_id)).at
+            )
 
         return await self._once("enforcement_at", load)
 

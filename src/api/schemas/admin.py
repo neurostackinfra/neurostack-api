@@ -137,6 +137,32 @@ class BuilderWithClinicsResponse(BaseModel):
     clinics: list[BuilderClinicResponse] = Field(default_factory=list)
 
 
+class BuilderChargingResponse(BaseModel):
+    """``charging`` of a ``GET /v1/admin/builders/subscriptions`` row
+    (cobranca-credito-por-builder, wish Group 5): read-only, derived from
+    ``credit_enforcement_marks``.
+
+    The exact shape is ``{"marked_at": <UTC instant, ISO 8601>}``: the
+    builder's latest mark event is a ``mark`` and ``marked_at`` is that
+    event's ``occurred_at``.  The row's ``charging`` is ``null`` for a
+    builder that was never marked or whose latest event is an ``unmark``,
+    and ``null`` for every row while the credit switch is not effective, the
+    database is below revision 047 (the marks table is not queried then) or
+    the marks read failed.  It means "this builder has an operator mark",
+    NOT "this builder is being charged": if the global enforcement is ever
+    armed every builder is charged and only the marked rows still carry it
+    (revisit when that wish runs).  Nothing in the API writes a mark: the
+    only writer is the operator command ``credit_charge_mark`` (a one-off
+    operator task).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    marked_at: datetime = Field(
+        description="occurred_at of the builder's latest event, a mark (UTC)."
+    )
+
+
 class CreateBuilderClinicRequest(BaseModel):
     """Request body for creating a clinic under a builder."""
 

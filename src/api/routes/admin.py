@@ -43,6 +43,7 @@ from src.api.schemas.admin import (
     BillingRolloutTransitionRequest,
     BillingTopupCapabilityDisableRequest,
     BillingTopupCapabilityEnableRequest,
+    BuilderChargingResponse,
     BuilderClinicResponse,
     BuilderWithClinicsResponse,
     ClinicSlotResponse,
@@ -76,7 +77,12 @@ from src.repositories.billing import (
     BillingStateUnavailable,
     BillingTransitionRejected,
 )
-from src.repositories.credit import LOT_DECREASES, LOT_INCREASES
+from src.repositories.credit import (
+    LOT_DECREASES,
+    LOT_INCREASES,
+    CreditRepository,
+    EnforcementMarkRow,
+)
 from src.services.billing_capability import (
     BillingCapabilityRejected,
     BillingTopupCapabilityService,
@@ -95,6 +101,7 @@ from src.services.billing_rollout import BillingRolloutOperationService
 from src.services.credit_switch import (
     courtesy_gate_open,
     credit_switch_reading,
+    enforcement_mark_gate_open,
     request_credit_switch,
 )
 from src.services.media_assets import (
@@ -931,6 +938,30 @@ async def _courtesy_by_builder(
     return summary
 
 
+def _charging_readable(request: Request) -> bool:
+    """cobranca-credito-por-builder (wish Group 5): the ``charging`` field
+    reads ``credit_enforcement_marks`` only with the credit switch this
+    request captured effective AND the 047 gate open on the switch reading
+    (below 047 the table does not exist).  The reading is read once;
+    anything that fails is "not readable", never a 500."""
+
+    if not request_credit_switch(request):
+        return False
+    try:
+        return enforcement_mark_gate_open(credit_switch_reading())
+    except Exception:
+        return False
+
+
+def _charging_row(mark: EnforcementMarkRow | None) -> Any:
+    """``charging`` of one row (:class:`BuilderChargingResponse`): the
+    builder's latest mark event when it is a ``mark``, else ``None``."""
+
+    if mark is None or mark.kind != "mark":
+        return None
+    return BuilderChargingResponse(marked_at=mark.occurred_at).model_dump(mode="json")
+
+
 def _subscription_row(subscription: SubscriptionReadback | None) -> Any:
     if subscription is None:
         return None
@@ -956,7 +987,17 @@ def _subscription_row(subscription: SubscriptionReadback | None) -> Any:
         "failed for this builder only; and `courtesy`, null while the credit "
         "switch is not effective or the courtesy routes are closed (schema "
         "below 046), else {active_expires_at, available_mc} of the active "
-        "courtesy lots (active_expires_at null when there is none)."
+        "courtesy lots (active_expires_at null when there is none); and "
+        "`charging`, read-only: {marked_at} (the UTC instant of the "
+        "builder's latest enforcement mark event) when that event is a "
+        "`mark`, null for a builder never marked or whose latest event is an "
+        "`unmark`, and null for every row while the credit switch is not "
+        "effective, the schema is below 047, or the marks read failed. The "
+        "badge means the builder has an operator mark, not that it is being "
+        "charged: if the global enforcement is ever armed every builder is "
+        "charged and only the marked rows still carry it. No route marks or "
+        "unmarks a builder: the only writer is the operator command "
+        "`credit_charge_mark` (a one-off operator task)."
     ),
     response_model=None,
 )
@@ -995,6 +1036,23 @@ async def builder_subscriptions(
                 error_type=type(error).__name__,
             )
             courtesy = None
+    marks: dict[UUID, EnforcementMarkRow] | None = None
+    if _charging_readable(request):
+        try:
+            # ONE statement for every builder of the table, in its own
+            # savepoint: a failed read is `charging` null for this response
+            # only, never a failed table.  The verdict was just taken on the
+            # reading, so the repository does not re-read the gate.
+            async with session.begin_nested():
+                marks = await CreditRepository(session).latest_enforcement_marks(
+                    (UUID(row["id"]) for row in builders), marks_readable=True
+                )
+        except Exception as error:
+            logger.warning(
+                "builder charging marks unreadable; charging is null",
+                error_type=type(error).__name__,
+            )
+            marks = None
     rows: list[dict[str, Any]] = []
     for row in builders:
         builder_id = UUID(row["id"])
@@ -1024,6 +1082,9 @@ async def builder_subscriptions(
                     else courtesy.get(
                         builder_id, {"active_expires_at": None, "available_mc": 0}
                     )
+                ),
+                "charging": (
+                    None if marks is None else _charging_row(marks.get(builder_id))
                 ),
             }
         )

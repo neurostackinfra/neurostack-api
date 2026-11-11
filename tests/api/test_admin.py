@@ -498,7 +498,7 @@ _LEGACY_KEYS = {
     "billing_cycle",
     "updated_at",
 }
-_NEW_KEYS = {"subscription", "subscription_unavailable", "courtesy"}
+_NEW_KEYS = {"subscription", "subscription_unavailable", "courtesy", "charging"}
 
 
 @contextmanager
@@ -816,6 +816,156 @@ class TestBuilderSubscriptions:
         assert (row["subscription"], row["subscription_unavailable"]) == (None, False)
         [logged] = [
             r for r in records if r["event"].startswith("builder courtesy summary")
+        ]
+        assert logged["error_type"] == "OperationalError"
+        assert "secret" not in repr(records)
+
+    # -- charging (cobranca-credito-por-builder Group 5) ---------------------
+
+    @staticmethod
+    def _below_047() -> str:
+        from src.services.credit_switch import (
+            ENFORCEMENT_MARK_SCHEMA_MIN_REVISION,
+            load_image_migration_chain,
+        )
+
+        chain = load_image_migration_chain()
+        return chain[chain.index(ENFORCEMENT_MARK_SCHEMA_MIN_REVISION) - 1]
+
+    @staticmethod
+    def _mark(
+        client: TestClient, builder_id: UUID, *events: tuple[str, datetime]
+    ) -> None:
+        """Append ``(kind, occurred_at)`` events to the builder's marks."""
+
+        from src.models.credit import CreditEnforcementMark
+
+        _seed_entities(
+            client,
+            *(
+                CreditEnforcementMark(
+                    id=uuid4(),
+                    builder_id=builder_id,
+                    kind=kind,
+                    occurred_at=at,
+                    actor_user_id=uuid4(),
+                    reason="teste",
+                )
+                for kind, at in events
+            ),
+        )
+
+    _T0 = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
+
+    def test_charging_is_null_and_unread_without_the_switch_or_below_047(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        [builder] = self._builders(client, 1)
+        self._mark(client, builder, ("mark", self._T0))
+        for effective, revision in (
+            (False, None),
+            (False, self._head()),
+            (True, self._below_047()),
+            (True, None),
+        ):
+            self._switch(monkeypatch, effective=effective, revision=revision)
+            with _sql() as statements:
+                row = self._rows(client, super_admin_headers, [builder])[builder]
+            assert row["charging"] is None, (effective, revision)
+            assert [s for s in statements if "credit_enforcement_marks" in s] == []
+        # At 046 the courtesy gate is open: only the marks are not read.
+        assert row["courtesy"] is None
+        self._switch(monkeypatch, effective=True, revision=self._below_047())
+        row = self._rows(client, super_admin_headers, [builder])[builder]
+        assert row["courtesy"] == {"active_expires_at": None, "available_mc": 0}
+        assert row["charging"] is None
+
+    def test_charging_shows_only_the_builder_whose_latest_event_is_a_mark(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        marked, unmarked, remarked, never = self._builders(client, 4)
+        hour = timedelta(hours=1)
+        self._mark(client, marked, ("mark", self._T0))
+        self._mark(client, unmarked, ("mark", self._T0), ("unmark", self._T0 + hour))
+        self._mark(
+            client,
+            remarked,
+            ("mark", self._T0),
+            ("unmark", self._T0 + hour),
+            ("mark", self._T0 + 2 * hour),
+        )
+        self._courtesy(client, marked, 4)
+        rows = self._rows(
+            client, super_admin_headers, [marked, unmarked, remarked, never]
+        )
+        assert rows[marked]["charging"] == {"marked_at": "2026-11-11T12:00:00Z"}
+        assert rows[remarked]["charging"] == {"marked_at": "2026-11-11T14:00:00Z"}
+        assert rows[unmarked]["charging"] is None
+        assert rows[never]["charging"] is None
+        # Every other field is what it was without a mark.
+        assert rows[marked]["courtesy"]["available_mc"] == 4_000
+        for builder_id, row in rows.items():
+            assert (row["subscription"], row["subscription_unavailable"]) == (
+                None,
+                False,
+            )
+            assert row["subscription_status"] == "trial"
+            assert row["name"] == f"Sub builder {builder_id.hex}"
+
+    def test_the_charging_part_is_one_statement_for_the_whole_table(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        counts = []
+        for size in (2, 6):
+            ids = self._builders(client, size)
+            for builder in ids:
+                self._mark(client, builder, ("mark", self._T0))
+            with _sql() as statements:
+                rows = self._rows(client, super_admin_headers, ids)
+            assert all(rows[b]["charging"] is not None for b in ids)
+            counts.append(
+                len([s for s in statements if "credit_enforcement_marks" in s])
+            )
+        assert counts == [1, 1]
+
+    def test_a_failed_marks_read_is_charging_null_only(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import structlog
+        from sqlalchemy import text
+
+        from src.repositories.credit import CreditRepository
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        [builder] = self._builders(client, 1)
+        self._mark(client, builder, ("mark", self._T0))
+        self._courtesy(client, builder, 2)
+
+        async def broken(self: Any, *_args: Any, **_kwargs: Any) -> Any:
+            await self.session.execute(text("SELECT * FROM no_such_table_secret"))
+
+        monkeypatch.setattr(CreditRepository, "latest_enforcement_marks", broken)
+        with structlog.testing.capture_logs() as records:
+            row = self._rows(client, super_admin_headers, [builder])[builder]
+        assert row["charging"] is None
+        assert row["courtesy"]["available_mc"] == 2_000
+        assert (row["subscription"], row["subscription_unavailable"]) == (None, False)
+        [logged] = [
+            r for r in records if r["event"].startswith("builder charging marks")
         ]
         assert logged["error_type"] == "OperationalError"
         assert "secret" not in repr(records)

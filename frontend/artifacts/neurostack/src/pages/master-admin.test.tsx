@@ -4,6 +4,7 @@ import { I18nProvider } from "@/context/i18n";
 import type { Txt } from "@/components/billing/format";
 import MasterAdmin from "./master-admin";
 import { paymentNotice } from "./billing-view";
+import { formatInstant } from "@/components/billing/format";
 
 // "Assinaturas por Builder" (DESIGN creditos-cortesia, decision 12 and the
 // Success Criteria "Tabela 'Assinaturas por Builder'").
@@ -44,6 +45,7 @@ function row(id: string, name: string, extra: Record<string, unknown>) {
     subscription: null,
     subscription_unavailable: false,
     courtesy: null,
+    charging: null,
     ...extra,
   };
 }
@@ -295,5 +297,86 @@ describe("Master Admin: Assinaturas por Builder", () => {
     expect(
       (await rowOf("Builder D Cortesia")).getByRole("button", { name: "Builder D Cortesia credits" }),
     ).toBeInTheDocument();
+  });
+});
+
+// cobranca-credito-por-builder Group 5: the read-only "Cobrança ativa" badge.
+describe("Master Admin: Cobrança ativa", () => {
+  const MARKED_AT = "2026-11-11T12:00:00Z";
+  const chargingRows = [
+    row("m", "Builder Marcado", {
+      subscription: subscription("active", "paid"),
+      courtesy: ACTIVE_COURTESY,
+      charging: { marked_at: MARKED_AT },
+    }),
+    row("u", "Builder Nao Marcado", { courtesy: { active_expires_at: null, available_mc: 0 } }),
+    // Below 047 or with the switch off the server sends `charging: null`.
+    row("off", "Builder Credito Desligado", {}),
+  ];
+
+  it("shows the badge only on the marked builder's row, with the mark instant in its title", async () => {
+    installFetch(chargingRows);
+    await openSubscriptionsTable();
+    const marked = await rowOf("Builder Marcado");
+    const badge = marked.getByText("Cobrança ativa");
+    expect(badge).toHaveAttribute("title", "Cobrança ativa desde 11/11/2026, 09:00");
+    // The date is also text (sr-only), not only a hover tooltip.
+    const since = marked.getByTestId("charging-since");
+    expect(since).toHaveTextContent(/^desde 11\/11\/2026, 09:00$/);
+    expect(since).toHaveClass("sr-only");
+    // Nothing else of the row changes.
+    expect(marked.getByText("Ativo")).toBeInTheDocument();
+    expect(marked.getByText("Cortesia, expira em 09/12")).toBeInTheDocument();
+    expect(marked.getByRole("button", { name: "Créditos de Builder Marcado" })).toBeInTheDocument();
+    for (const name of ["Builder Nao Marcado", "Builder Credito Desligado"]) {
+      expect((await rowOf(name)).queryByText(/Cobrança/)).not.toBeInTheDocument();
+      expect((await rowOf(name)).queryByTestId("charging-since")).not.toBeInTheDocument();
+    }
+  });
+
+  it("a row without the field (an older server) has no badge", async () => {
+    const { charging: _ignored, ...legacy } = row("old", "Builder Sem Campo", {
+      courtesy: { active_expires_at: null, available_mc: 0 },
+    });
+    installFetch([legacy]);
+    await openSubscriptionsTable();
+    const old = await rowOf("Builder Sem Campo");
+    expect(old.getByText("Sem plano")).toBeInTheDocument();
+    expect(old.queryByText(/Cobrança/)).not.toBeInTheDocument();
+    expect(old.queryByTestId("charging-since")).not.toBeInTheDocument();
+  });
+
+  it("offers no control to mark or unmark: the badge is plain text and nothing calls a marking route", async () => {
+    installFetch(chargingRows);
+    const table = await openSubscriptionsTable();
+    const badge = within(table).getByText("Cobrança ativa");
+    expect(badge.closest("button, a, [role='button'], [role='menuitem']")).toBeNull();
+    fireEvent.click(badge);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    const controls = [
+      ...screen.queryAllByRole("button"),
+      ...screen.queryAllByRole("menuitem"),
+      ...screen.queryAllByRole("checkbox"),
+      ...screen.queryAllByRole("switch"),
+      ...screen.queryAllByRole("link"),
+    ];
+    for (const control of controls) {
+      const name = `${control.textContent ?? ""} ${control.getAttribute("aria-label") ?? ""}`;
+      expect(name).not.toMatch(/marcar|desmarcar|cobran|unmark|\bmark|charging/i);
+    }
+    const urls = mocks.fetch.mock.calls.map(([input]) => String(input));
+    expect(urls.filter((url) => /mark|enforc|charg|cobran/i.test(url))).toEqual([]);
+  });
+
+  it("in English: Charging active, with the mark instant in its title", async () => {
+    localStorage.setItem("ns_locale", "en");
+    installFetch(chargingRows);
+    await openSubscriptionsTable();
+    const badge = (await rowOf("Builder Marcado")).getByText("Charging active");
+    expect(badge).toHaveAttribute("title", `Charging active since ${formatInstant(MARKED_AT, "en")}`);
+    expect((await rowOf("Builder Marcado")).getByTestId("charging-since")).toHaveTextContent(
+      `since ${formatInstant(MARKED_AT, "en")}`,
+    );
+    expect((await rowOf("Builder Nao Marcado")).queryByText("Charging active")).not.toBeInTheDocument();
   });
 });

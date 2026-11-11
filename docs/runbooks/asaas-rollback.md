@@ -178,6 +178,17 @@ not change, `046` is in both images' chains, and the credit switch stays
   production**: the `047` downgrade's refusal (SQLSTATE `55000`, nothing
   changed, while any mark exists) is only a dev and test guard.
 
+## Per-builder charging (PR-B)
+
+The behaviour release of cobranca-credito-por-builder (PR-B) reads the
+per-builder charge mark. Its rollback is kept in one place, the "Rollback"
+section of [`credit-charge-mark.md`](./credit-charge-mark.md#rollback): the bridge
+image back (a marked builder goes back to observational, the mark stays in
+force), a database restored below `047` while PR-B serves (deploy the bridge image or
+restart the tasks at once), and an image whose
+chain ends at `046` after `047` (credit off for everybody, forward fix).
+**Never an Alembic downgrade in production.**
+
 ## Current state (2026-10-25)
 
 Operator-recorded evidence, not derivable from this repository (details in

@@ -134,6 +134,17 @@ by ``state = 'sending' AND created_at = :observed`` once claimed, and the
 publisher never holds a row lock across a provider call (it commits the
 claim first).  :meth:`~CreditRepository.sweep_outbox_payloads` is the
 retention sweep.
+
+Per-builder enforcement (cobranca-credito-por-builder, migration 047).
+:meth:`~CreditRepository.effective_enforcement` is the request path's reader
+of the credit mode: the global ``credit_enforcement_at``
+(:meth:`~CreditRepository.enforcement_at`, unchanged, its one statement),
+else the builder's latest event in ``credit_enforcement_marks`` when it is a
+``mark``, else none -- with the origin.  Every method that reads or writes
+the marks is behind the 047 revision gate (below 047 the table does not
+exist) and is a plain read or append in the caller's transaction; a request
+re-checks what it captured under the account lock (lock order step 3) in
+:func:`src.services.credit_metering.require_captured_enforcement`.
 """
 
 from __future__ import annotations
@@ -142,7 +153,7 @@ import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -152,6 +163,7 @@ from sqlalchemy import (
     bindparam,
     case,
     func,
+    insert,
     or_,
     select,
     text,
@@ -168,6 +180,7 @@ from src.models.billing import (
 )
 from src.models.builder import Builder
 from src.models.credit import (
+    ENFORCEMENT_MARK_KINDS,
     ENFORCEMENT_STATE_ID,
     LEDGER_ENTRY_TYPES,
     CreditAccount,
@@ -186,10 +199,12 @@ from src.models.credit import (
     CreditResponseOutbox,
 )
 from src.models.credit_fact_inbox import CreditFactInbox, CreditRevisionGap
+from src.models.credit_inventory import CreditAllocation
 from src.models.handoff import HandoffRecord
 from src.models.session import Session as SessionRow
 from src.models.tenant import Tenant
 from src.repositories.billing import billing_advisory_key
+from src.services.credit_switch import credit_switch_reading, enforcement_mark_gate_open
 
 # Direction of each entry type on a lot's available balance and on the
 # builder's open debt.  ``debt_settlement`` moves both: the settling lot pays
@@ -285,6 +300,64 @@ class TenantWhatsappProvider:
 
     tenant_id: UUID
     whatsapp_provider: str | None
+
+
+EnforcementOrigin = Literal["global", "mark"]
+
+
+@dataclass(frozen=True)
+class EffectiveEnforcement:
+    """The enforcement instant that applies to one builder, and its origin
+    (cobranca-credito-por-builder, wish Decision 11).
+
+    The rule, in this order: the global ``credit_enforcement_at`` when set
+    (``global``); else the ``occurred_at`` of the builder's latest event in
+    ``credit_enforcement_marks`` when that event is a ``mark`` (``mark``);
+    else ``(None, None)``.  A request without a builder only ever sees the
+    global.  Equality is the verdict, ``(at, origin)``: the two other fields
+    are context and never part of it (``compare=False``) --
+
+    * ``builder_id``: the builder whose marks were consulted (``None``
+      without a builder, and when the global decided before the builder was
+      read);
+    * ``mark_unread``: the 047 revision gate was closed, so the builder's
+      marks were NOT read (below 047 the table does not exist).  "Not
+      marked" then means "not known to be marked": the per-tenant D1
+      (:mod:`src.services.credit_metering`) never takes it as a successful
+      "not marked" read.
+    """
+
+    at: datetime | None
+    origin: EnforcementOrigin | None
+    builder_id: UUID | None = field(default=None, compare=False)
+    mark_unread: bool = field(default=False, compare=False)
+
+    @property
+    def enforced(self) -> bool:
+        return self.at is not None
+
+
+NOT_ENFORCED: Final = EffectiveEnforcement(None, None)
+
+
+class EnforcementMarksUnavailable(RuntimeError):
+    """A method that must read or write ``credit_enforcement_marks`` was
+    called with the 047 revision gate closed (the table may not exist)."""
+
+
+@dataclass(frozen=True)
+class MarkWindowState:
+    """What the ``mark`` refusal of the operator command reads (wish
+    Decision 4): the builder's latest ``mark`` event (``None``: never
+    marked) and whether the accounting window containing the instant asked
+    about already has an opening (a ``baseline`` or ``maintenance``
+    allocation, ``credit_inventory.WindowWork.prepare``).  An opening only
+    exists under an enforcement; with the global unset (the ``mark``
+    refuses otherwise) it came from an earlier mark."""
+
+    latest_mark: EnforcementMarkRow | None
+    window_start: date
+    window_opened: bool
 
 
 # The tenants of one builder with their WhatsApp provider.  Only the JSON key
@@ -396,6 +469,19 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _mark_row(row: Any) -> EnforcementMarkRow:
+    """One selected ``credit_enforcement_marks`` row (its six columns)."""
+
+    return EnforcementMarkRow(
+        id=UUID(str(row.id)),
+        builder_id=UUID(str(row.builder_id)),
+        kind=str(row.kind),
+        occurred_at=_as_utc(row.occurred_at),
+        actor_user_id=UUID(str(row.actor_user_id)),
+        reason=str(row.reason),
+    )
 
 
 def fold_ledger(movements: Iterable[LedgerMovement]) -> DerivedBalance:
@@ -1867,19 +1953,117 @@ class CreditRepository:
 
     # -- enforcement marks (cobranca-credito-por-builder, migration 047) -----
     #
-    # The bridge release (PR-A) adds only these two plain reads, for the
-    # read-only ``python -m src.ops.credit_charge_mark status``; the shared
-    # mark code (the per-builder reader, inserts, batch reads) is the PR-B's.
-    # A caller of ``latest_enforcement_mark`` checks
-    # ``credit_switch.enforcement_mark_gate_open`` first: below 047 the table
-    # does not exist.
+    # Every method below that reads or writes ``credit_enforcement_marks`` is
+    # behind the 047 revision gate (below 047 the table does not exist):
+    # ``marks_readable`` is the caller's own verdict of
+    # ``credit_switch.enforcement_mark_gate_open`` on a reading it holds (the
+    # one-off operator task, after its own refresh), or ``None``: the verdict
+    # on the reading this process's switch already caches
+    # (:meth:`enforcement_marks_readable`, no database).  With the gate
+    # closed the table is never queried.  ``enforcement_at()`` above, the
+    # global reader, is not one of them and does not change (wish
+    # Decision 11).  These are the only mark primitives: the request path
+    # (Group 2), the workers (Group 3), the operator command (Group 4) and
+    # the admin badge (Group 5) all go through them.  Marks have no foreign
+    # key to ``builders`` (migration 047): a builder deleted while marked
+    # leaves its marks, which no request can reach (``tenants.builder_id``
+    # has the foreign key) and which only make :meth:`any_enforcement_mark`
+    # true.
+
+    @staticmethod
+    def enforcement_marks_readable(marks_readable: bool | None = None) -> bool:
+        """The 047 gate: the caller's verdict, or the process reading's."""
+
+        if marks_readable is not None:
+            return marks_readable is True
+        try:
+            return enforcement_mark_gate_open(credit_switch_reading()) is True
+        except Exception:
+            return False
+
+    async def effective_enforcement(
+        self, builder_id: UUID | None, *, marks_readable: bool | None = None
+    ) -> EffectiveEnforcement:
+        """:class:`EffectiveEnforcement` of ``builder_id``: the global first
+        (the one statement of :meth:`enforcement_at`, unchanged), then --
+        only with a builder, the global unset and the 047 gate open -- the
+        builder's latest mark event.  Plain reads, no lock: the caller
+        decides where in the lock order it reads (a request re-checks it
+        under the account lock, ``credit_metering.require_captured_enforcement``)."""
+
+        global_at = await self.enforcement_at()
+        if global_at is not None:
+            return EffectiveEnforcement(
+                _as_utc(global_at), "global", builder_id=builder_id
+            )
+        return await self._marked_enforcement(builder_id, marks_readable)
+
+    async def tenant_effective_enforcement(
+        self, tenant_id: UUID, *, marks_readable: bool | None = None
+    ) -> EffectiveEnforcement:
+        """:meth:`effective_enforcement` of the tenant's builder as stored now
+        (``tenants.builder_id``, a plain read: lock order step 0), read only
+        when the global is unset -- with it set, the request path reads
+        exactly what it read before (the global's one statement).  A vanished
+        tenant has no builder."""
+
+        global_at = await self.enforcement_at()
+        if global_at is not None:
+            return EffectiveEnforcement(_as_utc(global_at), "global")
+        scope = await self.tenant_scope(tenant_id)
+        return await self._marked_enforcement(
+            None if scope is None else scope.builder_id, marks_readable
+        )
+
+    async def _marked_enforcement(
+        self, builder_id: UUID | None, marks_readable: bool | None
+    ) -> EffectiveEnforcement:
+        """The global is unset: the builder's latest mark event decides."""
+
+        if builder_id is None:
+            return NOT_ENFORCED
+        if not self.enforcement_marks_readable(marks_readable):
+            return EffectiveEnforcement(
+                None, None, builder_id=builder_id, mark_unread=True
+            )
+        mark = CreditEnforcementMark
+        row = (
+            await self.session.execute(
+                select(mark.kind, mark.occurred_at)
+                .where(mark.builder_id == builder_id)
+                .order_by(mark.occurred_at.desc(), mark.id.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+        if row is None or str(row.kind) != "mark":
+            return EffectiveEnforcement(None, None, builder_id=builder_id)
+        return EffectiveEnforcement(
+            _as_utc(row.occurred_at), "mark", builder_id=builder_id
+        )
+
+    async def any_enforcement_mark(self, *, marks_readable: bool | None = None) -> bool:
+        """Whether ANY mark event was ever recorded (``mark`` or ``unmark``,
+        any builder): the workers' trigger besides the global (wish Group 3:
+        a pending enforced outbox row or an orphan still needs them after
+        the last ``unmark``).  ``False`` with the gate closed (no table, no
+        mark).  One plain read."""
+
+        if not self.enforcement_marks_readable(marks_readable):
+            return False
+        found = (
+            await self.session.execute(select(CreditEnforcementMark.id).limit(1))
+        ).scalar_one_or_none()
+        return found is not None
 
     async def latest_enforcement_mark(
-        self, builder_id: UUID
+        self, builder_id: UUID, *, marks_readable: bool | None = None
     ) -> EnforcementMarkRow | None:
         """The builder's latest mark event (``occurred_at``, then ``id``,
-        descending), or ``None`` when it has none.  A plain read, no lock."""
+        descending), or ``None`` when it has none.  A plain read, no lock.
+        Raises :class:`EnforcementMarksUnavailable` with the gate closed."""
 
+        if not self.enforcement_marks_readable(marks_readable):
+            raise EnforcementMarksUnavailable("the 047 revision gate is closed")
         mark = CreditEnforcementMark
         row = (
             await self.session.execute(
@@ -1898,13 +2082,201 @@ class CreditRepository:
         ).one_or_none()
         if row is None:
             return None
+        return _mark_row(row)
+
+    async def latest_enforcement_marks(
+        self, builder_ids: Iterable[UUID], *, marks_readable: bool | None = None
+    ) -> dict[UUID, EnforcementMarkRow] | None:
+        """The latest mark event of each of ``builder_ids`` that has one, in
+        ONE statement (the admin badge of wish Group 5); ``None`` -- not an
+        empty map -- with the gate closed (the badge is null below 047)."""
+
+        if not self.enforcement_marks_readable(marks_readable):
+            return None
+        wanted = sorted(set(builder_ids), key=str)
+        if not wanted:
+            return {}
+        mark = CreditEnforcementMark
+        ranked = (
+            select(
+                mark.id,
+                mark.builder_id,
+                mark.kind,
+                mark.occurred_at,
+                mark.actor_user_id,
+                mark.reason,
+                func.row_number()
+                .over(
+                    partition_by=mark.builder_id,
+                    order_by=(mark.occurred_at.desc(), mark.id.desc()),
+                )
+                .label("position"),
+            )
+            .where(mark.builder_id.in_(wanted))
+            .subquery()
+        )
+        rows = (
+            await self.session.execute(
+                select(
+                    ranked.c.id,
+                    ranked.c.builder_id,
+                    ranked.c.kind,
+                    ranked.c.occurred_at,
+                    ranked.c.actor_user_id,
+                    ranked.c.reason,
+                ).where(ranked.c.position == 1)
+            )
+        ).all()
+        latest = [_mark_row(row) for row in rows]
+        return {row.builder_id: row for row in latest}
+
+    async def marked_builders(
+        self, *, marks_readable: bool | None = None
+    ) -> dict[UUID, datetime]:
+        """Every builder whose latest mark event is a ``mark``, with that
+        event's ``occurred_at`` (its effective instant while the global is
+        unset), in ONE statement: the workers' candidates (wish Group 3) need
+        the marked builders without a builder in hand.  ``{}`` with the gate
+        closed (no table, no mark)."""
+
+        if not self.enforcement_marks_readable(marks_readable):
+            return {}
+        mark = CreditEnforcementMark
+        ranked = select(
+            mark.builder_id,
+            mark.kind,
+            mark.occurred_at,
+            func.row_number()
+            .over(
+                partition_by=mark.builder_id,
+                order_by=(mark.occurred_at.desc(), mark.id.desc()),
+            )
+            .label("position"),
+        ).subquery()
+        rows = (
+            await self.session.execute(
+                select(ranked.c.builder_id, ranked.c.occurred_at).where(
+                    ranked.c.position == 1, ranked.c.kind == "mark"
+                )
+            )
+        ).all()
+        return {UUID(str(builder)): _as_utc(at) for builder, at in rows}
+
+    async def mark_window_state(
+        self, builder_id: UUID, *, at: datetime, marks_readable: bool | None = None
+    ) -> MarkWindowState:
+        """:class:`MarkWindowState` of the builder at ``at`` (the operator's
+        ``mark`` refusal, wish Decision 4).  The window is
+        :func:`~src.services.credit_allocations.accounting_window` over the
+        builder's monthly lots, as ``WindowWork`` computes it.  Plain reads;
+        raises :class:`EnforcementMarksUnavailable` with the gate closed."""
+
+        if not self.enforcement_marks_readable(marks_readable):
+            raise EnforcementMarksUnavailable("the 047 revision gate is closed")
+        # Lazy import: credit_allocations builds on the ledger service,
+        # which builds on this module.
+        from src.services.credit_allocations import accounting_window
+
+        mark = CreditEnforcementMark
+        row = (
+            await self.session.execute(
+                select(
+                    mark.id,
+                    mark.builder_id,
+                    mark.kind,
+                    mark.occurred_at,
+                    mark.actor_user_id,
+                    mark.reason,
+                )
+                .where(mark.builder_id == builder_id, mark.kind == "mark")
+                .order_by(mark.occurred_at.desc(), mark.id.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+        cycles = (
+            await self.session.execute(
+                select(CreditLot.cycle_start, CreditLot.cycle_end).where(
+                    CreditLot.builder_id == builder_id,
+                    CreditLot.lot_kind == "monthly",
+                    CreditLot.cycle_start.is_not(None),
+                    CreditLot.cycle_end.is_not(None),
+                )
+            )
+        ).all()
+        window = accounting_window(((start, end) for start, end in cycles), _as_utc(at))
+        opening = (
+            await self.session.execute(
+                select(CreditAllocation.id)
+                .where(
+                    CreditAllocation.builder_id == builder_id,
+                    CreditAllocation.window_start == window.start,
+                    CreditAllocation.allocation_kind.in_(("baseline", "maintenance")),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return MarkWindowState(
+            latest_mark=None if row is None else _mark_row(row),
+            window_start=window.start,
+            window_opened=opening is not None,
+        )
+
+    async def insert_enforcement_mark(
+        self,
+        *,
+        builder_id: UUID,
+        kind: str,
+        actor_user_id: UUID,
+        reason: str,
+        marks_readable: bool | None = None,
+    ) -> EnforcementMarkRow:
+        """Append one mark event (the ONLY writer of the table; its one
+        caller is the operator command ``src.ops.credit_charge_mark``, wish
+        Group 4) and return it as written.
+
+        ``occurred_at`` is the database clock (:meth:`database_now`), raised
+        to one microsecond after the builder's latest event when the clock
+        is not past it: a builder's events are strictly increasing in
+        ``occurred_at``, because a tie would be broken by the random ``id``
+        (:meth:`latest_enforcement_mark`).  Two writers of one builder must
+        be serialized by the caller (the command's builder lock): this reads
+        the latest instant and then inserts, in the caller's transaction.
+        No validation beyond ``kind`` (the command checks the builder, the
+        author and the reason; the table's CHECKs stay the authority).
+        Raises :class:`EnforcementMarksUnavailable` with the gate closed."""
+
+        if not self.enforcement_marks_readable(marks_readable):
+            raise EnforcementMarksUnavailable("the 047 revision gate is closed")
+        if kind not in ENFORCEMENT_MARK_KINDS:
+            raise ValueError(f"unknown enforcement mark kind {kind!r}")
+        mark = CreditEnforcementMark
+        now = await self.database_now()
+        latest = (
+            await self.session.execute(
+                select(func.max(mark.occurred_at)).where(mark.builder_id == builder_id)
+            )
+        ).scalar_one_or_none()
+        occurred_at = now
+        if latest is not None and now <= _as_utc(latest):
+            occurred_at = _as_utc(latest) + timedelta(microseconds=1)
+        row_id = uuid4()
+        await self.session.execute(
+            insert(CreditEnforcementMark).values(
+                id=row_id,
+                builder_id=builder_id,
+                kind=kind,
+                occurred_at=occurred_at,
+                actor_user_id=actor_user_id,
+                reason=reason,
+            )
+        )
         return EnforcementMarkRow(
-            id=UUID(str(row.id)),
-            builder_id=UUID(str(row.builder_id)),
-            kind=str(row.kind),
-            occurred_at=_as_utc(row.occurred_at),
-            actor_user_id=UUID(str(row.actor_user_id)),
-            reason=str(row.reason),
+            id=row_id,
+            builder_id=builder_id,
+            kind=kind,
+            occurred_at=occurred_at,
+            actor_user_id=actor_user_id,
+            reason=reason,
         )
 
     async def builder_tenant_whatsapp_providers(
