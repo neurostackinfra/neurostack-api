@@ -3,8 +3,10 @@
 Migration 038 (``alembic/versions/20261026_000001_038_credit_system.py``) is
 the schema authority, as widened by migration 046 (courtesy lots, the
 ``courtesy_removal`` entry and ``credit_courtesy_events``,
-``alembic/versions/20261109_000001_046_credit_courtesy.py``); these mappers
-mirror the head column for column, constraint for constraint
+``alembic/versions/20261109_000001_046_credit_courtesy.py``) and migration
+047 (``credit_enforcement_marks``,
+``alembic/versions/20261110_000001_047_credit_enforcement_marks.py``); these
+mappers mirror the head column for column, constraint for constraint
 (``tests/integration/test_credit_orm_ddl_drift_postgres.py``).
 The fact inbox lives in :mod:`src.models.credit_fact_inbox`; the consumer's
 ack is the existing ASAAS model ``BillingFactAck``.
@@ -12,8 +14,8 @@ ack is the existing ASAAS model ``BillingFactAck``.
 Rules the schema enforces (see the migration docstring):
 
 * history rows (accounts, effects, lots, ledger, debts, debt origins,
-  settlements, readiness, observational effects, courtesy events) are
-  append-only by trigger;
+  settlements, readiness, observational effects, courtesy events,
+  enforcement marks) are append-only by trigger;
   a correction is a new row;
 * history keeps ``builder_id``/``tenant_id`` without a foreign key to
   ``builders``/``tenants``; only ``credit_ingress_claims`` and
@@ -72,6 +74,10 @@ LEDGER_ENTRY_TYPES: Final = (
 COURTESY_EVENT_KINDS: Final = ("grant", "removal")
 COURTESY_REASON_MAX_LENGTH: Final = 500
 COURTESY_IDEMPOTENCY_KEY_MAX_LENGTH: Final = 200
+# Migration 047 (cobranca-credito-por-builder): the operator's per-builder
+# enforcement mark events.
+ENFORCEMENT_MARK_KINDS: Final = ("mark", "unmark")
+ENFORCEMENT_MARK_REASON_MAX_LENGTH: Final = 500
 # The effect ids of a courtesy grant (``courtesy:{event_id}:grant``, the
 # lot's grant effect) and of a removal (``courtesy-removal:{event_id}``), as
 # the CHECKs of migration 046 pin them.  In CHECK text the colon before
@@ -779,4 +785,46 @@ class CreditCourtesyEvent(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CreditEnforcementMark(Base):
+    """One operator event marking or unmarking a builder for per-builder
+    enforcement (cobranca-credito-por-builder, migration 047).
+
+    Append-only by trigger; a builder's state is its latest event
+    (``mark -> unmark -> mark`` is three rows).  Like every credit history
+    table, neither ``builder_id`` nor ``actor_user_id`` has a foreign key:
+    the writer checks the builder in its own transaction, and a deleted
+    builder's marks stay.  Written only by the operator command of a later
+    release; in the bridge release the one reader is the read-only
+    ``python -m src.ops.credit_charge_mark status``, behind the revision gate
+    ``credit_switch.enforcement_mark_gate_open`` (047).
+    """
+
+    __tablename__ = "credit_enforcement_marks"
+    __table_args__ = (
+        CheckConstraint(
+            _in("kind", ENFORCEMENT_MARK_KINDS),
+            name="ck_credit_enforcement_marks_kind",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) > 0", name="ck_credit_enforcement_marks_reason"
+        ),
+        Index(
+            "ix_credit_enforcement_marks_builder_occurred", "builder_id", "occurred_at"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    builder_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    actor_user_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    reason: Mapped[str] = mapped_column(
+        String(ENFORCEMENT_MARK_REASON_MAX_LENGTH), nullable=False
     )

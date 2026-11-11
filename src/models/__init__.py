@@ -62,6 +62,7 @@ from src.models.credit import (
     CreditDebtSettlement,
     CreditEffect,
     CreditEnforcementBinding,
+    CreditEnforcementMark,
     CreditEnforcementState,
     CreditIngressClaim,
     CreditLedgerEntry,
@@ -150,6 +151,8 @@ __all__ = [
     "CreditCutoffAcceptance",
     # Credit courtesy events (creditos-cortesia, migration 046)
     "CreditCourtesyEvent",
+    # Credit enforcement marks (cobranca-credito-por-builder, migration 047)
+    "CreditEnforcementMark",
     # Credit inventory (neurostack-credit-system Group 4a, migration 039)
     "CreditInventoryVersion",
     "CreditAllocation",

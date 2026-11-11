@@ -1,6 +1,6 @@
 """The agent's media delivery core on real PostgreSQL (envio-midia-agente G5).
 
-One database at ``alembic upgrade head`` (046), shared by the module; every
+One database at ``alembic upgrade head`` (047), shared by the module; every
 test seeds its own builder, clinics, patient session and media assets.  The
 delivery runs for real -- the asset re-reads, the credit mode read without a
 ``Request``, the suspension gate, ``charge_egress`` /
@@ -158,7 +158,7 @@ async def database() -> AsyncIterator[_Database]:
         async with probe.connect() as connection:
             assert (
                 await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "046"
+                == "047"
             )
         yield _Database(url=cluster.url(name), probe=probe)
     finally:

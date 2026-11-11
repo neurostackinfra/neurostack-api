@@ -145,7 +145,19 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, and_, case, func, or_, select, text, update
+from sqlalchemy import (
+    DateTime,
+    String,
+    and_,
+    bindparam,
+    case,
+    func,
+    or_,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.billing import (
@@ -165,6 +177,7 @@ from src.models.credit import (
     CreditDebtSettlement,
     CreditEffect,
     CreditEnforcementBinding,
+    CreditEnforcementMark,
     CreditEnforcementState,
     CreditIngressClaim,
     CreditLedgerEntry,
@@ -248,6 +261,44 @@ class CourtesyEventRow:
     idempotency_key: str
     request_digest: str
     occurred_at: datetime
+
+
+@dataclass(frozen=True)
+class EnforcementMarkRow:
+    """One ``credit_enforcement_marks`` row as read (migration 047; Core
+    columns, never an ORM entity: the row is append-only)."""
+
+    id: UUID
+    builder_id: UUID
+    kind: str
+    occurred_at: datetime
+    actor_user_id: UUID
+    reason: str
+
+
+@dataclass(frozen=True)
+class TenantWhatsappProvider:
+    """A tenant linked to a builder and the raw text of the ONE key
+    ``whatsapp_provider`` of its ``clinic_configs.api_credentials`` (``None``
+    without a config row or without the key).  Callers print only a known
+    provider name, never this raw value."""
+
+    tenant_id: UUID
+    whatsapp_provider: str | None
+
+
+# The tenants of one builder with their WhatsApp provider.  Only the JSON key
+# ``whatsapp_provider`` leaves ``api_credentials`` (``->>``): no other key,
+# and never the whole object, is selected
+# (tests/ops/test_credit_charge_mark.py pins this text).
+BUILDER_TENANT_PROVIDERS_SQL: Final = (
+    "SELECT t.id AS tenant_id, "
+    "c.api_credentials ->> 'whatsapp_provider' AS whatsapp_provider "
+    "FROM tenants AS t "
+    "LEFT JOIN clinic_configs AS c ON c.tenant_id = t.id "
+    "WHERE t.builder_id = :builder_id "
+    "ORDER BY t.id"
+)
 
 
 @dataclass(frozen=True)
@@ -1813,6 +1864,73 @@ class CreditRepository:
             )
         ).scalar_one_or_none()
         return inserted is not None
+
+    # -- enforcement marks (cobranca-credito-por-builder, migration 047) -----
+    #
+    # The bridge release (PR-A) adds only these two plain reads, for the
+    # read-only ``python -m src.ops.credit_charge_mark status``; the shared
+    # mark code (the per-builder reader, inserts, batch reads) is the PR-B's.
+    # A caller of ``latest_enforcement_mark`` checks
+    # ``credit_switch.enforcement_mark_gate_open`` first: below 047 the table
+    # does not exist.
+
+    async def latest_enforcement_mark(
+        self, builder_id: UUID
+    ) -> EnforcementMarkRow | None:
+        """The builder's latest mark event (``occurred_at``, then ``id``,
+        descending), or ``None`` when it has none.  A plain read, no lock."""
+
+        mark = CreditEnforcementMark
+        row = (
+            await self.session.execute(
+                select(
+                    mark.id,
+                    mark.builder_id,
+                    mark.kind,
+                    mark.occurred_at,
+                    mark.actor_user_id,
+                    mark.reason,
+                )
+                .where(mark.builder_id == builder_id)
+                .order_by(mark.occurred_at.desc(), mark.id.desc())
+                .limit(1)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return EnforcementMarkRow(
+            id=UUID(str(row.id)),
+            builder_id=UUID(str(row.builder_id)),
+            kind=str(row.kind),
+            occurred_at=_as_utc(row.occurred_at),
+            actor_user_id=UUID(str(row.actor_user_id)),
+            reason=str(row.reason),
+        )
+
+    async def builder_tenant_whatsapp_providers(
+        self, builder_id: UUID
+    ) -> list[TenantWhatsappProvider]:
+        """The tenants whose ``tenants.builder_id`` is the builder, in id
+        order, each with the raw ``whatsapp_provider`` key of its
+        credentials (:data:`BUILDER_TENANT_PROVIDERS_SQL`).  A plain read."""
+
+        statement = (
+            text(BUILDER_TENANT_PROVIDERS_SQL)
+            .bindparams(bindparam("builder_id", type_=PG_UUID(as_uuid=True)))
+            .columns(tenant_id=PG_UUID(as_uuid=True), whatsapp_provider=String())
+        )
+        rows = (await self.session.execute(statement, {"builder_id": builder_id})).all()
+        return [
+            TenantWhatsappProvider(
+                tenant_id=UUID(str(row.tenant_id)),
+                whatsapp_provider=(
+                    None
+                    if row.whatsapp_provider is None
+                    else str(row.whatsapp_provider)
+                ),
+            )
+            for row in rows
+        ]
 
     # -- fact inbox, revision gaps and the enforcement binding (Group 2) ----
 

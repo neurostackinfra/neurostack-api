@@ -1929,6 +1929,182 @@ changed: report and stop.
   (taken at `045`), an owner decision of last resort that loses every write
   made after it.
 
+## Migration 047: credit enforcement marks (the charge mark bridge release)
+
+Migration `047` (cobranca-credito-por-builder, Group 1) is the table of the
+per-builder enforcement marks, shipped in a release of its own, the **bridge
+release** (PR-A), before the release that marks and unmarks builders and
+reads the mark on the request paths (PR-B). It only adds:
+
+- the table `credit_enforcement_marks` (`id`, `builder_id`, `kind` `mark` or
+  `unmark`, `occurred_at`, `actor_user_id` and a non-blank `reason` of at
+  most 500 characters), its index on `(builder_id, occurred_at)` and the
+  append-only trigger every credit history table uses
+  (`reject_credit_history_mutation()`): UPDATE and DELETE are refused
+  (SQLSTATE `23000`). A builder's state is its latest event, so `mark`,
+  `unmark`, `mark` is three rows. Like every credit history table, the table
+  has no foreign key (`builder_id` and `actor_user_id` are plain columns):
+  the writer of the behaviour release checks the builder in its own
+  transaction, and deleting a builder leaves its marks in place.
+
+No existing table, column, constraint, trigger or row changes, and no existing
+table is referenced. **The bridge image maps
+the table in its ORM** (the drift suite
+`tests/integration/test_credit_orm_ddl_drift_postgres.py` requires it) **but
+no code of it writes a mark and no request path reads one**: the one reader is
+the read-only operator command `python -m src.ops.credit_charge_mark status
+--builder-id <uuid>` (a one-off task of the service's own task definition),
+behind the revision gate `ENFORCEMENT_MARK_SCHEMA_MIN_REVISION` (`047`). With
+the database at `046` it prints `marks table absent` and still reads the rest
+(the effective enforcement instant and its origin, the open exhaustion episode
+and open debt, the linked tenants with only the `whatsapp_provider` key of
+their credentials, and the binding coverage). The image serves on `046`
+(before the migration) and on `047` (after it).
+
+**No migration window** (cobranca-credito-por-builder wish Decision 14).
+`047` has no entry in the window table of `scripts/asaas_migration_window.py`,
+by an explicit entry in `tests/scripts/test_asaas_migration_window.py` saying
+why: it creates one table, references none and rewrites nothing. Measured on
+PostgreSQL 16 (the locks read from `pg_locks` inside the upgrade's
+transaction, `tests/integration/test_credit_enforcement_marks_migration_postgres.py`):
+the migration's own statements lock only the objects they create (`ACCESS
+EXCLUSIVE` on the table, its primary key, its index and its TOAST table),
+besides the `ACCESS SHARE` every DDL takes on system catalogs, and the only
+lock on an existing table of the schema is the `ROW EXCLUSIVE` of the
+`alembic_version` update. No existing table is locked, scanned or rewritten:
+readers and writers of every existing table, `builders` included, go on, and
+neither an open writer of `builders` nor a session holding `ACCESS EXCLUSIVE`
+on it delays the run.
+
+`lock_timeout` (5 s, `SET LOCAL` by `047`) bounds each lock **wait**: past it
+the run gives up with SQLSTATE `55P03`, nothing changed and the revision stays
+`046`. Normally the run takes well under a second.
+
+**Why a bridge release** (cobranca-credito-por-builder DESIGN Decision 7):
+
+1. The credit switch reads `alembic_version` against the serving image's own
+   migration chain: a database at `047` under an image whose chain ends at
+   `046` is `revision_outside_image_chain`, and the switch turns **off**
+   (every credit surface). So the image that contains `047` serves before the
+   migration runs.
+2. `CREDIT_SCHEMA_MIN_REVISION` stays `042`: a minimum of `047` would turn
+   credit off from the image change until the migration
+   (`schema_below_minimum`). Only the code that reads the marks requires
+   `047`, through its own revision gate over the same reading.
+
+With the bridge, the behaviour release goes back to the bridge image, which
+contains `047`, and the credit switch stays on (see "Rollback (migration
+047)").
+
+**Production order** (the live sequence of cobranca-credito-por-builder in
+the real production, `neurostack-prod`; each step on its own "vai" from the
+owner, conducted by the orchestrator). The planner and the window tool of
+this runbook see only the staging service and are not used here; the
+production receives images through its infrastructure repository:
+
+0. Read production, read only (live step L0): `alembic_version` (`046`), the
+   table `credit_enforcement_marks` absent,
+   `credit_enforcement_state.credit_enforcement_at` NULL, and the serving
+   revision of the application service with its image digest.
+1. Deploy the bridge image (live step L1): the "Staging image build" of a
+   `main` that contains this release, with `expected_head=047`; the image
+   copied by digest to the production registry, its `image_tag` set by a PR
+   in the infrastructure repository, the `app` layer applied and the service
+   updated. Its chain ends at `047`; with the database at `046` the credit
+   switch stays **on** and no route is new.
+2. Apply migration `047` on that image (live step L2), in this order:
+   1. the manual RDS snapshot `pre-047-<date>` of the production database,
+      `available`, before anything else;
+   2. the preflight below, as the application role: every count `0`;
+   3. one RunTask of the production migrations task family, on the bridge
+      image by digest. Its command upgrades the database to the head of the
+      image it runs, which for the bridge image is exactly `047` (built with
+      `expected_head=047`), so it applies `047` alone, in one transaction;
+      the task exits `0` and its log shows exactly one upgrade line, `046 ->
+      047`;
+   4. the post-read below, as the application role: every row `true`, and
+      the credit switch still effective.
+3. Only then deploy the behaviour release (PR-B, live step L3).
+
+Never the reverse: `047` applied before the bridge image serves takes the
+database outside the serving image's chain, and credit is off until an image
+containing `047` serves; `tests/services/test_credit_switch.py` pins the
+verdict (`revision_outside_image_chain` for `047` under a chain that ends at
+`046`).
+
+**Preflight (SELECT only, immediately before the run)**, as the application
+role, in a `REPEATABLE READ`, `READ ONLY` transaction that is rolled back:
+`scripts/migration_047_preflight.sql`, byte for byte below (its comment lines
+aside). Every count must be `0`, or stop and return to the owner:
+
+- `alembic_version not exactly 046` is `0` only when `alembic_version` holds
+  exactly one row, `046`;
+- `047 tables present` counts the tables `047` creates that already exist
+  (looked up with `to_regclass`, so an absent table reads `0`);
+- `047 prerequisites missing` is `1` unless the function
+  `reject_credit_history_mutation()` (its trigger) exists.
+
+At `046` every count reads `0`; at `047` the revision and the table read `1`
+(`tests/integration/test_credit_enforcement_marks_migration_postgres.py`).
+
+```sql
+SELECT 'alembic_version not exactly 046' AS check_name, CASE WHEN count(*) = 1 AND min(version_num) = '046' THEN 0 ELSE 1 END AS found FROM alembic_version
+UNION ALL SELECT '047 tables present', count(*) FROM unnest(ARRAY['public.credit_enforcement_marks']) AS relation WHERE to_regclass(relation) IS NOT NULL
+UNION ALL SELECT '047 prerequisites missing', CASE WHEN to_regprocedure('public.reject_credit_history_mutation()') IS NULL THEN 1 ELSE 0 END;
+```
+
+**Post-read: the trigger and the privileges the mark command needs.** The
+migrations carry no `GRANT`: the application role reaches a new table only
+through the migration role's default privileges. So, after the run, the
+post-read `scripts/migration_047_post_read.sql`, as the application role
+(`current_user`, `neurostack_app` in production), in the same kind of
+transaction, reads three rows, each `true` or stop: `alembic_version is
+exactly 047`; `append-only trigger on public.credit_enforcement_marks`
+(`trg_credit_enforcement_marks_immutable` present, enabled, running
+`reject_credit_history_mutation()`); and `select and insert on
+public.credit_enforcement_marks`, `true` only when that role holds both
+`SELECT` and `INSERT` on the table (append-only, so neither `UPDATE` nor
+`DELETE` is needed). Each privilege is asked on its own and joined with `AND`,
+because `has_table_privilege` with a list (`'SELECT,INSERT'`) is true when
+**any** of them is held. A privilege row that is not `true` stops before the
+behaviour release; the remedy (a grant, or default privileges on the
+migration role) is an owner decision. The real runs: at `047` with default
+privileges granting both, every row `true`; granting `SELECT` or `INSERT`
+alone, the privilege row `false`; with the trigger disabled, the trigger row
+`false`; at `046` `false`, `false` and `NULL` (the table is looked up by OID,
+so the read does not fail).
+
+```sql
+SELECT 'alembic_version is exactly 047' AS check_name, count(*) = 1 AND min(version_num) = '047' AS held FROM alembic_version
+UNION ALL SELECT 'append-only trigger on public.credit_enforcement_marks', EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS trigger WHERE trigger.tgrelid = to_regclass('public.credit_enforcement_marks') AND trigger.tgname = 'trg_credit_enforcement_marks_immutable' AND NOT trigger.tgisinternal AND trigger.tgenabled = 'O' AND trigger.tgfoid = to_regprocedure('public.reject_credit_history_mutation()'))
+UNION ALL SELECT 'select and insert on public.credit_enforcement_marks', has_table_privilege(current_user, to_regclass('public.credit_enforcement_marks'), 'SELECT') AND has_table_privilege(current_user, to_regclass('public.credit_enforcement_marks'), 'INSERT');
+```
+
+### Rollback (migration 047)
+
+None from the run itself; SQLSTATE `55P03` or `40P01` means nothing changed:
+report and stop.
+
+- **Before the migration (after step 1, before step 2): the bridge image back
+  to the image it replaced.** An ordinary image rollback: the schema did not
+  change, `046` is in both images' chains, and the credit switch stays
+  **on**.
+- **The behaviour release (PR-B) back to the bridge image: credit stays on.**
+  The bridge image contains `047`, so its chain keeps the database's revision.
+  It reads no mark: every builder is back in the global mode while it serves.
+- **Any image whose chain ends at `046` after the migration: credit turns off
+  for everyone.** That image's credit switch reads
+  `revision_outside_image_chain` and stays **off** (every credit route
+  answers 503 `credit_unavailable`) until an image containing `047` serves
+  again. **The way back is a forward fix**: the bridge image again, or a
+  corrected image that contains `047`.
+- **The schema.** **Never an Alembic downgrade in production.** The `047`
+  downgrade refuses with SQLSTATE `55000` (nothing changed) while any mark
+  exists; that refusal is a dev and test guard, not a production way back.
+  The schema goes back only by restoring the snapshot `pre-047-<date>` (taken
+  at `046`), an owner decision of last resort that loses every write made
+  after it.
+
 ## Post-deploy rollout readback
 
 The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one
@@ -4432,8 +4608,8 @@ poetry run python scripts/production_image_smoke.py --expected-head <head of the
 ```
 
 `--expected-head` is the head of the migrations CONTAINED in the image, that
-is of `alembic/versions` in the checkout being built: `046` on `main` today
-(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041, enforcement 042, the media `audio/ogg` widening 043, the media `audio/mp4` widening 044, the media bridge 045 and the courtesy credit 046 are merged). It is not the production
+is of `alembic/versions` in the checkout being built: `047` on `main` today
+(migrations 036, 037, the credit schema 038, inventory 039, object copies 040, retention 041, enforcement 042, the media `audio/ogg` widening 043, the media `audio/mp4` widening 044, the media bridge 045, the courtesy credit 046 and the credit enforcement marks 047 are merged). It is not the production
 migration window, which stays pinned at `alembic upgrade 035` (gate 5) and is
 checked offline as `032:035` whatever the image's head is.
 
@@ -4463,7 +4639,7 @@ signer factories build their clients (no KMS call);
 `billing_fact_bundle_digest()` and the consumer pin both return the pinned
 digest; `alembic heads` prints
 exactly one line, `<expected head> (head)`, the head of the migrations in
-the image given with `--expected-head` (`046` on `main` today);
+the image given with `--expected-head` (`047` on `main` today);
 `/app/spa/index.html` exists; and `alembic upgrade
 032:035 --sql` emits the production migration window, which stays `032:035`
 whatever the image's head, as one transaction. The window

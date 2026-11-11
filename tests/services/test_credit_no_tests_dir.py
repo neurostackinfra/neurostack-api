@@ -173,8 +173,9 @@ def test_credit_modules_import_without_a_tests_tree(tmp_path: Path) -> None:
     # 15 of migration 038, three 039 inventory, three 040 copy tables and
     # thirteen 041 lifecycle/hold/purge/role tables (Group 5).
     # Migration 042 adds the immutable cutoff-acceptance table.
-    # 35 through migration 042, plus credit_courtesy_events (046).
-    assert "credit tables: 36" in completed.stdout
+    # 35 through migration 042, plus credit_courtesy_events (046) and
+    # credit_enforcement_marks (047).
+    assert "credit tables: 37" in completed.stdout
 
 
 _DIGEST_PROBE = _HOOKS + r"""

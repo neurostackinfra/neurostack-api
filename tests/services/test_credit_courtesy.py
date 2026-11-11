@@ -940,7 +940,11 @@ def test_the_digest_covers_operation_builder_lot_and_body() -> None:
 def test_the_courtesy_minimum_is_046_and_the_credit_minimum_stays_042() -> None:
     assert COURTESY_SCHEMA_MIN_REVISION == "046"
     assert CREDIT_SCHEMA_MIN_REVISION == "042"
-    assert load_image_migration_chain()[-1] == "046"
+    # 047 (cobranca-credito-por-builder) follows 046: the gate stays open at
+    # the head, which is at or after 046.
+    chain = load_image_migration_chain()
+    assert chain[-2:] == ("046", "047")
+    assert courtesy_gate_open(CreditSwitchReading(True, "schema_ready", chain[-1]))
 
 
 @pytest.mark.parametrize(
@@ -949,6 +953,7 @@ def test_the_courtesy_minimum_is_046_and_the_credit_minimum_stays_042() -> None:
         (CreditSwitchReading(True, "schema_ready", "045"), False),
         (CreditSwitchReading(True, "schema_ready", "042"), False),
         (CreditSwitchReading(True, "schema_ready", "046"), True),
+        (CreditSwitchReading(True, "schema_ready", "047"), True),
         (CreditSwitchReading(True, "schema_ready", None), False),
         (CreditSwitchReading(True, "schema_ready", ""), False),
         (CreditSwitchReading(True, "schema_ready", "999"), False),

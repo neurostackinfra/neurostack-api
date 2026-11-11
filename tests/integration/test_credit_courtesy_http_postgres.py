@@ -5,8 +5,9 @@ process pool) on a disposable PostgreSQL database, with
 ``credit_hot_path_enabled`` on and the REAL credit switch reading -- the
 ``alembic_version`` the lifespan reads, never a forced or published one:
 
-* at head (``046``) the courtesy gate opens: a super admin's grant is one
-  courtesy lot with no ``billing_*`` row; the removal, the admin read, the
+* at head (``047``, after ``046``) the courtesy gate opens: a super admin's
+  grant is one courtesy lot with no ``billing_*`` row; the removal, the admin
+  read, the
   builder's ``/v1/credits/*`` read, the binding coverage and
   ``/builders/subscriptions`` answer on PostgreSQL's real types; the
   ``/builders/subscriptions`` statements never name
@@ -99,7 +100,7 @@ async def databases() -> AsyncIterator[_Databases]:
         await _migrate(cluster.url(head), "upgrade", "head")
         before = await cluster.fresh()
         await _migrate(cluster.url(before), "upgrade", "045")
-        for name, revision in ((head, "046"), (before, "045")):
+        for name, revision in ((head, "047"), (before, "045")):
             assert (
                 await _scalar(
                     cluster.url(name), "SELECT version_num FROM alembic_version"
@@ -311,7 +312,7 @@ async def _courtesy_rows(url: URL, builder: UUID) -> tuple[int, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Head (046): the gate opens on the real reading.
+# Head (047, after 046): the gate opens on the real reading.
 # ---------------------------------------------------------------------------
 
 
@@ -324,7 +325,7 @@ async def test_at_046_a_super_admin_grants_removes_and_reads_over_http(
         from src.services.credit_switch import courtesy_gate_open, credit_switch_reading
 
         reading = credit_switch_reading()
-        assert (reading.effective, reading.revision) == (True, "046")
+        assert (reading.effective, reading.revision) == (True, "047")
         assert courtesy_gate_open(reading) is True
 
         grant = await client.post(

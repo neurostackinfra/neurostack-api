@@ -35,7 +35,10 @@ Reusable guards for the credit surfaces of Groups 2-7:
 * ``load_credit_panel`` (the UI degrades: a panel is ``None`` when off);
 * ``courtesy_gate_open`` (creditos-cortesia: the courtesy routes also need
   the schema at ``COURTESY_SCHEMA_MIN_REVISION``, judged on the reading the
-  route captured, never by a read of its own).
+  route captured, never by a read of its own);
+* ``enforcement_mark_gate_open`` (cobranca-credito-por-builder: code that
+  reads ``credit_enforcement_marks`` also needs the schema at
+  ``ENFORCEMENT_MARK_SCHEMA_MIN_REVISION``, judged the same way).
 
 This module touches no ``credit_*`` table and never reads ``tests/``.
 """
@@ -73,13 +76,20 @@ _T = TypeVar("_T")
 # off (schema_below_minimum) from the image change until the window that
 # applies it.  Credit migrations that deliberately do not raise it: 046
 # (creditos-cortesia), whose routes alone require 046 through a revision gate
-# of their own over this same reading.  tests/services/test_credit_switch.py
-# names that list.
+# of their own over this same reading, and 047 (cobranca-credito-por-builder),
+# whose marks table only the code that reads it requires, through
+# ENFORCEMENT_MARK_SCHEMA_MIN_REVISION the same way.
+# tests/services/test_credit_switch.py names that list.
 CREDIT_SCHEMA_MIN_REVISION: Final = "042"
 # The schema the courtesy routes alone require (creditos-cortesia, migration
 # 046), judged by ``courtesy_gate_open`` on the reading the switch already
 # holds; CREDIT_SCHEMA_MIN_REVISION does not move for it.
 COURTESY_SCHEMA_MIN_REVISION: Final = "046"
+# The schema every reader of ``credit_enforcement_marks`` requires
+# (cobranca-credito-por-builder, migration 047), judged by
+# ``enforcement_mark_gate_open`` on a reading the caller already holds;
+# CREDIT_SCHEMA_MIN_REVISION does not move for it either.
+ENFORCEMENT_MARK_SCHEMA_MIN_REVISION: Final = "047"
 # Key of the per-request captured value in the ASGI scope state
 # (``request.state.credit_switch_effective``).
 CREDIT_SWITCH_STATE_KEY: Final = "credit_switch_effective"
@@ -214,6 +224,31 @@ def evaluate_schema_revision(
     return CreditSwitchReading(True, "schema_ready", revision)
 
 
+def _revision_gate_open(
+    reading: CreditSwitchReading, minimum: str, unreadable: str
+) -> bool:
+    """Whether ``reading`` is effective at or after ``minimum`` in this
+    image's own chain (the body of every revision gate below).
+
+    Reads nothing but ``reading`` and the image chain (no database, no
+    capture of its own), by the same pure ``evaluate_schema_revision``.  An
+    absent revision, a reading that is not effective, or any exception
+    (``ImageMigrationChainError`` from ``load_image_migration_chain``
+    included) is closed, the exception logged as ``unreadable``: never
+    raises."""
+
+    try:
+        if reading.effective is not True or not reading.revision:
+            return False
+        verdict = evaluate_schema_revision(
+            (reading.revision,), load_image_migration_chain(), minimum
+        )
+        return verdict.effective is True
+    except Exception as error:
+        logger.error(unreadable, error_type=type(error).__name__)
+        return False
+
+
 def courtesy_gate_open(reading: CreditSwitchReading) -> bool:
     """Whether the courtesy routes may run on the schema of ``reading``.
 
@@ -226,21 +261,31 @@ def courtesy_gate_open(reading: CreditSwitchReading) -> bool:
     not effective, or any exception (``ImageMigrationChainError`` from
     ``load_image_migration_chain`` included) is closed: never raises."""
 
-    try:
-        if reading.effective is not True or not reading.revision:
-            return False
-        verdict = evaluate_schema_revision(
-            (reading.revision,),
-            load_image_migration_chain(),
-            COURTESY_SCHEMA_MIN_REVISION,
-        )
-        return verdict.effective is True
-    except Exception as error:
-        logger.error(
-            "credit courtesy gate unreadable; treating it as closed",
-            error_type=type(error).__name__,
-        )
-        return False
+    return _revision_gate_open(
+        reading,
+        COURTESY_SCHEMA_MIN_REVISION,
+        "credit courtesy gate unreadable; treating it as closed",
+    )
+
+
+def enforcement_mark_gate_open(reading: CreditSwitchReading) -> bool:
+    """Whether code may read ``credit_enforcement_marks`` on the schema of
+    ``reading`` (cobranca-credito-por-builder, migration 047).
+
+    The courtesy gate's rule with ``ENFORCEMENT_MARK_SCHEMA_MIN_REVISION``:
+    open only for an effective reading whose revision is at or after 047 in
+    this image's own chain; below it (the database at 046, the table absent),
+    not effective, without a revision or on any exception it is closed, and
+    it never raises.  The caller passes a reading it already holds (a
+    request's capture, or a one-off task's own refresh); this reads nothing
+    else.  In the bridge release the only caller is the read-only
+    ``python -m src.ops.credit_charge_mark status``."""
+
+    return _revision_gate_open(
+        reading,
+        ENFORCEMENT_MARK_SCHEMA_MIN_REVISION,
+        "credit enforcement mark gate unreadable; treating it as closed",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +634,7 @@ __all__ = [
     "CREDIT_SWITCH_EFFECTIVE",
     "CREDIT_SWITCH_STATE_KEY",
     "CREDIT_UNAVAILABLE_CODE",
+    "ENFORCEMENT_MARK_SCHEMA_MIN_REVISION",
     "IMAGE_VERSIONS_DIR",
     "VERSION_READ_TIMEOUT_SECONDS",
     "CreditSwitch",
@@ -603,6 +649,7 @@ __all__ = [
     "credit_unavailable_exception_handler",
     "credit_unavailable_response",
     "courtesy_gate_open",
+    "enforcement_mark_gate_open",
     "evaluate_schema_revision",
     "load_credit_panel",
     "load_image_migration_chain",

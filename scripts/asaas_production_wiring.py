@@ -390,8 +390,12 @@ MIGRATIONS_EXCLUDED: Mapping[str, str] = {
         "bridge image containing 046 serves"
     ),
     "046": (
-        "047 and later: none is written; a later revision needs its own "
-        "window in the table"
+        "047 (the per-builder enforcement marks of cobranca-credito-por-builder): "
+        "no window of its own, by explicit decision (it only creates one new "
+        "table); that wish's production applies it with its own one-off "
+        "migrations task after the bridge image containing 047 serves. "
+        "048 and later: none is written; a later revision needs its own "
+        "window in the table, or its own explicit entry saying why it has none"
     ),
 }
 _UNPINNED_UPGRADE = re.compile(r"upgrade\s+(?:heads?\b|[+-])", re.IGNORECASE)

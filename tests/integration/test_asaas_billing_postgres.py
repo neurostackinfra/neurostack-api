@@ -673,13 +673,14 @@ async def test_upgrade_downgrade_and_fresh_schema_are_equivalent(
     assert postgres_harness.schemas_equivalent is True
     assert postgres_harness.legacy_survived_downgrade is True
     async with postgres_harness.engine.connect() as connection:
-        # Head: 046, creditos-cortesia's courtesy credit, on top of 045
-        # (envio-midia-agente's media bridge), 044 (audio/mp4) and 043
-        # (audio/ogg) in the media category/MIME invariant and 042's
-        # enforcement cutoff acceptances.
+        # Head: 047, cobranca-credito-por-builder's enforcement marks, on top
+        # of 046 (creditos-cortesia's courtesy credit), 045 (envio-midia-
+        # agente's media bridge), 044 (audio/mp4) and 043 (audio/ogg) in the
+        # media category/MIME invariant and 042's enforcement cutoff
+        # acceptances.
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "046"
+            == "047"
         )
         legacy = (
             await connection.execute(

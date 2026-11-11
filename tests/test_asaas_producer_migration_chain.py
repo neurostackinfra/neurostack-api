@@ -45,5 +45,6 @@ def test_asaas_producer_migrations_extend_026_through_037_linearly() -> None:
     # media category/MIME invariant follow 042; envio-midia-agente's media
     # bridge (045, not an ASAAS producer migration either) follows 044;
     # creditos-cortesia's courtesy credit (046, a credit migration, not an
-    # ASAAS producer one) follows 045 and is head.
-    assert heads(revisions) == ["046"]
+    # ASAAS producer one) follows 045; cobranca-credito-por-builder's
+    # enforcement marks (047, a credit migration too) follow 046 and are head.
+    assert heads(revisions) == ["047"]

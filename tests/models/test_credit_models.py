@@ -171,6 +171,10 @@ _LATER_TABLES = {
     # tests/integration/test_credit_courtesy_migration_postgres.py and the
     # drift suite).
     "credit_courtesy_events",
+    # cobranca-credito-por-builder, migration 047 (pinned by
+    # tests/integration/test_credit_enforcement_marks_migration_postgres.py,
+    # the drift suite and test_the_marks_table_is_the_047_policy below).
+    "credit_enforcement_marks",
 }
 
 
@@ -214,9 +218,10 @@ def test_038_revises_037_and_is_the_single_head(migration: ModuleType) -> None:
     # (enforcement cutoff acceptances) follows 041; 043 (audio/ogg) and 044
     # (audio/mp4) widen the media category/MIME invariant; envio-midia-agente:
     # 045 (the media bridge, not a credit migration) follows 044;
-    # creditos-cortesia: 046 (courtesy lots, removals and events) follows 045
-    # and is the head.
-    assert current_head() == "046"
+    # creditos-cortesia: 046 (courtesy lots, removals and events) follows 045;
+    # cobranca-credito-por-builder: 047 (enforcement marks) follows 046 and is
+    # the head.
+    assert current_head() == "047"
     assert migration_revisions()[_MIGRATION.name] == ("038", "037")
     assert re.fullmatch(r"\d{8}_\d{6}_038_credit_system\.py", _MIGRATION.name)
 
@@ -435,6 +440,39 @@ def test_foreign_keys_follow_the_wish_policy() -> None:
         for fk in binding.constraints
         if isinstance(fk, ForeignKeyConstraint)
     } == {"credit_effects"}
+
+
+def test_the_marks_table_is_the_047_policy() -> None:
+    """credit_enforcement_marks (migration 047): history like every credit
+    table, so ``builder_id`` (and ``actor_user_id``) carry no foreign key to
+    ``builders`` or users (owner decision, review of Group 1); no
+    relationship, and exactly the six columns of the wish."""
+
+    table = Base.metadata.tables["credit_enforcement_marks"]
+    assert list(table.columns.keys()) == [
+        "id",
+        "builder_id",
+        "kind",
+        "occurred_at",
+        "actor_user_id",
+        "reason",
+    ]
+    assert [c for c in table.constraints if isinstance(c, ForeignKeyConstraint)] == []
+    assert all(not column.foreign_keys for column in table.columns)
+    assert all(not column.nullable for column in table.columns)
+    assert table.columns["reason"].type.length == 500
+    checks = {
+        c.name: str(c.sqltext)
+        for c in table.constraints
+        if isinstance(c, CheckConstraint)
+    }
+    assert checks == {
+        "ck_credit_enforcement_marks_kind": "kind IN ('mark', 'unmark')",
+        "ck_credit_enforcement_marks_reason": "length(trim(reason)) > 0",
+    }
+    assert {index.name: [c.name for c in index.columns] for index in table.indexes} == {
+        "ix_credit_enforcement_marks_builder_occurred": ["builder_id", "occurred_at"]
+    }
 
 
 def test_enumerations_are_the_wish_values() -> None:

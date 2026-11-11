@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog
 from fastapi import APIRouter, Depends, FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 from prometheus_client import REGISTRY
@@ -55,6 +56,7 @@ from src.services.credit_rollout import (
 from src.services.credit_switch import (
     CREDIT_SCHEMA_MIN_REVISION,
     CREDIT_SWITCH_STATE_KEY,
+    ENFORCEMENT_MARK_SCHEMA_MIN_REVISION,
     IMAGE_VERSIONS_DIR,
     CreditSwitch,
     CreditSwitchReading,
@@ -66,6 +68,7 @@ from src.services.credit_switch import (
     credit_switch_effective,
     credit_switch_reading,
     credit_unavailable_exception_handler,
+    enforcement_mark_gate_open,
     evaluate_schema_revision,
     load_credit_panel,
     load_image_migration_chain,
@@ -133,7 +136,9 @@ def test_the_image_chain_is_this_repository_s_linear_chain() -> None:
 # window that applies it, so such a migration gates only its own routes, on
 # the same switch reading.  A new credit migration either joins this list or
 # raises the minimum: both are explicit decisions, never a silent "fix".
-CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM = ("046",)
+# 047 (cobranca-credito-por-builder, DESIGN Decision 7) joins it: only the readers of
+# its marks table require it (ENFORCEMENT_MARK_SCHEMA_MIN_REVISION).
+CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM = ("046", "047")
 
 
 def test_the_minimum_is_042_and_rises_only_by_explicit_decision() -> None:
@@ -142,7 +147,8 @@ def test_the_minimum_is_042_and_rises_only_by_explicit_decision() -> None:
     rule ("every credit migration raises the minimum") 046 retires: the
     minimum stays 042 with head 046, every credit migration above it is named
     in CREDIT_REVISIONS_THAT_KEEP_THE_MINIMUM, and the minimum is still the
-    highest credit revision outside that list."""
+    highest credit revision outside that list.  047 (cobranca-credito-por-
+    builder) keeps it too: the minimum stays 042 with head 047."""
 
     credit_revisions = {
         revision
@@ -152,7 +158,7 @@ def test_the_minimum_is_042_and_rises_only_by_explicit_decision() -> None:
     assert credit_revisions
     chain = load_image_migration_chain()
     assert CREDIT_SCHEMA_MIN_REVISION == "042"
-    assert current_head() == "046"
+    assert current_head() == "047"
     above = sorted(
         (
             revision
@@ -249,15 +255,16 @@ def test_schema_verdict_matrix(
     assert (reading.effective, reading.reason) == (effective, reason)
 
 
-@pytest.mark.parametrize("revision", ["045", "046"])
-def test_revision_046_under_the_bridge_image_chain_is_on(revision: str) -> None:
-    """Rewritten on purpose (creditos-cortesia, Decision 5) from
-    ``test_revision_045_under_the_bridge_image_chain_is_on``: the bridge
-    image of creditos-cortesia (PR-A) carries 046, so its chain ends at 046,
-    and the credit switch stays on with the database at 045 (before window
-    046) and at 046 (after it).  Rolling the code release back to this
-    bridge image after the window therefore keeps credit on (the minimum
-    stays 042)."""
+@pytest.mark.parametrize("revision", ["045", "046", "047"])
+def test_revision_047_under_the_bridge_image_chain_is_on(revision: str) -> None:
+    """Rewritten on purpose (cobranca-credito-por-builder, DESIGN Decision 7) from
+    ``test_revision_046_under_the_bridge_image_chain_is_on`` (creditos-
+    cortesia, Decision 5): the bridge image of cobranca-credito-por-builder
+    (PR-A) carries 047, so its chain ends at 047, and the credit switch stays
+    on with the database at 046 (before migration 047) and at 047 (after it),
+    as at 045 and 046 under the courtesy bridge.  Rolling the behaviour
+    release (PR-B) back to this bridge image after 047 therefore keeps credit
+    on (the minimum stays 042)."""
 
     chain = load_image_migration_chain()
     assert chain[chain.index(CREDIT_SCHEMA_MIN_REVISION) :] == (
@@ -266,10 +273,27 @@ def test_revision_046_under_the_bridge_image_chain_is_on(revision: str) -> None:
         "044",
         "045",
         "046",
+        "047",
     )
-    assert chain[-1] == "046"
+    assert chain[-1] == "047"
     reading = evaluate_schema_revision((revision,), chain, CREDIT_SCHEMA_MIN_REVISION)
     assert reading == CreditSwitchReading(True, "schema_ready", revision)
+
+
+def test_revision_047_under_an_image_chain_without_047_is_off() -> None:
+    """The forbidden order of cobranca-credito-por-builder, and its rollback
+    hazard: migration 047 applied under an image whose chain ends at 046 (the
+    image serving before the bridge, or the bridge rolled back to it after
+    047) takes the database outside that image's chain and turns all of
+    credit off."""
+
+    chain = load_image_migration_chain()
+    without_047 = chain[: chain.index("047")]
+    assert without_047[-1] == "046" and "047" not in without_047
+    reading = evaluate_schema_revision(
+        ("047",), without_047, CREDIT_SCHEMA_MIN_REVISION
+    )
+    assert reading == CreditSwitchReading(False, "revision_outside_image_chain", "047")
 
 
 def test_revision_046_under_an_image_chain_without_046_is_off() -> None:
@@ -308,6 +332,94 @@ def test_revision_045_under_an_image_chain_cut_before_045_is_off(last: str) -> N
 def test_a_minimum_outside_the_image_chain_is_off() -> None:
     reading = evaluate_schema_revision(("038",), ("001", "038"), "042")
     assert reading == CreditSwitchReading(False, "revision_outside_image_chain", "038")
+
+
+# ---------------------------------------------------------------------------
+# The 047 gate of the enforcement marks (cobranca-credito-por-builder).
+# ---------------------------------------------------------------------------
+
+
+def test_the_mark_minimum_is_047_and_the_credit_minimum_stays_042() -> None:
+    assert ENFORCEMENT_MARK_SCHEMA_MIN_REVISION == "047"
+    assert CREDIT_SCHEMA_MIN_REVISION == "042"
+    chain = load_image_migration_chain()
+    assert chain.index(ENFORCEMENT_MARK_SCHEMA_MIN_REVISION) == len(chain) - 1
+
+
+@pytest.mark.parametrize(
+    ("reading", "expected"),
+    [
+        (CreditSwitchReading(True, "schema_ready", "046"), False),
+        (CreditSwitchReading(True, "schema_ready", "045"), False),
+        (CreditSwitchReading(True, "schema_ready", "042"), False),
+        (CreditSwitchReading(True, "schema_ready", "047"), True),
+        (CreditSwitchReading(True, "schema_ready", None), False),
+        (CreditSwitchReading(True, "schema_ready", ""), False),
+        (CreditSwitchReading(True, "schema_ready", "999"), False),
+        (CreditSwitchReading(True, "schema_ready", "047 "), False),
+        (CreditSwitchReading(False, "config_disabled"), False),
+        (CreditSwitchReading(False, "not_read"), False),
+        (CreditSwitchReading(False, "read_error", "047"), False),
+        (CreditSwitchReading(False, "schema_below_minimum", "047"), False),
+    ],
+)
+def test_the_mark_gate_opens_only_at_047_or_later(
+    reading: CreditSwitchReading, expected: bool
+) -> None:
+    """Closed with the database at 046 (the table absent) while the credit
+    switch itself is effective there: the gate is a second, narrower
+    minimum over the same reading, never a new requirement of credit."""
+
+    assert enforcement_mark_gate_open(reading) is expected
+    # At 046 the credit switch itself is effective under this image.
+    assert evaluate_schema_revision(("046",), load_image_migration_chain()).effective
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ImageMigrationChainError("no chain"), RuntimeError("boom"), KeyError("x")],
+)
+def test_any_exception_closes_the_mark_gate_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def broken(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+        raise error
+
+    monkeypatch.setattr(credit_switch, "load_image_migration_chain", broken)
+    with structlog.testing.capture_logs() as records:
+        assert (
+            enforcement_mark_gate_open(CreditSwitchReading(True, "schema_ready", "047"))
+            is False
+        )
+    [record] = [
+        r for r in records if r["event"].startswith("credit enforcement mark gate")
+    ]
+    assert record["error_type"] == type(error).__name__
+
+    class Hostile:
+        @property
+        def effective(self) -> bool:
+            raise error
+
+    assert enforcement_mark_gate_open(Hostile()) is False  # type: ignore[arg-type]
+
+
+def test_the_mark_gate_reads_nothing_beyond_the_reading_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No capture of its own: the gate never reads the switch itself."""
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the gate read the switch on its own")
+
+    monkeypatch.setattr(credit_switch, "credit_switch_reading", refuse)
+    monkeypatch.setattr(credit_switch, "credit_switch_effective", refuse)
+    monkeypatch.setattr(CreditSwitch, "reading", refuse)
+    monkeypatch.setattr(CreditSwitch, "effective", refuse)
+    reading = CreditSwitchReading(True, "schema_ready", "047")
+    assert enforcement_mark_gate_open(reading) is True
+    below = CreditSwitchReading(True, "schema_ready", "046")
+    assert enforcement_mark_gate_open(below) is False
 
 
 # ---------------------------------------------------------------------------
