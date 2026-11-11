@@ -6,8 +6,9 @@ credit models in a scratch schema: columns (type, nullability, server default,
 identity), primary key, foreign keys (target, columns, ON DELETE/ON UPDATE),
 unique constraints, CHECK constraints (name and PostgreSQL's own rendering)
 and plain indexes.  Both sides are reflected from PostgreSQL, so a difference
-is a real drift between the credit migrations (038 to 042, and 046's
-courtesy lot, removal entry and event table) and ``src/models/credit*.py``.
+is a real drift between the credit migrations (038 to 042, 046's courtesy
+lot, removal entry and event table, and 047's enforcement marks) and
+``src/models/credit*.py``.
 
 Needs ``POSTGRES_SMOKE_DATABASE_URL`` (a disposable loopback cluster, database
 ``postgres``); without it the module skips, and only
@@ -76,6 +77,8 @@ _EXPECTED_TABLES = {
     "credit_cutoff_acceptances",
     # creditos-cortesia, migration 046.
     "credit_courtesy_events",
+    # cobranca-credito-por-builder, migration 047.
+    "credit_enforcement_marks",
 }
 
 
@@ -204,7 +207,7 @@ async def test_the_migrated_credit_tables_are_exactly_the_mapped_ones(
             .scalars()
             .all()
         )
-    assert version == "046"
+    assert version == "047"
     assert set(tables) == set(_credit_tables()) == _EXPECTED_TABLES
 
 
@@ -272,6 +275,9 @@ async def test_drift_check_is_not_vacuous(migrated: AsyncEngine) -> None:
             "builders",
             "tenants",
         }, table
+    # Migration 047's marks name their builder by a plain column: no foreign
+    # key at all (a marked builder can be deleted; the writer checks it).
+    assert actual["credit_enforcement_marks"]["foreign_keys"] == []
     checks = dict(actual["credit_fact_inbox"]["checks"])
     assert "^[0-9a-f]{64}$" in checks["ck_credit_fact_inbox_digests"]
     assert actual["credit_enforcement_state"]["columns"]["id"][2] is None

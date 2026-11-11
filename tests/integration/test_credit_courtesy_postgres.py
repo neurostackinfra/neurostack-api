@@ -1,7 +1,7 @@
 """Courtesy credits on real PostgreSQL (creditos-cortesia Group 2).
 
 What SQLite cannot show, through :mod:`src.services.credit_courtesy` on a
-database migrated to head (046), with ``credit_enforcement_at`` set (the
+database migrated to head (047), with ``credit_enforcement_at`` set (the
 lifecycle evaluation runs after every write, as in production after L10):
 
 * "Capacidade": 10,000 granted and 6,000 removed is ``used_mc`` 0 and no
@@ -120,7 +120,7 @@ async def postgres_harness() -> AsyncIterator[_Harness]:
                     text("SELECT version_num FROM alembic_version")
                 )
             ).scalar_one()
-        assert version == "046"
+        assert version == "047"
         yield _Harness(
             engine=engine,
             sessions=async_sessionmaker(

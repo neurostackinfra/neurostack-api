@@ -2438,9 +2438,15 @@ def test_migration_windows_pin_each_exact_upgrade() -> None:
     assert "043" in wiring.MIGRATIONS_EXCLUDED["042"]
     assert "044" in wiring.MIGRATIONS_EXCLUDED["042"]
     assert "046" in wiring.MIGRATIONS_EXCLUDED["045"]
-    # The frontier: no revision past the last window is written yet.
-    assert "047" in wiring.MIGRATIONS_EXCLUDED["046"]
-    assert "none is written" in wiring.MIGRATIONS_EXCLUDED["046"]
+    # 047 (cobranca-credito-por-builder) is written with no window: the 046
+    # window names it as such, and the frontier moves past it.
+    assert wiring.MIGRATIONS_EXCLUDED["046"].startswith(
+        "047 (the per-builder enforcement marks of cobranca-credito-por-builder): "
+        "no window of its own, by explicit decision"
+    )
+    assert "047" not in mw.WINDOWS
+    # The frontier: no revision past 047 is written yet.
+    assert "048 and later: none is written" in wiring.MIGRATIONS_EXCLUDED["046"]
     assert all(
         scope == "separate_approval"
         for step, scope in wiring.STEPS

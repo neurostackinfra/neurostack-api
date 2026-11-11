@@ -1,6 +1,6 @@
 """The agent's file after the reply, on real PostgreSQL (envio-midia-agente G6).
 
-One database at ``alembic upgrade head`` (046) for the module.  Pinned here,
+One database at ``alembic upgrade head`` (047) for the module.  Pinned here,
 where only PostgreSQL can prove it:
 
 * the real application (lifespan, middleware, its 5-connection pool with no
@@ -130,7 +130,7 @@ async def database() -> AsyncIterator[_Database]:
         async with probe.connect() as connection:
             assert (
                 await connection.scalar(text("SELECT version_num FROM alembic_version"))
-                == "046"
+                == "047"
             )
         yield _Database(url=cluster.url(name), probe=probe)
     finally:

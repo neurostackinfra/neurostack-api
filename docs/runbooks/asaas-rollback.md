@@ -143,6 +143,41 @@ not change, `045` is in both images' chains, and the credit switch stays
   `55000`, nothing changed, while any courtesy lot, `courtesy_removal` entry
   or event exists) is only a dev and test guard.
 
+## Migration 047: the charge mark bridge release and the behaviour release
+
+Migration `047` (cobranca-credito-por-builder) ships in a bridge release of
+its own: its image contains `047` and its ORM describes the table
+`credit_enforcement_marks`, but **the bridge only has the table**: no code of
+it writes a mark and no request path reads one (the read-only `python -m
+src.ops.credit_charge_mark status` is the one reader). `047` has no window of
+its own; the real production applies it with its own one-off migrations task
+once that image serves, and only then is the behaviour release (PR-B, the
+image that marks builders and reads the mark) deployed
+([`asaas-deployment.md`](./asaas-deployment.md), "Migration 047").
+
+Before the migration (the bridge image serving on `046`), the bridge image
+back to the image it replaced is an ordinary image rollback: the schema did
+not change, `046` is in both images' chains, and the credit switch stays
+**on**. After the migration:
+
+- **Rolling PR-B back to the bridge image keeps credit on.** The bridge image
+  contains `047`, so its migration chain keeps the database's revision and
+  the credit switch stays **on**. The marks PR-B wrote stay (append-only),
+  and the bridge image does not read them: every builder is back in the
+  global mode while it serves.
+- **Rolling back to an image whose chain ends at `046` turns credit off for
+  everyone.** That image (the one serving before the bridge) reads a
+  database at `047` outside its own chain: its credit switch reads
+  `revision_outside_image_chain` and stays **off** (credit routes answer 503
+  `credit_unavailable`) until an image containing `047` serves again. **The
+  way back is a forward fix**: the bridge image again, or a corrected image
+  that contains `047`.
+- **The migration comes back only by a restore**, by owner decision, as a
+  last resort: the snapshot `pre-047-<date>` (taken at `046`, before the
+  run); it loses every write made after it. **Never an Alembic downgrade in
+  production**: the `047` downgrade's refusal (SQLSTATE `55000`, nothing
+  changed, while any mark exists) is only a dev and test guard.
+
 ## Current state (2026-10-25)
 
 Operator-recorded evidence, not derivable from this repository (details in

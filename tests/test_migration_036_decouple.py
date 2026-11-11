@@ -89,8 +89,10 @@ def test_036_revises_035_and_037_follows_it(migration: ModuleType) -> None:
     # (lifecycle, legal hold, purge and roles) follows 040; 043 (audio/ogg) and
     # 044 (audio/mp4) widen the media category/MIME invariant;
     # envio-midia-agente: 045 (the media bridge) follows 044;
-    # creditos-cortesia: 046 (courtesy credit) follows 045 and is the head.
-    assert current_head() == "046"
+    # creditos-cortesia: 046 (courtesy credit) follows 045;
+    # cobranca-credito-por-builder: 047 (enforcement marks) follows 046 and is
+    # the head.
+    assert current_head() == "047"
 
 
 def test_frozen_file_is_pinned_rendered_and_outside_versions(

@@ -347,11 +347,14 @@ async def at_046(baseline: _Baseline) -> AsyncIterator[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_046_revises_045_and_is_the_single_head() -> None:
+def test_046_revises_045_and_only_047_follows_it() -> None:
     assert (_MIGRATION.revision, _MIGRATION.down_revision) == ("046", "045")
     revisions = migration_revisions()
     assert revisions[_MIGRATION_PATH.name] == ("046", "045")
-    assert heads(revisions) == ["046"]
+    # cobranca-credito-por-builder: 047 (enforcement marks) is the one child
+    # of 046 and the head.
+    assert heads(revisions) == ["047"]
+    assert [rev for rev, down in revisions.values() if down == "046"] == ["047"]
     # A credit migration that deliberately keeps CREDIT_SCHEMA_MIN_REVISION
     # at 042 (tests/services/test_credit_switch.py names it).
     assert "_credit_" in _MIGRATION_PATH.name

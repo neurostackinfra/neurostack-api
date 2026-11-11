@@ -87,7 +87,7 @@ store crosses runs, and every run starts from a clone of one seeded template.
 * creditos-cortesia: the corpus ends with the three courtesy routes of the
   credit admin API, called by the builder's JWT and an API key: 503
   ``credit_unavailable`` while the switch is not effective, 403 with it (the
-  head is 046, so the courtesy gate opens on the real reading).  No super
+  head, 047, is past 046, so the courtesy gate opens on the real reading).  No super
   admin calls them here, so the corpus writes no courtesy; the gate on a
   045 database and a super admin's writes are
   ``tests/integration/test_credit_courtesy_http_postgres.py``.
@@ -212,7 +212,7 @@ _CREDIT_SURFACES = (
 )
 # creditos-cortesia: called by a builder JWT and an API key, never a super
 # admin, so the corpus writes no courtesy (the no-write and observational
-# checks stay as they are); with the switch effective the head (046) opens
+# checks stay as they are); with the switch effective the head (047) opens
 # the courtesy gate on the real reading and the refusal is the authority's.
 _COURTESY_CASES = {
     "credits-courtesy-grant-builder": {"detail": {"code": "super_admin_jwt_required"}},
@@ -1792,7 +1792,7 @@ async def test_the_courtesy_routes_refuse_everyone_but_a_super_admin(
 ) -> None:
     """creditos-cortesia: not effective, 503 ``credit_unavailable`` for every
     caller (no SQL, asserted by the run's statement listener); effective at
-    head (046, the courtesy gate open on the real reading), the builder JWT
+    head (047, the courtesy gate open on the real reading), the builder JWT
     and the API key are refused by the authority -- nothing written, which
     the no-write check of the effective run proves."""
 

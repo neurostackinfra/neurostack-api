@@ -244,8 +244,9 @@ def test_045_revises_044_and_only_046_follows_it() -> None:
     revisions = migration_revisions()
     assert revisions[_MIGRATION_PATH.name] == ("045", "044")
     # creditos-cortesia: 046 (courtesy credit, window 046) is the one child
-    # of 045 and the head.
-    assert heads(revisions) == ["046"]
+    # of 045; cobranca-credito-por-builder: 047 (enforcement marks, no
+    # window) follows 046 and is the head.
+    assert heads(revisions) == ["047"]
     assert [rev for rev, down in revisions.values() if down == "045"] == ["046"]
     # The window's chain: 043 and 044 (the media widenings) below 045.
     parents = dict(revisions.values())

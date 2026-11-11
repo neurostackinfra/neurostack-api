@@ -1251,10 +1251,32 @@ def test_the_window_rows_agree_with_the_alembic_revision_chain() -> None:
     assert declared["046"] == "045"
     assert [rev for rev, down in declared.items() if down == "045"] == ["046"]
     assert mw.WINDOW_046.chain == ("045", "046")
-    # No later revision can exist unseen: a 047 would need its own window, or
+    # 047 (the per-builder enforcement marks of cobranca-credito-por-builder,
+    # Group 1) has NO window, by this explicit entry (that wish's Decision
+    # 14): it only creates one new table, credit_enforcement_marks, with no
+    # foreign key, so it locks no existing table (measured on PostgreSQL 16:
+    # the only lock on an existing relation is Alembic's alembic_version
+    # bump) and scans or rewrites nothing.  The real production applies it
+    # with its own one-off migrations task ("Migration 047" in
+    # docs/runbooks/asaas-deployment.md); no window of this table carries it,
+    # and it alters and references nothing.
+    assert declared["047"] == "046"
+    assert [rev for rev, down in declared.items() if down == "046"] == ["047"]
+    assert "047" not in mw.WINDOWS
+    assert all("047" not in window.chain for window in mw.WINDOWS.values())
+    assert _migration_constants("047")["CREATED_TABLES"] == (
+        "credit_enforcement_marks",
+    )
+    (marks,) = (ROOT / "alembic" / "versions").glob("*_047_*.py")
+    source = marks.read_text(encoding="utf-8")
+    assert not re.search(
+        r"\b(ALTER|DROP)\s+TABLE\s+(?!credit_enforcement_marks\b)", source
+    )
+    assert "REFERENCES" not in source and "FOREIGN KEY" not in source
+    # No later revision can exist unseen: a 048 would need its own window, or
     # its own entry here saying why it has none.
-    assert "047" not in declared
-    assert not [rev for rev, down in declared.items() if down == "046"]
+    assert "048" not in declared
+    assert not [rev for rev, down in declared.items() if down == "047"]
 
 
 @pytest.mark.parametrize(
