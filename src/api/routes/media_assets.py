@@ -23,7 +23,7 @@ import codecs
 import hashlib
 import hmac
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import quote
@@ -203,12 +203,14 @@ _CREDIT_PENDING_RESPONSE = {
 
 
 async def _credit_mode(
-    request: Request, session: AsyncSession
+    request: Request, session: AsyncSession, tenant_id: UUID
 ) -> credit_inventory.CreditMode:
-    """Read once, before any row is loaded (switch off: no SQL)."""
+    """Read once, for the resolved target tenant (cobranca-credito-por-
+    builder: its builder's effective enforcement), before any row is loaded
+    (switch off: no SQL)."""
 
     try:
-        return await credit_inventory.read_credit_mode(request, session)
+        return await credit_inventory.read_credit_mode(request, session, tenant_id)
     except CreditEnforcementUnavailable:
         raise _media_error(503, CREDIT_ENFORCEMENT_UNAVAILABLE_CODE) from None
 
@@ -408,6 +410,8 @@ async def _authorized_target(
     tenant: TenantContext,
     requested_tenant_id: UUID | None,
     session: AsyncSession,
+    *,
+    before_load: Callable[[UUID], Awaitable[None]] | None = None,
 ) -> Tenant:
     effective_tenant_id = await resolve_effective_tenant(
         request,
@@ -417,6 +421,10 @@ async def _authorized_target(
     )
     if tenant.role == "builder" and tenant.builder_id is None:
         raise _media_error(status.HTTP_403_FORBIDDEN, "media_tenant_forbidden")
+    if before_load is not None:
+        # cobranca-credito-por-builder: the resolved tenant's credit mode, read
+        # before its row is loaded (:func:`_mode_and_target`).
+        await before_load(effective_tenant_id)
 
     target_filters = [
         Tenant.id == effective_tenant_id,
@@ -434,6 +442,34 @@ async def _authorized_target(
     if target is None:
         raise _media_error(status.HTTP_403_FORBIDDEN, "media_tenant_forbidden")
     return target
+
+
+async def _mode_and_target(
+    request: Request,
+    tenant: TenantContext,
+    requested_tenant_id: UUID | None,
+    session: AsyncSession,
+) -> tuple[credit_inventory.CreditMode, Tenant]:
+    """The upload's and the download's credit mode and target.
+
+    cobranca-credito-por-builder: the mode is the resolved target tenant's
+    (its builder's effective enforcement), read once between resolving the
+    tenant and loading its row -- a failed mode read rolls the session back,
+    which would expire a loaded ``Tenant``.  An ``_authorized_target`` that
+    does not call back (a suite's stand-in) gets the mode of the target it
+    returned."""
+
+    modes: list[credit_inventory.CreditMode] = []
+
+    async def read_mode(effective_tenant_id: UUID) -> None:
+        modes.append(await _credit_mode(request, session, effective_tenant_id))
+
+    target = await _authorized_target(
+        request, tenant, requested_tenant_id, session, before_load=read_mode
+    )
+    if not modes:
+        modes.append(await _credit_mode(request, session, target.id))
+    return modes[0], target
 
 
 def _authorized_media_target_exists(
@@ -559,10 +595,10 @@ async def upload_media_asset(
     upload: UploadFile | None = None
     target: Tenant | None = None
     try:
-        mode = await _credit_mode(request, session)
         # Authorization and target classification deliberately precede multipart
-        # parsing, validation and every access to media_assets.
-        target = await _authorized_target(request, tenant, tenant_id, session)
+        # parsing, validation and every access to media_assets; the credit
+        # mode is read for the resolved tenant before its row is loaded.
+        mode, target = await _mode_and_target(request, tenant, tenant_id, session)
         upload, fields, raw_trigger_intents = await _parse_upload(request)
         metadata = validate_media_metadata(
             display_name=fields["display_name"],
@@ -607,6 +643,7 @@ async def upload_media_asset(
                     object_ids=[asset.id],
                     upload_id=asset.id,
                     enforcement_at=mode.enforcement_at,
+                    captured=mode.captured,
                 )
                 if reserved.status == "credit_pending":
                     raise credit_inventory.CreditPendingError()
@@ -662,6 +699,11 @@ async def upload_media_asset(
     except credit_inventory.CreditPendingError:
         await _rollback(session)
         raise _media_error(402, "credit_pending") from None
+    except CreditEnforcementUnavailable:
+        # The captured mark changed under the lock (or became unreadable):
+        # 503, nothing stored (cobranca-credito-por-builder).
+        await _rollback(session)
+        raise _media_error(503, CREDIT_ENFORCEMENT_UNAVAILABLE_CODE) from None
     except CreditTenantGone:
         await _rollback(session)
         raise _media_error(
@@ -987,8 +1029,7 @@ async def download_media_asset(
     """Stream exact stored bytes as a non-sniffable attachment."""
     permit: ImmediatePermit | None = None
     try:
-        mode = await _credit_mode(request, session)
-        target = await _authorized_target(request, tenant, tenant_id, session)
+        mode, target = await _mode_and_target(request, tenant, tenant_id, session)
         target_id = target.id
         permit = _download_permit(request)
         asset = (
@@ -1031,6 +1072,7 @@ async def download_media_asset(
                 media_id=asset.id,
                 size_bytes=asset.size_bytes,
                 enforcement_at=mode.enforcement_at,
+                captured=mode.captured,
             )
             if charged.status == "credit_pending":
                 await _rollback(session)
@@ -1075,6 +1117,13 @@ async def download_media_asset(
             permit.release()
         await _rollback(session)
         raise _media_error(404, "media_asset_not_found") from None
+    except CreditEnforcementUnavailable:
+        # The captured mark changed under the lock (or became unreadable):
+        # 503, nothing charged and no byte sent (cobranca-credito-por-builder).
+        if permit is not None:
+            permit.release()
+        await _rollback(session)
+        raise _media_error(503, CREDIT_ENFORCEMENT_UNAVAILABLE_CODE) from None
     except HTTPException:
         if permit is not None:
             permit.release()

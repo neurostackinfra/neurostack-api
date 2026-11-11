@@ -1213,6 +1213,36 @@ describe("Billing credits", () => {
     expect(screen.queryByTestId("credit-mode")).not.toBeInTheDocument();
   });
 
+  // cobranca-credito-por-builder Group 5: the API computes `mode` from the
+  // account's builder (the global, else that builder's mark); the page reads
+  // nothing else. A marked builder is `enforced` with its mark instant and
+  // loses the notice; an unmarked builder stays `observational` and keeps it.
+  it.each([
+    ["the marked builder", "enforced", "2026-11-11T12:00:00Z", false],
+    ["an unmarked builder", "observational", null, true],
+    // Not keyed on `enforcement_at`: a future instant is still observational.
+    ["a future instant", "observational", "2099-01-01T00:00:00Z", true],
+  ] as const)("the observational notice follows only the API mode: %s", async (_who, mode, enforcementAt, shown) => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () =>
+        response(creditSummary({ state: { mode, enforcement_at: enforcementAt } })),
+    });
+    renderBilling();
+
+    expect(await screen.findByTestId("credit-panel")).toBeInTheDocument();
+    if (shown) {
+      expect(screen.getByTestId("credit-mode")).toHaveTextContent(
+        "Modo observacional: o consumo é medido, mas ainda não é cobrado dos seus créditos.",
+      );
+      expect(screen.getByTestId("credit-consumption")).toHaveTextContent(/Consumo estimado no ciclo \(não cobrado\)/);
+    } else {
+      expect(screen.queryByTestId("credit-mode")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Modo observacional/)).not.toBeInTheDocument();
+      expect(screen.getByTestId("credit-consumption")).toHaveTextContent(/Consumo cobrado no ciclo/);
+    }
+  });
+
   it("marks consumption as not charged while the mode is observational", async () => {
     routeFetch(fetchMock, {
       "GET /v1/billing/summary": () => response(summary),

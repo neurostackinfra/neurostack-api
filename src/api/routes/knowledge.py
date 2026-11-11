@@ -356,10 +356,14 @@ def _enforcement_unavailable() -> HTTPException:
 
 
 async def _credit_mode(
-    request: Request, session: AsyncSession
+    request: Request, session: AsyncSession, tenant_id: UUID
 ) -> credit_inventory.CreditMode:
+    """The mode of the tenant the request acts on (cobranca-credito-por-
+    builder: that tenant's builder's effective enforcement), read once,
+    right after the tenant is resolved and before any ORM row is loaded."""
+
     try:
-        return await credit_inventory.read_credit_mode(request, session)
+        return await credit_inventory.read_credit_mode(request, session, tenant_id)
     except CreditEnforcementUnavailable:
         raise _enforcement_unavailable() from None
 
@@ -384,10 +388,16 @@ async def _reserve_or_refuse(
             object_ids=object_ids,
             upload_id=upload_id,
             enforcement_at=mode.enforcement_at,
+            captured=mode.captured,
         )
     except CreditTenantGone:
         await session.rollback()
         raise _tenant_not_found() from None
+    except CreditEnforcementUnavailable:
+        # The captured mark changed under the lock (or became unreadable):
+        # 503, everything rolled back.
+        await session.rollback()
+        raise _enforcement_unavailable() from None
     if outcome.status == "credit_pending":
         await session.rollback()
         raise _credit_pending()
@@ -410,17 +420,23 @@ async def _reserve_or_refuse(
             )
 
 
-async def _refuse_standalone(session: AsyncSession, tenant_id: UUID) -> None:
+async def _refuse_standalone(
+    session: AsyncSession, tenant_id: UUID, mode: credit_inventory.CreditMode
+) -> None:
     """Lock order step 1 before the upload writes anything: a standalone
-    tenant has no account (``credit_pending``)."""
+    tenant has no account (``credit_pending``) -- unless it was captured on
+    its builder's mark, then unlinked: 503 (the race), never 402."""
 
     try:
         has_builder = await credit_inventory.lock_tenant_for_reservation(
-            session, tenant_id
+            session, tenant_id, captured=mode.captured
         )
     except CreditTenantGone:
         await session.rollback()
         raise _tenant_not_found() from None
+    except CreditEnforcementUnavailable:
+        await session.rollback()
+        raise _enforcement_unavailable() from None
     if not has_builder:
         await session.rollback()
         raise _credit_pending()
@@ -487,17 +503,18 @@ async def upload_document(
     """
     Upload and index a document.
     """
-    # Credits: read once, before any row is loaded (switch off: no SQL).
-    mode = await _credit_mode(http_request, session)
     # The payload tenant is an override request; authorize it before use.
     effective_tenant_id = await resolve_effective_tenant(
         http_request, tenant, request.tenant_id, session
     )
+    # Credits: read once, for the tenant written into, before any row is
+    # loaded (switch off: no SQL).
+    mode = await _credit_mode(http_request, session, effective_tenant_id)
     await _require_tenant_row(session, effective_tenant_id)
     if mode.enforced:
         # The PDF's 500,000-character limit is the multipart route's only
         # (owner decision H): this schema's 100,000 always refuses first.
-        await _refuse_standalone(session, effective_tenant_id)
+        await _refuse_standalone(session, effective_tenant_id, mode)
     repo = KnowledgeDocumentRepository(session)
 
     # The schema already refused reserved keys in custom, so it cannot
@@ -676,10 +693,10 @@ async def upload_document_files(
 ) -> DocumentBatchUploadResponse:
     """Upload DOCX / textual PDF files as knowledge documents."""
 
-    mode = await _credit_mode(request, session)
     effective_tenant_id = await resolve_effective_tenant(
         request, tenant, tenant_id, session
     )
+    mode = await _credit_mode(request, session, effective_tenant_id)
     await _require_tenant_row(session, effective_tenant_id)
     # Authorized: end the read transaction so no pooled connection is held
     # while the body arrives and its files are parsed (a tenant deleted
@@ -692,7 +709,7 @@ async def upload_document_files(
         raise _upload_error(422, error.code) from None
     if mode.enforced:
         _enforce_upload_limits(files, extracted)
-        await _refuse_standalone(session, effective_tenant_id)
+        await _refuse_standalone(session, effective_tenant_id, mode)
     repo = KnowledgeDocumentRepository(session)
     documents: list[KnowledgeDocument] = []
     try:
@@ -873,13 +890,13 @@ async def search_knowledge(
     Perform semantic search in the knowledge base.
     """
     start_time = datetime.utcnow()
-    mode = await _credit_mode(http_request, session)
 
     # Authorize before searching: retrieval may only ever use this tenant,
     # never request.tenant_id.
     effective_tenant_id = await resolve_effective_tenant(
         http_request, tenant, request.tenant_id, session
     )
+    mode = await _credit_mode(http_request, session, effective_tenant_id)
     if mode.enforced and (
         classify_interaction_origin(tenant) is InteractionOrigin.PRODUCTION
     ):

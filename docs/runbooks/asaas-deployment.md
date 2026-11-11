@@ -2105,6 +2105,15 @@ report and stop.
   at `046`), an owner decision of last resort that loses every write made
   after it.
 
+### Deploy order (per-builder charging, PR-B)
+
+The behaviour release (PR-B) deploys only after the bridge image serves and
+the database is at `047`. Do not run the first `mark` before its rollout has
+finished on every task: a task still on the bridge image ignores the mark.
+Operating the mark and its rollback are in
+[`credit-charge-mark.md`](./credit-charge-mark.md) and
+[`asaas-rollback.md`](./asaas-rollback.md), "Per-builder charging (PR-B)".
+
 ## Post-deploy rollout readback
 
 The "Rollout fechado" criterion of the asaas-payment-gateway wish needs one

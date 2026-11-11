@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from src.models.billing import BillingSubscription
+from src.models.builder import Builder
 from src.models.content_retention import (
     CreditHoldEvent,
     CreditHoldGeneration,
@@ -293,9 +294,10 @@ class ContentRetentionRepository:
         self,
         *,
         now: datetime,
-        enforcement_at: datetime,
+        enforcement_at: datetime | None = None,
         limit: int,
         today: date | None = None,
+        marked: Mapping[UUID, datetime] | None = None,
     ) -> list[UUID]:
         """Builders the worker must look at -- only those with work pending,
         so a backlog of quiet episodes (already suspended, nothing due) never
@@ -313,7 +315,47 @@ class ContentRetentionRepository:
           brings at its start, with no traffic;
         * a builder with a lot that expired after the enforcement (in the
           last :data:`EXPIRY_LOOKBACK`) and no ``expiry`` entry recorded yet
-          (an exhaustion without traffic)."""
+          (an exhaustion without traffic).
+
+        Exactly one of the two scopes (cobranca-credito-por-builder, wish
+        Group 3):
+
+        * ``enforcement_at`` -- the global ``credit_enforcement_at``: every
+          builder, every lot bounded by that one instant (the statements of
+          ``main``, unchanged);
+        * ``marked`` -- the global is unset: ONLY these builders (each with
+          its own effective instant, the ``occurred_at`` of its latest
+          ``mark``), each lot bounded by its OWN builder's instant.  A builder
+          absent from ``marked`` is never selected, so the worker never
+          locks, sweeps or writes it.  A marked builder that no longer exists
+          is dropped first (its marks outlive it: ``credit_enforcement_marks``
+          has no foreign key, migration 047), so its marks still only make
+          ``CreditRepository.any_enforcement_mark`` true.  An empty map reads
+          nothing."""
+
+        if (enforcement_at is None) == (marked is None):
+            raise ValueError("pass exactly one of enforcement_at and marked")
+        scope: list[UUID] | None = None
+        if marked is not None:
+            wanted = sorted(set(marked), key=str)
+            if not wanted:
+                return []
+            existing = {
+                UUID(str(builder_id))
+                for (builder_id,) in (
+                    await self.session.execute(
+                        select(Builder.id).where(Builder.id.in_(wanted))
+                    )
+                ).all()
+            }
+            scope = [builder_id for builder_id in wanted if builder_id in existing]
+            if not scope:
+                return []
+
+        def within(column: Any) -> list[Any]:
+            """The marked builders only (nothing with the global scope)."""
+
+            return [] if scope is None else [column.in_(scope)]
 
         episode = CreditLifecycleEpisode
         open_ = episode.reactivated_at.is_(None)
@@ -332,6 +374,7 @@ class ContentRetentionRepository:
                     and_(episode.suspension_due_at <= now, ~recorded("suspended")),
                     and_(episode.deletion_due_at <= now, ~recorded("deletion_due")),
                 ),
+                *within(episode.builder_id),
             )
             .order_by(episode.suspension_due_at, episode.builder_id)
             .limit(limit)
@@ -342,6 +385,7 @@ class ContentRetentionRepository:
                 open_,
                 episode.cycle_end_at.is_not(None),
                 episode.grace_ends_at > now,
+                *within(episode.builder_id),
             )
             .order_by(episode.grace_ends_at, episode.builder_id)
             .limit(limit)
@@ -359,14 +403,32 @@ class ContentRetentionRepository:
                     CreditLot.cycle_start
                     >= local_today - timedelta(days=EXPIRY_LOOKBACK.days),
                 ),
+                *within(episode.builder_id),
             )
             .order_by(episode.suspension_due_at, episode.builder_id)
             .limit(limit)
         )
+        floor = now - EXPIRY_LOOKBACK
+        if scope is None:
+            assert enforcement_at is not None
+            expired_after = CreditLot.expires_at > max(enforcement_at, floor)
+        else:
+            # Each marked builder's lots after ITS OWN instant: one bound per
+            # builder, never one instant for all of them.
+            assert marked is not None
+            expired_after = or_(
+                *(
+                    and_(
+                        CreditLot.builder_id == builder_id,
+                        CreditLot.expires_at > max(marked[builder_id], floor),
+                    )
+                    for builder_id in scope
+                )
+            )
         expired_rows = await self.session.execute(
             select(CreditLot.builder_id)
             .where(
-                CreditLot.expires_at > max(enforcement_at, now - EXPIRY_LOOKBACK),
+                expired_after,
                 CreditLot.expires_at <= now,
                 ~exists().where(
                     CreditLedgerEntry.builder_id == CreditLot.builder_id,

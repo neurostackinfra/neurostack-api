@@ -79,7 +79,12 @@ from src.models.credit_object_copy import (
 from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
-from src.repositories.credit import CreditRepository, TenantScope
+from src.repositories.credit import (
+    CreditRepository,
+    EffectiveEnforcement,
+    EnforcementOrigin,
+    TenantScope,
+)
 from src.repositories.credit_inventory import CreditInventoryRepository, SourceRow
 from src.services.credit_allocations import (
     AccountingWindow,
@@ -112,6 +117,8 @@ from src.services.credit_metering import (
     _single_connection_pool,
     end_route_transaction,
     enforcement_seen,
+    read_tenant_enforcement,
+    require_captured_enforcement,
 )
 from src.services.credit_switch import credit_switch_effective, request_credit_switch
 
@@ -150,10 +157,14 @@ class CreditPendingError(Exception):
 
 @dataclass(frozen=True)
 class CreditMode:
-    """Captured once per request: the switch, and ``credit_enforcement_at``."""
+    """Captured once per request: the switch, and the effective enforcement
+    instant of the request's tenant with its origin (the global
+    ``credit_enforcement_at``, else its builder's mark;
+    cobranca-credito-por-builder)."""
 
     switch_on: bool
     enforcement_at: datetime | None = None
+    origin: EnforcementOrigin | None = None
 
     @property
     def enforced(self) -> bool:
@@ -162,6 +173,16 @@ class CreditMode:
     @property
     def observational(self) -> bool:
         return self.switch_on and self.enforcement_at is None
+
+    @property
+    def captured(self) -> EffectiveEnforcement | None:
+        """What the enforced transaction re-checks under its locks
+        (``credit_metering.require_captured_enforcement``): ``None`` unless
+        enforced with a known origin."""
+
+        if not self.enforced or self.origin is None:
+            return None
+        return EffectiveEnforcement(self.enforcement_at, self.origin)
 
 
 CREDIT_OFF: Final = CreditMode(False)
@@ -187,15 +208,23 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def read_credit_mode(request: HTTPConnection, session: object) -> CreditMode:
-    """The request's credit mode; call it FIRST in the route, before any ORM
-    object is loaded (a failed read rolls the session back).
+async def read_credit_mode(
+    request: HTTPConnection, session: object, tenant_id: UUID | None = None
+) -> CreditMode:
+    """The request's credit mode for ``tenant_id`` (the tenant the request
+    acts on, resolved and authorized); call it before any ORM object is
+    loaded (a failed read rolls the session back).
 
     Switch off, or a session that is not a real ``AsyncSession`` or a
     request that is not an ASGI one (the suites' fakes): :data:`CREDIT_OFF`,
-    no SQL.  A failed read keeps the
-    request observational (``main``'s answer) -- unless this process already
-    saw ``credit_enforcement_at`` set: then
+    no SQL.  With a tenant the mode is that tenant's effective enforcement
+    (cobranca-credito-por-builder: the global, else its builder's mark, its
+    builder read once here; the per-tenant D1 of
+    :func:`~src.services.credit_metering.read_tenant_enforcement`); without
+    one, the global alone (a tenant with no builder only ever sees it).  A
+    failed read keeps the request observational (``main``'s answer) --
+    unless this process already saw ``credit_enforcement_at`` set (or this
+    tenant enforced by a mark): then
     :class:`~src.services.credit_metering.CreditEnforcementUnavailable`.
     """
 
@@ -205,11 +234,14 @@ async def read_credit_mode(request: HTTPConnection, session: object) -> CreditMo
         return CREDIT_OFF  # not an ASGI request (a suite's fake)
     if not request_credit_switch(request):
         return CREDIT_OFF
-    return await _read_enforcement_mode(session)
+    return await _read_enforcement_mode(session, tenant_id)
 
 
 async def read_credit_mode_without_request(
-    session: object, *, switch_on: bool | None = None
+    session: object,
+    *,
+    switch_on: bool | None = None,
+    tenant_id: UUID | None = None,
 ) -> CreditMode:
     """:func:`read_credit_mode` for a caller that has no ``Request``: the
     agent's media delivery (envio-midia-agente Group 5), inline after a
@@ -219,10 +251,12 @@ async def read_credit_mode_without_request(
     request's entry value), else the process-wide verdict read now
     (:func:`~src.services.credit_switch.credit_switch_effective`, what the
     publisher re-reads before every row).  Everything after the switch is
-    :func:`read_credit_mode`'s: switch off, or a session that is not a real
-    ``AsyncSession``: :data:`CREDIT_OFF`, no SQL; a failed read keeps the
-    caller observational unless this process already saw
-    ``credit_enforcement_at`` set -- then
+    :func:`read_credit_mode`'s, ``tenant_id`` included (the delivery passes
+    it only for a channel a marked builder is charged on, Meta and Z-API):
+    switch off, or a session that is not a real ``AsyncSession``:
+    :data:`CREDIT_OFF`, no SQL; a failed read keeps the caller
+    observational unless this process already saw ``credit_enforcement_at``
+    set (or this tenant enforced by a mark) -- then
     :class:`~src.services.credit_metering.CreditEnforcementUnavailable`.
     """
 
@@ -231,14 +265,31 @@ async def read_credit_mode_without_request(
     effective = credit_switch_effective() if switch_on is None else switch_on
     if effective is not True:
         return CREDIT_OFF
-    return await _read_enforcement_mode(session)
+    return await _read_enforcement_mode(session, tenant_id)
 
 
-async def _read_enforcement_mode(session: AsyncSession) -> CreditMode:
-    """The switch is on: ``credit_enforcement_at``, read once (the D1 rule)."""
+async def _read_enforcement_mode(
+    session: AsyncSession, tenant_id: UUID | None = None
+) -> CreditMode:
+    """The switch is on: the enforcement, read once (the D1 rule).  With a
+    tenant, its effective enforcement (the per-tenant D1 too); without one,
+    ``credit_enforcement_at`` alone, exactly as before."""
 
     global _enforcement_seen
 
+    if tenant_id is not None:
+        effective = await read_tenant_enforcement(
+            session,
+            tenant_id,
+            global_seen=_enforcement_seen or enforcement_seen(),
+            log=logger,
+            event=ENFORCED_LOG,
+        )
+        if effective is None or effective.at is None:
+            return CreditMode(True, None)
+        if effective.origin == "global":
+            _enforcement_seen = True
+        return CreditMode(True, _aware(effective.at), effective.origin)
     try:
         enforced_at = await CreditRepository(session).enforcement_at()
     except Exception as error:
@@ -263,7 +314,7 @@ async def _read_enforcement_mode(session: AsyncSession) -> CreditMode:
         return CreditMode(True, None)
     if isinstance(enforced_at, datetime):
         _enforcement_seen = True
-        return CreditMode(True, _aware(enforced_at))
+        return CreditMode(True, _aware(enforced_at), "global")
     return CreditMode(True, None)
 
 
@@ -595,12 +646,14 @@ async def open_window_for_debit(
 ) -> WindowWork | None:
     """The opening a trace (or any :meth:`CreditLedger.debit`) triggers
     before its own debit, once the enforcement is set; ``None`` when the
-    enforcement is not set.  The caller persists the book, then
-    :meth:`WindowWork.write_pending`.  Raises
+    enforcement is not set.  The enforcement is the book's builder's
+    effective one (cobranca-credito-por-builder: the global, else its mark),
+    so the window open at a mark's instant gets the free baseline.  The
+    caller persists the book, then :meth:`WindowWork.write_pending`.  Raises
     :class:`InventoryReadbackFailed` (the debit answers
     ``credit_pending``)."""
 
-    enforcement_at = await ledger.repository.enforcement_at()
+    enforcement_at = (await ledger.repository.effective_enforcement(book.builder_id)).at
     if enforcement_at is None:
         return None
     work = WindowWork(ledger.session, ledger, book, enforcement_at)
@@ -629,6 +682,7 @@ async def _enforced_book(
     *,
     at: datetime,
     effect_ids: tuple[str, ...],
+    captured: EffectiveEnforcement | None = None,
 ) -> tuple[TenantScope, CreditLedger, LedgerBook] | None:
     """Lock order steps 1-4; ``None`` is ``credit_pending``.
 
@@ -638,12 +692,30 @@ async def _enforced_book(
     book: a reconciliation failure may not create a debit, debt, allocation
     or lifecycle row.  A genuinely empty but reconciled source remains
     usable and reaches the existing debt lifecycle.
+
+    cobranca-credito-por-builder: ``captured`` is the request's
+    :attr:`CreditMode.captured`.  A captured mark is re-checked right after
+    the tenant lock, under the builder's account lock
+    (``credit_metering.require_captured_enforcement``): a change raises
+    ``CreditEnforcementChanged`` (503) before anything is written -- the
+    caller rolls back -- so a tenant unlinked from a marked builder in
+    between is never ``credit_pending``, and a builder it was relinked to is
+    never charged for it.
     """
 
     repository = CreditRepository(session)
     scope = await repository.tenant_scope(tenant_id, lock=True)
     if scope is None:
         raise CreditTenantGone("the tenant vanished before its reservation")
+    if captured is not None:
+        await require_captured_enforcement(
+            repository,
+            scope.builder_id,
+            captured,
+            tenant_id=tenant_id,
+            log=logger,
+            event=ENFORCED_LOG,
+        )
     if scope.builder_id is None:
         return None
     from src.services.credit_rollout import CreditRolloutService
@@ -672,17 +744,23 @@ async def reserve_upload(
     upload_id: UUID,
     enforcement_at: datetime,
     at: datetime | None = None,
+    captured: EffectiveEnforcement | None = None,
 ) -> AllocationOutcome:
     """The reservation of one upload (its new objects already flushed in
     this transaction): the window's opening, then ``target - coverage``.
 
     ``upload_id`` names the effect (a document, a batch, a media asset): an
     internal retry of the same upload is a duplicate.  Validation (format,
-    size, count) happens BEFORE this call."""
+    size, count) happens BEFORE this call.  ``captured``: the request's
+    :attr:`CreditMode.captured` (the race check of :func:`_enforced_book`)."""
 
     effect_id = reservation_effect_id(tenant_id, category, upload_id)
     opened = await _enforced_book(
-        session, tenant_id, at=at or _now(), effect_ids=(effect_id,)
+        session,
+        tenant_id,
+        at=at or _now(),
+        effect_ids=(effect_id,),
+        captured=captured,
     )
     if opened is None:
         _log_pending("standalone_or_hold", tenant_id, category=category)
@@ -725,15 +803,21 @@ async def charge_egress(
     enforcement_at: datetime,
     at: datetime | None = None,
     delivery_id: UUID | None = None,
+    captured: EffectiveEnforcement | None = None,
 ) -> AllocationOutcome:
     """One download, BEFORE it is answered (owner decision G): the window's
     opening, the delivery, and the overage beyond 200 MB per media credit
-    covered.  Every request is a delivery (server id, owner decision F)."""
+    covered.  Every request is a delivery (server id, owner decision F).
+    ``captured``: as :func:`reserve_upload`'s."""
 
     delivery = delivery_id or uuid4()
     effect_id = egress_effect_id(tenant_id, media_id, delivery)
     opened = await _enforced_book(
-        session, tenant_id, at=at or _now(), effect_ids=(effect_id,)
+        session,
+        tenant_id,
+        at=at or _now(),
+        effect_ids=(effect_id,),
+        captured=captured,
     )
     if opened is None:
         _log_pending("standalone_or_hold", tenant_id, category="egress")
@@ -829,13 +913,34 @@ async def charge_rag_reprocessing(
     return AllocationOutcome("applied", charged_mc=charged, target_mc=target)
 
 
-async def lock_tenant_for_reservation(session: AsyncSession, tenant_id: UUID) -> bool:
+async def lock_tenant_for_reservation(
+    session: AsyncSession,
+    tenant_id: UUID,
+    *,
+    captured: EffectiveEnforcement | None = None,
+) -> bool:
     """Lock order step 1 before the upload's own writes: ``False`` for a
-    standalone tenant (``credit_pending`` before anything is written)."""
+    standalone tenant (``credit_pending`` before anything is written).
 
-    scope = await CreditRepository(session).tenant_scope(tenant_id, lock=True)
+    cobranca-credito-por-builder: a request captured on its builder's mark
+    whose tenant is standalone now is the race, not ``credit_pending``:
+    ``CreditEnforcementChanged`` (503, nothing written).  A tenant still
+    linked is re-checked under the account lock by the reservation itself
+    (:func:`_enforced_book`)."""
+
+    repository = CreditRepository(session)
+    scope = await repository.tenant_scope(tenant_id, lock=True)
     if scope is None:
         raise CreditTenantGone("the tenant vanished before its upload")
+    if captured is not None and scope.builder_id is None:
+        await require_captured_enforcement(
+            repository,
+            None,
+            captured,
+            tenant_id=tenant_id,
+            log=logger,
+            event=ENFORCED_LOG,
+        )
     return scope.builder_id is not None
 
 

@@ -92,6 +92,21 @@ store crosses runs, and every run starts from a clone of one seeded template.
   045 database and a super admin's writes are
   ``tests/integration/test_credit_courtesy_http_postgres.py``.
 
+* cobranca-credito-por-builder Group 2: with the switch effective and the
+  global unset, the request path reads the effective enforcement of the
+  tenant's builder (``CreditRepository.effective_enforcement``): besides
+  the global, the builder's latest mark, by one SELECT (``_MARK_READ``) of
+  ``credit_enforcement_marks``, which the corpus leaves empty -- nobody is
+  marked, so every answer, event and observational row is the one before
+  the per-builder reader.  With the global set the marks are never read.
+
+* cobranca-credito-por-builder Group 3: with the global unset, a tick of
+  the lifecycle worker, the response-outbox publisher or the orphan pass
+  also reads whether ANY mark event exists (``_ANY_MARK_READ``, one SELECT)
+  and stops there -- nothing is marked in the corpus; such a tick may land
+  inside a replay.  With the global set no worker reads the marks.  The
+  workers' own proofs: tests/integration/test_credit_charge_workers_postgres.py.
+
 Groups 3-7 append their surfaces to the corpus and to these runs, always
 also below the image's credit minimum.
 """
@@ -174,6 +189,12 @@ _READ_ONLY_TABLES = frozenset(
         "credit_lifecycle_transitions",
         "credit_threshold_alerts",
         "credit_allocations",
+        # cobranca-credito-por-builder Group 2: the per-builder reader
+        # (``CreditRepository.effective_enforcement``) reads the builder's
+        # latest mark while the global is unset -- one SELECT per read
+        # (``_MARK_READ``), never a write; the corpus marks nobody, so the
+        # table stays empty and every answer is the unmarked one.
+        "credit_enforcement_marks",
     }
 )
 # Group 5: the corpus uploads of the enforced run that need NEW capacity.
@@ -233,6 +254,21 @@ _ENFORCEMENT_READ = re.compile(
     r"SELECT credit_enforcement_state\.credit_enforcement_at\s+"
     r"FROM credit_enforcement_state\s+"
     r"WHERE credit_enforcement_state\.id = \$1::SMALLINT"
+)
+# cobranca-credito-por-builder Group 2: the one statement with which the
+# per-builder reader reads a builder's latest mark (kind and instant).
+_MARK_READ = re.compile(
+    r"SELECT credit_enforcement_marks\.kind, credit_enforcement_marks\.occurred_at"
+    r"\s+FROM credit_enforcement_marks\s+"
+    r"WHERE credit_enforcement_marks\.builder_id = \$1::UUID\s+"
+    r"ORDER BY credit_enforcement_marks\.occurred_at DESC, "
+    r"credit_enforcement_marks\.id DESC\s+LIMIT \$2::INTEGER"
+)
+# cobranca-credito-por-builder Group 3: the workers' one extra statement with
+# the global unset (``CreditRepository.any_enforcement_mark``).
+_ANY_MARK_READ = re.compile(
+    r"SELECT credit_enforcement_marks\.id\s+"
+    r"FROM credit_enforcement_marks\s+LIMIT \$1::INTEGER"
 )
 
 
@@ -1604,6 +1640,20 @@ async def test_the_effective_switch_only_meters_observationally(
     assert names & set(rows) == _METERING_TABLES | _READ_ONLY_TABLES
     # The one other credit_* name in that SQL is the enforcement column.
     assert names - set(rows) == {"credit_enforcement_at"}
+    # The marks are only ever read, by the one per-builder statement -- and
+    # (Group 3) by a worker tick's one statement, ``_ANY_MARK_READ``, set
+    # apart here by its exact text and nothing else.
+    worker_marks = [s for s in run["statements"] if _ANY_MARK_READ.fullmatch(s.strip())]
+    marks = [
+        s
+        for s in run["statements"]
+        if "credit_enforcement_marks" in s and s not in worker_marks
+    ]
+    assert marks and all(_MARK_READ.fullmatch(s.strip()) for s in marks), marks
+    # Each worker reads the global first, so never more of these than of it.
+    assert len(worker_marks) <= sum(
+        1 for s in run["statements"] if _ENFORCEMENT_READ.fullmatch(s.strip())
+    )
     assert rows["credit_ingress_claims"] > 0
     assert rows["credit_observational_effects"] > 0
     assert {
@@ -2016,6 +2066,10 @@ async def test_the_enforced_run_charges_each_production_decision_once(
     world = oracle.world
 
     assert run["reading"]["effective"] is True
+    # cobranca-credito-por-builder Group 2: with the global set the
+    # per-builder reader never reads a mark (the global path is the one
+    # statement it ran before).
+    assert not any("credit_enforcement_marks" in s for s in run["statements"])
     answers = {r["id"]: r for r in run["responses"]}
     for case, code in _KEYLESS.items():
         assert (answers[case]["status"], answers[case]["body"]) == (
@@ -2421,5 +2475,15 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     # config on, the response-outbox publisher's tick reads
     # credit_enforcement_at while the switch is effective -- that read and
     # nothing else (no claim, no sweep: the enforcement is not set).
+    # cobranca-credito-por-builder Group 3: at the 047 head, with the global
+    # unset, the tick also reads whether any mark event exists
+    # (``_ANY_MARK_READ``) -- none does, so it still claims nothing.
     credit_sql = [s for s in statements if _CREDIT_SQL.search(s)]
-    assert all(_ENFORCEMENT_READ.fullmatch(s.strip()) for s in credit_sql), credit_sql
+    assert all(
+        _ENFORCEMENT_READ.fullmatch(s.strip()) or _ANY_MARK_READ.fullmatch(s.strip())
+        for s in credit_sql
+    ), credit_sql
+    # The any-mark read always follows the same tick's global read.
+    assert sum(1 for s in credit_sql if _ANY_MARK_READ.fullmatch(s.strip())) <= sum(
+        1 for s in credit_sql if _ENFORCEMENT_READ.fullmatch(s.strip())
+    ), credit_sql

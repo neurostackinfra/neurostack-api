@@ -11,6 +11,10 @@ Inert before the enforcement.  Nothing here exists before
 while it is unset (or later than the instant evaluated), the worker claims
 nothing, and no episode, threshold, transition or deadline is inherited at
 the enforcement instant -- an episode only ever opens on an effect AFTER it.
+Per builder (cobranca-credito-por-builder): with the global unset, "the
+enforcement" is the builder's effective one (its latest ``mark``), and the
+worker looks only at marked builders, each from its own instant
+(:func:`run_lifecycle_once`).
 
 Opening (owner decisions; DESIGN "esgotamento").  Evaluated under the
 builder's account lock after every ledger write (:meth:`CreditLedger.persist`
@@ -99,6 +103,7 @@ from src.services.credit_switch import credit_switch_effective, run_credit_worke
 
 if TYPE_CHECKING:
     from src.models.content_retention import CreditLifecycleEpisode
+    from src.repositories.credit import EffectiveEnforcement
 
 logger = get_logger(__name__)
 
@@ -442,6 +447,16 @@ class CreditLifecycle:
 
         return as_utc(await CreditRepository(self.session).enforcement_at())
 
+    async def _builder_enforcement_at(self, builder_id: UUID) -> datetime | None:
+        """The builder's effective enforcement instant (``evaluate``'s reader;
+        :meth:`enforcement_at`, the global one, stays the worker's)."""
+
+        from src.repositories.credit import CreditRepository
+
+        return as_utc(
+            (await CreditRepository(self.session).effective_enforcement(builder_id)).at
+        )
+
     async def evaluate(
         self,
         book: LedgerBook,
@@ -453,13 +468,18 @@ class CreditLifecycle:
         """Open, shorten, transition, reactivate and alert -- AFTER the book's
         rows were inserted, under the account lock the book was opened with.
 
-        Inert (writes nothing) while ``credit_enforcement_at`` is unset or
-        after the instant evaluated."""
+        Inert (writes nothing) while the book's builder has no effective
+        enforcement or it is after the instant evaluated.  Without
+        ``enforcement_at`` (the worker passes its own), the instant is the
+        builder's effective one (cobranca-credito-por-builder: the global
+        ``credit_enforcement_at``, else the builder's mark), read here."""
 
         at = book.clock
         if at is None:
             return _INERT
-        enforcement = enforcement_at or await self.enforcement_at()
+        enforcement = enforcement_at or await self._builder_enforcement_at(
+            book.builder_id
+        )
         if enforcement is None or at < enforcement:
             return _INERT
         outcome = LifecycleOutcome(evaluated=True)
@@ -878,38 +898,107 @@ async def run_lifecycle_once(
     """One tick: claims nothing with the switch off or before the
     enforcement; otherwise each candidate builder in its own transaction,
     its account claimed ``FOR UPDATE SKIP LOCKED``.  Returns the number of
-    builders evaluated."""
+    builders evaluated.
+
+    Per builder (cobranca-credito-por-builder, wish Group 3).  With the
+    global ``credit_enforcement_at`` set the tick is ``main``'s, statement
+    for statement.  With it unset the tick reads, once, whether ANY mark
+    event was ever recorded (``CreditRepository.any_enforcement_mark``:
+    without the 047 gate open it is ``False`` and reads nothing) and stops
+    there when none was -- so with nothing ever marked it costs one read
+    more than before and writes nothing.  Otherwise its candidates are ONLY
+    the builders whose latest mark event is a ``mark`` at or before the
+    tick (``CreditRepository.marked_builders``), each bounded by its own
+    instant (:meth:`ContentRetentionRepository.lifecycle_candidates`); an
+    unmarked builder is never selected, locked, swept or written.  A marked
+    candidate is evaluated only when, under its account lock (the lock the
+    operator's ``unmark`` takes), its effective enforcement is still the
+    mark it was selected with -- an ``unmark`` that committed after the
+    selection skips it with nothing written."""
 
     async def tick() -> int:
+        from src.repositories.credit import EffectiveEnforcement
+
         factory = session_factory or _session_factory()
         instant = _aware(now or datetime.now(timezone.utc), "now")
+        captured: dict[UUID, EffectiveEnforcement] = {}
         async with factory() as session:
             lifecycle = CreditLifecycle(session)
             enforcement = await lifecycle.enforcement_at()
-            if enforcement is None or instant < enforcement:
-                return 0
-            candidates = await lifecycle.repository.lifecycle_candidates(
-                now=instant,
-                enforcement_at=enforcement,
-                limit=limit,
-                today=instant.astimezone(CREDIT_TIMEZONE).date(),
-            )
+            if enforcement is not None:
+                if instant < enforcement:
+                    return 0
+                candidates = await lifecycle.repository.lifecycle_candidates(
+                    now=instant,
+                    enforcement_at=enforcement,
+                    limit=limit,
+                    today=instant.astimezone(CREDIT_TIMEZONE).date(),
+                )
+            else:
+                marked = await _marked_builders(session, instant)
+                if not marked:
+                    return 0
+                candidates = await lifecycle.repository.lifecycle_candidates(
+                    now=instant,
+                    marked=marked,
+                    limit=limit,
+                    today=instant.astimezone(CREDIT_TIMEZONE).date(),
+                )
+                captured = {
+                    builder_id: EffectiveEnforcement(marked[builder_id], "mark")
+                    for builder_id in candidates
+                }
             await session.rollback()
         evaluated = 0
         for builder_id in candidates:
-            evaluated += await _evaluate_candidate(factory, builder_id, instant)
+            evaluated += await _evaluate_candidate(
+                factory, builder_id, instant, captured.get(builder_id)
+            )
         return evaluated
 
     result = await run_credit_worker_tick(tick)
     return result or 0
 
 
+async def _marked_builders(
+    session: AsyncSession, instant: datetime
+) -> dict[UUID, datetime]:
+    """The global is unset: the builders marked at or before ``instant``,
+    with their instant -- after ONE read (``any_enforcement_mark``) when no
+    mark event was ever recorded, after none with the 047 gate closed."""
+
+    from src.repositories.credit import CreditRepository
+
+    repository = CreditRepository(session)
+    if not await repository.any_enforcement_mark():
+        return {}
+    return {
+        builder_id: at
+        for builder_id, at in (await repository.marked_builders()).items()
+        if at <= instant
+    }
+
+
 async def _evaluate_candidate(
-    factory: Callable[[], AsyncSession], builder_id: UUID, instant: datetime
+    factory: Callable[[], AsyncSession],
+    builder_id: UUID,
+    instant: datetime,
+    captured: EffectiveEnforcement | None = None,
 ) -> int:
+    """One candidate under its account lock.  ``captured`` -- a builder
+    selected by its mark (the global unset) -- must still be the builder's
+    effective enforcement once the lock is held, or nothing is written (the
+    request path's re-check, ``credit_metering.require_captured_enforcement``);
+    ``None`` (the global) re-reads nothing: the global is irreversible."""
+
     async with factory() as session:
         try:
             if not await ContentRetentionRepository(session).claim_account(builder_id):
+                await session.rollback()
+                return 0
+            if captured is not None and not await _still_marked(
+                session, builder_id, captured
+            ):
                 await session.rollback()
                 return 0
             await evaluate_locked(session, builder_id, at=instant, source="worker")
@@ -925,6 +1014,26 @@ async def _evaluate_candidate(
                 error_type=type(error).__name__,
             )
             return 0
+
+
+async def _still_marked(
+    session: AsyncSession, builder_id: UUID, captured: EffectiveEnforcement
+) -> bool:
+    """Under the account lock: the builder's effective enforcement is still
+    the mark it was selected with (logged when not)."""
+
+    from src.repositories.credit import CreditRepository
+
+    locked = await CreditRepository(session).effective_enforcement(builder_id)
+    if locked == captured:
+        return True
+    logger.info(
+        LIFECYCLE_LOG,
+        reason="enforcement_changed_since_selection",
+        builder_id=str(builder_id),
+        source="worker",
+    )
+    return False
 
 
 async def run_lifecycle_worker(

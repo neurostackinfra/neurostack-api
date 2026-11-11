@@ -1760,7 +1760,9 @@ async def run_credit_orphan_reconciliation_once(
     """Run the post-enforcement orphan pass once.
 
     Before the effective switch and the immutable enforcement timestamp the
-    worker performs no query beyond the timestamp read and emits no metric.
+    worker performs no query beyond the timestamp read and emits no metric;
+    with the timestamp unset it runs once any per-builder mark event was ever
+    recorded (cobranca-credito-por-builder), after one read more.
     Afterward it is read-only except for idempotent deleted-tenant closure
     effects (age-independent, :data:`ORPHAN_CLOSURE_BATCH` per pass); every
     other orphan remains visible to the operator as a bounded gauge and
@@ -1784,7 +1786,18 @@ async def run_credit_orphan_reconciliation_once(
     full_count: int | None = None
     async with factory() as session:  # type: ignore[operator]
         try:
-            if await CreditRepository(session).enforcement_at() is None:
+            repository = CreditRepository(session)
+            # cobranca-credito-por-builder (wish Group 3): with the global
+            # unset the pass still runs once ANY mark event was ever recorded
+            # (a ``mark``, or the last ``unmark``): a marked builder's
+            # enforced claims, effects and outbox rows need it, and it only
+            # ever anchors on what enforced requests wrote.  One read more
+            # (none with the 047 gate closed), and nothing else when no mark
+            # event exists.
+            if (
+                await repository.enforcement_at() is None
+                and not await repository.any_enforcement_mark()
+            ):
                 await session.rollback()
                 return 0
             # One pass at a time across every process (2 ECS tasks x 4

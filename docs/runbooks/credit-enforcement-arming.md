@@ -82,6 +82,18 @@ All of these must hold before `arm`. The owner confirms them for this step:
    `reasons` and reports `readiness.ready_after_arm_closures: false`, so
    **prerequisite 4 cannot be met before `uazapi-credit-enforcement` lands.**
 
+### Builders already marked (`credit_charge_mark`)
+
+A builder marked with `credit_charge_mark`
+([`credit-charge-mark.md`](./credit-charge-mark.md)) already runs the
+enforced path. Its tenants produce enforced traffic that writes no
+observational credit effect, so the cutoff report may raise
+`message_without_observation` findings for them; accept them in the owner's
+private record at arming time (write the rationale under "Owner record
+per finding", then step "3. `accept`"). The L10 code and report are
+unchanged. After the global is armed, `mark` and `unmark` are refused
+(`global_enforcement_armed`) and the mark is redundant.
+
 ## Running a step
 
 Each subcommand is one Fargate task on the service's **current** task

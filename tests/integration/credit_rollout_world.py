@@ -566,14 +566,145 @@ async def subscribed_builder(
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-builder enforcement marks (cobranca-credito-por-builder, Group 2): the
+# shared helpers of every suite that reads or writes the marks table (wish
+# Decision 18: Groups 3 and 4 import these, they add none).  ``target`` is a
+# harness (its ``engine``) or an ``AsyncEngine``.
+# ---------------------------------------------------------------------------
+
+MARK_REASON = "per-builder charge test"
+MARK_ACTOR = UUID("00000000-0000-4000-8000-0000000000a7")
+
+
+def _engine_of(target: Any) -> Any:
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    return target if isinstance(target, AsyncEngine) else target.engine
+
+
+async def record_mark(
+    target: Any,
+    builder_id: UUID,
+    kind: str = "mark",
+    *,
+    occurred_at: datetime | None = None,
+    actor_user_id: UUID = MARK_ACTOR,
+    reason: str = MARK_REASON,
+) -> datetime:
+    """One ``credit_enforcement_marks`` event, by SQL with every trigger on
+    (the row the operator command writes); returns its ``occurred_at``.
+    Without ``occurred_at`` it is the database clock, raised one microsecond
+    past the builder's latest event (strictly increasing, as
+    ``CreditRepository.insert_enforcement_mark`` keeps it)."""
+
+    async with _engine_of(target).begin() as connection:
+        stored = await connection.scalar(
+            text(
+                "INSERT INTO credit_enforcement_marks "
+                "(id, builder_id, kind, occurred_at, actor_user_id, reason) "
+                "SELECT :id, :builder, :kind, COALESCE(CAST(:at AS timestamptz), "
+                "GREATEST(clock_timestamp(), (SELECT max(occurred_at) + "
+                "interval '1 microsecond' FROM credit_enforcement_marks "
+                "WHERE builder_id = :builder))), :actor, :reason "
+                "RETURNING occurred_at"
+            ),
+            {
+                "id": uuid4(),
+                "builder": builder_id,
+                "kind": kind,
+                "at": occurred_at,
+                "actor": actor_user_id,
+                "reason": reason,
+            },
+        )
+    assert isinstance(stored, datetime)
+    return stored
+
+
+async def mark_events(target: Any, builder_id: UUID) -> list[tuple[str, datetime]]:
+    """The builder's mark events, oldest first: ``(kind, occurred_at)``."""
+
+    async with _engine_of(target).connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT kind, occurred_at FROM credit_enforcement_marks "
+                "WHERE builder_id = :builder ORDER BY occurred_at, id"
+            ),
+            {"builder": builder_id},
+        )
+        return [(str(kind), at) for kind, at in rows]
+
+
+async def relink_tenant(target: Any, tenant_id: UUID, builder_id: UUID | None) -> None:
+    """``tenants.builder_id`` changed under a request (the admin's link or
+    unlink of a clinic): the race of the per-builder reader."""
+
+    await execute_on(
+        target,
+        "UPDATE tenants SET builder_id = :builder WHERE id = :tenant",
+        tenant=tenant_id,
+        builder=builder_id,
+    )
+
+
+async def execute_on(target: Any, sql: str, **params: Any) -> None:
+    """:func:`execute` for a harness or an engine."""
+
+    async with _engine_of(target).begin() as connection:
+        await connection.execute(text(sql), params)
+
+
+def force_credit_switch(
+    monkeypatch: pytest.MonkeyPatch, *, revision: str | None = None
+) -> None:
+    """This process's credit switch effective with a reading at ``revision``
+    (default: this image's head), for code that runs without the app's
+    lifespan: below 047 the marks gate is closed, at 047 or later open
+    (``credit_switch.enforcement_mark_gate_open``)."""
+
+    from src.services.credit_switch import (
+        CreditSwitch,
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True,
+        "schema_ready",
+        revision if revision is not None else load_image_migration_chain()[-1],
+    )
+    monkeypatch.setattr(CreditSwitch, "effective", lambda _self: True)
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+
+
+def forget_enforcement_latches() -> None:
+    """A fresh process for every D1 latch: the two global ones and the
+    per-tenant mark set."""
+
+    from src.services import credit_inventory, credit_metering
+
+    credit_inventory.forget_enforcement_seen()
+    credit_metering.forget_enforcement_seen()
+    credit_metering.forget_enforcement_mark_seen()
+
+
 __all__ = [
     "Grant",
+    "MARK_ACTOR",
+    "MARK_REASON",
     "SAO_PAULO",
     "SHA",
     "Subscribed",
     "civil_today",
     "clean",
     "execute",
+    "execute_on",
+    "force_credit_switch",
+    "forget_enforcement_latches",
+    "mark_events",
+    "record_mark",
+    "relink_tenant",
     "make_builder",
     "make_cycle",
     "make_monthly_grant",

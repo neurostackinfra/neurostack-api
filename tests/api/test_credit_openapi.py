@@ -11,6 +11,7 @@ calls accepts only ``offer_id``, ``method`` and an optional subscription
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -242,3 +243,77 @@ def test_the_builder_read_documents_courtesy(schema: dict[str, Any]) -> None:
     assert "courtesy_available_mc" in balance["required"]
     binding = components["CreditBindingStatus"]
     assert "usable_courtesy" in binding["required"]
+
+
+# ---------------------------------------------------------------------------
+# cobranca-credito-por-builder Group 5: the read-only ``charging`` field.
+# ---------------------------------------------------------------------------
+
+_SUBSCRIPTIONS = "/v1/admin/builders/subscriptions"
+
+
+def test_the_builder_subscriptions_document_charging(schema: dict[str, Any]) -> None:
+    operations = schema["paths"][_SUBSCRIPTIONS]
+    assert set(operations) == {"get"}
+    get = operations["get"]
+    assert "requestBody" not in get
+    description = get["description"]
+    for needle in (
+        "`courtesy`",
+        "`charging`",
+        "{marked_at}",
+        "`unmark`",
+        "below 047",
+        "No route marks or unmarks a builder",
+        "operator command `credit_charge_mark` (a one-off operator task)",
+        "has an operator mark, not that it is being charged",
+    ):
+        assert needle in description, needle
+
+
+def test_the_charging_shape_is_closed() -> None:
+    from src.api.schemas.admin import BuilderChargingResponse
+
+    document = BuilderChargingResponse.model_json_schema()
+    assert document["additionalProperties"] is False
+    assert set(document["properties"]) == {"marked_at"}
+    assert document["required"] == ["marked_at"]
+    assert document["properties"]["marked_at"]["format"] == "date-time"
+
+
+def _mounted_routes(routes: Any, prefix: str = "") -> Iterator[tuple[str, str]]:
+    """Every route the app serves, documented or not, as ``(path, methods)``.
+
+    FastAPI 0.142 keeps an included router as an ``_IncludedRouter`` (no
+    ``.path`` of its own): walk ``original_router.routes`` under
+    ``include_context.prefix``, recursively."""
+
+    for route in routes:
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            yield from _mounted_routes(
+                inner.routes, prefix + route.include_context.prefix
+            )
+            continue
+        methods = ",".join(sorted(getattr(route, "methods", None) or ()))
+        yield prefix + str(getattr(route, "path", "")), methods
+
+
+def test_no_route_marks_or_unmarks_a_builder(schema: dict[str, Any]) -> None:
+    """The mark is written only by the operator command: no HTTP route --
+    documented or not -- names a mark, an enforcement or a charging mode."""
+
+    import re
+
+    from src.api.main import app
+
+    pattern = re.compile(r"mark|enforc|charg|cobranc")
+    documented = [path for path in schema["paths"] if pattern.search(path.lower())]
+    assert documented == []
+    mounted = list(_mounted_routes(app.routes))
+    # The walk reaches the included routers (it cannot go quiet again): the
+    # documented route that carries `charging` is among what it found, and
+    # it finds at least every documented path.
+    assert (_SUBSCRIPTIONS, "GET") in mounted
+    assert {path for path, _ in mounted} >= set(schema["paths"])
+    assert [route for route in mounted if pattern.search(route[0].lower())] == []

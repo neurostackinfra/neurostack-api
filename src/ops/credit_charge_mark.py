@@ -1,15 +1,21 @@
 """One-off operator task for the per-builder charge mark (cobranca-credito-por-builder).
 
-The bridge release (PR-A) ships one subcommand, read-only::
+Three subcommands, and no other way in (no HTTP route, worker or script
+imports this module)::
 
     python -m src.ops.credit_charge_mark status --builder-id <uuid>
+    python -m src.ops.credit_charge_mark mark --builder-id <uuid> \\
+        --author-user-id <uuid> --reason "<why>"
+    python -m src.ops.credit_charge_mark unmark --builder-id <uuid> \\
+        --author-user-id <uuid> --reason "<why>"
 
 It runs as a one-off ECS task started from the service's own task
-definition.  ``mark`` and ``unmark`` (the only writers of
-``credit_enforcement_marks``) come with the behaviour release (PR-B); in this
-release nothing writes a mark and no request path reads one, so the origin
-``mark`` below describes what that release will apply, not what this image
-does.
+definition.  ``mark`` and ``unmark`` are the only writers of
+``credit_enforcement_marks``, through
+``CreditRepository.insert_enforcement_mark`` (this module is that method's
+one caller); the request path reads the mark through
+``CreditRepository.effective_enforcement`` -- the same reader ``status``
+prints below.
 
 ``status`` prints, for one builder:
 
@@ -21,7 +27,9 @@ does.
 * ``enforcement``: the instant enforcement takes effect for the builder and
   its origin, in the order of the wish: the global ``credit_enforcement_state``
   row (``global``), else a latest event ``mark`` (``mark``, at its
-  ``occurred_at``), else ``none``;
+  ``occurred_at``), else ``none`` -- read by
+  ``CreditRepository.effective_enforcement``, the request path's own reader
+  (one implementation of the rule);
 * ``lifecycle``: the open exhaustion episode and the open debt, read as the
   credit read routes read them (the stored rows, swept in memory at the
   database clock, never persisted);
@@ -33,25 +41,106 @@ does.
 * ``coverage``: ``CreditRolloutService.binding_coverage`` at the database
   clock (``usable``, ``reconciliation_failure``).
 
+``mark`` and ``unmark`` each append ONE event (kind, the database clock,
+``--author-user-id``, ``--reason``) in one read-write transaction, or refuse
+and write nothing (the transaction is rolled back).  In that transaction, in
+this order (the lock order of ``src.repositories.credit``, extended by two
+rows no request path locks before an account):
+
+1. the author's ``users`` row ``FOR SHARE``: it must exist, be active and be a
+   ``super_admin`` (the L10 task's author rule, same row, same lock, same
+   reason code), else ``author_not_active_super_admin``;
+2. the builder's ``builders`` row ``FOR KEY SHARE`` (the marks table has no
+   foreign key, so this is the existence check: a builder deleted
+   concurrently either commits first and is ``builder_not_found``, or waits
+   for this commit), else ``builder_not_found``;
+3. the builder's credit account ``FOR UPDATE`` -- ``ensure_account`` then
+   ``lock_account``, exactly as the request path takes it
+   (``credit_metering.require_captured_enforcement``, lock order step 3).
+   It serializes two commands of one builder (``insert_enforcement_mark``
+   reads the latest instant, then inserts) and an ``unmark`` with the
+   enforced requests of the builder.  A builder that never had an account
+   gets its empty account in a command that succeeds (the request path's own
+   on-demand creation); a refusal rolls it back with everything else;
+4. the global ``credit_enforcement_at``: once the L10 is armed every builder
+   is charged and a mark is redundant, so both commands refuse
+   (``global_enforcement_armed``).  This read takes no L10 rollout lock: an
+   L10 arm that commits while a command runs is harmless, because the global
+   always wins over a mark;
+5. the builder's latest event: ``mark`` refuses an already marked builder
+   (``already_marked``, no duplicate event), ``unmark`` a builder whose
+   latest event is not a ``mark`` (``not_marked``).
+
+Then ``mark`` refuses, reporting every one that applies:
+
+* ``coverage_unusable``: ``binding_coverage(...).usable`` is false at the
+  database clock (an ASAAS quarantine, an identity conflict or a
+  ``reconciliation_failure``): enforced, every request would be
+  ``credit_pending``;
+* ``channel_not_allowed``: a tenant linked to the builder has a
+  ``whatsapp_provider`` outside :data:`ALLOWED_WHATSAPP_PROVIDERS` (``zapi``,
+  ``meta_cloud``) other than none (no config row, no key, JSON null).
+  ``uazapi``, ``evolution``, ``dialog360``, ``twilio``, an empty string and
+  any unknown value are refused: those channels have no enforced credit
+  path.  Only ``whatsapp_provider`` is read (``->>``), and only a known name
+  is printed.  Accepted as partial charging (documented in the wish): a
+  clinic linked to the builder after the ``mark``, and a tenant holding
+  Uazapi/Evolution keys with no ``whatsapp_provider``;
+* ``window_already_opened``: the current accounting window already has an
+  opening (``CreditRepository.mark_window_state``).  With the global unset
+  an opening only comes from an earlier mark; a re-mark in that window
+  would charge what was loaded while unmarked.  The next window admits it:
+  after an ``unmark``, a re-``mark`` of a builder whose enforced traffic
+  opened the current window is refused as ``window_already_opened`` until
+  the next civil month (the next accounting window).
+
+And ``unmark`` refuses, read under the account lock of step 3:
+
+* ``open_episode``: the builder has an open exhaustion episode;
+* ``open_debt``: the builder has open debt (the stored rows swept at the
+  database clock, as ``status`` reads it).
+
+A request that captured the mark before the ``unmark`` and already holds,
+or is queued on, the account lock may still debit after the ``unmark``
+commits (it re-checks the mark under that lock only once it has it): the
+``unmark`` waits for a holder, and a request queued behind it sees the
+``unmark``; one admitted in between debits once more.  The way out of a
+charge left that way is the usual one (a courtesy, then ``unmark``).
+
+With the 047 gate closed (database below 047) both commands refuse
+(``marks_table_absent``) without touching the table.
+
 Guarantees:
 
 1. The credit switch is re-read IN THIS PROCESS (``refresh_credit_switch``)
    and the command refuses unless it is effective (``switch_off``), reading
    nothing else.
-2. Everything is read in one ``REPEATABLE READ READ ONLY`` transaction that
-   is rolled back: the command can write nothing.
+2. ``status`` reads everything in one ``REPEATABLE READ READ ONLY``
+   transaction that is rolled back: it can write nothing.
 3. An unknown builder is ``refused`` (``builder_not_found``).
+4. ``mark``/``unmark`` write one event or nothing; ``occurred_at`` is the
+   database clock, kept strictly increasing per builder by the writer.
+
+``--reason`` is required: trimmed, non-empty, at most
+:data:`REASON_MAX_LENGTH` characters, one printable line (no control or
+format character, no invisible filler), with at least one letter or digit,
+and nothing that looks like an e-mail address; anything else is ``usage``.
+Invisible combining marks next to real text (such as U+034F) are still
+accepted: cosmetic, the reason stays readable.  It is stored with the event
+and printed as given to stdout, stderr and the task logs, and the table is
+append-only: it must carry no personal data and no secret (the runbook says
+so).
 
 Output: exactly one JSON document on stdout, and on stderr the same document
 plus the log fields (``event: credit_charge_mark_ops``), after any JSON log
 line of the code it ran (``configure_task_logging``: JSON whatever
 ``LOG_FORMAT`` says, tracebacks without local variables).  Values are closed
-vocabularies, identifiers (builder, tenant, episode and user UUIDs), instants,
-amounts in millicredits and the reason an operator wrote with the mark.
-Once PR-B writes marks, that operator-supplied reason is printed as stored to
-stdout, stderr and the task logs: it must carry no personal data or secret
-(PR-B's ``mark``/``unmark`` refuse control characters in it).
-Exit codes are in ``EXIT_CODES``: 0 only for ``ok``.
+vocabularies, identifiers (builder, tenant, episode, event and user UUIDs),
+instants, amounts in millicredits and the reason an operator wrote with a
+mark.
+Exit codes are in ``EXIT_CODES``: 0 only for the command's own success
+verdict (``ok``, ``marked``, ``unmarked``); every refusal is ``refused``
+(20).
 """
 
 from __future__ import annotations
@@ -60,12 +149,13 @@ import argparse
 import asyncio
 import contextlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Callable, Final, Mapping, NoReturn, Sequence, TextIO
+from typing import Any, Callable, Final, Mapping, NoReturn, Sequence, TextIO
 from uuid import UUID
 
 # Every ``src`` import builds the global settings, which raise on an invalid
@@ -76,11 +166,15 @@ try:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from src.config.settings import settings
+    from src.models.builder import Builder
     from src.models.credit import CreditAccount, CreditLot
+    from src.models.user import User, UserRole
     from src.repositories.content_retention import ContentRetentionRepository
     from src.repositories.credit import (
         CreditRepository,
+        EffectiveEnforcement,
         EnforcementMarkRow,
+        MarkWindowState,
         TenantWhatsappProvider,
     )
     from src.services.api_credentials import PROVIDER_AVAILABILITY
@@ -100,17 +194,21 @@ else:
 LOGGER_NAME: Final = "src.ops.credit_charge_mark"
 SCHEMA: Final = "neurostack.credit_charge_mark_ops.v1"
 LOG_EVENT: Final = "credit_charge_mark_ops"
-COMMANDS: Final = ("status",)
+COMMANDS: Final = ("status", "mark", "unmark")
 EXIT_CODES: Final[Mapping[str, int]] = MappingProxyType(
     {
         "ok": 0,
+        "marked": 0,
+        "unmarked": 0,
         "refused": 20,
         "switch_off": 21,
         "unconfigured": 30,
         "error": 50,
     }
 )
-SUCCESS: Final[Mapping[str, str]] = MappingProxyType({"status": "ok"})
+SUCCESS: Final[Mapping[str, str]] = MappingProxyType(
+    {"status": "ok", "mark": "marked", "unmark": "unmarked"}
+)
 REASONS: Final = frozenset(
     {
         "usage",
@@ -119,8 +217,32 @@ REASONS: Final = frozenset(
         "credit_switch_off",
         "builder_not_found",
         "unexpected",
+        # mark / unmark refusals (module docstring).
+        "author_not_active_super_admin",
+        "marks_table_absent",
+        "global_enforcement_armed",
+        "already_marked",
+        "not_marked",
+        "coverage_unusable",
+        "channel_not_allowed",
+        "window_already_opened",
+        "open_episode",
+        "open_debt",
     }
 )
+# The channels a marked builder's tenants may use: the ones with an enforced
+# credit path.  A tenant with no provider (``None``) is admitted too.
+ALLOWED_WHATSAPP_PROVIDERS: Final = frozenset({"zapi", "meta_cloud"})
+# ``credit_enforcement_marks.reason`` is ``VARCHAR(500)`` with a non-blank
+# CHECK (migration 047, ``ENFORCEMENT_MARK_REASON_MAX_LENGTH``).
+REASON_MAX_LENGTH: Final = 500
+# An e-mail-like token (the L10 task's rationale rule, copied: this module
+# never imports that task): personal data the append-only table must not keep.
+_EMAIL_LIKE: Final = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+# Printable but invisible fillers (Hangul fillers count as letters for
+# ``str.isalnum``; the Braille blank is a symbol): refused anywhere in a
+# reason, so a blank-looking reason cannot pass the letter-or-digit rule.
+_INVISIBLE_FILLERS: Final = frozenset("\u115f\u1160\u3164\uffa0\u2800")
 # What ``marks.summary`` says.
 MARKS_TABLE_ABSENT: Final = "marks table absent"
 NO_MARKS: Final = "no marks"
@@ -161,6 +283,9 @@ class RunResult:
     lifecycle: Mapping[str, object] | None = None
     tenants: Sequence[Mapping[str, object]] | None = None
     coverage: Mapping[str, object] | None = None
+    # ``mark``/``unmark`` only: the author, the reason, the window state and
+    # the event written (``None`` when nothing was written).
+    change: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.verdict not in EXIT_CODES:
@@ -198,6 +323,7 @@ class RunResult:
                 None if self.tenants is None else [dict(row) for row in self.tenants]
             ),
             "coverage": None if self.coverage is None else dict(self.coverage),
+            "change": None if self.change is None else dict(self.change),
         }
 
 
@@ -248,22 +374,17 @@ def marks_document(
     }
 
 
-def enforcement_document(
-    global_at: datetime | None, latest: EnforcementMarkRow | None
-) -> dict[str, object]:
-    """Global first, then a latest ``mark``, else none (the wish's order)."""
+def enforcement_document(effective: EffectiveEnforcement) -> dict[str, object]:
+    """The builder's :class:`~src.repositories.credit.EffectiveEnforcement`
+    as printed.  The rule itself (global first, then a latest ``mark``, else
+    none) is ``CreditRepository.effective_enforcement``'s, the request
+    path's own reader: this only formats it.  ``global_at`` is the global
+    instant, known exactly when it decided (it always wins)."""
 
-    if global_at is not None:
-        effective_at: datetime | None = global_at
-        origin = "global"
-    elif latest is not None and latest.kind == "mark":
-        effective_at, origin = latest.occurred_at, "mark"
-    else:
-        effective_at, origin = None, "none"
     return {
-        "global_at": _iso(global_at),
-        "effective_at": _iso(effective_at),
-        "origin": origin,
+        "global_at": _iso(effective.at if effective.origin == "global" else None),
+        "effective_at": _iso(effective.at),
+        "origin": "none" if effective.origin is None else effective.origin,
     }
 
 
@@ -275,6 +396,32 @@ def tenants_document(rows: Sequence[TenantWhatsappProvider]) -> list[dict[str, o
         }
         for row in rows
     ]
+
+
+def channel_allowed(raw: str | None) -> bool:
+    """Whether a tenant's stored ``whatsapp_provider`` admits a ``mark``:
+    none at all, or one of :data:`ALLOWED_WHATSAPP_PROVIDERS` exactly."""
+
+    return raw is None or raw in ALLOWED_WHATSAPP_PROVIDERS
+
+
+def event_document(row: EnforcementMarkRow) -> dict[str, object]:
+    return {
+        "id": str(row.id),
+        "kind": row.kind,
+        "occurred_at": _iso(row.occurred_at),
+        "actor_user_id": str(row.actor_user_id),
+        "reason": row.reason,
+    }
+
+
+def window_document(state: MarkWindowState) -> dict[str, object]:
+    latest = state.latest_mark
+    return {
+        "window_start": state.window_start.isoformat(),
+        "window_opened": state.window_opened,
+        "latest_mark_at": None if latest is None else _iso(latest.occurred_at),
+    }
 
 
 def _switch_document(reading: CreditSwitchReading) -> dict[str, object]:
@@ -387,13 +534,18 @@ async def _status(
                     database_now=_iso(now),
                 )
             # Below 047 (the gate closed) the table does not exist and is not
-            # touched; at 047 or later it is read.
+            # touched; at 047 or later it is read.  Both reads take this
+            # command's own gate verdict, never the process cache's.
             latest = (
-                await repository.latest_enforcement_mark(builder_id)
+                await repository.latest_enforcement_mark(
+                    builder_id, marks_readable=True
+                )
                 if gate_open
                 else None
             )
-            global_at = await repository.enforcement_at()
+            effective = await repository.effective_enforcement(
+                builder_id, marks_readable=gate_open
+            )
             episode = await ContentRetentionRepository(session).open_episode(builder_id)
             # Copied before the rollback, which expires every loaded entity.
             open_episode = (
@@ -421,7 +573,7 @@ async def _status(
         database_now=_iso(now),
         builder={"exists": True, "active": active},
         marks=marks_document(gate_open=gate_open, latest=latest),
-        enforcement=enforcement_document(global_at, latest),
+        enforcement=enforcement_document(effective),
         lifecycle={
             "open_episode": open_episode,
             "open_debt_mc": open_debt_mc,
@@ -432,6 +584,175 @@ async def _status(
             "usable": coverage.usable,
             "reconciliation_failure": coverage.reconciliation_failure,
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# mark / unmark (one read-write transaction: one event or nothing)
+# ---------------------------------------------------------------------------
+
+
+async def _author_is_active_super_admin(session: AsyncSession, user_id: UUID) -> bool:
+    """The L10 task's author rule (the cutoff acceptance's): the row exists,
+    is active and is a ``super_admin``; held ``FOR SHARE`` until the
+    commit, so a concurrent deactivation waits for this command."""
+
+    row = (
+        await session.execute(
+            select(User.is_active, User.role)
+            .where(User.id == user_id)
+            .with_for_update(read=True)
+        )
+    ).one_or_none()
+    return (
+        row is not None and row.is_active is True and row.role == UserRole.super_admin
+    )
+
+
+async def _builder_exists(session: AsyncSession, builder_id: UUID) -> bool:
+    """The builder row ``FOR KEY SHARE``: the marks table has no foreign key,
+    so a deletion either committed before (``False``) or waits for this
+    transaction."""
+
+    found = (
+        await session.execute(
+            select(Builder.id)
+            .where(Builder.id == builder_id)
+            .with_for_update(read=True, key_share=True)
+        )
+    ).scalar_one_or_none()
+    return found is not None
+
+
+async def _change(
+    args: argparse.Namespace,
+    sessions: SessionFactory,
+    reading: CreditSwitchReading,
+    switch: dict[str, object],
+) -> RunResult:
+    """``mark`` or ``unmark`` (``args.command``): the steps and refusals of
+    the module docstring, in its order."""
+
+    command: str = args.command
+    builder_id: UUID = args.builder_id
+    change: dict[str, object] = {
+        "kind": command,
+        "author_user_id": str(args.author_user_id),
+        "reason": args.reason,
+        "window": None,
+        "event": None,
+    }
+
+    def result(verdict: str, *reasons: str, **fields: Any) -> RunResult:
+        return RunResult(
+            command=command,
+            verdict=verdict,
+            reasons=reasons,
+            switch=switch,
+            builder_id=str(builder_id),
+            change=dict(change),
+            **fields,
+        )
+
+    if not enforcement_mark_gate_open(reading):
+        # Below 047: the table does not exist and is not touched.
+        return result("refused", "marks_table_absent")
+    async with sessions() as session:
+        try:
+            repository = CreditRepository(session)
+            if not await _author_is_active_super_admin(session, args.author_user_id):
+                await session.rollback()
+                return result("refused", "author_not_active_super_admin")
+            if not await _builder_exists(session, builder_id):
+                await session.rollback()
+                return result("refused", "builder_not_found")
+            # Lock order step 3, as the request path takes it.
+            await repository.ensure_account(builder_id)
+            await repository.lock_account(builder_id)
+            now = await repository.database_now()
+            if await repository.enforcement_at() is not None:
+                effective = await repository.effective_enforcement(
+                    builder_id, marks_readable=True
+                )
+                await session.rollback()
+                return result(
+                    "refused",
+                    "global_enforcement_armed",
+                    database_now=_iso(now),
+                    enforcement=enforcement_document(effective),
+                )
+            latest = await repository.latest_enforcement_mark(
+                builder_id, marks_readable=True
+            )
+            marked = latest is not None and latest.kind == "mark"
+            context: dict[str, Any] = {
+                "database_now": _iso(now),
+                "marks": marks_document(gate_open=True, latest=latest),
+            }
+            if command == "mark" and marked:
+                await session.rollback()
+                return result("refused", "already_marked", **context)
+            if command == "unmark" and not marked:
+                await session.rollback()
+                return result("refused", "not_marked", **context)
+            refusals: list[str] = []
+            if command == "mark":
+                coverage = await CreditRolloutService(session).binding_coverage(
+                    builder_id, at=now
+                )
+                tenants = await repository.builder_tenant_whatsapp_providers(builder_id)
+                window = await repository.mark_window_state(
+                    builder_id, at=now, marks_readable=True
+                )
+                change["window"] = window_document(window)
+                context["coverage"] = {
+                    "usable": coverage.usable,
+                    "reconciliation_failure": coverage.reconciliation_failure,
+                }
+                context["tenants"] = tenants_document(tenants)
+                if not coverage.usable:
+                    refusals.append("coverage_unusable")
+                if not all(channel_allowed(row.whatsapp_provider) for row in tenants):
+                    refusals.append("channel_not_allowed")
+                if window.window_opened:
+                    refusals.append("window_already_opened")
+            else:
+                episode = await ContentRetentionRepository(session).open_episode(
+                    builder_id
+                )
+                open_episode = None if episode is None else str(episode.id)
+                open_debt_mc, open_debts = await _open_debt(session, builder_id, now)
+                context["lifecycle"] = {
+                    "open_episode": open_episode,
+                    "open_debt_mc": open_debt_mc,
+                    "open_debts": open_debts,
+                }
+                if open_episode is not None:
+                    refusals.append("open_episode")
+                if open_debt_mc > 0:
+                    refusals.append("open_debt")
+            if refusals:
+                await session.rollback()
+                return result("refused", *refusals, **context)
+            written = await repository.insert_enforcement_mark(
+                builder_id=builder_id,
+                kind=command,
+                actor_user_id=args.author_user_id,
+                reason=args.reason,
+                marks_readable=True,
+            )
+            effective = await repository.effective_enforcement(
+                builder_id, marks_readable=True
+            )
+            await session.commit()
+        except BaseException:
+            await session.rollback()
+            raise
+    change["event"] = event_document(written)
+    return result(
+        SUCCESS[command],
+        **context,
+        enforcement=enforcement_document(effective),
     )
 
 
@@ -462,7 +783,9 @@ async def run(
             )
         if sessions is None:  # effective implies a database was read
             raise RuntimeError("no session factory for an effective switch")
-        return await _status(args, sessions, reading, switch)
+        if args.command == "status":
+            return await _status(args, sessions, reading, switch)
+        return await _change(args, sessions, reading, switch)
     finally:
         if owned:
             from src.repositories.database import close_database
@@ -496,6 +819,28 @@ def _uuid(value: str) -> UUID:
     return parsed
 
 
+def _reason(value: str) -> str:
+    """Trimmed, non-empty, at most :data:`REASON_MAX_LENGTH` characters and
+    one printable line: ``str.isprintable`` refuses every control, format,
+    separator-other-than-space and unassigned character (newline, tab,
+    ``\\x1b``, zero-width space, bidi overrides).  It must also hold at least
+    one letter or digit, no printable invisible filler (U+115F, U+1160,
+    U+3164, U+FFA0, U+2800: a reason that looks blank says nothing) and no
+    e-mail-like token (no personal data in an append-only table)."""
+
+    stripped = value.strip()
+    if (
+        not stripped
+        or len(stripped) > REASON_MAX_LENGTH
+        or not stripped.isprintable()
+        or not any(character.isalnum() for character in stripped)
+        or any(character in _INVISIBLE_FILLERS for character in stripped)
+        or _EMAIL_LIKE.search(stripped)
+    ):
+        raise argparse.ArgumentTypeError("reason")
+    return stripped
+
+
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     """Parse one invocation; anything malformed raises ``_UsageError``."""
 
@@ -508,6 +853,11 @@ def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     )
     status = commands.add_parser("status", add_help=False, allow_abbrev=False)
     status.add_argument("--builder-id", type=_uuid, required=True)
+    for name in ("mark", "unmark"):
+        change = commands.add_parser(name, add_help=False, allow_abbrev=False)
+        change.add_argument("--builder-id", type=_uuid, required=True)
+        change.add_argument("--author-user-id", type=_uuid, required=True)
+        change.add_argument("--reason", type=_reason, required=True)
     return parser.parse_args(list(argv))
 
 

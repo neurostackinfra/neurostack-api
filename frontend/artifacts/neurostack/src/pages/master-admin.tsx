@@ -31,7 +31,7 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
 import { CourtesyCreditsDialog } from "@/components/admin/courtesy-credits-dialog";
-import { formatCivilDate, type Locale, type Txt } from "@/components/billing/format";
+import { formatCivilDate, formatInstant, type Locale, type Txt } from "@/components/billing/format";
 import { paymentNotice, planName, subscriptionMarker } from "./billing-view";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -197,6 +197,15 @@ interface AdminCourtesySummary {
   available_mc: number;
 }
 
+/** `charging` of a row (cobranca-credito-por-builder Group 5), read-only: the
+ * builder's latest enforcement mark event is a `mark`, recorded at
+ * `marked_at` (UTC). `null` for an unmarked builder, and for every row while
+ * the credit switch is not effective or the schema is below `047`. Marks are
+ * written only by the operator command, never from this page. */
+interface AdminChargingSummary {
+  marked_at: string;
+}
+
 interface BuilderSubscription {
   id: string;
   name: string;
@@ -210,6 +219,7 @@ interface BuilderSubscription {
   subscription?: AdminSubscriptionReadback | null;
   subscription_unavailable?: boolean;
   courtesy?: AdminCourtesySummary | null;
+  charging?: AdminChargingSummary | null;
 }
 
 type SubscriptionTone = "active" | "cancelled" | "pending" | "courtesy" | "none" | "unavailable";
@@ -305,6 +315,27 @@ function subscriptionRowState(row: BuilderSubscription, txt: Txt, locale: Locale
   }
   return { plan, status: { label: txt("Sem plano", "No plan"), tone: "none" }, notice: null, courtesyBadge: null };
 }
+
+/** The read-only "Cobrança ativa" badge of a marked builder, with the mark
+ * instant in its tooltip and, for keyboard, touch and screen-reader users,
+ * as `sr-only` text next to it; `null` without a mark (or `charging` absent).
+ * It means "this builder has an operator mark", not "is being charged". */
+function chargingBadge(
+  row: BuilderSubscription,
+  txt: Txt,
+  locale: Locale,
+): { label: string; title: string; since: string } | null {
+  const markedAt = row.charging?.marked_at;
+  if (!markedAt) return null;
+  const since = formatInstant(markedAt, locale) ?? "-";
+  return {
+    label: txt("Cobrança ativa", "Charging active"),
+    title: txt(`Cobrança ativa desde ${since}`, `Charging active since ${since}`),
+    since: txt(`desde ${since}`, `since ${since}`),
+  };
+}
+
+const CHARGING_BADGE_CLASSES = "bg-sky-500/15 text-sky-400 border-sky-500/30";
 
 const SUBSCRIPTION_TONE_CLASSES: Record<SubscriptionTone, string> = {
   active: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
@@ -2325,6 +2356,7 @@ export default function MasterAdmin() {
                       <tbody>
                         {builderSubscriptions.map((s) => {
                           const rowState = subscriptionRowState(s, txt, locale as Locale);
+                          const charging = chargingBadge(s, txt, locale as Locale);
                           return (
                             <tr key={s.id} className="border-b border-border/30 last:border-0">
                               <td className="py-2 pr-4 font-medium">{s.name}</td>
@@ -2347,6 +2379,19 @@ export default function MasterAdmin() {
                                     <Badge className={`${SUBSCRIPTION_TONE_CLASSES.courtesy} text-[10px]`}>
                                       {rowState.courtesyBadge}
                                     </Badge>
+                                  )}
+                                  {charging && (
+                                    <>
+                                      <Badge
+                                        className={`${CHARGING_BADGE_CLASSES} text-[10px]`}
+                                        title={charging.title}
+                                      >
+                                        {charging.label}
+                                      </Badge>
+                                      <span className="sr-only" data-testid="charging-since">
+                                        {charging.since}
+                                      </span>
+                                    </>
                                   )}
                                 </div>
                                 {rowState.notice && (

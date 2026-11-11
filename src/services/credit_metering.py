@@ -175,6 +175,7 @@ from src.interaction_context import InteractionOrigin, ResolvedInteractionContex
 from src.repositories.credit import (
     ClaimRow,
     CreditRepository,
+    EffectiveEnforcement,
     OutboxClaim,
     ResponseOutboxRow,
 )
@@ -1101,6 +1102,248 @@ def forget_enforcement_seen() -> None:
     _enforcement_seen = False
 
 
+# ---------------------------------------------------------------------------
+# Per-builder enforcement (cobranca-credito-por-builder, wish Group 2).
+#
+# A request's mode comes from ``CreditRepository.effective_enforcement`` of
+# its tenant's builder (the global, else the builder's latest mark, else
+# none), read ONCE per request from ``tenants.builder_id``.  A tenant with no
+# builder only ever sees the global.
+#
+# D1 per tenant, both ways (DESIGN Decision 8).  A mark, unlike the global,
+# can be removed, so the one-way latch above cannot serve it: this
+# process-wide set holds the TENANT ids (the request's own tenant: the
+# builder comes from a read that can fail) whose requests this process saw
+# enforced by a MARK.  For such a tenant an unreadable mode -- a failed read,
+# or the 047 gate closed so the marks could not be read -- is
+# ``CreditEnforcementUnavailable`` (503 ``credit_enforcement_unavailable``)
+# instead of the free path, for that tenant only; a successful "not marked"
+# read (no builder, or the builder's latest event not a ``mark``) removes
+# it.  Seeing a mark never sets the global latch, and the global latch is
+# set only by the global origin: ``effective_enforcement`` returns the
+# origin and the caller sets the flag that matches it.  Per process, never
+# persisted.  Another builder's tenants keep answering as before.
+# ---------------------------------------------------------------------------
+
+ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED: Final = (
+    "enforcement_mark_unreadable_after_marked"
+)
+ENFORCEMENT_CHANGED_UNDER_LOCK: Final = "enforcement_changed_under_lock"
+_mark_seen_tenants: set[UUID] = set()
+
+
+class CreditEnforcementChanged(CreditEnforcementUnavailable):
+    """The race (wish Decision 5): the effective enforcement of the builder
+    the enforced transaction locked is not the one the request captured at
+    entry (the tenant was linked to another builder, or its builder was
+    marked or unmarked, in between).  Answered like its base class, ``503
+    credit_enforcement_unavailable``, before any write.  Repeatable only on
+    ``POST /v1/events`` (no claim was written yet: a retry decides again);
+    on a webhook the 503 loses the message, because main's Redis replay
+    claim is already spent (``precheck_webhook``)."""
+
+
+def enforcement_mark_seen(tenant_id: UUID) -> bool:
+    """Whether this process saw a request of ``tenant_id`` enforced by a mark
+    (and no successful "not marked" read of it since)."""
+
+    return tenant_id in _mark_seen_tenants
+
+
+def forget_enforcement_mark_seen() -> None:
+    """Back to a process that never saw a mark (tests only)."""
+
+    _mark_seen_tenants.clear()
+
+
+def _note_mark_state(tenant_id: UUID, effective: EffectiveEnforcement) -> None:
+    """The two ways of the per-tenant D1 after a SUCCESSFUL read: enforced by
+    a mark adds the tenant; known not marked removes it.  The global origin
+    and an unread mark (the gate closed) leave the set as it is."""
+
+    if effective.origin == "mark":
+        _mark_seen_tenants.add(tenant_id)
+    elif effective.origin is None and not effective.mark_unread:
+        _mark_seen_tenants.discard(tenant_id)
+
+
+async def read_tenant_enforcement(
+    session: AsyncSession,
+    tenant_id: UUID,
+    *,
+    global_seen: bool,
+    log: Any = None,
+    event: str | None = None,
+    **fields: Any,
+) -> EffectiveEnforcement | None:
+    """The request's effective enforcement, read ONCE (no write): the global,
+    else -- read only then -- ``tenants.builder_id`` and that builder's
+    latest mark (``CreditRepository.tenant_effective_enforcement``).
+
+    ``None``: the read failed and neither latch applies -- the caller keeps
+    the free path, logged (``credit_enforcement_read``), exactly as a failed
+    global read before.  :class:`CreditEnforcementUnavailable` (alert
+    ``credit_enforcement_unavailable``, the session rolled back) when the
+    read failed and ``global_seen`` (the caller's own global latch: reason
+    ``enforcement_unreadable_after_enforced``, as before) or this tenant is
+    in the per-tenant set (reason
+    ``enforcement_mark_unreadable_after_marked``); also when the 047 gate
+    kept the marks unread for a tenant of that set.  On success the set is
+    updated (:func:`_note_mark_state`) and the caller sets its global latch
+    when the origin is ``global``.  ``log``/``event``/``fields``: the
+    caller's logger, message and extra log fields (every line also carries
+    ``tenant_id``; the global alerts keep their fields)."""
+
+    logger_ = logger if log is None else log
+    message = ENFORCED_LOG if event is None else event
+    fields = {**fields, "tenant_id": str(tenant_id)}
+    try:
+        effective = await CreditRepository(session).tenant_effective_enforcement(
+            tenant_id
+        )
+    except Exception as error:
+        with suppress(Exception):
+            await session.rollback()
+        if global_seen or enforcement_mark_seen(tenant_id):
+            reason = (
+                ENFORCEMENT_UNREADABLE_AFTER_ENFORCED
+                if global_seen
+                else ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED
+            )
+            logger_.error(
+                message,
+                alert="credit_enforcement_unavailable",
+                reason=reason,
+                error_type=type(error).__name__,
+                **fields,
+            )
+            raise CreditEnforcementUnavailable(
+                "credit_enforcement_at was set and can no longer be read"
+                if global_seen
+                else "the enforcement mark was seen and can no longer be read"
+            ) from error
+        logger_.warning(
+            message,
+            alert="credit_enforcement_read",
+            reason="enforcement_unreadable",
+            error_type=type(error).__name__,
+            **fields,
+        )
+        return None
+    if effective.mark_unread and enforcement_mark_seen(tenant_id):
+        logger_.error(
+            message,
+            alert="credit_enforcement_unavailable",
+            reason=ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED,
+            error_type="EnforcementMarkGateClosed",
+            **fields,
+        )
+        raise CreditEnforcementUnavailable(
+            "the enforcement mark was seen and can no longer be read"
+        )
+    _note_mark_state(tenant_id, effective)
+    return effective
+
+
+async def require_captured_enforcement(
+    repository: CreditRepository,
+    builder_id: UUID | None,
+    captured: EffectiveEnforcement,
+    *,
+    tenant_id: UUID,
+    log: Any = None,
+    event: str | None = None,
+    **fields: Any,
+) -> None:
+    """The race check (wish Decisions 5 and 6), in an enforced transaction
+    that already holds the tenant row ``FOR SHARE`` (lock order step 1) and
+    read ``builder_id`` from it: the builder's account ``FOR UPDATE`` (step
+    3; created on demand -- the caller rolls back on a refusal, so nothing
+    is written), then ``effective_enforcement(builder_id)`` must equal
+    ``captured``, the request's value at entry.  Taken after the account
+    lock it serializes with the operator's ``unmark``, which takes the same
+    lock.  A tenant that has no builder any more has no account: its
+    effective enforcement is the global's, so with the global unset it
+    differs from a captured mark and is refused here -- never
+    ``credit_pending``.
+
+    A mismatch raises :class:`CreditEnforcementChanged` (503) before any
+    write; a failed read, or the 047 gate closed since the capture (the
+    marks unread), raises :class:`CreditEnforcementUnavailable` (the tenant
+    captured a mark: the per-tenant D1).  The caller rolls back.
+    Only a captured MARK is re-checked: the global is irreversible, so a
+    request captured on it reads here nothing more than it read before."""
+
+    if captured.origin != "mark":
+        return
+    logger_ = logger if log is None else log
+    message = ENFORCED_LOG if event is None else event
+    fields = {**fields, "tenant_id": str(tenant_id)}
+    try:
+        if builder_id is not None:
+            await repository.ensure_account(builder_id)
+            await repository.lock_account(builder_id)
+        locked = await repository.effective_enforcement(builder_id)
+    except Exception as error:
+        logger_.error(
+            message,
+            alert="credit_enforcement_unavailable",
+            reason=ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED,
+            error_type=type(error).__name__,
+            **fields,
+        )
+        raise CreditEnforcementUnavailable(
+            "the enforcement mark was seen and can no longer be read"
+        ) from error
+    if locked.mark_unread:
+        # The 047 gate closed since the capture: the mark is unreadable, not
+        # changed (D1 for this tenant, which captured a mark).
+        logger_.error(
+            message,
+            alert="credit_enforcement_unavailable",
+            reason=ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED,
+            error_type="EnforcementMarkGateClosed",
+            **fields,
+        )
+        raise CreditEnforcementUnavailable(
+            "the enforcement mark was seen and can no longer be read"
+        )
+    if locked != captured:
+        logger_.warning(
+            message,
+            alert="credit_enforcement_unavailable",
+            reason=ENFORCEMENT_CHANGED_UNDER_LOCK,
+            captured_origin=captured.origin,
+            locked_origin=locked.origin,
+            **fields,
+        )
+        raise CreditEnforcementChanged(
+            "the tenant's effective enforcement changed before its lock"
+        )
+    _note_mark_state(tenant_id, locked)
+
+
+def reparented_since_capture(
+    captured: EffectiveEnforcement | None, builder_id: UUID | None
+) -> bool:
+    """A request captured as enforced by its builder's MARK whose tenant is
+    linked to another builder now (a reparent between its pre-check and a
+    later transaction of the same request).  The claim's transaction then
+    refuses (:class:`CreditEnforcementChanged`, 503: no claim for the other
+    builder); phase 1 and the final transaction charge nothing -- like a
+    tenant turned standalone since the pre-check (LOW-5) -- so a builder
+    the request was not captured for (maybe not marked) is never debited.
+    Inert for the global origin (every builder is enforced then, as before)
+    and for a hand-built enforcement."""
+
+    return (
+        captured is not None
+        and captured.origin == "mark"
+        and builder_id is not None
+        and builder_id != captured.builder_id
+    )
+
+
 def claim_lease() -> timedelta:
     """The claim lease, read at call time (``CLAIM_LEASE_SECONDS``)."""
 
@@ -1132,6 +1375,11 @@ class EventsEnforcement:
     payload_sha256: str
     idempotency_key: str | None
     key_problem: str | None
+    # cobranca-credito-por-builder: the effective enforcement captured at
+    # entry (always set by :func:`capture_events_enforcement`); the enforced
+    # transactions re-check a captured mark under the account lock.  ``None``
+    # only for an enforcement a suite builds by hand (nothing re-checked).
+    captured: EffectiveEnforcement | None = None
 
 
 @dataclass(frozen=True)
@@ -1219,14 +1467,16 @@ async def capture_events_enforcement(
 
     ``None`` -- ``main``'s path and the Group 3a writer -- unless the request
     captured the switch on at entry, its origin is ``production`` with an
-    authenticated principal, the route's session is a real one and
-    ``credit_enforcement_at`` (read once, here, with no write) is set.
-    ``simulator`` and ``unknown`` never get here.  A failed read is logged
-    (an alert) and keeps the request observational -- before the enforcement
-    a credit-side failure never changes ``main``'s answer -- unless this
-    process already saw ``credit_enforcement_at`` set: the enforcement is
-    one-way, so then it raises :class:`CreditEnforcementUnavailable` (the
-    route answers 503) with its own alert (D1).
+    authenticated principal, the route's session is a real one and the
+    tenant's effective enforcement (:func:`read_tenant_enforcement`: the
+    global ``credit_enforcement_at``, else its builder's mark; read once,
+    here, with no write) is set.  ``simulator`` and ``unknown`` never get
+    here.  A failed read is logged (an alert) and keeps the request
+    observational -- before the enforcement a credit-side failure never
+    changes ``main``'s answer -- unless this process already saw
+    ``credit_enforcement_at`` set, or saw this tenant enforced by a mark:
+    then it raises :class:`CreditEnforcementUnavailable` (the route answers
+    503) with its own alert (D1, per process and per tenant).
     """
 
     global _enforcement_seen
@@ -1246,33 +1496,13 @@ async def capture_events_enforcement(
     )
     if not principal.authenticated:
         return None
-    try:
-        enforced_at = await CreditRepository(db).enforcement_at()
-    except Exception as error:
-        with suppress(Exception):
-            await db.rollback()
-        if _enforcement_seen:
-            logger.error(
-                ENFORCED_LOG,
-                alert="credit_enforcement_unavailable",
-                reason=ENFORCEMENT_UNREADABLE_AFTER_ENFORCED,
-                tenant_id=str(context.effective_tenant_id),
-                error_type=type(error).__name__,
-            )
-            raise CreditEnforcementUnavailable(
-                "credit_enforcement_at was set and can no longer be read"
-            ) from error
-        logger.warning(
-            ENFORCED_LOG,
-            alert="credit_enforcement_read",
-            reason="enforcement_unreadable",
-            tenant_id=str(context.effective_tenant_id),
-            error_type=type(error).__name__,
-        )
+    effective = await read_tenant_enforcement(
+        db, context.effective_tenant_id, global_seen=_enforcement_seen
+    )
+    if effective is None or not isinstance(effective.at, datetime):
         return None
-    if not isinstance(enforced_at, datetime):
-        return None
-    _enforcement_seen = True
+    if effective.origin == "global":
+        _enforcement_seen = True
     key, problem = _validated_key(request.headers.get(IDEMPOTENCY_KEY_HEADER))
     return EventsEnforcement(
         tenant_id=context.effective_tenant_id,
@@ -1281,6 +1511,7 @@ async def capture_events_enforcement(
         payload_sha256=event_payload_sha256(canonical_request),
         idempotency_key=key,
         key_problem=problem,
+        captured=effective,
     )
 
 
@@ -1396,6 +1627,14 @@ async def precheck_events(
     that never paid is served as debt, never ``credit_pending`` -- and a
     quarantine hold is ``credit_pending``.  ``credit_pending`` rolls back:
     nothing is written (not even the account).
+
+    cobranca-credito-por-builder: a request captured on its builder's MARK
+    first re-checks it under the account lock
+    (:func:`require_captured_enforcement`): a changed one raises
+    :class:`CreditEnforcementChanged` (503, rolled back: nothing written),
+    which a client may simply retry -- no claim exists yet.  So a tenant
+    unlinked from a marked builder in between is never ``credit_pending``
+    while the global is unset.
     """
 
     repository = CreditRepository(db)
@@ -1404,6 +1643,13 @@ async def precheck_events(
         if scope is None:
             await db.rollback()
             return "tenant_gone"
+        if enforcement.captured is not None:
+            await require_captured_enforcement(
+                repository,
+                scope.builder_id,
+                enforcement.captured,
+                tenant_id=enforcement.tenant_id,
+            )
         if scope.builder_id is None:
             await db.rollback()
             return "credit_pending"
@@ -1460,6 +1706,12 @@ async def acquire_events_claim(
             scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
             if scope is None:
                 raise CreditTenantGone("the tenant vanished before its claim")
+            if reparented_since_capture(enforcement.captured, scope.builder_id):
+                # cobranca-credito-por-builder: relinked since the pre-check
+                # -- no claim for the other builder; 503, retryable.
+                raise CreditEnforcementChanged(
+                    "the tenant's builder changed before its claim"
+                )
             row = await repository.insert_enforced_claim(
                 tenant_id=enforcement.tenant_id,
                 builder_id=scope.builder_id,
@@ -1673,6 +1925,7 @@ async def run_enforced_phase1(
         mark=mark,
         lock_timeout=PHASE1_LOCK_TIMEOUT_SECONDS,
         decision_kind="events_phase1_handoff",
+        captured=enforcement.captured,
     )
 
 
@@ -1687,12 +1940,15 @@ async def _run_phase1(
     lock_timeout: int | None,
     decision_kind: str,
     observe: Callable[[CreditRepository], Awaitable[Any]] | None = None,
+    captured: EffectiveEnforcement | None = None,
 ) -> Phase1Outcome | None:
     """Phase 1 of an enforced decision (``POST /v1/events`` and webhooks):
     ``SET LOCAL lock_timeout`` (only when given) -> tenant ``FOR SHARE`` ->
     ``run_pipeline`` -> the phase 1 handoff's charge and link -> ``mark``
     (the claim's phase 1 marker, LAST) -> commit; ``None`` (rolled back)
-    when the marker's fence did not hold."""
+    when the marker's fence did not hold.  A request captured on its
+    builder's mark whose tenant now belongs to another builder charges
+    nothing here (:func:`reparented_since_capture`)."""
 
     repository = CreditRepository(db)
     if lock_timeout is not None:
@@ -1710,6 +1966,14 @@ async def _run_phase1(
                 ENFORCED_LOG,
                 alert="credit_enforced_standalone",
                 reason="standalone_at_phase1",
+                tenant_id=str(tenant_id),
+                interaction_id=str(interaction_id),
+            )
+        elif reparented_since_capture(captured, scope.builder_id):
+            logger.warning(
+                ENFORCED_LOG,
+                alert="credit_enforced_reparented",
+                reason="reparented_at_phase1",
                 tenant_id=str(tenant_id),
                 interaction_id=str(interaction_id),
             )
@@ -1816,6 +2080,7 @@ async def run_enforced_final(
             "delivered",
         ),
         fence=fence,
+        captured=enforcement.captured,
     )
 
 
@@ -1830,6 +2095,7 @@ async def _run_final(
     deliverable: bool,
     stored_answer: Callable[[UUID | None], tuple[dict[str, Any], str] | None],
     fence: Callable[[CreditRepository], Awaitable[bool]],
+    captured: EffectiveEnforcement | None = None,
 ) -> FinalOutcome | None:
     """The final transaction shared by ``POST /v1/events`` and the webhooks.
 
@@ -1838,7 +2104,9 @@ async def _run_final(
     decision that is not ``deliverable`` -- the effect of zero
     ``trace_no_response``) -> the response-outbox row ``stored_answer``
     returns (payload and state; none when it returns ``None``) -> ``fence``
-    -> commit.
+    -> commit.  A request captured on its builder's mark whose tenant now
+    belongs to another builder charges nothing, like a tenant turned
+    standalone (:func:`reparented_since_capture`).
     """
 
     repository = CreditRepository(db)
@@ -1852,9 +2120,10 @@ async def _run_final(
     # final transaction reuses that outcome and never looks the builder up
     # again, so a reparent between the phases never charges twice (LOW-5).
     decided_in_phase1 = phase1.handoff_id is not None
+    reparented = reparented_since_capture(captured, scope.builder_id)
     if charge is not None:
         credit_effect_id: str | None = charge.effect_id
-    elif not decided_in_phase1 and scope.builder_id is not None:
+    elif not decided_in_phase1 and scope.builder_id is not None and not reparented:
         credit_effect_id = effect_id
     else:
         credit_effect_id = None
@@ -1866,6 +2135,16 @@ async def _run_final(
                 ENFORCED_LOG,
                 alert="credit_enforced_standalone",
                 reason="standalone_at_final",
+                tenant_id=str(tenant_id),
+                interaction_id=str(interaction_id),
+            )
+        elif reparented:
+            # cobranca-credito-por-builder: captured on another builder's
+            # mark -- the builder locked now is never charged for it.
+            logger.warning(
+                ENFORCED_LOG,
+                alert="credit_enforced_reparented",
+                reason="reparented_at_final",
                 tenant_id=str(tenant_id),
                 interaction_id=str(interaction_id),
             )
@@ -2084,6 +2363,8 @@ class WebhookEnforcement:
     principal_id: str
     provider_message_id: str
     payload_sha256: str
+    # As ``EventsEnforcement.captured`` (set by :func:`precheck_webhook`).
+    captured: EffectiveEnforcement | None = None
 
 
 def provider_claim_id(raw: str) -> str:
@@ -2111,13 +2392,15 @@ async def precheck_webhook(
 
     ``None`` -- main's path and the Group 3a writer -- unless the request
     captured the switch on at entry, the route's session is a real one, the
-    principal is authenticated and ``credit_enforcement_at`` (read ONCE,
-    here) is set.  Then, in the same short transaction: tenant ``FOR SHARE``
+    principal is authenticated and the tenant's effective enforcement
+    (:func:`read_tenant_enforcement`, read ONCE, here: the global, else its
+    builder's mark) is set.  Then, in the same short transaction: tenant ``FOR SHARE``
     -> a standalone tenant is ``credit_pending`` -> the builder's account on
     demand -> a quarantine hold is ``credit_pending`` -> commit.
     ``credit_pending`` rolls back: nothing is written, nothing is sent.  A
     failed read keeps main's path (logged) unless this process already saw
-    the enforcement set: then :class:`CreditEnforcementUnavailable` (D1) and
+    the enforcement set (or this tenant enforced by a mark): then
+    :class:`CreditEnforcementUnavailable` (D1) and
     the webhook answers 503 -- which in practice drops the message: main's
     replay claim (Redis, before this pre-check) is already spent, so the
     provider's retry answers ``duplicate_message``.  Uazapi (no enforced
@@ -2153,37 +2436,27 @@ async def precheck_webhook(
     if not principal.authenticated:
         return None
     repository = CreditRepository(db)
-    try:
-        enforced_at = await repository.enforcement_at()
-    except Exception as error:
-        with suppress(Exception):
-            await db.rollback()
-        if _enforcement_seen:
-            logger.error(
-                ENFORCED_LOG,
-                alert="credit_enforcement_unavailable",
-                reason=ENFORCEMENT_UNREADABLE_AFTER_ENFORCED,
-                source=source,
-                tenant_id=str(tenant_id),
-                error_type=type(error).__name__,
-            )
-            raise CreditEnforcementUnavailable(
-                "credit_enforcement_at was set and can no longer be read"
-            ) from error
-        logger.warning(
-            ENFORCED_LOG,
-            alert="credit_enforcement_read",
-            reason="enforcement_unreadable",
-            source=source,
-            tenant_id=str(tenant_id),
-            error_type=type(error).__name__,
-        )
+    effective = await read_tenant_enforcement(
+        db, tenant_id, global_seen=_enforcement_seen, source=source
+    )
+    if effective is None or not isinstance(effective.at, datetime):
         return None
-    if not isinstance(enforced_at, datetime):
-        return None
-    _enforcement_seen = True
+    if effective.origin == "global":
+        _enforcement_seen = True
     try:
         scope = await repository.tenant_scope(tenant_id, lock=True)
+        if scope is not None:
+            # A captured mark is re-checked under the account lock; a change
+            # raises CreditEnforcementChanged, answered 503 by the adapter --
+            # which, like D1's 503, loses this message: main's Redis replay
+            # claim is already spent (wish Decision 6).
+            await require_captured_enforcement(
+                repository,
+                scope.builder_id,
+                effective,
+                tenant_id=tenant_id,
+                source=source,
+            )
         if scope is None or scope.builder_id is None:
             await db.rollback()
             return "credit_pending"
@@ -2221,6 +2494,7 @@ async def precheck_webhook(
         principal_id=principal.principal_id,
         provider_message_id=provider_claim_id(provider_message_id),
         payload_sha256=payload_sha256(),
+        captured=effective,
     )
 
 
@@ -2304,6 +2578,13 @@ async def acquire_webhook_claim(
         scope = await repository.tenant_scope(enforcement.tenant_id, lock=True)
         if scope is None:
             raise CreditTenantGone("the tenant vanished before its claim")
+        if reparented_since_capture(enforcement.captured, scope.builder_id):
+            # cobranca-credito-por-builder: relinked since the pre-check -- no
+            # claim for the other builder; the adapter answers 503 (the
+            # message is lost, like any webhook 503).
+            raise CreditEnforcementChanged(
+                "the tenant's builder changed before its claim"
+            )
         row = await repository.insert_webhook_claim(
             tenant_id=enforcement.tenant_id,
             builder_id=scope.builder_id,
@@ -2362,6 +2643,7 @@ async def run_webhook_phase1(
         lock_timeout=None,
         decision_kind=f"{enforcement.source}_phase1_handoff",
         observe=observe,
+        captured=enforcement.captured,
     )
 
 
@@ -2411,6 +2693,7 @@ async def run_webhook_final(
             None if reply is None else (dict(reply), "pending")
         ),
         fence=fence,
+        captured=enforcement.captured,
     )
 
 
@@ -2466,6 +2749,18 @@ async def run_meta_file_handoff(
         session_version = await repository.lock_session(tenant_id, session_id)
         if session_version is None:
             raise CreditTenantGone("the session vanished before the file handoff")
+        if enforcement.captured is not None:
+            # cobranca-credito-por-builder: a captured mark is re-checked under
+            # the account lock (lock order step 3, after the session's): a
+            # change raises CreditEnforcementChanged before any write, rolled
+            # back below; the message is lost like any webhook 503.
+            await require_captured_enforcement(
+                repository,
+                scope.builder_id,
+                enforcement.captured,
+                tenant_id=tenant_id,
+                source=enforcement.source,
+            )
         if scope.builder_id is None:
             # Turned standalone since the pre-check: no account to charge.
             await db.rollback()
@@ -2973,7 +3268,9 @@ PublisherOutcome = Literal["delivered", "failed", "fenced"]
 @dataclass
 class PublisherTick:
     """What one publisher tick did (``None`` from :meth:`run_once` when the
-    switch was off: nothing was read)."""
+    switch was off: nothing was read).  ``enforced``: the tick looked for
+    rows -- the global ``credit_enforcement_at`` is set, or (with it unset)
+    a mark event was ever recorded (cobranca-credito-por-builder)."""
 
     enforced: bool = False
     outcomes: list[PublisherOutcome] = field(default_factory=list)
@@ -2986,7 +3283,10 @@ class CreditResponsePublisher:
     between the final commit and the inline claim) or a ``sending`` row
     older than :data:`SENDING_LEASE_SECONDS` (a crash between the claim and
     the mark).  It claims nothing with the switch off -- re-read before EVERY
-    row -- nor before ``credit_enforcement_at``; claims ONE row at a time in a
+    row -- nor before ``credit_enforcement_at`` unless a mark event was ever
+    recorded (cobranca-credito-por-builder: a marked builder's requests write
+    enforced rows with the global unset, and they still need recovering
+    after the last ``unmark``); claims ONE row at a time in a
     short transaction (``FOR UPDATE SKIP LOCKED``) committed as ``sending``
     before the provider call -- two tasks never send one row at once, and no
     row lock is held across a send --; and sends a row at most ONCE: a row it
@@ -3043,9 +3343,17 @@ class CreditResponsePublisher:
         tick = PublisherTick()
         factory = self._sessions()
         async with factory() as session:
-            enforced_at = await CreditRepository(session).enforcement_at()
+            repository = CreditRepository(session)
+            enforced_at = await repository.enforcement_at()
+            # cobranca-credito-por-builder (wish Group 3): with the global
+            # unset, any mark event ever recorded -- a ``mark`` or the last
+            # ``unmark`` -- keeps the publisher on, so an enforced reply a
+            # marked builder's request left behind is still recovered.  One
+            # read more (none with the 047 gate closed); it only ever finds
+            # rows an enforced request wrote.
+            marked = enforced_at is None and await repository.any_enforcement_mark()
             await session.rollback()
-        if enforced_at is None:
+        if enforced_at is None and not marked:
             return tick
         tick.enforced = True
         for _ in range(self.batch):
@@ -3272,6 +3580,7 @@ __all__ = [
     "RETRY_AFTER_MAX_SECONDS",
     "ClaimAnswer",
     "ClaimLease",
+    "CreditEnforcementChanged",
     "CreditEnforcementUnavailable",
     "CreditTenantGone",
     "DecisionCharge",
@@ -3281,8 +3590,15 @@ __all__ = [
     "acquire_events_claim",
     "capture_events_enforcement",
     "claim_lease",
+    "ENFORCEMENT_CHANGED_UNDER_LOCK",
+    "ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED",
+    "enforcement_mark_seen",
     "enforcement_seen",
+    "forget_enforcement_mark_seen",
     "forget_enforcement_seen",
+    "read_tenant_enforcement",
+    "reparented_since_capture",
+    "require_captured_enforcement",
     "phase1_decision",
     "precheck_events",
     "read_events_claim",
