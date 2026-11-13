@@ -72,6 +72,14 @@ open; the per-test self-check asserts that
 verdict and are not plugin suites; a test that needs a ``045`` database under
 the plugin must patch ``CreditSwitch.reading``, not publish a reading.
 
+debito-cortesia-automatico (Groups 3 and 4): the Uazapi and Evolution
+adapters decide on their own capture (``credit_metering.precheck_uazapi`` /
+``precheck_evolution`` -> ``decide_webhook``), never through
+``precheck_webhook``, so the plugin wraps both the same way and counts their
+verdicts under ``uazapi ...`` / ``evolution ...`` in the same summary line:
+outside the courtesy rule (every suite that grants no courtesy) they must
+show only ``main`` ones.
+
 Group 7: the "must show only ``main``" rules above are enforced, not only
 printed.  Every enforced capture, enforced or ``credit_pending`` webhook
 pre-check and enforced inventory mode is attributed to the test file that
@@ -105,11 +113,13 @@ ENFORCED_SUITES = frozenset(
         "tests/api/test_credits.py",
         "tests/api/test_events_credit_enforced.py",
         "tests/integration/test_credit_enforcement_rollout_fence.py",
+        "tests/integration/test_credit_evolution_enforced_postgres.py",
         "tests/integration/test_credit_ledger_postgres.py",
         "tests/integration/test_credit_maintenance_postgres.py",
         "tests/integration/test_credit_metering_postgres.py",
         "tests/integration/test_credit_retention_postgres.py",
         "tests/integration/test_credit_schema_dominance_postgres.py",
+        "tests/integration/test_credit_uazapi_enforced_postgres.py",
         "tests/services/test_credit_inventory.py",
         "tests/services/test_credit_ledger.py",
         "tests/services/test_credit_lifecycle.py",
@@ -129,6 +139,8 @@ _captures: Counter[str] = Counter()
 _ORIGINAL_CAPTURE: Any = None
 _webhook_prechecks: Counter[str] = Counter()
 _ORIGINAL_WEBHOOK_PRECHECK: Any = None
+_ORIGINAL_UAZAPI_PRECHECK: Any = None
+_ORIGINAL_EVOLUTION_PRECHECK: Any = None
 _inventory_modes: Counter[str] = Counter()
 _inventory_writes: Counter[str] = Counter()
 _ORIGINAL_MODE: Any = None
@@ -200,20 +212,48 @@ async def _counted_capture(*args: Any, **kwargs: Any) -> Any:
     return enforcement
 
 
+def _count_webhook_verdict(label: str, verdict: Any) -> None:
+    """``label`` is ``""`` for ``precheck_webhook`` (its keys unchanged) and
+    ``"uazapi "`` / ``"evolution "`` for the adapters that decide on their
+    own capture."""
+
+    if verdict is None:
+        _webhook_prechecks[f"{label}main"] += 1
+    elif verdict == "credit_pending":
+        _webhook_prechecks[f"{label}credit_pending"] += 1
+        _enforced_verdict(f"{label}webhook pre-check credit_pending")
+    else:
+        _webhook_prechecks[f"{label}enforced"] += 1
+        _enforced_verdict(f"{label}webhook pre-check enforced")
+
+
 async def _counted_webhook_precheck(*args: Any, **kwargs: Any) -> Any:
     try:
         verdict = await _ORIGINAL_WEBHOOK_PRECHECK(*args, **kwargs)
     except BaseException as error:
         _webhook_prechecks[f"raised {type(error).__name__}"] += 1
         raise
-    if verdict is None:
-        _webhook_prechecks["main"] += 1
-    elif verdict == "credit_pending":
-        _webhook_prechecks["credit_pending"] += 1
-        _enforced_verdict("webhook pre-check credit_pending")
-    else:
-        _webhook_prechecks["enforced"] += 1
-        _enforced_verdict("webhook pre-check enforced")
+    _count_webhook_verdict("", verdict)
+    return verdict
+
+
+async def _counted_uazapi_precheck(*args: Any, **kwargs: Any) -> Any:
+    try:
+        verdict = await _ORIGINAL_UAZAPI_PRECHECK(*args, **kwargs)
+    except BaseException as error:
+        _webhook_prechecks[f"uazapi raised {type(error).__name__}"] += 1
+        raise
+    _count_webhook_verdict("uazapi ", verdict)
+    return verdict
+
+
+async def _counted_evolution_precheck(*args: Any, **kwargs: Any) -> Any:
+    try:
+        verdict = await _ORIGINAL_EVOLUTION_PRECHECK(*args, **kwargs)
+    except BaseException as error:
+        _webhook_prechecks[f"evolution raised {type(error).__name__}"] += 1
+        raise
+    _count_webhook_verdict("evolution ", verdict)
     return verdict
 
 
@@ -265,6 +305,7 @@ async def _counted_snapshot_book(self: Any, *args: Any, **kwargs: Any) -> Any:
 
 def pytest_configure(config: pytest.Config) -> None:
     global _ORIGINAL_WRITER, _ORIGINAL_CAPTURE, _ORIGINAL_WEBHOOK_PRECHECK
+    global _ORIGINAL_UAZAPI_PRECHECK, _ORIGINAL_EVOLUTION_PRECHECK
     global _ORIGINAL_MODE, _ORIGINAL_UPLOAD_WRITER, _ORIGINAL_EGRESS_WRITER
     global _ORIGINAL_SNAPSHOT_BOOK, _FORCED_READING
     from src.api.routes import credits
@@ -287,6 +328,10 @@ def pytest_configure(config: pytest.Config) -> None:
     patcher.setattr(credit_metering, "capture_events_enforcement", _counted_capture)
     _ORIGINAL_WEBHOOK_PRECHECK = credit_metering.precheck_webhook
     patcher.setattr(credit_metering, "precheck_webhook", _counted_webhook_precheck)
+    _ORIGINAL_UAZAPI_PRECHECK = credit_metering.precheck_uazapi
+    patcher.setattr(credit_metering, "precheck_uazapi", _counted_uazapi_precheck)
+    _ORIGINAL_EVOLUTION_PRECHECK = credit_metering.precheck_evolution
+    patcher.setattr(credit_metering, "precheck_evolution", _counted_evolution_precheck)
     _ORIGINAL_MODE = credit_inventory.read_credit_mode
     patcher.setattr(credit_inventory, "read_credit_mode", _counted_mode)
     _ORIGINAL_UPLOAD_WRITER = credit_inventory.record_observational_upload
@@ -388,6 +433,10 @@ def _assert_forced() -> None:
     assert (
         credit_metering.precheck_webhook is _counted_webhook_precheck
     ), "the webhook pre-check counter was swapped and not restored"
+    assert (
+        credit_metering.precheck_uazapi is _counted_uazapi_precheck
+        and credit_metering.precheck_evolution is _counted_evolution_precheck
+    ), "a Uazapi or Evolution pre-check counter was swapped and not restored"
     assert (
         credit_inventory.read_credit_mode is _counted_mode
         and credit_inventory.record_observational_upload is _counted_upload_writer

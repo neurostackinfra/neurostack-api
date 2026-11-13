@@ -23,7 +23,8 @@ debt), never as hand-made balances.  Pinned here:
 from __future__ import annotations
 
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -1077,3 +1078,575 @@ def test_a_credit_scope_needs_a_tenant_or_a_builder() -> None:
     builder = uuid4()
     assert CreditScope(None, builder).builder_id == builder
     assert CreditScope(uuid4(), None).builder_id is None
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 5a: the courtesy rule on ``/v1/credits/*``
+# (DESIGN items 4, 5, 7 and 13; wish Decision 4).  The rule needs the 046
+# gate open on the process reading (``rule_reading``); no
+# ``credit_enforcement_at`` is set: the rule enforces a builder with
+# courtesy, no mark and no global, from its first grant.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rule_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process reading at this image's head (046 and 047 gates open)."""
+
+    from src.services.credit_switch import (
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+
+
+async def _courtesy(builder: UUID, credits: int) -> Any:
+    from src.services import credit_courtesy
+
+    result: list[Any] = []
+
+    async def work(database: Any) -> None:
+        result.append(
+            await credit_courtesy.grant(
+                database,
+                builder_id=builder,
+                credits=credits,
+                reason="cortesia",
+                actor_user_id=uuid4(),
+                idempotency_key=f"rule-{uuid4()}",
+            )
+        )
+
+    await _plain(work)
+    return result[0]
+
+
+async def _remove_all(lot_id: UUID) -> None:
+    from src.services import credit_courtesy
+
+    async def work(database: Any) -> None:
+        await credit_courtesy.remove(
+            database,
+            lot_id=lot_id,
+            remove_all=True,
+            reason="tirar tudo",
+            actor_user_id=uuid4(),
+            idempotency_key=f"rule-removal-{uuid4()}",
+        )
+
+    await _plain(work)
+
+
+async def _rule_debit(builder: UUID, amount: int, first_grant_at: datetime) -> Any:
+    """A trace debit captured under the rule (``charged``), as a request's."""
+
+    from src.repositories.credit import EffectiveEnforcement
+
+    found: list[Any] = []
+
+    async def work(database: Any) -> None:
+        found.append(
+            await CreditLedger(database).debit(
+                builder,
+                f"trace:{uuid4()}:decision:1",
+                amount,
+                at=datetime.now(UTC),
+                effect_kind="trace",
+                captured=EffectiveEnforcement(
+                    first_grant_at, "courtesy", state="charged"
+                ),
+            )
+        )
+
+    await _plain(work)
+    return found[0]
+
+
+async def _mark(builder: UUID) -> None:
+    from src.models.credit import CreditEnforcementMark
+
+    async def work(database: Any) -> None:
+        database.add(
+            CreditEnforcementMark(
+                id=uuid4(),
+                builder_id=builder,
+                kind="mark",
+                occurred_at=datetime.now(UTC) - timedelta(days=1),
+                actor_user_id=uuid4(),
+                reason="piloto",
+            )
+        )
+
+    await _plain(work)
+
+
+def _instant(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+_DEADLINES = (
+    "exhausted_at",
+    "suspension_due_at",
+    "deletion_due_at",
+    "export_deadline_at",
+)
+
+
+def test_a_charged_rule_builder_is_active_and_enforced_with_no_deadline(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    headers = world.builder(world.empty, world.empty_tenant)
+    first = client._submit(_courtesy(world.empty, 5))
+    client._submit(_courtesy(world.empty, 2))  # never moves the rule's instant
+    state = _ok(client, "state", headers)
+    assert (state["mode"], state["state"], state["pending_reasons"]) == (
+        "enforced",
+        "active",
+        [],
+    )
+    assert _instant(state["enforcement_at"]) == first.occurred_at.astimezone(UTC)
+    assert all(state[name] is None for name in _DEADLINES)
+    # An episode a mark era left open (suspended, deletion due) shows
+    # neither its state nor its deadlines under the rule.
+    client._submit(_episode(world.empty, transitions=("suspended", "deletion_due")))
+    stale = _ok(client, "state", headers)
+    assert _without_as_of(stale) == _without_as_of(state)
+    assert _ok(client, "consumption", headers)["mode"] == "enforced"
+
+
+def test_a_blocked_rule_builder_is_suspended_with_every_deadline_null(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    headers = world.builder(world.empty, world.empty_tenant)
+    granted = client._submit(_courtesy(world.empty, 3))
+    client._submit(_remove_all(granted.lot_id))  # "Tirar tudo", no paid plan
+    state = _ok(client, "state", headers)
+    assert (state["mode"], state["state"], state["pending_reasons"]) == (
+        "enforced",
+        "suspended",
+        [],
+    )
+    assert _instant(state["enforcement_at"]) == granted.occurred_at.astimezone(UTC)
+    assert all(state[name] is None for name in _DEADLINES)
+    client._submit(_episode(world.empty, transitions=("suspended",)))
+    assert _without_as_of(_ok(client, "state", headers)) == _without_as_of(state)
+    # Zero courtesy capacity in force reads as 100 % used, nothing reached.
+    assert _without_as_of(_ok(client, "thresholds", headers)) == {
+        "capacity_mc": 0,
+        "available_mc": 0,
+        "used_mc": 0,
+        "used_percent": 100,
+        "reached": [],
+        "alerts": [],
+    }
+    # A new courtesy unblocks at the next read (nothing is stored).
+    client._submit(_courtesy(world.empty, 1))
+    assert _ok(client, "state", headers)["state"] == "active"
+    # DESIGN Decision 7: the courtesy expires with its balance left and no
+    # paid plan in force -- blocked again, never spending the expired lot.
+    client._submit(_expire_courtesy(world.empty))
+    expired = _ok(client, "state", headers)
+    assert (expired["mode"], expired["state"], expired["pending_reasons"]) == (
+        "enforced",
+        "suspended",
+        [],
+    )
+    assert all(expired[name] is None for name in _DEADLINES)
+    assert _ok(client, "balance", headers)["net_available_mc"] == 0
+
+
+async def _expire_courtesy(builder: UUID) -> None:
+    """Age every courtesy lot of ``builder`` past its expiry (balance kept)."""
+
+    from sqlalchemy import update
+
+    from src.models.credit import CreditLot as CreditLotRow
+
+    async def work(database: Any) -> None:
+        await database.execute(
+            update(CreditLotRow)
+            .where(
+                CreditLotRow.builder_id == builder,
+                CreditLotRow.lot_kind == "courtesy",
+            )
+            .values(expires_at=datetime.now(UTC) - timedelta(days=1))
+        )
+
+    await _plain(work)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_under_the_rule_quarantine_stays_a_reason_and_never_pends(
+    client: Any,
+    world: Builders,
+    switch: Any,
+    rule_reading: None,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked: bool,
+) -> None:
+    """Wish Decision 4: ``quarantine`` stays in ``pending_reasons`` (the
+    top-up stays refused), the state is the rule's (never ``pending``) and
+    the binding coverage is never read (no ``reconciliation``)."""
+
+    from src.services.credit_rollout import CreditRolloutService
+
+    granted = client._submit(_courtesy(world.empty, 3))
+    if blocked:
+        client._submit(_remove_all(granted.lot_id))
+
+    async def quarantined(_self: Any, builder_id: UUID) -> bool:
+        return True
+
+    async def never(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the binding coverage is read under the rule")
+
+    monkeypatch.setattr(CreditRepository, "quarantine_hold", quarantined)
+    monkeypatch.setattr(CreditRolloutService, "binding_coverage", never)
+    headers = world.builder(world.empty, world.empty_tenant)
+    for state in (
+        _ok(client, "state", headers),
+        _ok(client, "summary", headers)["state"],
+    ):
+        assert (state["mode"], state["state"], state["pending_reasons"]) == (
+            "enforced",
+            "suspended" if blocked else "active",
+            ["quarantine"],
+        )
+
+
+def test_an_unusable_coverage_never_adds_reconciliation_under_the_rule(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    """The rich builder's current cycle has no binding: enforced by the
+    global it is ``pending``/``reconciliation`` (above); under the rule its
+    debits touch only courtesy, so it stays ``active``."""
+
+    client._submit(_current_cycle(world, "missing"))
+    client._submit(_courtesy(world.rich, 4))
+    state = _ok(client, "state", world.rich_jwt)
+    assert (state["mode"], state["state"], state["pending_reasons"]) == (
+        "enforced",
+        "active",
+        [],
+    )
+
+
+def test_the_balance_by_kind_stays_and_net_is_the_spendable_courtesy(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    before = _ok(client, "balance", world.rich_jwt)
+    client._submit(_courtesy(world.rich, 7))
+    after = _ok(client, "balance", world.rich_jwt)
+    for line in (
+        "monthly_available_mc",
+        "monthly_not_started_mc",
+        "topup_available_mc",
+        "open_debt_mc",
+        "reserved_mc",
+    ):
+        assert after[line] == before[line], line
+    assert after["courtesy_available_mc"] == 7_000
+    assert after["available_mc"] == before["available_mc"] + 7_000
+    # Under the rule: all it spends is the courtesy (never the paid lots).
+    assert after["net_available_mc"] == 7_000
+    # A debt a mark era left stays shown, and is neither netted nor settled.
+    headers = world.builder(world.empty, world.empty_tenant)
+    client._submit(_courtesy(world.empty, 5))
+    client._submit(_old_debt(world.empty, 3_000))
+    empty = _ok(client, "balance", headers)
+    assert (empty["open_debt_mc"], empty["available_mc"]) == (3_000, 5_000)
+    assert empty["net_available_mc"] == empty["courtesy_available_mc"] == 5_000
+    summary = _ok(client, "summary", headers)
+    assert _without_as_of(summary["balance"]) == _without_as_of(empty)
+    assert _ok(client, "debt", headers)["open_debt_mc"] == 3_000
+
+
+async def _old_debt(builder: UUID, amount: int) -> None:
+    """An open debt left from a mark era (the rule makes none)."""
+
+    from src.models.credit import CreditDebt
+
+    effect = f"trace:{uuid4()}:decision:1"
+    at = datetime.now(UTC) - timedelta(days=2)
+
+    async def work(database: Any) -> None:
+        account = await database.scalar(
+            select(CreditAccount.id).where(CreditAccount.builder_id == builder)
+        )
+        database.add(
+            CreditEffect(builder_id=builder, effect_id=effect, effect_kind="trace")
+        )
+        await database.flush()
+        database.add(
+            CreditLedgerEntry(
+                builder_id=builder,
+                account_id=account,
+                effect_id=effect,
+                lot_id=None,
+                entry_type="debt",
+                amount_mc=amount,
+                occurred_at=at,
+            )
+        )
+        database.add(
+            CreditDebt(
+                builder_id=builder,
+                account_id=account,
+                debt_source_kind="debit",
+                debt_source_effect_id=effect,
+                original_grant_lot_id=None,
+                amount_mc=amount,
+                created_at=at,
+            )
+        )
+
+    await _plain(work)
+
+
+def test_the_thresholds_are_on_the_courtesy_basis_with_its_arm(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    """DESIGN items 4 and 13: capacity the courtesy in force, available the
+    spendable courtesy, the alerts of ``c:{grant_effect_id}`` of the latest
+    grant -- recorded by the lifecycle on the rule's own debit."""
+
+    from src.services.credit_lifecycle import courtesy_arm_key
+
+    headers = world.builder(world.empty, world.empty_tenant)
+    granted = client._submit(_courtesy(world.empty, 10))
+    debit = client._submit(_rule_debit(world.empty, 6_000, granted.occurred_at))
+    assert debit.status == "applied" and debit.debited_mc == 6_000
+
+    async def plant(database: Any) -> None:
+        # An alert on an episode-and-window arm is never this basis'.
+        window = accounting_window([], datetime.now(UTC))
+        key = arm_key(0, window.start.isoformat())
+        database.add(
+            CreditThresholdAlert(
+                builder_id=world.empty,
+                arm_key=key,
+                threshold=90,
+                capacity_mc=0,
+                available_mc=0,
+                effect_id=f"threshold:{world.empty}:{key}:90",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+
+    client._submit(_plain(plant))
+    body = _ok(client, "thresholds", headers)
+    assert (body["capacity_mc"], body["available_mc"], body["used_mc"]) == (
+        10_000,
+        4_000,
+        6_000,
+    )
+    assert (body["used_percent"], body["reached"]) == (60, [50])
+    assert [alert["threshold"] for alert in body["alerts"]] == [50]
+
+    async def arms(database: Any) -> list[str]:
+        return [
+            str(key)
+            for key in (
+                await database.execute(
+                    select(CreditThresholdAlert.arm_key).where(
+                        CreditThresholdAlert.builder_id == world.empty,
+                        CreditThresholdAlert.threshold == 50,
+                    )
+                )
+            ).scalars()
+        ]
+
+    found: list[list[str]] = []
+
+    async def read(database: Any) -> None:
+        found.append(await arms(database))
+
+    client._submit(_plain(read))
+    lot_effect = client._submit(_grant_effect(granted.lot_id))
+    assert found == [[courtesy_arm_key(lot_effect)]]
+    # A new grant re-arms on its own key: the lifecycle records that arm's
+    # 50 % at the grant (6 000 of 12 000), and only that arm is listed.
+    second = client._submit(_courtesy(world.empty, 2))
+    body = _ok(client, "thresholds", headers)
+    assert (body["capacity_mc"], body["available_mc"], body["used_mc"]) == (
+        12_000,
+        6_000,
+        6_000,
+    )
+    assert body["reached"] == [50]
+    found.clear()
+    client._submit(_plain(read))
+    second_key = courtesy_arm_key(client._submit(_grant_effect(second.lot_id)))
+    assert sorted(found[0]) == sorted([courtesy_arm_key(lot_effect), second_key])
+
+    async def occurred(database: Any) -> None:
+        found.append(
+            [
+                _utc_iso(at)
+                for at in (
+                    await database.execute(
+                        select(CreditThresholdAlert.occurred_at).where(
+                            CreditThresholdAlert.builder_id == world.empty,
+                            CreditThresholdAlert.arm_key == second_key,
+                        )
+                    )
+                ).scalars()
+            ]
+        )
+
+    client._submit(_plain(occurred))
+    assert [(a["threshold"], a["occurred_at"]) for a in body["alerts"]] == [
+        (50, found[-1][0])
+    ]
+    summary = _ok(client, "summary", headers)
+    assert _without_as_of(summary["thresholds"]) == _without_as_of(body)
+
+
+def _utc_iso(value: datetime) -> str:
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+async def _grant_effect(lot_id: UUID) -> str:
+    from src.models.credit import CreditLot as CreditLotRow
+
+    database = get_db_session()
+    try:
+        return str(
+            await database.scalar(
+                select(CreditLotRow.grant_effect_id).where(CreditLotRow.id == lot_id)
+            )
+        )
+    finally:
+        await database.close()
+
+
+def test_a_protected_builder_stays_observational(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    """Courtesy spent with a paid lot in force (the rich builder's top-up):
+    no origin -- every route answers as without the rule."""
+
+    before = {route: _ok(client, route, world.rich_jwt) for route in ("state",)}
+    granted = client._submit(_courtesy(world.rich, 2))
+    client._submit(_remove_all(granted.lot_id))
+    state = _ok(client, "state", world.rich_jwt)
+    assert _without_as_of(state) == _without_as_of(before["state"])
+    assert state["mode"] == "observational"
+    thresholds = _ok(client, "thresholds", world.rich_jwt)
+    assert thresholds["capacity_mc"] == 510_000  # the episode basis, as before
+
+
+@contextmanager
+def _sql() -> Iterator[list[str]]:
+    from sqlalchemy import event
+
+    from src.repositories.database import get_db_engine
+
+    seen: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        seen.append(" ".join(statement.split()).lower())
+
+    engine = get_db_engine().sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def _is_rule_read(statement: str) -> bool:
+    """``CreditRepository.courtesy_rule``'s one statement (Group 1)."""
+
+    return "as granted_at" in statement and "from credit_lots" in statement
+
+
+def test_dominance_without_courtesy_and_for_a_marked_builder(
+    client: Any,
+    world: Builders,
+    switch: Any,
+    rule_reading: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """For a builder that never had courtesy and for a marked one (with
+    courtesy), every ``/v1/credits/*`` answer is the same with the rule's
+    046 read open and closed; with no courtesy the balance and thresholds
+    run exactly the same statements and the state only the rule's one read
+    (Group 1's); nothing is written."""
+
+    client._submit(_enforce_mark_world(world))
+    marked = world.builder(world.expired, world.expired_tenant)
+    plain = world.rich_jwt
+
+    def answers(headers: dict[str, str]) -> dict[str, Any]:
+        return {
+            route: _without_as_of(_ok(client, route, headers)) for route in READ_ROUTES
+        }
+
+    def statements(route: str) -> list[str]:
+        with _sql() as seen:
+            _ok(client, route, plain)
+        return seen
+
+    opened = {"marked": answers(marked), "plain": answers(plain)}
+    opened_sql = {
+        route: statements(route) for route in ("balance", "thresholds", "state")
+    }
+    monkeypatch.setattr(
+        CreditRepository, "courtesy_rule_readable", staticmethod(lambda *_: False)
+    )
+    closed = {"marked": answers(marked), "plain": answers(plain)}
+    closed_sql = {
+        route: statements(route) for route in ("balance", "thresholds", "state")
+    }
+    assert opened == closed
+    assert opened["marked"]["state"]["mode"] == "enforced"  # the mark's
+    for route in ("balance", "thresholds"):
+        assert opened_sql[route] == closed_sql[route], route
+        assert not any(_is_rule_read(s) for s in opened_sql[route]), route
+    rule_reads = [s for s in opened_sql["state"] if _is_rule_read(s)]
+    assert len(rule_reads) == 1
+    assert [s for s in opened_sql["state"] if s not in rule_reads] == closed_sql[
+        "state"
+    ]
+
+
+async def _enforce_mark_world(world: Builders) -> None:
+    """The expired builder gets courtesy and a mark (the mark wins)."""
+
+    await _courtesy(world.expired, 3)
+    await _mark(world.expired)
+
+
+def test_rule_reads_write_nothing(
+    client: Any, world: Builders, switch: Any, rule_reading: None
+) -> None:
+    from src.models import content_retention, credit, credit_inventory
+
+    granted = client._submit(_courtesy(world.empty, 2))
+    client._submit(_courtesy(world.indebted, 2))
+    client._submit(_remove_all(granted.lot_id))
+    models = [
+        getattr(module, name)
+        for module in (credit, content_retention, credit_inventory)
+        for name in dir(module)
+        if isinstance(getattr(module, name), type)
+        and getattr(getattr(module, name), "__tablename__", "").startswith("credit_")
+    ]
+
+    def counts() -> dict[str, int]:
+        return {model.__tablename__: client._submit(_count(model)) for model in models}
+
+    before = counts()
+    for headers in (
+        world.builder(world.empty, world.empty_tenant),
+        world.indebted_jwt,
+    ):
+        for route in READ_ROUTES:
+            _ok(client, route, headers)
+    assert counts() == before

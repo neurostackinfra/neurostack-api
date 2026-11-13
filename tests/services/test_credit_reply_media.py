@@ -787,7 +787,7 @@ def test_the_outbox_budgets_are_unchanged() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("channel", ["zapi", "meta"])
+@pytest.mark.parametrize("channel", ["zapi", "meta", "uazapi", "evolution"])
 async def test_the_enforced_branch_gives_selection_and_delivery_one_provider(
     monkeypatch: pytest.MonkeyPatch, channel: str
 ) -> None:
@@ -846,3 +846,72 @@ async def test_the_enforced_branch_gives_selection_and_delivery_one_provider(
     assert seen["agent_sends"] is pool
     assert seen["reply"]["media_id"] == str(media_id)
     assert seen["reply"]["channel"] == channel
+
+
+async def test_a_charged_uazapi_reply_starts_its_file_through_the_uazapi_provider(
+    db: _Db, world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """debito-cortesia-automatico Group 3: a Uazapi reply charged under the
+    courtesy rule, once delivered and marked, starts its file through the
+    route's own provider (``uazapi``), with the in-memory phone and the
+    Uazapi credentials; its echo bookkeeping is the Uazapi one."""
+
+    async with db.sessions() as session, session.begin():
+        row = await session.scalar(
+            select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == db.tenant)
+        )
+        assert row is not None
+        row.api_credentials = {
+            "whatsapp_provider": "uazapi",
+            "uazapi_instance_name": "media-uazapi",
+            "uazapi_api_url": "https://uazapi.invalid",
+            "uazapi_token": "uz-media",
+        }
+    uazapi_texts = AsyncMock(return_value={"id": "5511000:UAZ-TEXT-1"})
+    monkeypatch.setattr(webhook, "send_uazapi_text", uazapi_texts)
+    row_id = await _row(db, _reply(db, channel="uazapi", media_id=str(world.asset.id)))
+    delivery = await _inline(world, row_id)
+    assert delivery.outcome == "delivered"
+    await reply_media_runner.wait_idle()
+    uazapi_texts.assert_awaited_once()
+    [(provider, credentials, phone)] = world.media.bound
+    assert (provider, phone) == ("uazapi", _PHONE)
+    assert credentials["uazapi_token"] == "uz-media"
+    assert world.trace.index("mark") < world.trace.index("start_media")
+    assert "UAZ-TEXT-1" in await _stored_ids(db)
+
+
+async def test_a_charged_evolution_reply_starts_its_file_through_the_evolution_provider(
+    db: _Db, world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """debito-cortesia-automatico Group 4: an Evolution reply charged under the
+    courtesy rule, once delivered and marked, starts its file through the
+    route's own provider (``evolution``), with the in-memory phone and the
+    Evolution credentials; its echo bookkeeping is main's Evolution one (the
+    reply's ``key.id``)."""
+
+    async with db.sessions() as session, session.begin():
+        row = await session.scalar(
+            select(ClinicConfigTable).where(ClinicConfigTable.tenant_id == db.tenant)
+        )
+        assert row is not None
+        row.api_credentials = {
+            "whatsapp_provider": "evolution",
+            "evolution_instance_name": "media-evolution",
+            "evolution_api_url": "https://evolution.invalid",
+            "evolution_api_key": "evo-media",
+        }
+    evolution_texts = AsyncMock(return_value={"key": {"id": "EVO-TEXT-1"}})
+    monkeypatch.setattr(webhook, "send_evolution_text", evolution_texts)
+    row_id = await _row(
+        db, _reply(db, channel="evolution", media_id=str(world.asset.id))
+    )
+    delivery = await _inline(world, row_id)
+    assert delivery.outcome == "delivered"
+    await reply_media_runner.wait_idle()
+    evolution_texts.assert_awaited_once()
+    [(provider, credentials, phone)] = world.media.bound
+    assert (provider, phone) == ("evolution", _PHONE)
+    assert credentials["evolution_api_key"] == "evo-media"
+    assert world.trace.index("mark") < world.trace.index("start_media")
+    assert "EVO-TEXT-1" in await _stored_ids(db)

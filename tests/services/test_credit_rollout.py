@@ -320,6 +320,37 @@ def test_the_guard_predicate_is_a_constant_false() -> None:
     assert statement.value.value is False
 
 
+def test_the_guard_says_the_adapter_charges_only_under_the_courtesy_rule() -> None:
+    """debito-cortesia-automatico (DESIGN item 13, LOW-5): the enforced
+    Uazapi adapter comes from that design and charges only under the
+    courtesy rule, so the L10 guard stays closed; nobody opens a duplicate
+    ``uazapi-credit-enforcement``.  The coverage's docs say the rule never
+    reads it."""
+
+    import inspect
+
+    from src.services import credit_rollout
+
+    guard = " ".join(
+        (credit_rollout.uazapi_enforced_credit_adapter_available.__doc__ or "").split()
+    )
+    for needle in (
+        "comes from debito-cortesia-automatico",
+        "charges ONLY under the courtesy rule",
+        "The guard stays closed.",
+        "``uazapi-credit-enforcement``",
+        "no duplicate wish is opened",
+    ):
+        assert needle in guard, needle
+    coverage = " ".join(
+        (credit_rollout.CreditRolloutService.binding_coverage.__doc__ or "").split()
+    )
+    assert "A request under the courtesy rule" in coverage
+    assert "never reads this coverage nor the quarantine hold" in coverage
+    field = " ".join(inspect.getsource(credit_rollout.BindingCoverage).split())
+    assert "under the courtesy rule the enforced path consults neither" in field
+
+
 def _guard_references(path: Path) -> list[tuple[int, str]]:
     """Every reference to the predicate in *path*: how it is used."""
 
@@ -423,3 +454,26 @@ def test_a_courtesy_counts_for_the_cutoff_coverage_only() -> None:
     failing = BindingCoverage(usable_courtesy=True, reconciliation_failure=True)
     assert not failing.usable
     assert failing.usable == BindingCoverage(reconciliation_failure=True).usable
+
+
+@pytest.mark.asyncio
+async def test_the_courtesy_lot_trigger_reads_nothing_with_the_046_gate_closed() -> (
+    None
+):
+    """debito-cortesia-automatico (DESIGN Decision 20): the workers' courtesy
+    trigger is one plain read of ``credit_lots`` behind the 046 gate."""
+
+    from src.services.credit_rollout import any_courtesy_lot
+
+    closed = Mock()
+    closed.execute = AsyncMock(side_effect=AssertionError("read with the gate closed"))
+    assert await any_courtesy_lot(closed, rule_readable=False) is False
+    for found, expected in ((uuid4(), True), (None, False)):
+        result = Mock()
+        result.scalar_one_or_none.return_value = found
+        session = Mock()
+        session.execute = AsyncMock(return_value=result)
+        assert await any_courtesy_lot(session, rule_readable=True) is expected
+        [statement] = [call.args[0] for call in session.execute.await_args_list]
+        compiled = str(statement)
+        assert "FROM credit_lots" in compiled and "credit_lots.lot_kind" in compiled

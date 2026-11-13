@@ -163,6 +163,21 @@ class BuilderChargingResponse(BaseModel):
     )
 
 
+# ``courtesy_rule`` of a ``GET /v1/admin/builders/subscriptions`` row
+# (debito-cortesia-automatico, DESIGN item 13): read-only, computed on every
+# read from the builder's courtesy lots (and, with none left spendable, its
+# paid plan in force), never stored.  ``"charged"``: the builder is under the
+# courtesy rule (it received courtesy, the global enforcement is unset and it
+# has no operator mark) with courtesy left -- its usage is debited from it;
+# ``"blocked"``: under the rule with nothing spendable and no paid plan in
+# force -- its agent, RAG and media are suspended now.  ``null``: not under
+# the rule (never received courtesy, marked, the global set, or protected by
+# a paid plan in force), and for every row while the credit switch is not
+# effective, the schema is below 046 or the read failed.  The mark's
+# ``charging`` field is independent and unchanged.
+BuilderCourtesyRule = Literal["charged", "blocked"]
+
+
 class CreateBuilderClinicRequest(BaseModel):
     """Request body for creating a clinic under a builder."""
 

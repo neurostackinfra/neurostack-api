@@ -182,3 +182,71 @@ def test_with_the_switch_off_an_overdue_episode_suspends_nothing(
     assert _search(client, world).status_code == 200
     assert _download(client, world).status_code == 200
     assert _suspensions(client) == []
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 5a: search and download under the
+# courtesy rule (no ``credit_enforcement_at``).  A blocked builder's API key
+# search and download are 402 ``credit_suspended`` with nothing recorded
+# (no episode, no transition, no egress); the panel and the export stay
+# open; a charged builder is served whatever episode a mark era left.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rule_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process reading at this image's head (046 and 047 gates open)."""
+
+    from src.services.credit_switch import (
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+
+
+def test_a_rule_blocked_builder_is_402_for_api_keys_and_open_for_the_panel(
+    client: Any, world: World, switch: Any, rule_reading: None
+) -> None:
+    from tests.api.test_credit_category_gate import _clinic_admin, _panel, _rule
+
+    client._submit(_rule(world.builder, 3, keep=False))
+    for response in (_search(client, world), _download(client, world)):
+        assert (response.status_code, response.json()) == (402, SUSPENDED)
+    assert client._submit(_rows(CreditEgressDelivery)) == []
+    assert client._submit(_rows(CreditLifecycleEpisode)) == []
+    assert _suspensions(client) == []
+    # The panel (reading) and the export stay open.
+    media = client._submit(_media_id(world.tenant))
+    panel = _panel(world, client._submit(_clinic_admin(world)))
+    assert (
+        client.post(
+            "/v1/knowledge/search", json={"query": "horários"}, headers=panel
+        ).status_code
+        == 200
+    )
+    for path in (
+        f"/v1/media-assets/{media}/content",
+        "/v1/media-assets",
+        "/v1/knowledge/documents",
+    ):
+        assert client.get(path, headers=panel).status_code == 200, path
+    assert (
+        client.get("/v1/knowledge/documents", headers=world.headers).status_code == 200
+    )
+    assert client.get("/v1/credits/export", headers=world.headers).status_code == 200
+
+
+def test_a_charged_rule_builder_with_a_stale_overdue_episode_is_served(
+    client: Any, world: World, switch: Any, rule_reading: None
+) -> None:
+    from tests.api.test_credit_category_gate import _rule, _stale_episode
+
+    client._submit(_rule(world.builder, 50, keep=True))
+    client._submit(_stale_episode(world.builder, overdue=True))  # a mark era's
+    assert _search(client, world).status_code == 200
+    assert _download(client, world).status_code == 200
+    assert _suspensions(client) == []  # never suspended by that episode

@@ -20,7 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import type { CreditLot, CreditStateInfo, CreditSummary } from "@/pages/billing-contract";
-import { creditLedgerStanding } from "@/pages/billing-view";
+import { chargedInQuarantine, creditBalanceStanding } from "@/pages/billing-view";
 import {
   formatCivilDate,
   formatCount,
@@ -84,19 +84,22 @@ export interface ExportAction {
 
 /**
  * How the ledger's figures may be presented for a credit state; decided only
- * by `creditLedgerStanding` (`billing-view.ts`), the same rule that blocks the
- * top-up:
+ * by `creditBalanceStanding` (`billing-view.ts`): the rule that blocks the
+ * top-up (`creditLedgerStanding`), except that a builder charged under the
+ * courtesy rule while a payment is in quarantine (`active` + `quarantine`)
+ * sees its balance without "Pendente" while the top-up stays blocked
+ * (debito-cortesia-automatico, wish Decision 4):
  * - `not_applicable`: a standalone tenant has no credit account; the API
  *   answers zeros that are not data, so nothing is shown as a balance.
  * - `pending` (on hold): the `pending` state, or any reason other than
  *   `standalone` under any lifecycle state (quarantine, reconciliation or a
  *   reason this UI does not know): no figure is presented as usable. The
  *   lifecycle's deadline and export information stays visible.
- * - `standing`: active, grace, suspended, deletion due without a hold: the
- *   balance is shown.
+ * - `standing`: active, grace, suspended, deletion due without a hold, and
+ *   the courtesy rule's charged builder in quarantine: the balance is shown.
  */
 export function creditStanding(state: CreditStateInfo): "not_applicable" | "pending" | "standing" {
-  return creditLedgerStanding(state);
+  return creditBalanceStanding(state);
 }
 
 function pendingReasonLines(reasons: string[], txt: Txt): string[] {
@@ -263,6 +266,19 @@ function lotKindLabel(kind: CreditLot["kind"], txt: Txt): string {
   }
 }
 
+/**
+ * No capacity in force, nothing available and no threshold reached: only
+ * the courtesy basis answers this (debito-cortesia-automatico, a blocked
+ * builder whose courtesy lots all expired, or were removed in full before
+ * any use: the courtesy capacity subtracts reversals and removals, never
+ * consumption, so a lot used even once keeps counting; every amount 0,
+ * `used_percent` 100 by the server's convention, `reached` empty). The
+ * ledger basis never does: there, nothing usable reaches every threshold.
+ */
+function noCapacityInForce(thresholds: CreditSummary["thresholds"]): boolean {
+  return thresholds.capacity_mc <= 0 && thresholds.available_mc <= 0 && thresholds.reached.length === 0;
+}
+
 function BalanceDetails({ summary, locale, txt }: { summary: CreditSummary; locale: Locale; txt: Txt }) {
   const credits = (mc: number) => `${formatCredits(mc, locale)} ${txt("créditos", "credits")}`;
   const { balance, debt, reservations, thresholds, consumption } = summary;
@@ -270,6 +286,7 @@ function BalanceDetails({ summary, locale, txt }: { summary: CreditSummary; loca
   const consumptionItems = consumption.mode === "enforced" ? consumption.charged : consumption.observed;
   const windowStart = formatCivilDate(reservations.window.start, locale);
   const windowEnd = formatCivilDate(reservations.window.end, locale);
+  const noCapacity = noCapacityInForce(thresholds);
   return (
     <>
       <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
@@ -366,16 +383,30 @@ function BalanceDetails({ summary, locale, txt }: { summary: CreditSummary; loca
         })}
       </div>
 
-      <div className="space-y-1.5" data-testid="credit-thresholds">
+      <div
+        className="space-y-1.5"
+        data-testid="credit-thresholds"
+        data-state={noCapacity ? "no_capacity" : undefined}
+      >
         <div className="flex items-center justify-between text-xs">
           <span className="text-muted-foreground">{txt("Capacidade consumida", "Capacity used")}</span>
-          <span className="font-semibold tabular-nums">{thresholds.used_percent}%</span>
+          {/* Zero capacity with nothing reached (`noCapacityInForce`): the
+              server's `used_percent` reads 100 by convention, and a full bar
+              would claim a consumption that never happened. No percentage
+              and no bar, only the fact. */}
+          {noCapacity ? (
+            <span className="font-semibold">{txt("Sem créditos em vigor", "No credits in force")}</span>
+          ) : (
+            <span className="font-semibold tabular-nums">{thresholds.used_percent}%</span>
+          )}
         </div>
-        <Progress
-          value={Math.min(100, Math.max(0, thresholds.used_percent))}
-          aria-label={txt("Capacidade consumida", "Capacity used")}
-          className={`h-2 ${thresholds.reached.includes(90) ? "[&>div]:bg-red-500" : ""}`}
-        />
+        {!noCapacity && (
+          <Progress
+            value={Math.min(100, Math.max(0, thresholds.used_percent))}
+            aria-label={txt("Capacidade consumida", "Capacity used")}
+            className={`h-2 ${thresholds.reached.includes(90) ? "[&>div]:bg-red-500" : ""}`}
+          />
+        )}
         {thresholds.reached.length > 0 && (
           <p className="text-[11px] text-amber-700 dark:text-amber-400">
             {txt("Alertas atingidos", "Thresholds reached")}: {thresholds.reached.map((value) => `${value}%`).join(", ")}
@@ -458,7 +489,7 @@ function CreditHistory({
   locale: Locale;
   txt: Txt;
   onRetry?: () => void;
-  /** The ledger is on hold (`creditLedgerStanding`): no lot reads as spendable. */
+  /** The balance is withheld (`creditBalanceStanding`): no lot reads as spendable. */
   onHold: boolean;
 }) {
   const title = txt("Histórico de créditos", "Credit history");
@@ -917,6 +948,18 @@ export function CreditsAndTopups({
             )}
             {standing === "standing" && (
               <StandingNotice state={summary.state} locale={locale} txt={txt} topupOffered={topup.status === "offered"} />
+            )}
+            {/* Charged under the courtesy rule while a payment is in
+                quarantine, with no top-up area to say so (owner decision
+                19): one neutral line. When the top-up area is shown, its
+                own blocked line already explains the verification. */}
+            {standing === "standing" && chargedInQuarantine(summary.state) && topup.status === "hidden" && (
+              <p data-testid="credit-verification-note" className="text-xs text-muted-foreground">
+                {txt(
+                  "Um pagamento está em verificação; o consumo da cortesia não é afetado.",
+                  "A payment is being verified; courtesy usage is not affected.",
+                )}
+              </p>
             )}
           </div>
           {standing === "standing" && <BalanceDetails summary={summary} locale={locale} txt={txt} />}

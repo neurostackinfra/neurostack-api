@@ -349,3 +349,278 @@ def test_a_builder_with_capacity_is_never_category_exhausted(
         assert response.status_code == 201, response.text
     assert client._submit(_open_episodes(world.builder)) == 0
     assert client._submit(_reservations("rag"))
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 5a: uploads under the courtesy rule (no
+# ``credit_enforcement_at``).  A builder the rule blocks uploads nothing --
+# 402 ``credit_suspended`` before any body is read or row written, from an
+# API key and from the panel alike; a charged one uploads, paid from its
+# courtesy, whatever episode a mark era left open.
+# ---------------------------------------------------------------------------
+
+SUSPENDED = {"detail": {"code": "credit_suspended"}}
+
+
+@pytest.fixture
+def rule_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process reading at this image's head (046 and 047 gates open)."""
+
+    from src.services.credit_switch import (
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+
+
+async def _rule(builder: UUID, credits: int, *, keep: bool) -> None:
+    from src.services import credit_courtesy
+
+    database = get_db_session()
+    try:
+        async with database.begin():
+            granted = await credit_courtesy.grant(
+                database,
+                builder_id=builder,
+                credits=credits,
+                reason="cortesia",
+                actor_user_id=uuid4(),
+                idempotency_key=f"gate-rule-{uuid4()}",
+            )
+        if not keep:
+            async with database.begin():
+                await credit_courtesy.remove(
+                    database,
+                    lot_id=granted.lot_id,
+                    remove_all=True,
+                    reason="tirar tudo",
+                    actor_user_id=uuid4(),
+                    idempotency_key=f"gate-rule-removal-{uuid4()}",
+                )
+    finally:
+        await database.close()
+
+
+async def _stale_episode(builder: UUID, *, overdue: bool) -> None:
+    """An exhaustion episode left open from a mark era, on the builder's
+    existing account (the courtesy grant created it)."""
+
+    exhausted = datetime.now(UTC) - timedelta(hours=73 if overdue else 1)
+    database = get_db_session()
+    try:
+        async with database.begin():
+            account = await database.scalar(
+                select(CreditAccount.id).where(CreditAccount.builder_id == builder)
+            )
+            database.add(
+                CreditLifecycleEpisode(
+                    id=uuid4(),
+                    builder_id=builder,
+                    account_id=account,
+                    opened_effect_id=f"lifecycle:{builder}:episode:0:opened",
+                    exhausted_at=exhausted,
+                    suspension_due_at=exhausted + timedelta(hours=72),
+                    deletion_due_at=exhausted + timedelta(days=30),
+                )
+            )
+    finally:
+        await database.close()
+
+
+async def _clinic_admin(world: World) -> UUID:
+    """A clinic admin user of the world's clinic (the panel's caller)."""
+
+    from src.models.user import User, UserRole
+
+    user_id = uuid4()
+    database = get_db_session()
+    try:
+        async with database.begin():
+            database.add(
+                User(
+                    id=user_id,
+                    tenant_id=world.tenant,
+                    email=f"{user_id.hex}@panel.invalid",
+                    password_hash="x",
+                    role=UserRole.clinic_admin,
+                    is_active=True,
+                )
+            )
+    finally:
+        await database.close()
+    return user_id
+
+
+def _panel(world: World, user_id: UUID | None = None) -> dict[str, str]:
+    """A clinic admin's JWT on the world's clinic (the panel)."""
+
+    import jwt
+
+    from src.config.settings import settings
+
+    now = datetime.now(UTC)
+    token = jwt.encode(
+        {
+            "sub": str(user_id or uuid4()),
+            "tenant_id": str(world.tenant),
+            "role": "clinic_admin",
+            "iat": now,
+            "exp": now + timedelta(hours=1),
+        },
+        settings.secret_key,
+        algorithm="HS256",
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _written() -> dict[str, int]:
+    from src.models.credit import CreditEffect, CreditLedgerEntry
+
+    return {
+        model.__tablename__: await _count(model)
+        for model in (
+            KnowledgeDocument,
+            MediaAsset,
+            CreditAllocation,
+            CreditEffect,
+            CreditLedgerEntry,
+        )
+    }
+
+
+def _uploads(client: Any, world: World, headers: dict[str, str]) -> list[Any]:
+    return [
+        client.post(
+            "/v1/knowledge/documents",
+            json={"content": "Aceitamos Unimed.", "metadata": {"title": "Gate"}},
+            headers=headers,
+        ),
+        client.post(
+            "/v1/knowledge/documents/upload",
+            files={"files": ("horarios.pdf", PDF, "application/pdf")},
+            headers=headers,
+        ),
+        client.post(
+            "/v1/media-assets",
+            files={"file": ("foto.png", PNG, "image/png")},
+            data={"display_name": "Foto", "original_filename": "foto.png"},
+            headers=headers,
+        ),
+    ]
+
+
+def test_a_rule_blocked_builder_uploads_nothing_from_a_key_or_the_panel(
+    client: Any,
+    world: World,
+    switch: Any,
+    rule_reading: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.api.routes import knowledge, media_assets
+
+    client._submit(_rule(world.builder, 3, keep=False))
+    panel = _panel(world, client._submit(_clinic_admin(world)))
+    before = client._submit(_written())
+
+    async def unread(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a blocked builder's body was read")
+
+    async def unwritten(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a blocked builder's upload reached a write")
+
+    from src.repositories import KnowledgeDocumentRepository
+
+    monkeypatch.setattr(knowledge, "_read_upload_files", unread)
+    monkeypatch.setattr(media_assets, "_parse_upload", unread)
+    # Before ANY write, not a write rolled back: neither the row nor the
+    # reservation is ever attempted.
+    monkeypatch.setattr(KnowledgeDocumentRepository, "create", unwritten)
+    monkeypatch.setattr(credit_inventory, "reserve_upload", unwritten)
+    for headers in (world.headers, panel):
+        for response in _uploads(client, world, headers):
+            assert (response.status_code, response.json()) == (402, SUSPENDED), (
+                response.request.url,
+                response.text,
+            )
+    assert client._submit(_written()) == before
+    assert client._submit(_open_episodes(world.builder)) == 0
+
+
+def test_the_reservation_lock_refuses_a_blocked_capture_too(
+    client: Any,
+    world: World,
+    switch: Any,
+    rule_reading: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second layer: with the entry refusal out of the way, the
+    reservation's verdict on the captured mode is ``suspended`` -- answered
+    402 ``credit_suspended`` and rolled back, never served as ``ok``."""
+
+    from src.api.routes import knowledge, media_assets
+
+    client._submit(_rule(world.builder, 3, keep=False))
+    before = client._submit(_written())
+
+    async def let_through(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(knowledge, "_refuse_blocked", let_through)
+    monkeypatch.setattr(media_assets, "_refuse_blocked", lambda _mode: None)
+    for response in _uploads(client, world, world.headers):
+        assert (response.status_code, response.json()) == (402, SUSPENDED), (
+            response.request.url,
+            response.text,
+        )
+    assert client._submit(_written()) == before
+
+
+@pytest.mark.parametrize("module_name", ["knowledge", "media_assets"])
+def test_every_category_verdict_has_its_own_answer(module_name: str) -> None:
+    import importlib
+
+    module = importlib.import_module(f"src.api.routes.{module_name}")
+    assert module._verdict_refusal("ok") is None
+    for verdict, code in (
+        ("suspended", "credit_suspended"),
+        ("category_exhausted", "credit_category_exhausted"),
+    ):
+        refusal = module._verdict_refusal(verdict)
+        assert (refusal.status_code, refusal.detail) == (402, {"code": code})
+
+
+def test_a_charged_rule_builder_uploads_from_courtesy_despite_a_stale_episode(
+    client: Any, world: World, switch: Any, rule_reading: None
+) -> None:
+    """A charged builder's uploads are served and their reservations paid
+    by the courtesy; an exhaustion episode left from a mark era is not the
+    rule's and refuses nothing (no ``credit_category_exhausted``)."""
+
+    client._submit(_rule(world.builder, 100, keep=True))
+    client._submit(_stale_episode(world.builder, overdue=False))
+    panel = _panel(world, client._submit(_clinic_admin(world)))
+    for headers in (world.headers, panel):
+        for response in _uploads(client, world, headers):
+            assert response.status_code == 201, (response.request.url, response.text)
+    reserved = client._submit(_reservations("rag")) + client._submit(
+        _reservations("media")
+    )
+    assert reserved and all(row.charged_mc >= 0 for row in reserved)
+    assert sum(row.charged_mc for row in client._submit(_reservations("rag"))) > 0
+
+
+def test_without_courtesy_the_rule_reading_changes_no_upload(
+    client: Any, world: World, switch: Any, rule_reading: None
+) -> None:
+    """Dominance: a builder that never had courtesy (no global, no mark) is
+    observational with the rule's gate open -- every upload is accepted as
+    on ``prod-fe800aec`` and nothing is reserved."""
+
+    for response in _uploads(client, world, world.headers):
+        assert response.status_code == 201, response.text
+    assert client._submit(_reservations("rag")) == []
+    assert client._submit(_reservations("media")) == []

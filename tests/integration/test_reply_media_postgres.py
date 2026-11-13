@@ -1020,3 +1020,143 @@ async def test_meta_sends_a_mono_ogg_and_an_m4a_claimed_and_charged_once(
     assert await _claims(database, world.tenant) == 1
     ((mode, size, _delivery_id, charged_media),) = await _egress(database, world.tenant)
     assert (mode, size, charged_media) == ("enforced", len(payload), media_id)
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Groups 3 and 4: Uazapi's and Evolution's
+# outbound media charge only under the courtesy rule (no global); a
+# rule-blocked builder's file never goes out, on any provider.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rule_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process reading at head (the 046 and 047 gates open), a fresh
+    process for the per-tenant D1 sets."""
+
+    from tests.integration.credit_rollout_world import (
+        force_credit_switch,
+        forget_enforcement_latches,
+    )
+
+    force_credit_switch(monkeypatch)
+    forget_enforcement_latches()
+
+
+async def _courtesy_debits(database: _Database, builder: UUID) -> list[Any]:
+    async with database.probe.connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT l.lot_kind, e.entry_type FROM credit_ledger_entries e JOIN "
+                "credit_lots l ON l.builder_id = e.builder_id AND l.id = e.lot_id "
+                "WHERE e.builder_id = :b AND e.entry_type NOT IN ('grant', "
+                "'courtesy_removal')"
+            ),
+            {"b": builder},
+        )
+        return [tuple(row) for row in rows]
+
+
+@pytest.mark.parametrize("provider", ["uazapi", "evolution"])
+@pytest.mark.parametrize(
+    ("mode", "outcome", "egress"),
+    [
+        ("charged", "sent", "enforced"),
+        ("blocked", "credit_refused", None),
+        ("marked", "sent", "observational"),
+        ("none", "sent", "observational"),
+    ],
+)
+async def test_uazapi_media_is_charged_only_under_the_courtesy_rule_on_postgres(
+    database: _Database,
+    world: _World,
+    delivery: _Delivery,
+    flag: list[bool],
+    switch: Callable[[bool], None],
+    rule_reading: None,
+    reasons: list[str],
+    mode: str,
+    outcome: str,
+    egress: str | None,
+    provider: str,
+) -> None:
+    """The global unset: the tenant's courtesy rule decides Uazapi's (Group 3)
+    and Evolution's (Group 4) file --
+    ``charged`` is claimed and charged through ``charge_egress`` with the
+    captured courtesy mode (re-checked under the account lock; never a paid
+    lot, never debt), ``blocked`` is refused before the claim with the
+    notice, and under a mark (which decides first) or nothing the file is
+    observational, as before."""
+
+    from tests.integration.credit_rollout_world import (
+        debt_rows,
+        grant_courtesy,
+        paid_lot_moves,
+        record_mark,
+        remove_courtesy,
+    )
+
+    switch(True)
+    delivery.channel.provider = provider  # type: ignore[assignment]
+    if mode != "none":
+        granted = await grant_courtesy(database.probe, world.builder, 5)
+        if mode == "blocked":
+            await remove_courtesy(database.probe, granted.lot_id)
+        elif mode == "marked":
+            await record_mark(database.probe, world.builder)
+    media_id = await _asset(database, world.tenant, payload=_pdf(3_333))
+
+    result = await delivery.run(media_id)
+
+    assert result.outcome == outcome
+    if egress is None:
+        assert reasons == ["tenant_suspended"]
+        assert delivery.channel.media_calls == []
+        assert delivery.channel.text_calls == [_PT_NOTICE]
+        assert await _claims(database, world.tenant) == 0
+        assert await _egress(database, world.tenant) == []
+    else:
+        assert reasons == ["sent"]
+        assert delivery.channel.media_calls != []
+        assert await _claims(database, world.tenant) == 1
+        [(stored_mode, size, _delivery_id, media)] = await _egress(
+            database, world.tenant
+        )
+        assert (stored_mode, size, media) == (egress, 3_333, media_id)
+    # Whatever the rule did, it moved no paid lot and opened no debt.
+    assert await paid_lot_moves(database.probe, world.builder) == []
+    assert await debt_rows(database.probe, world.builder) == (0, 0)
+    if mode != "charged":
+        assert await _courtesy_debits(database, world.builder) == []
+
+
+@pytest.mark.parametrize("provider", ["zapi", "meta"])
+async def test_a_rule_blocked_builder_s_file_never_goes_out_on_postgres(
+    database: _Database,
+    world: _World,
+    delivery: _Delivery,
+    flag: list[bool],
+    switch: Callable[[bool], None],
+    rule_reading: None,
+    reasons: list[str],
+    provider: str,
+) -> None:
+    """The shared gate gets the captured mode: a builder blocked by its
+    courtesy rule (no episode) is refused before the claim on Z-API and
+    Meta too, nothing written."""
+
+    from tests.integration.credit_rollout_world import grant_courtesy, remove_courtesy
+
+    switch(True)
+    delivery.channel.provider = provider  # type: ignore[assignment]
+    granted = await grant_courtesy(database.probe, world.builder, 5)
+    await remove_courtesy(database.probe, granted.lot_id)
+    media_id = await _asset(database, world.tenant)
+
+    result = await delivery.run(media_id)
+
+    assert result == ReplyMediaResult("credit_refused", True)
+    assert reasons == ["tenant_suspended"]
+    assert delivery.channel.media_calls == []
+    assert await _claims(database, world.tenant) == 0
+    assert await _egress(database, world.tenant) == []

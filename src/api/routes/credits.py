@@ -54,6 +54,24 @@ cobranca-credito-por-builder: the instant is the account's builder's
 effective enforcement (``scope.builder_id``: the global, else that
 builder's mark), so ``mode`` is ``enforced`` for a marked builder only while
 the global is unset.
+
+debito-cortesia-automatico (DESIGN items 4, 5, 7 and 13; wish Decision 4):
+with neither, the courtesy rule -- judged at the snapshot's instant --
+governs a builder that ever received a courtesy lot.  Under it (origin
+``courtesy``) ``mode`` is ``enforced`` from the first grant and there is no
+episode: ``state`` is the rule's, ``active`` while courtesy is spendable
+(``charged``) and ``suspended`` with no deadline at all when it is not and no
+paid plan is in force (``blocked``) -- an episode a mark era left open shows
+neither its state nor its deadlines.  ``pending_reasons`` keeps
+``quarantine`` (the top-up stays refused under it) but never gets
+``reconciliation``, and neither makes the state ``pending``: the rule debits
+only courtesy, which depends on no ASAAS fact.  The balance by lot kind is
+unchanged; ``net_available_mc`` is the spendable courtesy (all the rule
+spends, never debt), and the thresholds are on the courtesy basis with the
+arm of the latest courtesy grant -- the lifecycle's own
+(:mod:`src.services.credit_lifecycle`).  A builder that never had a courtesy
+lot reads nothing more than before.  Protected (no courtesy left, a paid
+plan in force) is no origin: observational, as before.
 """
 
 from __future__ import annotations
@@ -111,7 +129,7 @@ from src.models.content_retention import (
 from src.models.credit import CreditAccount, CreditEffect, CreditLedgerEntry
 from src.models.credit import CreditLot as CreditLotRow
 from src.models.credit import CreditObservationalEffect
-from src.repositories.credit import CreditRepository
+from src.repositories.credit import CreditRepository, EffectiveEnforcement
 from src.repositories.credit_inventory import AllocationRow, CreditInventoryRepository
 from src.repositories.database import get_db_session_dependency
 from src.services.billing_catalog import BILLING_CATALOG, CATALOG_VERSION_ID
@@ -135,6 +153,9 @@ from src.services.credit_ledger import (
 from src.services.credit_lifecycle import (
     arm_key,
     capacity_in_force_mc,
+    courtesy_arm_key,
+    courtesy_capacity_in_force_mc,
+    courtesy_thresholds_reached,
     lifecycle_state,
     thresholds_reached,
 )
@@ -412,21 +433,46 @@ class CreditSnapshot:
 
     # -- state -----------------------------------------------------------
 
-    async def enforcement_at(self) -> datetime | None:
-        """The effective enforcement instant of the account read
+    async def effective(self) -> EffectiveEnforcement:
+        """The effective enforcement of the account read
         (cobranca-credito-por-builder, wish Decision 15): of
         ``scope.builder_id`` -- the builder of the account, also for a
         builder reading through its unlinked home tenant (#219) -- the global
-        ``credit_enforcement_at``, else that builder's mark; a scope without
-        a builder only ever sees the global.  ``mode`` (summary, state,
-        consumption) and ``state.enforcement_at`` follow it."""
+        ``credit_enforcement_at``, else that builder's mark, else
+        (debito-cortesia-automatico) the courtesy rule, judged at the
+        snapshot's instant (:meth:`as_of`, the instant of the book it is shown
+        with); a scope without a builder only ever sees the global.  Read
+        once per snapshot."""
 
-        async def load() -> datetime | None:
-            return _optional_utc(
-                (await self.repository.effective_enforcement(self.scope.builder_id)).at
+        async def load() -> EffectiveEnforcement:
+            as_of = await self.as_of()
+            return await self.repository.effective_enforcement(
+                self.scope.builder_id, at=as_of
             )
 
-        return await self._once("enforcement_at", load)
+        return await self._once("effective", load)
+
+    async def enforcement_at(self) -> datetime | None:
+        """The instant of :meth:`effective`: ``mode`` (summary, state,
+        consumption) and ``state.enforcement_at`` follow it."""
+
+        return _optional_utc((await self.effective()).at)
+
+    async def rule(self) -> EffectiveEnforcement | None:
+        """The courtesy rule's verdict when it governs the account
+        (debito-cortesia-automatico): :meth:`effective` when its origin is
+        ``courtesy`` (``charged`` or ``blocked``), else ``None`` -- the
+        global, a mark, a protected builder or one with no courtesy.  Only a
+        builder that ever received a courtesy lot can be under the rule
+        (DESIGN item 1), so a book without one is ``None`` with nothing more
+        read: such a builder's balance and thresholds run exactly the
+        statements they ran before."""
+
+        book = await self.book()
+        if book is None or not any(lot.lot_kind == "courtesy" for lot in book.lots):
+            return None
+        effective = await self.effective()
+        return effective if effective.origin == "courtesy" else None
 
     async def enforced(self) -> bool:
         enforcement = await self.enforcement_at()
@@ -450,6 +496,11 @@ class CreditSnapshot:
                 enforcement_at=enforcement,
                 state="pending",
                 pending_reasons=["standalone"],
+            )
+        rule = await self.rule()
+        if rule is not None:
+            return await self._rule_state(
+                builder_id, rule, as_of=as_of, enforcement=enforcement, mode=mode
             )
         episode = await self.session.scalar(
             select(CreditLifecycleEpisode).where(
@@ -514,6 +565,34 @@ class CreditSnapshot:
             ),
             deletion_due_at=deletion,
             export_deadline_at=deletion,
+        )
+
+    async def _rule_state(
+        self,
+        builder_id: UUID,
+        rule: EffectiveEnforcement,
+        *,
+        as_of: datetime,
+        enforcement: datetime | None,
+        mode: CreditMode,
+    ) -> CreditStateResponse:
+        """The state under the courtesy rule (debito-cortesia-automatico,
+        DESIGN items 4, 5 and 7; wish Decision 4).  No episode: ``active``
+        for ``charged``, ``suspended`` for ``blocked``, and none of the
+        episode's instants -- not even those of an episode a mark era left
+        open, which never gates a builder under the rule.  ``quarantine``
+        stays a reason (the top-up stays refused under it), but neither it
+        nor the binding coverage gates the rule's debits (courtesy lots
+        only, no ASAAS fact): never ``pending``, never ``reconciliation``.
+        Reads only the quarantine hold."""
+
+        quarantined = await self.repository.quarantine_hold(builder_id)
+        return CreditStateResponse(
+            as_of=as_of,
+            mode=mode,
+            enforcement_at=enforcement,
+            state="suspended" if rule.blocked else "active",
+            pending_reasons=["quarantine"] if quarantined else [],
         )
 
     # -- reservations ----------------------------------------------------
@@ -591,6 +670,15 @@ class CreditSnapshot:
         topups = [lot for lot in book.lots if lot.lot_kind == "topup"]
         courtesies = [lot for lot in book.lots if lot.lot_kind == "courtesy"]
         expiries = self.expiries_of(book, as_of)
+        # debito-cortesia-automatico (wish Decision 4): under the courtesy
+        # rule the capacity net of debt is the spendable courtesy -- all the
+        # rule spends; it never creates debt nor settles the old one with
+        # it, and it never touches a paid lot.  The lines by kind stay.
+        net_available = (
+            book.available_trace_mc(as_of)
+            if await self.rule() is None
+            else book.courtesy_spendable_mc(as_of)
+        )
         return CreditBalanceResponse(
             as_of=as_of,
             monthly_available_mc=sum(lot.spendable_mc(as_of) for lot in monthly),
@@ -601,7 +689,7 @@ class CreditSnapshot:
             courtesy_available_mc=sum(lot.spendable_mc(as_of) for lot in courtesies),
             available_mc=book.available_mc(as_of),
             open_debt_mc=book.open_debt_mc,
-            net_available_mc=book.available_trace_mc(as_of),
+            net_available_mc=net_available,
             reserved_mc=reserved,
             next_expiry=(
                 None if not expiries else CreditNextExpiry(**expiries[0].model_dump())
@@ -659,9 +747,29 @@ class CreditSnapshot:
 
     # -- thresholds --------------------------------------------------------
 
+    async def _alerts(
+        self, builder_id: UUID, key: str
+    ) -> list[CreditThresholdAlertItem]:
+        """The threshold alerts recorded on one arm, lowest first."""
+
+        rows = await self.session.execute(
+            select(CreditThresholdAlert.threshold, CreditThresholdAlert.occurred_at)
+            .where(
+                CreditThresholdAlert.builder_id == builder_id,
+                CreditThresholdAlert.arm_key == key,
+            )
+            .order_by(CreditThresholdAlert.threshold)
+        )
+        return [
+            CreditThresholdAlertItem(threshold=int(threshold), occurred_at=_utc(at))
+            for threshold, at in rows
+        ]
+
     async def thresholds(self) -> CreditThresholdsResponse:
         book = await self.book()
         as_of = await self.as_of()
+        if book is not None and await self.rule() is not None:
+            return await self._rule_thresholds(book, as_of)
         capacity = 0 if book is None else capacity_in_force_mc(book, as_of)
         available = 0 if book is None else book.available_trace_mc(as_of)
         used = max(capacity - available, 0)
@@ -680,20 +788,7 @@ class CreditSnapshot:
                 or 0
             )
             key = arm_key(closed, (await self.window()).start.isoformat())
-            rows = await self.session.execute(
-                select(CreditThresholdAlert.threshold, CreditThresholdAlert.occurred_at)
-                .where(
-                    CreditThresholdAlert.builder_id == builder_id,
-                    CreditThresholdAlert.arm_key == key,
-                )
-                .order_by(CreditThresholdAlert.threshold)
-            )
-            alerts = [
-                CreditThresholdAlertItem(
-                    threshold=int(threshold), occurred_at=_utc(occurred_at)
-                )
-                for threshold, occurred_at in rows
-            ]
+            alerts = await self._alerts(builder_id, key)
         return CreditThresholdsResponse(
             as_of=as_of,
             capacity_mc=capacity,
@@ -702,6 +797,36 @@ class CreditSnapshot:
             used_percent=_used_percent(capacity, available, used),
             reached=list(thresholds_reached(capacity, available)),
             alerts=alerts,
+        )
+
+    async def _rule_thresholds(
+        self, book: LedgerBook, as_of: datetime
+    ) -> CreditThresholdsResponse:
+        """The thresholds under the courtesy rule (debito-cortesia-automatico,
+        DESIGN items 4 and 13): the lifecycle's courtesy basis -- capacity
+        what the unexpired courtesy lots brought net of removals
+        (:func:`~src.services.credit_lifecycle.courtesy_capacity_in_force_mc`),
+        available the spendable courtesy, no debt counted (the rule makes
+        none) -- and the alerts of the arm the lifecycle records them on,
+        ``c:{grant_effect_id}`` of the most recent courtesy grant: never an
+        episode-and-window arm."""
+
+        capacity = courtesy_capacity_in_force_mc(book, as_of)
+        available = book.courtesy_spendable_mc(as_of)
+        used = max(capacity - available, 0)
+        grant = await self.repository.latest_courtesy_grant_effect_id(book.builder_id)
+        return CreditThresholdsResponse(
+            as_of=as_of,
+            capacity_mc=capacity,
+            available_mc=available,
+            used_mc=used,
+            used_percent=_used_percent(capacity, available, used),
+            reached=list(courtesy_thresholds_reached(capacity, available)),
+            alerts=(
+                []
+                if grant is None
+                else await self._alerts(book.builder_id, courtesy_arm_key(grant))
+            ),
         )
 
     # -- consumption -------------------------------------------------------
@@ -965,8 +1090,9 @@ async def credit_summary(
         "Usable capacity of the monthly allowance, of the top-ups and of the "
         "courtesy credits a super admin granted (all three summed in "
         "available_mc), the allowance granted before its cycle starts, open "
-        "debt, capacity net of debt, what the window's reservations debited "
-        "and the next expiry."
+        "debt, capacity net of debt (under the courtesy rule: the spendable "
+        "courtesy), what the window's reservations debited and the next "
+        "expiry."
     ),
     model=CreditBalanceResponse,
 )
@@ -1054,7 +1180,12 @@ async def credit_reservations(
     summary="Credit thresholds",
     description=(
         "Share of the capacity in force consumed (counting open debt), the "
-        "50/90/100 % thresholds reached and the alerts recorded this arm."
+        "50/90/100 % thresholds reached and the alerts recorded this arm. "
+        "Under the courtesy rule: the courtesy basis (what the unexpired "
+        "courtesy lots brought, net of removals, against the spendable "
+        "courtesy) and the arm of the latest courtesy grant; with no "
+        "courtesy capacity in force (a blocked builder) every amount is 0, "
+        "used_percent reads 100 and nothing is reached."
     ),
     model=CreditThresholdsResponse,
 )
@@ -1072,7 +1203,13 @@ async def credit_thresholds(
         "active, pending (credit_pending), grace, suspended or deletion_due, "
         "the deadlines of an open exhaustion episode (the export deadline is "
         "its deletion deadline) and the mode (observational until "
-        "credit_enforcement_at)."
+        "credit_enforcement_at). Under the courtesy rule (a builder with "
+        "courtesy, neither the global enforcement nor an operator mark) the "
+        "mode is enforced and there is no episode: active while courtesy is "
+        "spendable, suspended with every deadline null once it is not and no "
+        "paid plan is in force; quarantine stays in pending_reasons (the "
+        "top-up stays refused) without making the state pending, and "
+        "reconciliation never applies."
     ),
     model=CreditStateResponse,
 )

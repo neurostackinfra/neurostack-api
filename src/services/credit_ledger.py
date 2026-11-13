@@ -165,6 +165,22 @@ like a reversal, but never debt and never anything consumed, settled or
 expired.  The super-admin service that drives both is
 :mod:`src.services.credit_courtesy`.
 
+The courtesy rule (debito-cortesia-automatico, DESIGN item 3 and Decisions
+4, 14 and 17).  A builder under it (``EffectiveEnforcement.origin ==
+"courtesy"``: no global, no mark, a courtesy lot ever received) spends in
+the mode its request CAPTURED at the pre-check, passed down as
+``captured`` (:meth:`CreditLedger.debit`, :meth:`CreditLedger.open_book`)
+and never re-read; without a capture the read under the lock decides.
+In that mode (:attr:`SpendHold.courtesy`) a debit pays only from
+``courtesy`` lots, FEFO among them, the last one possibly in part; what they
+cannot pay is forgiven (``DebitResult.forgiven_mc``), never debt; it settles
+nothing (neither :meth:`LedgerBook._settle` nor the start catch-up run, and
+a book opened to spend sweeps without the catch-up); ``monthly`` and
+``topup`` lots are never touched; and the quarantine hold never refuses
+(the courtesy depends on no ASAAS fact).  Grants, removals, reversals and
+restorations are unchanged: a new courtesy grant still settles old open
+debt first (DESIGN Risk 7).
+
 Group 4a (RAG and media).  A reservation is a DEBIT (owner decision B,
 2026-10-30): :mod:`src.services.credit_inventory` debits ``target -
 coverage`` of an accounting window through this book, so it has already left
@@ -202,7 +218,7 @@ from src.models.credit import (
     CreditLedgerEntry,
     CreditLot,
 )
-from src.repositories.credit import CreditRepository
+from src.repositories.credit import CreditRepository, EffectiveEnforcement
 
 logger = get_logger(__name__)
 
@@ -685,16 +701,34 @@ class DebtState:
 
 @dataclass(frozen=True)
 class SpendHold:
-    """Quarantine hold of one builder, read under its account lock."""
+    """Quarantine hold of one builder, read under its account lock, and the
+    mode its book spends in.
+
+    ``courtesy_at`` (debito-cortesia-automatico): set when the courtesy rule
+    governs the book -- the instant of the builder's first courtesy grant,
+    the rule's ``at`` -- either as the CAPTURED mode a debit caller passed
+    (:meth:`CreditLedger.open_book`, DESIGN Decision 14: never re-read) or,
+    without a capture, as the builder's effective enforcement read under
+    the lock.  Under it the book debits only courtesy lots, never creates
+    debt and never settles (:meth:`LedgerBook.debit`), and the hold never
+    refuses: the ASAAS gates do not apply to the rule (DESIGN item 7)."""
 
     quarantined: bool = False
     enforced: bool = False
+    courtesy_at: datetime | None = None
+
+    @property
+    def courtesy(self) -> bool:
+        """The courtesy rule governs this book (charged or blocked)."""
+
+        return self.courtesy_at is not None
 
     @property
     def active(self) -> bool:
-        """The hold refuses spend only after ``credit_enforcement_at``."""
+        """The hold refuses spend only after ``credit_enforcement_at`` -- and
+        never under the courtesy rule (DESIGN item 7)."""
 
-        return self.quarantined and self.enforced
+        return self.quarantined and self.enforced and not self.courtesy
 
 
 @dataclass(frozen=True)
@@ -762,6 +796,9 @@ class DebitResult:
     debited_mc: int = 0
     debt_mc: int = 0
     at: datetime | None = None
+    # debito-cortesia-automatico: what a courtesy-rule debit could not pay
+    # from courtesy lots and forgave (never debt, DESIGN Decision 4).
+    forgiven_mc: int = 0
 
 
 @dataclass(frozen=True)
@@ -944,6 +981,18 @@ class LedgerBook:
         at = self._read(at)
         return sum(lot.spendable_mc(at) for lot in self._lots.values())
 
+    def courtesy_spendable_mc(self, at: datetime) -> int:
+        """What the unexpired ``courtesy`` lots may spend at ``at``: the
+        "saldo gastavel de cortesia", all a courtesy-rule debit can pay
+        (debito-cortesia-automatico, DESIGN item 3)."""
+
+        at = self._read(at)
+        return sum(
+            lot.spendable_mc(at)
+            for lot in self._lots.values()
+            if lot.lot_kind == "courtesy"
+        )
+
     def available_trace_mc(self, at: datetime) -> int:
         """Usable capacity net of open debt.  The RAG/media reservations of
         Group 4a are debits of this book (owner decision B): they already
@@ -967,13 +1016,19 @@ class LedgerBook:
 
     # -- operations --------------------------------------------------------
 
-    def sweep_expired(self, at: datetime) -> None:
+    def sweep_expired(self, at: datetime, *, catch_up: bool = True) -> None:
         """Append the ``expiry`` of every lot past its deadline with balance,
         after the start catch-up (an allowance pays what it owed from its
-        start before it expires)."""
+        start before it expires).
+
+        ``catch_up=False`` (debito-cortesia-automatico): the sweep of a book
+        opened to SPEND under the courtesy rule, which settles nothing
+        (DESIGN item 3); the next writer outside the rule catches the
+        allowances up, dated at their starts as always."""
 
         at = self._tick(at)
-        self._settle_started_allowances(at)
+        if catch_up:
+            self._settle_started_allowances(at)
         before = len(self.writes.effects)
         for lot in self.lots:
             self._expire_if_due(lot, at)
@@ -1336,7 +1391,8 @@ class LedgerBook:
         """Consume ``amount_mc`` monthly-first then FEFO; the rest is debt.
 
         A known effect is a replay (nothing changes); an active quarantine
-        hold answers ``credit_pending`` (nothing changes).
+        hold answers ``credit_pending`` (nothing changes).  Under the
+        courtesy rule (``spend_hold.courtesy``) see :meth:`_debit_courtesy`.
         """
 
         at = self._tick(at)
@@ -1344,6 +1400,15 @@ class LedgerBook:
             raise ValueError("amount_mc must be a positive integer")
         if effect_id in self._known_effects:
             return DebitResult("duplicate", at=at)
+        if self.spend_hold.courtesy:
+            return self._debit_courtesy(
+                effect_id,
+                amount_mc,
+                at=at,
+                effect_kind=effect_kind,
+                tenant_id=tenant_id,
+                decision_digest=decision_digest,
+            )
         if self.spend_hold.active:
             return DebitResult("credit_pending", at=at)
         # A refused or replayed debit changes nothing; an accepted one first
@@ -1374,6 +1439,47 @@ class LedgerBook:
                 at=at,
             )
         return DebitResult("applied", amount_mc - remaining, remaining, at=at)
+
+    def _debit_courtesy(
+        self,
+        effect_id: str,
+        amount_mc: int,
+        *,
+        at: datetime,
+        effect_kind: str,
+        tenant_id: UUID | None,
+        decision_digest: str | None,
+    ) -> DebitResult:
+        """The debit of the courtesy rule (debito-cortesia-automatico, DESIGN
+        item 3 and Decision 4), by the mode the book was opened with: only
+        ``courtesy`` lots pay, FEFO among them (the earliest expiry first),
+        the last one possibly in part; what they cannot pay is forgiven
+        (``forgiven_mc``), never debt; open debt is never settled -- neither
+        :meth:`_settle` nor the start catch-up run -- and ``monthly`` and
+        ``topup`` lots are never touched.  The effect is always recorded:
+        it is the decision's idempotency boundary, even when nothing is
+        left to pay (storage never asks for that, ``credit_inventory`` pays
+        first what the courtesy holds)."""
+
+        self._ensure_effect(
+            effect_id,
+            effect_kind,
+            tenant_id=tenant_id,
+            decision_digest=decision_digest,
+        )
+        remaining = amount_mc
+        for lot in self.lots:
+            if remaining == 0:
+                break
+            if lot.lot_kind != "courtesy":
+                continue
+            take = min(remaining, lot.spendable_mc(at))
+            if take > 0:
+                self._entry(effect_id, lot.id, "debit", take, at)
+                remaining -= take
+        return DebitResult(
+            "applied", amount_mc - remaining, 0, at=at, forgiven_mc=remaining
+        )
 
     # -- internals ---------------------------------------------------------
 
@@ -1861,19 +1967,44 @@ class CreditLedger:
                 f"{self.clock_tolerance}"
             )
 
-    async def spend_hold(self, builder_id: UUID) -> SpendHold:
+    async def spend_hold(
+        self,
+        builder_id: UUID,
+        *,
+        captured: EffectiveEnforcement | None = None,
+        at: datetime | None = None,
+    ) -> SpendHold:
         """The builder's quarantine hold (read-only; exposed before the
         enforcement too, when it does not act).  ``enforced`` is the
         builder's effective enforcement (cobranca-credito-por-builder: the
         global ``credit_enforcement_at``, else the builder's mark), so the
         hold, the lifecycle of :meth:`persist` and the window opening of
         :meth:`debit` act for a marked builder and for no other one while
-        the global is unset."""
+        the global is unset.
 
+        debito-cortesia-automatico: a ``captured`` courtesy mode (a debit
+        caller's capture at its pre-check, DESIGN Decision 14) IS the mode:
+        nothing is re-read.  Without a capture the read decides, the
+        courtesy rule included.  Any other capture keeps the read above for
+        ``enforced`` and is never taken for the rule: a request captured on
+        a mark or the global debits as it was captured -- and when the
+        operator unmarked it between that capture and the debit, the rule the
+        read now finds is not taken for ``enforced`` either: the debit acts as
+        an unmarked builder's did before the rule (no hold, no window
+        opening), never with courtesy semantics.  ``at`` (the book's instant,
+        :meth:`open_book`) is when the read judges the rule; default now."""
+
+        quarantined = await self.repository.quarantine_hold(builder_id)
+        if captured is not None and captured.origin == "courtesy":
+            return SpendHold(
+                quarantined=quarantined, enforced=True, courtesy_at=captured.at
+            )
+        effective = await self.repository.effective_enforcement(builder_id, at=at)
+        rule = effective.origin == "courtesy"
         return SpendHold(
-            quarantined=await self.repository.quarantine_hold(builder_id),
-            enforced=(await self.repository.effective_enforcement(builder_id)).at
-            is not None,
+            quarantined=quarantined,
+            enforced=effective.at is not None and not (captured is not None and rule),
+            courtesy_at=effective.at if captured is None and rule else None,
         )
 
     async def open_book(
@@ -1882,6 +2013,8 @@ class CreditLedger:
         *,
         at: datetime,
         effect_ids: Iterable[str] = (),
+        captured: EffectiveEnforcement | None = None,
+        spending: bool = False,
     ) -> LedgerBook:
         """Lock order steps 2-3, then load the builder's state and sweep.
 
@@ -1891,6 +2024,12 @@ class CreditLedger:
         ledger, so an ``at`` behind another writer's never acts in the past;
         every operation of the book acts within the tolerance of the
         database clock read once the lock is held (:meth:`checked_instant`).
+
+        debito-cortesia-automatico: ``captured`` is the debit caller's mode
+        (:meth:`spend_hold`); ``spending`` -- a book opened to debit (a
+        trace, a reservation, a window opening, egress) -- under the
+        courtesy rule sweeps without the start catch-up: the rule settles
+        nothing (DESIGN item 3).  Every other book sweeps as before.
         """
 
         at = _aware(at, "at")
@@ -1912,7 +2051,7 @@ class CreditLedger:
             # row exists on ``main``).
             self._refuse_ledger_ahead(builder_id, _utc(latest), reference)
         at = self._within(builder_id, at, reference)
-        hold = await self.spend_hold(builder_id)
+        hold = await self.spend_hold(builder_id, captured=captured, at=at)
         locked = await repository.lock_lots(builder_id)
         known = set(
             await repository.effect_ids_of_kinds(builder_id, LEDGER_EFFECT_KINDS)
@@ -1938,7 +2077,7 @@ class CreditLedger:
             clock_ceiling=reference + self.clock_tolerance,
             spend_hold=hold,
         )
-        book.sweep_expired(at)
+        book.sweep_expired(at, catch_up=not (spending and hold.courtesy))
         return book
 
     async def persist(
@@ -2029,6 +2168,7 @@ class CreditLedger:
         effect_kind: str,
         tenant_id: UUID | None = None,
         decision_digest: str | None = None,
+        captured: EffectiveEnforcement | None = None,
     ) -> DebitResult:
         """Open the book, consume, persist (caller's transaction).
 
@@ -2041,9 +2181,20 @@ class CreditLedger:
         free baseline of the window open at the enforcement), in this book,
         after the sweep and before its own consumption; a readback that
         cannot be trusted answers ``credit_pending`` (nothing written).
+
+        debito-cortesia-automatico: ``captured`` is the request's mode at its
+        pre-check; a courtesy one is never re-read (DESIGN Decision 14): the
+        window opening and the debit pay only from courtesy lots, the rest
+        is forgiven (:meth:`LedgerBook.debit`).
         """
 
-        book = await self.open_book(builder_id, at=at, effect_ids=(effect_id,))
+        book = await self.open_book(
+            builder_id,
+            at=at,
+            effect_ids=(effect_id,),
+            captured=captured,
+            spending=True,
+        )
         opening = None
         if (
             book.spend_hold.enforced

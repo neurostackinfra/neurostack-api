@@ -28,6 +28,10 @@ proof on a fresh clone of one migrated (047) database:
 * with the global unset and no mark event ever, each worker runs ONE read
   more than before (``_ANY_MARK_READ``; none with the 047 gate closed) and
   writes nothing; with the global set no worker reads the marks.
+  debito-cortesia-automatico (DESIGN Decision 20): with no courtesy lot
+  either, the publisher and the orphan pass read one statement more
+  (``ANY_COURTESY_LOT_READ``) and stop; a courtesy lot alone turns them on
+  (tests/integration/test_credit_effective_enforcement_postgres.py).
 
 How an unmarked builder is shown untouched: every row of every ``credit_*``
 table that has a ``builder_id`` (and its tenant's outbox, claims and
@@ -68,6 +72,7 @@ from src.services.credit_rollout import (
 from tests.integration import test_credit_metering_postgres as metering_suite
 from tests.integration import test_credit_orphan_reconciliation_postgres as orphans
 from tests.integration.credit_rollout_world import (
+    ANY_COURTESY_LOT_READ,
     civil_today,
     clean,
     execute,
@@ -785,13 +790,22 @@ async def test_after_the_last_unmark_an_orphan_is_still_reconciled(
 # ---------------------------------------------------------------------------
 
 
-async def _dormant_world(harness: _Harness, clock: _Clock) -> tuple[UUID, datetime]:
+async def _dormant_world(
+    harness: _Harness, clock: _Clock, *, courtesy: bool = True
+) -> tuple[UUID, datetime]:
     """A builder whose courtesy lot expired, a stale outbox row and an
     enforced claim without its effect: everything a worker would act on if
-    it ran.  Returns the builder and an instant one hour after its expiry."""
+    it ran.  Returns the builder and an instant one hour after its expiry.
+
+    ``courtesy=False`` (debito-cortesia-automatico, DESIGN Decision 20): no
+    courtesy lot at all -- one would turn the publisher and the orphan pass
+    on by itself -- and the instant is the same."""
 
     builder_id = await make_builder(harness)
-    expired = await _courtesy(harness, clock, builder_id, _BASE)
+    if courtesy:
+        expired = await _courtesy(harness, clock, builder_id, _BASE)
+    else:
+        expired = _BASE + timedelta(days=30)
     seeded = await metering_suite._tenant(harness.engine)
     await metering_suite._outbox_row(harness.engine, seeded)
     assert seeded.builder_id is not None
@@ -828,13 +842,19 @@ async def test_with_nothing_ever_marked_each_worker_reads_once_more_and_writes_n
     """The global unset and no mark event: each worker reads the global (its
     one statement before the per-builder change) and then -- with the 047
     gate open -- whether any mark event exists, and stops.  With the gate
-    closed (a reading below 047) it reads the global only, as before."""
+    closed (a reading below 047) it reads the global only, as before.
+
+    debito-cortesia-automatico (DESIGN Decision 20): with no courtesy lot
+    either, the publisher and the orphan pass read one statement more --
+    whether any courtesy lot exists (the 046 gate is open on both readings)
+    -- and stop; the lifecycle worker never reads it."""
 
     if not gate_open:
         force_credit_switch(monkeypatch, revision="046")
-    _builder, at = await _dormant_world(clean, clock)
+    _builder, at = await _dormant_world(clean, clock, courtesy=False)
     before = await _all_credit_rows(clean)
     expected = [_ENFORCEMENT_READ, _ANY_MARK_READ] if gate_open else [_ENFORCEMENT_READ]
+    rule_trigger = [*expected, ANY_COURTESY_LOT_READ]
     sender = metering_suite._Recorded()
     credit_rollout.CREDIT_ORPHAN_EFFECTS.set(-1)
 
@@ -853,10 +873,11 @@ async def test_with_nothing_ever_marked_each_worker_reads_once_more_and_writes_n
             assert result == 0
 
     for name, statements in ticks.items():
-        assert len(statements) == len(expected), (name, statements)
+        reads = expected if name == "lifecycle" else rule_trigger
+        assert len(statements) == len(reads), (name, statements)
         assert all(
             pattern.fullmatch(statement)
-            for pattern, statement in zip(expected, statements, strict=True)
+            for pattern, statement in zip(reads, statements, strict=True)
         ), (name, statements)
     assert sender.sent == []
     assert orphans._orphan_gauge() == -1  # dormant: not even the gauge

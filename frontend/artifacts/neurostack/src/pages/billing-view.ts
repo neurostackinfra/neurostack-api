@@ -116,6 +116,10 @@ export function subscriptionMarker(subscription: Pick<SubscriptionSummary, "stat
  *   request is refused (`credit_pending`) before the lifecycle gate, so the
  *   balance is withheld and no top-up is offered. Fail closed.
  * - `standing`: no hold; the balance is shown.
+ *
+ * It decides the top-up (`deriveTopupState`) on its own. Showing the balance
+ * goes through `creditBalanceStanding`, which differs from it only for the
+ * courtesy rule's charged builder in quarantine (wish Decision 4).
  */
 export function creditLedgerStanding(
   state: Pick<CreditStateInfo, "state" | "pending_reasons">,
@@ -128,6 +132,44 @@ export function creditLedgerStanding(
   if (standalone && others.length === 0) return "not_applicable";
   if (state.state === "pending" || others.length > 0) return "pending";
   return "standing";
+}
+
+/**
+ * debito-cortesia-automatico (wish Decision 4): a builder charged under the
+ * courtesy rule while an ASAAS payment is in quarantine. The server answers
+ * `mode` `enforced`, `state` `active` and `quarantine` as the only reason --
+ * a pair only the rule produces: outside it, any reason turns `active` into
+ * `pending`. The rule debits courtesy only, which depends on no ASAAS fact,
+ * so the balance is real; the top-up stays refused under `quarantine`.
+ * Allowlist, fail closed: another reason (`reconciliation`, which the rule
+ * never sends, or one this UI does not know), another state or the
+ * observational mode is not this pair.
+ */
+export function chargedInQuarantine(
+  state: Pick<CreditStateInfo, "mode" | "state" | "pending_reasons">,
+): boolean {
+  return (
+    state.mode === "enforced" &&
+    state.state === "active" &&
+    state.pending_reasons.length > 0 &&
+    state.pending_reasons.every((reason) => reason === "quarantine")
+  );
+}
+
+/**
+ * Whether the balance is SHOWN (wish Decision 4 separates showing the balance
+ * from offering a top-up, which stays with `creditLedgerStanding`): the
+ * ledger's own standing, except that a builder charged under the courtesy
+ * rule in quarantine (`chargedInQuarantine`) sees its balance without
+ * "Pendente". Every other hold, `suspended` + `quarantine` included (the
+ * rule's blocked builder as much as a marked one), stays `pending` exactly as
+ * before.
+ */
+export function creditBalanceStanding(
+  state: Pick<CreditStateInfo, "mode" | "state" | "pending_reasons">,
+): "not_applicable" | "pending" | "standing" {
+  const ledger = creditLedgerStanding(state);
+  return ledger === "pending" && chargedInQuarantine(state) ? "standing" : ledger;
 }
 
 export function deriveBillingView({
@@ -318,7 +360,10 @@ const TOPUP_METHODS: readonly TopupMethod[] = ["credit_card", "pix"];
  *   with no credit account), under every lifecycle state.
  * - `blocked` (no action, a textual reason) while the ledger is on hold
  *   (`creditLedgerStanding`: any reason other than `standalone`, under any
- *   lifecycle state, or the `pending` state itself), while a checkout is live
+ *   lifecycle state, or the `pending` state itself; also for a builder
+ *   charged under the courtesy rule in quarantine, whose balance is shown by
+ *   `creditBalanceStanding`: the money rule does not change, wish
+ *   Decision 4), while a checkout is live
  *   (the summary's `live_session`, or this tab's stored session, read or not
  *   yet read), or when the packages could not be read.
  * - `hidden` while the packages are still loading: loading is not an error.

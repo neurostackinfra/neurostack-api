@@ -141,6 +141,55 @@ def test_the_state_and_mode_are_closed_enumerations(schema: dict[str, Any]) -> N
     assert "export_deadline_at" in state
 
 
+def _words(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_the_state_documents_the_courtesy_rule_with_no_new_value(
+    schema: dict[str, Any],
+) -> None:
+    """debito-cortesia-automatico, wish Decision 4: the contract keeps every
+    value (the enumerations above are unchanged; no field is added) and
+    documents the rule -- ``active``/``suspended`` with null deadlines,
+    ``quarantine`` kept as a reason without ``pending``, never
+    ``reconciliation``, and the spendable courtesy as the net available."""
+
+    components = schema["components"]["schemas"]
+    state = components["CreditStateResponse"]
+    assert set(state["properties"]) == {
+        "as_of",
+        "mode",
+        "enforcement_at",
+        "state",
+        "pending_reasons",
+        "exhausted_at",
+        "suspension_due_at",
+        "deletion_due_at",
+        "export_deadline_at",
+    }
+    described = _words(state["description"])
+    for needle in (
+        "Under the courtesy rule",
+        "``mode`` is ``enforced`` and there is no episode",
+        "``active`` while courtesy is spendable and ``suspended``",
+        "``export_deadline_at`` null",
+        "``quarantine`` stays in ``pending_reasons`` (a top-up stays refused)",
+        "without making the state ``pending``",
+        "``reconciliation`` never applies",
+    ):
+        assert needle in described, needle
+    balance = _words(components["CreditBalanceResponse"]["description"])
+    assert "``net_available_mc`` is the spendable courtesy" in balance
+    route = _words(schema["paths"]["/v1/credits/state"]["get"]["description"])
+    for needle in (
+        "Under the courtesy rule",
+        "suspended with every deadline null",
+        "quarantine stays in pending_reasons (the top-up stays refused)",
+        "reconciliation never applies",
+    ):
+        assert needle in route, needle
+
+
 def test_the_checkout_the_ui_calls_accepts_no_price_quantity_or_builder(
     schema: dict[str, Any],
 ) -> None:
@@ -317,3 +366,15 @@ def test_no_route_marks_or_unmarks_a_builder(schema: dict[str, Any]) -> None:
     assert (_SUBSCRIPTIONS, "GET") in mounted
     assert {path for path, _ in mounted} >= set(schema["paths"])
     assert [route for route in mounted if pattern.search(route[0].lower())] == []
+
+
+def test_the_thresholds_document_zero_courtesy_capacity(
+    schema: dict[str, Any],
+) -> None:
+    """debito-cortesia-automatico Group 5a: a blocked builder's thresholds
+    (no courtesy capacity in force) read 100 %, described, not computed."""
+
+    described = schema["paths"]["/v1/credits/thresholds"]["get"]["description"]
+    assert "used_percent reads 100 and nothing is reached" in described
+    component = schema["components"]["schemas"]["CreditThresholdsResponse"]
+    assert "``used_percent`` 100 and nothing reached" in component["description"]

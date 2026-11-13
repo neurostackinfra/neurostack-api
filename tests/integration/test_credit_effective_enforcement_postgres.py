@@ -18,8 +18,9 @@ gate):
   read API -- and nothing breaks;
 * a marked builder with only a courtesy lot is debited by expiry (FEFO) on
   ``POST /v1/events`` by API key, Z-API and Meta, and reads ``mode``
-  ``enforced``; an unmarked builder in the same test, with a courtesy lot
-  too, reads ``observational`` and its lot and ledger never move;
+  ``enforced``; an unmarked builder in the same test, without courtesy
+  (one with courtesy is under the courtesy rule, debito-cortesia-automatico),
+  reads ``observational`` and its ledger never moves;
 * the channels: Uazapi and Evolution traffic of the marked builder stays
   observational (recorded, never silent, never charged), and its outgoing
   media there is recorded observationally while Z-API and Meta media is
@@ -35,6 +36,22 @@ gate):
   knowledge upload; a tenant unlinked from its marked builder is never
   ``credit_pending``; relinked during the LLM call, the builder locked at
   the final transaction is never charged.
+* debito-cortesia-automatico Group 2, through the real app on
+  ``POST /v1/events``, Z-API and Meta: a builder with no global and no mark
+  that ever received courtesy is captured on the courtesy rule -- charged
+  from courtesy lots only (even in an ASAAS quarantine and with an
+  unusable binding coverage, where its marked twin is ``credit_pending``),
+  ``blocked`` answered 402/200 ``credit_suspended`` with nothing written (no
+  session, no reply, no LGPD notice) until a new grant unblocks it; the
+  race: a grant or a removal between the capture and the lock is 503 before
+  any write, the final transaction never re-reads the mode (a removal or a
+  mark during the LLM call changes nothing of its debit) and a tenant
+  relinked to another builder is charged to neither; the rule's per-tenant
+  D1; a charged row of an ``unknown`` turn carries ``unknown`` in its
+  ``decision_digest``, a production one ``production``; the publisher and
+  the orphan pass run on a courtesy lot alone; and the shared block gate
+  (``tenant_suspended``, ``reservation_verdict``) reports the rule's block
+  and never a stale mark-era episode for a charged builder.
 
 How each proof shows that an unmarked builder is never charged, blocked or
 written to: its credit rows (accounts, effects, ledger, lots, allocations,
@@ -54,6 +71,7 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -78,12 +96,21 @@ from src.repositories.credit import (
 from src.services import credit_inventory, credit_metering
 from tests.integration import test_credit_metering_postgres as metering_suite
 from tests.integration.credit_rollout_world import (
+    civil_today,
+    debt_rows,
+    effective_of,
     execute_on,
     force_credit_switch,
     forget_enforcement_latches,
+    grant_courtesy,
+    make_cycle,
+    make_subscription,
+    make_topup,
     mark_events,
+    paid_lot_moves,
     record_mark,
     relink_tenant,
+    remove_courtesy,
 )
 from tests.integration.test_asaas_billing_postgres import _validated_admin_url
 from tests.integration.test_migration_036_postgres import _Cluster, _migrate
@@ -488,14 +515,17 @@ def test_the_verdict_is_the_instant_and_the_origin_only() -> None:
     assert not NOT_ENFORCED.enforced and EffectiveEnforcement(at, "mark").enforced
 
 
-def test_the_reparent_rule_applies_only_to_a_captured_mark() -> None:
+def test_the_reparent_rule_applies_to_a_captured_mark_or_courtesy_rule() -> None:
     at = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
     builder, other = uuid4(), uuid4()
     mark = EffectiveEnforcement(at, "mark", builder_id=builder)
+    # debito-cortesia-automatico (DESIGN item 11): the courtesy rule too.
+    rule = EffectiveEnforcement(at, "courtesy", builder_id=builder, state="charged")
     reparented = credit_metering.reparented_since_capture
-    assert reparented(mark, other)
-    assert not reparented(mark, builder)
-    assert not reparented(mark, None)  # standalone: LOW-5's own branch
+    for captured in (mark, rule):
+        assert reparented(captured, other)
+        assert not reparented(captured, builder)
+        assert not reparented(captured, None)  # standalone: LOW-5's own branch
     assert not reparented(EffectiveEnforcement(at, "global"), other)
     assert not reparented(None, other)
 
@@ -771,9 +801,14 @@ async def test_a_marked_builder_is_charged_fefo_and_reads_enforced(
     """Success Criteria 3: the marked builder's courtesy lot pays its API
     key, Z-API and Meta decisions (one trace each, by expiry) and its
     knowledge upload's reservation, ``mode`` is ``enforced`` for it; the
-    unmarked builder of the same test, with a courtesy lot of its own, stays
-    ``observational`` and nothing of its credit moves.  None of it sets a
-    global latch (the inventory's included: the upload reads its mode)."""
+    unmarked builder of the same test stays ``observational`` and nothing of
+    its credit moves.  None of it sets a global latch (the inventory's
+    included: the upload reads its mode).
+
+    debito-cortesia-automatico: the unmarked builder has NO courtesy here --
+    an unmarked builder with courtesy is under the courtesy rule and charged
+    (tests/integration/test_credit_courtesy_rule_postgres.py); one that
+    never had courtesy is exactly the unmarked builder of before."""
 
     from src.api.routes import webhook
 
@@ -782,7 +817,6 @@ async def test_a_marked_builder_is_charged_fefo_and_reads_enforced(
         marked = UUID(world.builder)
         other = await _builder_with_api_tenant(direct)
         lot = await _grant_courtesy(direct, marked, 100)
-        other_lot = await _grant_courtesy(direct, other.builder, 100)
         other_before = await _builder_rows(direct, other.builder)
         await record_mark(direct, marked)
         async with asyncio.timeout(_TURN_SECONDS):
@@ -886,11 +920,9 @@ async def test_a_marked_builder_is_charged_fefo_and_reads_enforced(
     assert theirs.json()["state"]["mode"] == "observational"
     assert theirs.json()["consumption"]["mode"] == "observational"
     assert theirs.json()["state"]["enforcement_at"] is None
-    assert theirs.json()["balance"]["courtesy_available_mc"] == 100_000
+    assert theirs.json()["balance"]["courtesy_available_mc"] == 0
     assert await _builder_rows(direct, other.builder) == other_before
-    assert [(k, a, l) for k, a, l in await _ledger(direct, other.builder)] == [
-        ("grant", 100_000, other_lot)
-    ]
+    assert await _ledger(direct, other.builder) == []
     observed = await _tenant_rows(direct, other.tenant)
     assert observed["observations"] == 1 and observed["effects"] == 0
     # Seeing marks never sets a global latch -- the inventory's neither,
@@ -1102,11 +1134,13 @@ async def test_d1_per_tenant_both_ways_and_another_builder_unaffected(
         original = CreditRepository._marked_enforcement
 
         async def maybe_broken(
-            self: CreditRepository, builder_id: UUID | None, readable: Any
+            self: CreditRepository, builder_id: UUID | None, readable: Any, *rest: Any
         ) -> EffectiveEnforcement:
+            # ``rest``: the courtesy rule's gate and instant
+            # (debito-cortesia-automatico), forwarded untouched.
             if broken["on"]:
                 raise OperationalError("SELECT", {}, Exception("marks unreadable"))
-            return await original(self, builder_id, readable)
+            return await original(self, builder_id, readable, *rest)
 
         monkeypatch.setattr(CreditRepository, "_marked_enforcement", maybe_broken)
         keys = iter(f"d1-{n}" for n in range(100))
@@ -1719,3 +1753,831 @@ async def test_relinked_during_the_llm_the_locked_builder_is_never_charged(
     rows = await _tenant_rows(direct, tenant)
     assert rows["effects"] == 0 and rows["outbox"] == 1  # answered, stored
     assert marked_before["credit_ledger_entries"] == 0
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 2: the courtesy rule on the shared enforced
+# path (POST /v1/events, Z-API, Meta) -- charged from courtesy only, blocked
+# at once, the race, the rule's D1, the real origin, the workers and the
+# shared block gate.
+# ---------------------------------------------------------------------------
+
+
+def _harness(engine: AsyncEngine) -> Any:
+    """What the ``credit_rollout_world`` seeds take (``engine``, ``sessions``)."""
+
+    return SimpleNamespace(
+        engine=engine,
+        sessions=async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+        ),
+    )
+
+
+def _charged(at: datetime) -> EffectiveEnforcement:
+    return EffectiveEnforcement(at, "courtesy", state="charged")
+
+
+def _blocked(at: datetime) -> EffectiveEnforcement:
+    return EffectiveEnforcement(at, "courtesy", state="blocked")
+
+
+async def _trace_debits(engine: AsyncEngine, builder_id: UUID) -> list[tuple[int, Any]]:
+    """The builder's ``debit`` entries of its ``trace`` effects."""
+
+    return [
+        (amount, lot)
+        for kind, amount, lot in await _debits(engine, builder_id)
+        if kind == "trace"
+    ]
+
+
+async def _trace_effects(engine: AsyncEngine, builder_id: UUID) -> list[str | None]:
+    """The ``decision_digest`` of every ``trace`` effect of the builder."""
+
+    async with engine.connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT decision_digest FROM credit_effects WHERE builder_id = :b "
+                "AND effect_kind = 'trace' ORDER BY created_at, id"
+            ),
+            {"b": builder_id},
+        )
+        return [digest for (digest,) in rows]
+
+
+async def _patient_sessions(engine: AsyncEngine, tenant_id: UUID, phone: str) -> int:
+    async with engine.connect() as connection:
+        return int(
+            await connection.scalar(
+                text(
+                    "SELECT count(*) FROM sessions WHERE tenant_id = :t "
+                    "AND user_id = :p"
+                ),
+                {"t": tenant_id, "p": phone},
+            )
+        )
+
+
+def _digests(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Every ``decision_digest`` the process computes: ``(origin, digest)``."""
+
+    seen: list[tuple[str, str]] = []
+    original = credit_metering.decision_digest
+
+    def spy(**kwargs: Any) -> str:
+        digest = original(**kwargs)
+        seen.append((kwargs["origin"].value, digest))
+        return digest
+
+    monkeypatch.setattr(credit_metering, "decision_digest", spy)
+    return seen
+
+
+def _tenants(world: Any) -> tuple[UUID, UUID, UUID]:
+    return UUID(world.api_tenant), UUID(world.zapi_tenant), UUID(world.meta_tenant)
+
+
+async def test_a_charged_courtesy_builder_pays_courtesy_only_even_in_quarantine(
+    pg: Any, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No global, no mark, a courtesy lot: one trace per ``POST /v1/events``,
+    Z-API and Meta decision, debited from the courtesy lot alone; an ASAAS
+    quarantine and an unusable binding coverage refuse none of them (DESIGN
+    item 7: no ``credit_pending``), no paid lot moves, no debt; every
+    digest is ``production``.  The control: the same builder, once marked,
+    is ``credit_pending`` by that very quarantine."""
+
+    from src.services.credit_rollout import CreditRolloutService
+
+    async with _app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        builder = UUID(world.builder)
+        harness = _harness(direct)
+        granted = await grant_courtesy(direct, builder, 10)  # its account too
+        subscription = await make_subscription(harness, builder)
+        today = civil_today()
+        await make_cycle(
+            harness,
+            builder,
+            subscription,
+            start=today - timedelta(days=3),
+            end=today + timedelta(days=27),
+            state="quarantined",
+        )
+        await make_topup(harness, builder, state="quarantined")
+        async with AsyncSession(direct) as session:
+            quarantined = await CreditRepository(session).quarantine_hold(builder)
+            coverage = await CreditRolloutService(session).binding_coverage(builder)
+            await session.rollback()
+        assert quarantined and not coverage.usable  # the gates would refuse
+        assert await effective_of(direct, builder) == _charged(granted.occurred_at)
+        digests = _digests(monkeypatch)
+        async with asyncio.timeout(_TURN_SECONDS):
+            events = await client.post(
+                "/v1/events",
+                json=metering_suite._events_body(world.api_session),
+                headers=_api(world.api_key, "rule-charged-1"),
+            )
+            zapi = await client.post(
+                f"/v1/webhook/zapi/{world.zapi_token}",
+                json=_zapi(world, "rule-charged-zapi-1", "5511900008101"),
+            )
+            raw, headers = metering_suite._signed_meta(
+                world, _meta_message("wamid.rule-charged-meta-1", "5511900008102")
+            )
+            meta = await client.post("/v1/webhook/meta", content=raw, headers=headers)
+        seen = [credit_metering.enforcement_rule_seen(t) for t in _tenants(world)]
+        marks_seen = [credit_metering.enforcement_mark_seen(t) for t in _tenants(world)]
+        global_seen = credit_metering.enforcement_seen()
+        await record_mark(direct, builder)
+        async with asyncio.timeout(_TURN_SECONDS):
+            marked = await client.post(
+                "/v1/events",
+                json=metering_suite._events_body(world.api_session),
+                headers=_api(world.api_key, "rule-charged-marked-1"),
+            )
+    assert events.status_code == 200, events.text
+    assert zapi.json() == {"ok": True, "replied": True}, zapi.text
+    assert meta.status_code == 200 and "skipped" not in meta.json(), meta.text
+    assert await _trace_debits(direct, builder) == [(1_000, granted.lot_id)] * 3
+    assert await paid_lot_moves(direct, builder) == []
+    assert await debt_rows(direct, builder) == (0, 0)
+    assert (await _builder_rows(direct, builder))["enforced_claims"] == 3
+    stored = await _trace_effects(direct, builder)
+    assert len(stored) == 3
+    assert set(stored) <= {
+        digest for origin, digest in digests if origin == "production"
+    }
+    assert {origin for origin, _ in digests} == {"production"}
+    assert seen == [True, True, True]
+    assert marks_seen == [False, False, False] and global_seen is False
+    assert marked.status_code == 402 and marked.json() == {"code": "credit_pending"}
+
+
+async def test_a_blocked_courtesy_builder_is_suspended_with_nothing_written(
+    pg: Any, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its courtesy removed ("Tirar tudo") and no paid plan: ``POST
+    /v1/events`` 402 ``credit_suspended`` (a call without ``Idempotency-Key``
+    still 400, DESIGN Risk 4), Z-API and Meta 200 ``skipped:
+    credit_suspended`` -- no session, no reply, no LGPD notice, no claim,
+    effect, event or credit row.  A new grant unblocks it with no
+    operator."""
+
+    from src.api.routes import webhook
+
+    async with _app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        builder = UUID(world.builder)
+        granted = await grant_courtesy(direct, builder, 5)
+        await remove_courtesy(direct, granted.lot_id)
+        assert await effective_of(direct, builder) == _blocked(granted.occurred_at)
+        zapi_phone, meta_phone = "5511900008201", "5511900008202"
+        before = [await _builder_rows(direct, builder)] + [
+            await _tenant_rows(direct, tenant) for tenant in _tenants(world)
+        ]
+        zapi_sends = webhook.send_text_message.await_count
+        meta_sends = webhook.send_meta_cloud_text.await_count
+        async with asyncio.timeout(_TURN_SECONDS):
+            events = await client.post(
+                "/v1/events",
+                json=metering_suite._events_body(world.api_session),
+                headers=_api(world.api_key, "rule-blocked-1"),
+            )
+            keyless = await client.post(
+                "/v1/events",
+                json=metering_suite._events_body(world.api_session),
+                headers=_api(world.api_key, None),
+            )
+            zapi = await client.post(
+                f"/v1/webhook/zapi/{world.zapi_token}",
+                json=_zapi(world, "rule-blocked-zapi-1", zapi_phone),
+            )
+            raw, headers = metering_suite._signed_meta(
+                world, _meta_message("wamid.rule-blocked-meta-1", meta_phone)
+            )
+            meta = await client.post("/v1/webhook/meta", content=raw, headers=headers)
+        after = [await _builder_rows(direct, builder)] + [
+            await _tenant_rows(direct, tenant) for tenant in _tenants(world)
+        ]
+        sends = (
+            webhook.send_text_message.await_count - zapi_sends,
+            webhook.send_meta_cloud_text.await_count - meta_sends,
+        )
+        patients = (
+            await _patient_sessions(direct, UUID(world.zapi_tenant), zapi_phone),
+            await _patient_sessions(direct, UUID(world.meta_tenant), meta_phone),
+        )
+        regranted = await grant_courtesy(direct, builder, 1)
+        async with asyncio.timeout(_TURN_SECONDS):
+            unblocked = await client.post(
+                "/v1/events",
+                json=metering_suite._events_body(world.api_session),
+                headers=_api(world.api_key, "rule-blocked-2"),
+            )
+    suspended = {"ok": True, "skipped": "credit_suspended"}
+    assert events.status_code == 402 and events.json() == {"code": "credit_suspended"}
+    assert keyless.status_code == 400
+    assert keyless.json() == {"code": "idempotency_key_required"}
+    assert zapi.status_code == 200 and zapi.json() == suspended, zapi.text
+    assert meta.status_code == 200 and meta.json() == suspended, meta.text
+    assert after == before
+    assert sends == (0, 0)  # no reply and no LGPD notice
+    assert patients == (0, 0)  # no session
+    assert unblocked.status_code == 200, unblocked.text
+    assert await _trace_debits(direct, builder) == [(1_000, regranted.lot_id)]
+
+
+def _after(monkeypatch: pytest.MonkeyPatch, name: str, change: Any) -> dict[str, int]:
+    """Wrap ``credit_metering.<name>`` so that ``change`` runs right after it
+    returned -- once: the operator's grant or removal landing between the
+    capture of the mode and the enforced transaction's lock."""
+
+    original = getattr(credit_metering, name)
+    calls = {"changed": 0}
+
+    async def wrapped(*args: Any, **kwargs: Any) -> Any:
+        captured = await original(*args, **kwargs)
+        if not calls["changed"]:
+            calls["changed"] += 1
+            await change()
+        return captured
+
+    monkeypatch.setattr(credit_metering, name, wrapped)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("channel", "change"),
+    [
+        ("events", "removed"),
+        ("events", "granted"),
+        ("zapi", "removed"),
+        ("meta", "granted"),
+    ],
+)
+async def test_a_rule_change_between_the_capture_and_the_lock_is_503(
+    pg: Any,
+    direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    change: str,
+) -> None:
+    """DESIGN item 11: captured ``charged`` then all courtesy removed
+    (``blocked`` under the lock), or captured ``blocked`` then granted
+    (``charged``): the pre-check's re-check by ``(origin, at, state)`` is 503
+    ``credit_enforcement_unavailable`` before any write; on ``POST
+    /v1/events`` a retry with the same key decides again on the new state;
+    on a webhook the message is lost (as for a mark)."""
+
+    async with _app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        builder = UUID(world.builder)
+        tenant = UUID(
+            {
+                "events": world.api_tenant,
+                "zapi": world.zapi_tenant,
+                "meta": world.meta_tenant,
+            }[channel]
+        )
+        first = await grant_courtesy(direct, builder, 5)
+        if change == "granted":
+            await remove_courtesy(direct, first.lot_id)
+        lots: dict[str, Any] = {}
+
+        async def operator() -> None:
+            if change == "removed":
+                await remove_courtesy(direct, first.lot_id)
+            else:
+                lots["new"] = (await grant_courtesy(direct, builder, 2)).lot_id
+
+        calls = _after(
+            monkeypatch,
+            (
+                "capture_events_enforcement"
+                if channel == "events"
+                else "read_tenant_enforcement"
+            ),
+            operator,
+        )
+        before = await _tenant_rows(direct, tenant)
+        async with asyncio.timeout(_TURN_SECONDS):
+            if channel == "events":
+                raced = await client.post(
+                    "/v1/events",
+                    json=metering_suite._events_body(world.api_session),
+                    headers=_api(world.api_key, "rule-raced-1"),
+                )
+            elif channel == "zapi":
+                raced = await client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi(world, "rule-raced-zapi-1", "5511900008301"),
+                )
+            else:
+                raw, headers = metering_suite._signed_meta(
+                    world, _meta_message("wamid.rule-raced-meta-1", "5511900008302")
+                )
+                raced = await client.post(
+                    "/v1/webhook/meta", content=raw, headers=headers
+                )
+        after = await _tenant_rows(direct, tenant)
+        claims = (await _builder_rows(direct, builder))["enforced_claims"]
+        traces = await _trace_effects(direct, builder)
+        if channel == "events":
+            async with asyncio.timeout(_TURN_SECONDS):
+                retried = await client.post(
+                    "/v1/events",
+                    json=metering_suite._events_body(world.api_session),
+                    headers=_api(world.api_key, "rule-raced-1"),
+                )
+    assert calls == {"changed": 1}
+    expected = (
+        {"code": "credit_enforcement_unavailable"}
+        if channel == "events"
+        else {"error": "credit_enforcement_unavailable"}
+    )
+    assert raced.status_code == 503 and raced.json() == expected, raced.text
+    assert after == before  # no claim, effect, outbox, event of the request
+    assert claims == 0 and traces == []
+    if channel == "events":
+        if change == "removed":
+            assert retried.status_code == 402
+            assert retried.json() == {"code": "credit_suspended"}
+        else:
+            assert retried.status_code == 200, retried.text
+            assert await _trace_debits(direct, builder) == [(1_000, lots["new"])]
+
+
+@pytest.mark.parametrize("channel", ["events", "zapi"])
+@pytest.mark.parametrize("during", ["removed", "marked"])
+async def test_the_final_transaction_never_rereads_the_rule(
+    pg: Any,
+    direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    during: str,
+) -> None:
+    """DESIGN Decision 14: captured ``charged``; during the LLM call the
+    operator removes all courtesy (the builder is then protected by its
+    paid top-up) or marks the builder.  The final transaction never re-reads
+    the mode and never answers 503: it debits what courtesy there is (the
+    rest forgiven) -- no paid lot moves (a re-read would spend the top-up,
+    which expires first), no debt -- and the decision is answered."""
+
+    from src.services.event_service import EventService
+
+    async with _app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        builder = UUID(world.builder)
+        granted = await grant_courtesy(direct, builder, 3)  # its account too
+        await make_topup(
+            _harness(direct),
+            builder,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=3),
+        )
+        generate = EventService.generate_response
+        changed = {"count": 0}
+
+        async def mid_turn(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if not changed["count"]:
+                changed["count"] += 1
+                if during == "removed":
+                    await remove_courtesy(direct, granted.lot_id)
+                else:
+                    await record_mark(direct, builder)
+            return await generate(self, *args, **kwargs)
+
+        monkeypatch.setattr(EventService, "generate_response", mid_turn)
+        async with asyncio.timeout(_TURN_SECONDS):
+            if channel == "events":
+                answer = await client.post(
+                    "/v1/events",
+                    json=metering_suite._events_body(world.api_session),
+                    headers=_api(world.api_key, "rule-final-1"),
+                )
+            else:
+                answer = await client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi(world, "rule-final-zapi-1", "5511900008401"),
+                )
+        now = await effective_of(direct, builder)
+    assert changed == {"count": 1}
+    assert answer.status_code == 200, answer.text
+    if channel == "zapi":
+        assert answer.json() == {"ok": True, "replied": True}
+    assert now.origin == (None if during == "removed" else "mark")
+    paid = [] if during == "removed" else [(1_000, granted.lot_id)]
+    assert await _trace_debits(direct, builder) == paid
+    assert len(await _trace_effects(direct, builder)) == 1  # forgiven or paid
+    assert await paid_lot_moves(direct, builder) == []
+    assert await debt_rows(direct, builder) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("channel", "when"),
+    [("events", "before_claim"), ("events", "during_llm"), ("zapi", "during_llm")],
+)
+async def test_a_tenant_relinked_after_a_rule_capture_is_charged_to_no_courtesy(
+    pg: Any,
+    direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    when: str,
+) -> None:
+    """``reparented_since_capture`` holds for ``courtesy`` (DESIGN item 11):
+    relinked to another builder with courtesy of its own after the
+    pre-check, the claim is refused (503, no claim for the other builder),
+    or -- relinked during the LLM call -- the decision is answered and
+    charged to neither builder's courtesy."""
+
+    from src.services.event_service import EventService
+
+    async with _app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        builder = UUID(world.builder)
+        tenant = UUID(world.api_tenant if channel == "events" else world.zapi_tenant)
+        other = await _builder_with_api_tenant(direct, "Courtesy builder")
+        await grant_courtesy(direct, builder, 5)
+        await grant_courtesy(direct, other.builder, 5)
+        other_before = await _builder_rows(direct, other.builder)
+        relinked = {"count": 0}
+
+        async def relink() -> None:
+            if not relinked["count"]:
+                relinked["count"] += 1
+                await relink_tenant(direct, tenant, other.builder)
+
+        if when == "before_claim":
+            original = credit_metering.precheck_events
+
+            async def then_relink(*args: Any, **kwargs: Any) -> Any:
+                verdict = await original(*args, **kwargs)
+                await relink()
+                return verdict
+
+            monkeypatch.setattr(credit_metering, "precheck_events", then_relink)
+        else:
+            generate = EventService.generate_response
+
+            async def mid_turn(self: Any, *args: Any, **kwargs: Any) -> Any:
+                await relink()
+                return await generate(self, *args, **kwargs)
+
+            monkeypatch.setattr(EventService, "generate_response", mid_turn)
+        async with asyncio.timeout(_TURN_SECONDS):
+            if channel == "events":
+                answer = await client.post(
+                    "/v1/events",
+                    json=metering_suite._events_body(world.api_session),
+                    headers=_api(world.api_key, "rule-relinked-1"),
+                )
+            else:
+                answer = await client.post(
+                    f"/v1/webhook/zapi/{world.zapi_token}",
+                    json=_zapi(world, "rule-relinked-zapi-1", "5511900008501"),
+                )
+        rows = await _tenant_rows(direct, tenant)
+    assert relinked == {"count": 1}
+    if when == "before_claim":
+        assert answer.status_code == 503, answer.text
+        assert answer.json() == {"code": "credit_enforcement_unavailable"}
+        assert rows["claims"] == 0
+    else:
+        assert answer.status_code == 200, answer.text
+        assert rows["effects"] == 0
+    assert await _trace_debits(direct, builder) == []
+    assert await _trace_debits(direct, other.builder) == []
+    assert await _builder_rows(direct, other.builder) == other_before
+
+
+async def test_the_rule_d1_is_per_tenant_and_another_builder_is_unaffected(
+    pg: Any, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESIGN item 11: a tenant seen under the rule gets 503 when its rule
+    cannot be read -- a failed read, or the 046 gate closed (a reading at
+    045) -- while another builder's tenant answers as before; a successful
+    read that is not under the rule (protected by a paid top-up) clears it;
+    seeing the rule sets neither the global latch nor the mark set."""
+
+    from src.services import credit_switch
+
+    async with _app(pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        builder, tenant = UUID(world.builder), UUID(world.api_tenant)
+        other = await _builder_with_api_tenant(direct)
+        granted = await grant_courtesy(direct, builder, 5)
+        broken = {"on": False}
+        original = CreditRepository._courtesy_enforcement
+
+        async def maybe_broken(
+            self: CreditRepository, *args: Any, **kwargs: Any
+        ) -> Any:
+            if broken["on"]:
+                raise OperationalError("SELECT", {}, Exception("lots unreadable"))
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(CreditRepository, "_courtesy_enforcement", maybe_broken)
+        keys = iter(f"rule-d1-{n}" for n in range(100))
+
+        async def post(session: str, key: str) -> Any:
+            async with asyncio.timeout(_TURN_SECONDS):
+                return await client.post(
+                    "/v1/events",
+                    json=metering_suite._events_body(session),
+                    headers=_api(key, next(keys)),
+                )
+
+        charged = await post(world.api_session, world.api_key)
+        seen = credit_metering.enforcement_rule_seen(tenant)
+        broken["on"] = True
+        refused = await post(world.api_session, world.api_key)
+        unaffected = await post(str(other.session), other.api_key)
+        broken["on"] = False
+        head = credit_switch.credit_switch_reading()
+        credit_switch._SWITCH.publish(
+            credit_switch.CreditSwitchReading(True, "schema_ready", "045")
+        )
+        try:
+            gate_closed = await post(world.api_session, world.api_key)
+            other_gate_closed = await post(str(other.session), other.api_key)
+        finally:
+            credit_switch._SWITCH.publish(head)
+        # Protected (no courtesy left, a paid top-up): read, not under it.
+        await remove_courtesy(direct, granted.lot_id)
+        await make_topup(_harness(direct), builder)
+        cleared = await post(world.api_session, world.api_key)
+        seen_after_clear = credit_metering.enforcement_rule_seen(tenant)
+        broken["on"] = True
+        free_again = await post(world.api_session, world.api_key)
+        broken["on"] = False
+        latches = (
+            credit_metering.enforcement_seen(),
+            credit_inventory._enforcement_seen,
+            credit_metering.enforcement_mark_seen(tenant),
+        )
+    assert charged.status_code == 200, charged.text
+    assert seen is True
+    unavailable = {"code": "credit_enforcement_unavailable"}
+    assert refused.status_code == 503 and refused.json() == unavailable
+    assert unaffected.status_code == 200, unaffected.text
+    assert gate_closed.status_code == 503 and gate_closed.json() == unavailable
+    assert other_gate_closed.status_code == 200, other_gate_closed.text
+    assert cleared.status_code == 200, cleared.text
+    assert seen_after_clear is False
+    assert free_again.status_code == 200, free_again.text
+    assert latches == (False, False, False)
+    # One decision was charged (the first); the others refused or free.
+    assert len(await _trace_debits(direct, builder)) == 1
+
+
+async def test_an_unknown_turn_is_charged_under_the_rule_and_digests_unknown(
+    pg: Any, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESIGN item 10, on PostgreSQL, through the shared webhook path the
+    Uazapi and Evolution adapters will call: an unauthenticated principal of
+    a builder under the rule is enforced as ``unknown`` -- claimed, its
+    decision debited from courtesy, its effect's ``decision_digest`` the
+    digest of origin ``unknown`` -- and, once the builder is marked, the
+    same principal is main's free path (nothing read past the mode)."""
+
+    from src.interaction_context import InteractionOrigin
+    from src.services.credit_principal import credit_identity
+
+    force_credit_switch(monkeypatch)
+    seeded = await metering_suite._tenant(direct)
+    assert seeded.builder_id is not None
+    granted = await grant_courtesy(direct, seeded.builder_id, 3)
+    request = SimpleNamespace(
+        scope={"state": {"credit_switch_effective": True}}, headers={}
+    )
+
+    async def precheck(message_id: str) -> Any:
+        async with AsyncSession(direct) as db:
+            return await credit_metering.precheck_webhook(
+                request,  # type: ignore[arg-type]
+                db,
+                source="zapi",
+                tenant_id=seeded.tenant_id,
+                identity=lambda: credit_identity("uazapi", seeded.tenant_id),
+                provider_message_id=message_id,
+                payload_sha256=lambda: "e" * 64,
+            )
+
+    enforcement = await precheck("unknown-turn-1")
+    assert isinstance(enforcement, credit_metering.WebhookEnforcement)
+    assert enforcement.origin is InteractionOrigin.UNKNOWN
+    response = SimpleNamespace(
+        event_id=uuid4(),
+        prompt=SimpleNamespace(suggested_response="Olá!", deterministic=False),
+        handoff_summary=None,
+        decision=None,
+        mode=None,
+    )
+
+    async def pipeline() -> tuple[Any, Any, Any]:
+        return SimpleNamespace(handoff_summary=None), None, []
+
+    async def no_bundle(_effect: str | None) -> None:
+        return None
+
+    async with AsyncSession(direct) as db:
+        lease = await credit_metering.acquire_webhook_claim(db, enforcement)
+        assert isinstance(lease, credit_metering.ClaimLease)
+        phase1 = await credit_metering.run_webhook_phase1(
+            db,
+            enforcement,
+            lease,
+            session_id=seeded.session_id,
+            run_pipeline=pipeline,
+        )
+        assert phase1 is not None
+        final = await credit_metering.run_webhook_final(
+            db,
+            enforcement,
+            lease,
+            phase1,
+            response=response,
+            write_bundle=no_bundle,
+            reply=None,
+        )
+    assert final is not None and final.charge is not None
+    decided = credit_metering.response_decision(response)
+    assert decided is not None
+    expected = {
+        origin: credit_metering.decision_digest(
+            tenant_id=seeded.tenant_id,
+            interaction_id=lease.interaction_id,
+            decision_version=credit_metering.ENFORCED_DECISION_VERSION,
+            origin=origin,
+            decision=decided[1],
+        )
+        for origin in (InteractionOrigin.UNKNOWN, InteractionOrigin.PRODUCTION)
+    }
+    assert await _trace_effects(direct, seeded.builder_id) == [
+        expected[InteractionOrigin.UNKNOWN]
+    ]
+    assert expected[InteractionOrigin.UNKNOWN] != expected[InteractionOrigin.PRODUCTION]
+    assert await _trace_debits(direct, seeded.builder_id) == [(1_000, granted.lot_id)]
+    # Marked: the same unauthenticated turn is free (credit-system Decision 25).
+    await record_mark(direct, seeded.builder_id)
+    assert await precheck("unknown-turn-2") is None
+    assert (await _tenant_rows(direct, seeded.tenant_id))["claims"] == 1
+
+
+async def test_the_workers_run_on_a_courtesy_lot_alone_and_recover(
+    pg: Any, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESIGN item 12, Decision 20: no global, no mark.  Without a courtesy
+    lot the publisher looks for nothing and the orphan pass stops after its
+    reads; once a courtesy lot exists the publisher recovers the pending
+    charged reply (a crash after the final commit) and the orphan pass
+    reconciles the rule's enforced claim left without its effect."""
+
+    from src.services import credit_rollout
+    from src.services.credit_rollout import (
+        OrphanSweepState,
+        run_credit_orphan_reconciliation_once,
+    )
+
+    force_credit_switch(monkeypatch)
+    sessions = _harness(direct).sessions
+    seeded = await metering_suite._tenant(direct)
+    assert seeded.builder_id is not None
+    row = await metering_suite._outbox_row(direct, seeded)  # a crash
+    await execute_on(
+        direct,
+        "INSERT INTO credit_ingress_claims (id, tenant_id, builder_id, source, "
+        "principal_id, idempotency_key, provider_message_id, interaction_id, "
+        "payload_sha256, decision_version, mode) VALUES (:id, :t, :b, 'events', "
+        ":p, :k, NULL, :i, :sha, 1, 'enforced')",
+        id=uuid4(),
+        t=seeded.tenant_id,
+        b=seeded.builder_id,
+        p=f"events:{seeded.tenant_id}",
+        k="rule-orphan-1",
+        i=uuid4(),
+        sha="d" * 64,
+    )
+    sender = metering_suite._Recorded()
+    publisher = credit_metering.CreditResponsePublisher(
+        sender, session_factory=sessions
+    )
+    credit_rollout.CREDIT_ORPHAN_EFFECTS.set(-1)  # a sentinel no pass writes
+
+    dormant = await publisher.run_once()
+    dormant_orphans = await run_credit_orphan_reconciliation_once(
+        sessions, state=OrphanSweepState()
+    )
+    dormant_gauge = metering_suite_gauge()
+    await grant_courtesy(direct, seeded.builder_id, 1)
+    tick = await publisher.run_once()
+    published = await run_credit_orphan_reconciliation_once(
+        sessions, state=OrphanSweepState()
+    )
+
+    assert dormant is not None and not dormant.enforced and dormant.outcomes == []
+    assert dormant_orphans == 0 and dormant_gauge == -1
+    assert tick is not None and tick.enforced and tick.outcomes == ["delivered"]
+    assert sender.sent == [str(row)]
+    state, payload, attempts = await metering_suite._outbox_state(direct, row)
+    assert (state, attempts) == ("delivered", 1) and "phone" not in payload
+    assert published >= 1 and metering_suite_gauge() == published
+
+
+def metering_suite_gauge() -> float:
+    """``neurostack_credit_orphan_effects`` as a scrape would read it."""
+
+    from src.services import credit_rollout
+
+    (value,) = [
+        sample.value
+        for metric in credit_rollout.CREDIT_ORPHAN_EFFECTS.collect()
+        for sample in metric.samples
+    ]
+    return value
+
+
+async def _plant_episode(engine: AsyncEngine, builder_id: UUID) -> None:
+    """An exhaustion episode left from a mark era, past its suspension
+    deadline (and still open)."""
+
+    at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=5)
+    await execute_on(
+        engine,
+        "INSERT INTO credit_accounts (id, builder_id) VALUES (:a, :b) "
+        "ON CONFLICT DO NOTHING",
+        a=uuid4(),
+        b=builder_id,
+    )
+    await execute_on(
+        engine,
+        "INSERT INTO credit_lifecycle_episodes (id, builder_id, account_id, "
+        "opened_effect_id, exhausted_at, suspension_due_at, deletion_due_at) "
+        "SELECT :id, :b, id, :effect, :at, :due, :deletion FROM credit_accounts "
+        "WHERE builder_id = :b",
+        id=uuid4(),
+        b=builder_id,
+        effect=f"debit:mark-era:{uuid4()}",
+        at=at,
+        due=at + timedelta(hours=72),
+        deletion=at + timedelta(days=30),
+    )
+
+
+async def test_the_shared_block_gate_reports_the_rule_and_ignores_a_stale_episode(
+    pg: Any, direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tenant_suspended`` and ``reservation_verdict`` with the caller's
+    captured mode (what Groups 3, 4 and 5a consume): ``blocked`` is
+    suspended; ``charged`` is served even with an open, past-due episode
+    left from a mark era -- which, without a capture, still decides the
+    reservation verdict as before (the control)."""
+
+    from src.services import credit_lifecycle
+
+    force_credit_switch(monkeypatch)
+    charged = await metering_suite._tenant(direct)
+    blocked = await metering_suite._tenant(direct)
+    assert charged.builder_id is not None and blocked.builder_id is not None
+    kept = await grant_courtesy(direct, charged.builder_id, 3)
+    spent = await grant_courtesy(direct, blocked.builder_id, 3)
+    await remove_courtesy(direct, spent.lot_id)
+    for seeded in (charged, blocked):
+        await _plant_episode(direct, seeded.builder_id)  # type: ignore[arg-type]
+    captured_charged = await effective_of(direct, charged.builder_id)
+    captured_blocked = await effective_of(direct, blocked.builder_id)
+    assert captured_charged == _charged(kept.occurred_at)
+    assert captured_blocked == _blocked(spent.occurred_at)
+
+    async def verdicts(seeded: Any, captured: Any) -> tuple[bool, str, str]:
+        async with AsyncSession(direct) as session:
+            suspended = await credit_lifecycle.tenant_suspended(
+                session, seeded.tenant_id, captured=captured
+            )
+            charged_verdict = await credit_lifecycle.reservation_verdict(
+                session,
+                builder_id=seeded.builder_id,
+                effect_id=f"rag:{seeded.tenant_id}:{uuid4()}:reserve",
+                charged_mc=1_000,
+                captured=captured,
+            )
+            free_verdict = await credit_lifecycle.reservation_verdict(
+                session,
+                builder_id=seeded.builder_id,
+                effect_id=f"rag:{seeded.tenant_id}:{uuid4()}:reserve",
+                charged_mc=0,
+                captured=captured,
+            )
+            await session.rollback()
+        return suspended, charged_verdict, free_verdict
+
+    assert await verdicts(charged, captured_charged) == (False, "ok", "ok")
+    assert await verdicts(blocked, captured_blocked) == (
+        True,
+        "suspended",
+        "suspended",
+    )
+    # The control: without a capture the stale episode still decides the
+    # reservation verdict (an exhausted category), as before the rule.
+    assert (await verdicts(charged, None))[1] == "category_exhausted"

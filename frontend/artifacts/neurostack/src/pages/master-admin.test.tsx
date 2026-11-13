@@ -46,6 +46,7 @@ function row(id: string, name: string, extra: Record<string, unknown>) {
     subscription_unavailable: false,
     courtesy: null,
     charging: null,
+    courtesy_rule: null,
     ...extra,
   };
 }
@@ -378,5 +379,101 @@ describe("Master Admin: Cobrança ativa", () => {
       `since ${formatInstant(MARKED_AT, "en")}`,
     );
     expect((await rowOf("Builder Nao Marcado")).queryByText("Charging active")).not.toBeInTheDocument();
+  });
+});
+
+// debito-cortesia-automatico Group 5b: the read-only courtesy rule state,
+// independent of the operator mark badge.
+describe("Master Admin: regra da cortesia", () => {
+  const ruleRows = [
+    row("rc", "Builder Cortesia Cobrando", { courtesy: ACTIVE_COURTESY, courtesy_rule: "charged" }),
+    row("rb", "Builder Cortesia Bloqueado", {
+      courtesy: { active_expires_at: null, available_mc: 0 },
+      courtesy_rule: "blocked",
+    }),
+    // Protected, marked, never courtesy, or the switch off: `null`.
+    row("rp", "Builder Protegido", {
+      subscription: subscription("active", "paid"),
+      courtesy: { active_expires_at: null, available_mc: 0 },
+    }),
+    row("rm", "Builder Marcado Com Cortesia", {
+      courtesy: ACTIVE_COURTESY,
+      charging: { marked_at: "2026-11-11T12:00:00Z" },
+    }),
+    row("rx", "Builder Valor Desconhecido", { courtesy: ACTIVE_COURTESY, courtesy_rule: "a_future_value" }),
+  ];
+
+  it("shows Cortesia: cobrando and Cortesia: bloqueado on the rule's rows, nothing for null", async () => {
+    installFetch(ruleRows);
+    await openSubscriptionsTable();
+
+    const charged = await rowOf("Builder Cortesia Cobrando");
+    const chargedBadge = charged.getByTestId("courtesy-rule");
+    expect(chargedBadge).toHaveTextContent(/^Cortesia: cobrando$/);
+    expect(chargedBadge).toHaveAttribute("data-rule", "charged");
+    expect(chargedBadge).toHaveAttribute("title", "Regra da cortesia: o consumo é debitado dos créditos de cortesia.");
+    // The rest of the row is unchanged: the courtesy status and no mark badge.
+    expect(charged.getByText("Cortesia, expira em 09/12")).toBeInTheDocument();
+    expect(charged.queryByText("Cobrança ativa")).not.toBeInTheDocument();
+
+    const blocked = await rowOf("Builder Cortesia Bloqueado");
+    const blockedBadge = blocked.getByTestId("courtesy-rule");
+    expect(blockedBadge).toHaveTextContent(/^Cortesia: bloqueado$/);
+    expect(blockedBadge).toHaveAttribute("data-rule", "blocked");
+    expect(blockedBadge).toHaveAttribute(
+      "title",
+      "Regra da cortesia: sem cortesia e sem plano pago em vigor, o agente está bloqueado.",
+    );
+    expect(blocked.getByText("Sem plano")).toBeInTheDocument();
+
+    for (const name of ["Builder Protegido", "Builder Marcado Com Cortesia", "Builder Valor Desconhecido"]) {
+      const other = await rowOf(name);
+      expect(other.queryByTestId("courtesy-rule")).not.toBeInTheDocument();
+      expect(other.queryByText(/Cortesia: /)).not.toBeInTheDocument();
+    }
+  });
+
+  it("is independent of the Cobrança ativa mark badge: both can show, each from its own field", async () => {
+    installFetch([
+      row("both", "Builder Ambos", {
+        courtesy: ACTIVE_COURTESY,
+        charging: { marked_at: "2026-11-11T12:00:00Z" },
+        courtesy_rule: "charged",
+      }),
+    ]);
+    await openSubscriptionsTable();
+    const both = await rowOf("Builder Ambos");
+    expect(both.getByText("Cobrança ativa")).toBeInTheDocument();
+    expect(both.getByTestId("courtesy-rule")).toHaveTextContent("Cortesia: cobrando");
+  });
+
+  it("a row without the field (an older server) shows no rule state", async () => {
+    const { courtesy_rule: _ignored, ...legacy } = row("old", "Builder Sem Regra", { courtesy: ACTIVE_COURTESY });
+    installFetch([legacy]);
+    await openSubscriptionsTable();
+    expect((await rowOf("Builder Sem Regra")).queryByTestId("courtesy-rule")).not.toBeInTheDocument();
+  });
+
+  it("is read-only text: no control and no write route", async () => {
+    installFetch(ruleRows);
+    const table = await openSubscriptionsTable();
+    const badge = within(table).getByText("Cortesia: bloqueado");
+    expect(badge.closest("button, a, [role='button'], [role='menuitem']")).toBeNull();
+    fireEvent.click(badge);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    const methods = mocks.fetch.mock.calls.map(([, init]) => (init as RequestInit | undefined)?.method ?? "GET");
+    expect(methods.filter((method) => method !== "GET")).toEqual([]);
+  });
+
+  it("in English: Courtesy: charging and Courtesy: blocked", async () => {
+    localStorage.setItem("ns_locale", "en");
+    installFetch(ruleRows);
+    await openSubscriptionsTable();
+    expect((await rowOf("Builder Cortesia Cobrando")).getByTestId("courtesy-rule")).toHaveTextContent(
+      /^Courtesy: charging$/,
+    );
+    const blocked = (await rowOf("Builder Cortesia Bloqueado")).getByTestId("courtesy-rule");
+    expect(blocked).toHaveTextContent(/^Courtesy: blocked$/);
+    expect(blocked).toHaveAttribute("title", "Courtesy rule: no courtesy and no paid plan in force, so the agent is blocked.");
   });
 });

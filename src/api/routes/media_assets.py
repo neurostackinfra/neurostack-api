@@ -73,6 +73,7 @@ from src.services.api_credentials import (
 from src.services.credit_allocations import reservation_effect_id
 from src.services.credit_metering import (
     CREDIT_ENFORCEMENT_UNAVAILABLE_CODE,
+    CREDIT_SUSPENDED_CODE,
     CreditEnforcementUnavailable,
     CreditTenantGone,
 )
@@ -196,10 +197,40 @@ _CREDIT_PENDING_RESPONSE = {
         "or, on upload, its builder is exhausted and the upload needs new "
         "capacity (credit_category_exhausted), or, on an API key download, its "
         "builder is suspended after its 72 hours of debt (credit_suspended); "
+        "under the courtesy rule, a builder with no courtesy left and no paid "
+        "plan in force is credit_suspended on every upload (before the body "
+        "is read) and on an API key download; "
         "nothing was stored and no byte was sent."
     ),
     "model": MediaAssetErrorResponse,
 }
+
+
+def _verdict_refusal(verdict: credit_lifecycle.CategoryVerdict) -> HTTPException | None:
+    """The answer of the upload reservation's category verdict: ``ok`` is
+    served; ``category_exhausted`` and ``suspended`` (debito-cortesia-
+    automatico: the courtesy rule's block of the captured mode) are each
+    their own 402 -- never ``suspended`` taken as ``ok``."""
+
+    if verdict == "suspended":
+        return _media_error(402, CREDIT_SUSPENDED_CODE)
+    if verdict == "category_exhausted":
+        return _media_error(402, "credit_category_exhausted")
+    return None
+
+
+def _refuse_blocked(mode: credit_inventory.CreditMode) -> None:
+    """debito-cortesia-automatico (DESIGN item 5): a builder the courtesy
+    rule blocks (captured ``courtesy``/``blocked``: nothing spendable, no
+    paid plan in force) adds no media, whoever uploads (an API key or the
+    panel) -- ``402 credit_suspended`` before the body is read or anything
+    written (the route's handler rolls the session back).  The block is the
+    captured mode's, computed and never stored
+    (``credit_lifecycle.courtesy_block``); a mode that changes after the
+    capture is the reservation lock's 503, as for a mark."""
+
+    if credit_lifecycle.courtesy_block(mode.captured):
+        raise _media_error(402, CREDIT_SUSPENDED_CODE)
 
 
 async def _credit_mode(
@@ -599,6 +630,7 @@ async def upload_media_asset(
         # parsing, validation and every access to media_assets; the credit
         # mode is read for the resolved tenant before its row is loaded.
         mode, target = await _mode_and_target(request, tenant, tenant_id, session)
+        _refuse_blocked(mode)
         upload, fields, raw_trigger_intents = await _parse_upload(request)
         metadata = validate_media_metadata(
             display_name=fields["display_name"],
@@ -650,16 +682,24 @@ async def upload_media_asset(
                 # Group 5: decided with the reservation, under the account
                 # lock it took -- an exhausted builder adds no media that
                 # needs new capacity (everything rolls back).
-                if target.builder_id is not None and (
-                    await credit_lifecycle.reservation_verdict(
-                        session,
-                        builder_id=target.builder_id,
-                        effect_id=reservation_effect_id(target.id, "media", asset.id),
-                        charged_mc=reserved.charged_mc,
+                # debito-cortesia-automatico: with the captured mode, so the
+                # courtesy rule decides for its builders (``suspended`` when
+                # blocked; ``ok`` when charged, whatever episode a mark era
+                # left open).
+                if target.builder_id is not None:
+                    refusal = _verdict_refusal(
+                        await credit_lifecycle.reservation_verdict(
+                            session,
+                            builder_id=target.builder_id,
+                            effect_id=reservation_effect_id(
+                                target.id, "media", asset.id
+                            ),
+                            charged_mc=reserved.charged_mc,
+                            captured=mode.captured,
+                        )
                     )
-                    == "category_exhausted"
-                ):
-                    raise _media_error(402, "credit_category_exhausted")
+                    if refusal is not None:
+                        raise refusal
         await session.commit()
         logger.info(
             "media_asset_upload",
@@ -1060,12 +1100,16 @@ async def download_media_asset(
                 # Group 5: past its 72 h of debt a suspended builder's media
                 # is suspended for API keys (the gate's transition commits
                 # either way); no byte is sent and nothing is charged.
-                suspended = await credit_lifecycle.tenant_suspended(session, target_id)
+                # debito-cortesia-automatico: the captured mode decides for
+                # the courtesy rule (its block; never a mark era's episode).
+                suspended = await credit_lifecycle.tenant_suspended(
+                    session, target_id, captured=mode.captured
+                )
                 await session.commit()
                 if suspended:
                     permit.release()
                     permit = None
-                    raise _media_error(402, "credit_suspended")
+                    raise _media_error(402, CREDIT_SUSPENDED_CODE)
             charged = await credit_inventory.charge_egress(
                 session,
                 tenant_id=target_id,

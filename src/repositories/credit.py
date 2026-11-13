@@ -145,6 +145,19 @@ the marks is behind the 047 revision gate (below 047 the table does not
 exist) and is a plain read or append in the caller's transaction; a request
 re-checks what it captured under the account lock (lock order step 3) in
 :func:`src.services.credit_metering.require_captured_enforcement`.
+
+The courtesy rule (debito-cortesia-automatico, DESIGN items 1-2).  With
+neither the global nor a mark, :meth:`~CreditRepository.effective_enforcement`
+reads the courtesy rule (:meth:`~CreditRepository.courtesy_rule`, behind the
+046 revision gate ``credit_switch.courtesy_rule_gate_open``): a builder that
+ever received a ``courtesy`` lot is ``courtesy`` from its first grant's
+``occurred_at``, ``charged`` while its unexpired courtesy lots can spend,
+``blocked`` once they cannot and no paid plan is in force
+(:meth:`~CreditRepository.paid_plan_in_force`, read only then), and ``none``
+-- protected, observational -- with one.  Computed on every read from
+``credit_lots`` and the sums of their entries (and, only with nothing
+spendable, ``billing_subscriptions``, ``billing_subscription_cycles`` and
+the bindings, never written): no table, no stored state.
 """
 
 from __future__ import annotations
@@ -155,6 +168,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     DateTime,
@@ -175,6 +189,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.models.billing import (
     BillingOutboxEvent,
     BillingRolloutControl,
+    BillingSubscription,
     BillingSubscriptionCycle,
     BillingTopupOrder,
 )
@@ -204,7 +219,11 @@ from src.models.handoff import HandoffRecord
 from src.models.session import Session as SessionRow
 from src.models.tenant import Tenant
 from src.repositories.billing import billing_advisory_key
-from src.services.credit_switch import credit_switch_reading, enforcement_mark_gate_open
+from src.services.credit_switch import (
+    courtesy_rule_gate_open,
+    credit_switch_reading,
+    enforcement_mark_gate_open,
+)
 
 # Direction of each entry type on a lot's available balance and on the
 # builder's open debt.  ``debt_settlement`` moves both: the settling lot pays
@@ -302,20 +321,38 @@ class TenantWhatsappProvider:
     whatsapp_provider: str | None
 
 
-EnforcementOrigin = Literal["global", "mark"]
+EnforcementOrigin = Literal["global", "mark", "courtesy"]
+# debito-cortesia-automatico: the two states of a builder under the courtesy
+# rule (DESIGN items 1-2, Decision 13).  The third one, "protected" (no
+# courtesy left, a paid plan in force), is ``origin = None``: observational.
+CourtesyRuleState = Literal["charged", "blocked"]
+# The lot kinds a paid plan in force is read from (wish Decision 5).
+PAID_LOT_KINDS: Final = ("monthly", "topup")
+# The ``billing_subscription_cycles.state`` values of a paid cycle (wish
+# Decision 5: settled or restored; a reversed, pending or quarantined cycle
+# is not paid).
+PAID_CYCLE_STATES: Final = ("settled", "restored")
+_CREDIT_ZONE: Final = ZoneInfo("America/Sao_Paulo")
 
 
 @dataclass(frozen=True)
 class EffectiveEnforcement:
     """The enforcement instant that applies to one builder, and its origin
-    (cobranca-credito-por-builder, wish Decision 11).
+    (cobranca-credito-por-builder, wish Decision 11; debito-cortesia-
+    automatico, DESIGN Decision 13).
 
     The rule, in this order: the global ``credit_enforcement_at`` when set
     (``global``); else the ``occurred_at`` of the builder's latest event in
     ``credit_enforcement_marks`` when that event is a ``mark`` (``mark``);
-    else ``(None, None)``.  A request without a builder only ever sees the
-    global.  Equality is the verdict, ``(at, origin)``: the two other fields
-    are context and never part of it (``compare=False``) --
+    else -- the courtesy rule -- for a builder that ever received a
+    ``courtesy`` lot, the ``occurred_at`` of its FIRST courtesy grant
+    (``courtesy``) with ``state`` ``charged`` (courtesy spendable > 0) or
+    ``blocked`` (courtesy spendable 0 and no paid plan in force); else
+    ``(None, None)`` -- a builder that never had courtesy, and one whose
+    courtesy is spent while a paid plan is in force ("protected",
+    observational).  A request without a builder only ever sees the global.
+    Equality is the verdict, ``(at, origin, state)``: the other fields are
+    context and never part of it (``compare=False``) --
 
     * ``builder_id``: the builder whose marks were consulted (``None``
       without a builder, and when the global decided before the builder was
@@ -324,20 +361,264 @@ class EffectiveEnforcement:
       marks were NOT read (below 047 the table does not exist).  "Not
       marked" then means "not known to be marked": the per-tenant D1
       (:mod:`src.services.credit_metering`) never takes it as a successful
-      "not marked" read.
+      "not marked" read;
+    * ``rule_unread``: the 046 revision gate of the courtesy rule was
+      closed, so the rule read nothing (below 046 there is no courtesy).
     """
 
     at: datetime | None
     origin: EnforcementOrigin | None
     builder_id: UUID | None = field(default=None, compare=False)
     mark_unread: bool = field(default=False, compare=False)
+    state: CourtesyRuleState | None = None
+    rule_unread: bool = field(default=False, compare=False)
 
     @property
     def enforced(self) -> bool:
         return self.at is not None
 
+    @property
+    def courtesy(self) -> bool:
+        """Under the courtesy rule (charged or blocked)."""
+
+        return self.origin == "courtesy"
+
+    @property
+    def blocked(self) -> bool:
+        """Under the courtesy rule with nothing left to spend and no paid
+        plan in force: the agent is blocked (DESIGN items 1 and 5)."""
+
+        return self.origin == "courtesy" and self.state == "blocked"
+
 
 NOT_ENFORCED: Final = EffectiveEnforcement(None, None)
+
+
+@dataclass(frozen=True)
+class PaidPlanInForce:
+    """The "plano pago em vigor" of a builder (wish Decision 5), at ``at``:
+
+    * ``paid_lot``: a ``monthly`` or ``topup`` lot with ``expires_at`` after
+      ``at`` (whatever its balance or any quarantine);
+    * ``last_binding_cycle_end``/``grace_ends_at``: the ``cycle_end`` of the
+      latest ``active`` binding of an ACTIVE ASAAS subscription and the end
+      of its renewal grace (``credit_lifecycle.binding_grace_end``,
+      ``credit_binding_grace_days``); an inactive or cancelled subscription
+      has no grace (wish Decision 3);
+    * ``unbound_paid_cycle``: an ACTIVE ASAAS subscription whose CURRENT
+      cycle exists in ``billing_subscription_cycles`` in a paid state
+      (``settled`` or ``restored``) with no binding written yet (the fact
+      consumer's lag: protected while it lasts).
+    """
+
+    at: datetime
+    paid_lot: bool = False
+    last_binding_cycle_end: date | None = None
+    grace_ends_at: datetime | None = None
+    unbound_paid_cycle: bool = False
+
+    @property
+    def in_grace(self) -> bool:
+        return self.grace_ends_at is not None and self.at < self.grace_ends_at
+
+    @property
+    def in_force(self) -> bool:
+        return self.paid_lot or self.in_grace or self.unbound_paid_cycle
+
+
+@dataclass(frozen=True)
+class CourtesyRuleReading:
+    """What the courtesy rule read of one builder (debito-cortesia-
+    automatico, DESIGN item 1): plain reads, no lock.
+
+    * ``courtesy_lots``: how many ``courtesy`` lots the builder ever
+      received (0: never under the rule);
+    * ``first_grant_at``: the ``occurred_at`` of its first courtesy grant
+      (the rule's stable ``at``);
+    * ``spendable_mc``: the spendable balance of its unexpired courtesy lots
+      at ``at`` (the "saldo gastavel de cortesia");
+    * ``paid_plan``: the paid plan in force, read ONLY when ``spendable_mc``
+      is 0 (wish Decision 8), ``None`` otherwise.
+    """
+
+    at: datetime
+    courtesy_lots: int = 0
+    first_grant_at: datetime | None = None
+    spendable_mc: int = 0
+    paid_plan: PaidPlanInForce | None = None
+
+    @property
+    def under_rule(self) -> bool:
+        return self.courtesy_lots > 0 and self.first_grant_at is not None
+
+    @property
+    def state(self) -> CourtesyRuleState | None:
+        """``charged``, ``blocked``, or ``None``: not under the rule, or
+        protected (no courtesy left, a paid plan in force)."""
+
+        if not self.under_rule:
+            return None
+        if self.spendable_mc > 0:
+            return "charged"
+        if self.paid_plan is not None and self.paid_plan.in_force:
+            return None
+        return "blocked"
+
+
+def _courtesy_lot_sums() -> tuple[Any, Any]:
+    """The courtesy rule's per-lot aggregates over the lot's ledger entries
+    (DESIGN item 1), shared by the single-builder and the batch readers:
+    the balance (increases minus decreases) and the first ``grant``."""
+
+    entry = CreditLedgerEntry
+    balance = func.coalesce(
+        func.sum(
+            case(
+                (entry.entry_type.in_(sorted(LOT_INCREASES)), entry.amount_mc),
+                (entry.entry_type.in_(sorted(LOT_DECREASES)), -entry.amount_mc),
+                else_=0,
+            )
+        ),
+        0,
+    )
+    granted_at = func.min(
+        case((entry.entry_type == "grant", entry.occurred_at), else_=None)
+    )
+    return balance, granted_at
+
+
+def _courtesy_lot_entries() -> tuple[Any, Any]:
+    """The ``outerjoin`` of a lot to its own ledger entries."""
+
+    lot, entry = CreditLot, CreditLedgerEntry
+    return entry, and_(entry.builder_id == lot.builder_id, entry.lot_id == lot.id)
+
+
+def _courtesy_rule_reading(
+    rows: Iterable[Any], instant: datetime
+) -> CourtesyRuleReading:
+    """One builder's :class:`CourtesyRuleReading` from its courtesy lots'
+    rows (``expires_at``, ``balance``, ``granted_at``), paid plan unread:
+    the spendable balance counts only the lots unexpired at ``instant``."""
+
+    lots = list(rows)
+    grants = [_as_utc(row.granted_at) for row in lots if row.granted_at is not None]
+    spendable = sum(
+        max(int(row.balance), 0) for row in lots if _as_utc(row.expires_at) > instant
+    )
+    return CourtesyRuleReading(
+        at=instant,
+        courtesy_lots=len(lots),
+        first_grant_at=min(grants) if grants else None,
+        spendable_mc=spendable,
+    )
+
+
+def _with_paid_plan(
+    reading: CourtesyRuleReading, plan: PaidPlanInForce
+) -> CourtesyRuleReading:
+    """A spent reading with the paid plan in force it was judged against."""
+
+    return CourtesyRuleReading(
+        at=reading.at,
+        courtesy_lots=reading.courtesy_lots,
+        first_grant_at=reading.first_grant_at,
+        spendable_mc=0,
+        paid_plan=plan,
+    )
+
+
+def _paid_plan_subqueries(builder: Any, instant: datetime) -> tuple[Any, Any, Any]:
+    """The three subqueries of the paid plan in force (wish Decision 5) of
+    ``builder`` -- a builder id (one builder, bound) or
+    ``CreditAccount.builder_id`` (the batch, correlated): a ``monthly``/``topup`` lot expiring after
+    ``instant``, the ``cycle_end`` of the latest ``active`` binding of an
+    active ASAAS subscription, and a paid current cycle of an active ASAAS
+    subscription with no binding written yet."""
+
+    today = instant.astimezone(_CREDIT_ZONE).date()
+    lot = CreditLot
+    binding = CreditEnforcementBinding
+    subscription = BillingSubscription
+    cycle = BillingSubscriptionCycle
+    active_asaas = and_(
+        subscription.provider == "asaas", subscription.is_active.is_(True)
+    )
+    paid_lot = (
+        select(lot.id)
+        .where(
+            lot.builder_id == builder,
+            lot.lot_kind.in_(PAID_LOT_KINDS),
+            lot.expires_at > instant,
+        )
+        .exists()
+    )
+    last_cycle_end = (
+        select(func.max(binding.cycle_end))
+        .join(
+            subscription,
+            and_(
+                subscription.id == binding.subscription_id,
+                subscription.builder_id == binding.builder_id,
+            ),
+        )
+        .where(
+            binding.builder_id == builder,
+            binding.status == "active",
+            active_asaas,
+        )
+        .scalar_subquery()
+    )
+    bound = select(binding.id).where(binding.subscription_cycle_id == cycle.id).exists()
+    unbound_paid_cycle = (
+        select(cycle.id)
+        .join(
+            subscription,
+            and_(
+                subscription.id == cycle.subscription_id,
+                subscription.builder_id == cycle.builder_id,
+            ),
+        )
+        .where(
+            cycle.builder_id == builder,
+            cycle.state.in_(PAID_CYCLE_STATES),
+            cycle.cycle_start <= today,
+            cycle.cycle_end > today,
+            active_asaas,
+            ~bound,
+        )
+        .exists()
+    )
+    return paid_lot, last_cycle_end, unbound_paid_cycle
+
+
+def _paid_plan_reading(row: Any, instant: datetime) -> PaidPlanInForce:
+    """:class:`PaidPlanInForce` from a row of :func:`_paid_plan_subqueries`
+    (``paid_lot``, ``last_cycle_end``, ``unbound_paid_cycle``)."""
+
+    # Lazy: credit_lifecycle builds on credit_ledger, which builds on this
+    # module.
+    from src.config.settings import settings
+    from src.services.credit_ledger import start_of_civil_day
+    from src.services.credit_lifecycle import binding_grace_end
+
+    cycle_end = row.last_cycle_end
+    if isinstance(cycle_end, str):  # SQLite returns the date's text
+        cycle_end = date.fromisoformat(cycle_end)
+    grace_ends_at: datetime | None = None
+    if cycle_end is not None:
+        grace_ends_at = binding_grace_end(
+            start_of_civil_day(cycle_end),
+            grace_days=settings.credit_binding_grace_days,
+            is_active=True,
+        )
+    return PaidPlanInForce(
+        at=instant,
+        paid_lot=bool(row.paid_lot),
+        last_binding_cycle_end=cycle_end,
+        grace_ends_at=grace_ends_at,
+        unbound_paid_cycle=bool(row.unbound_paid_cycle),
+    )
 
 
 class EnforcementMarksUnavailable(RuntimeError):
@@ -353,7 +634,9 @@ class MarkWindowState:
     about already has an opening (a ``baseline`` or ``maintenance``
     allocation, ``credit_inventory.WindowWork.prepare``).  An opening only
     exists under an enforcement; with the global unset (the ``mark``
-    refuses otherwise) it came from an earlier mark."""
+    refuses otherwise) it came from an earlier mark or from the courtesy
+    rule (debito-cortesia-automatico: a builder under the rule is enforced
+    from its first courtesy grant, with no mark)."""
 
     latest_mark: EnforcementMarkRow | None
     window_start: date
@@ -1981,25 +2264,52 @@ class CreditRepository:
         except Exception:
             return False
 
+    @staticmethod
+    def courtesy_rule_readable(rule_readable: bool | None = None) -> bool:
+        """The 046 gate of the courtesy rule (debito-cortesia-automatico):
+        the caller's verdict, or the process reading's
+        (``credit_switch.courtesy_rule_gate_open``)."""
+
+        if rule_readable is not None:
+            return rule_readable is True
+        try:
+            return courtesy_rule_gate_open(credit_switch_reading()) is True
+        except Exception:
+            return False
+
     async def effective_enforcement(
-        self, builder_id: UUID | None, *, marks_readable: bool | None = None
+        self,
+        builder_id: UUID | None,
+        *,
+        marks_readable: bool | None = None,
+        rule_readable: bool | None = None,
+        at: datetime | None = None,
     ) -> EffectiveEnforcement:
         """:class:`EffectiveEnforcement` of ``builder_id``: the global first
         (the one statement of :meth:`enforcement_at`, unchanged), then --
         only with a builder, the global unset and the 047 gate open -- the
-        builder's latest mark event.  Plain reads, no lock: the caller
-        decides where in the lock order it reads (a request re-checks it
-        under the account lock, ``credit_metering.require_captured_enforcement``)."""
+        builder's latest mark event, then -- only with neither, and the 046
+        gate open -- the courtesy rule (:meth:`courtesy_rule`, judged at
+        ``at``, default now).  Plain reads, no lock: the caller decides
+        where in the lock order it reads (a request re-checks it under the
+        account lock, ``credit_metering.require_captured_enforcement``)."""
 
         global_at = await self.enforcement_at()
         if global_at is not None:
             return EffectiveEnforcement(
                 _as_utc(global_at), "global", builder_id=builder_id
             )
-        return await self._marked_enforcement(builder_id, marks_readable)
+        return await self._marked_enforcement(
+            builder_id, marks_readable, rule_readable, at
+        )
 
     async def tenant_effective_enforcement(
-        self, tenant_id: UUID, *, marks_readable: bool | None = None
+        self,
+        tenant_id: UUID,
+        *,
+        marks_readable: bool | None = None,
+        rule_readable: bool | None = None,
+        at: datetime | None = None,
     ) -> EffectiveEnforcement:
         """:meth:`effective_enforcement` of the tenant's builder as stored now
         (``tenants.builder_id``, a plain read: lock order step 0), read only
@@ -2012,19 +2322,31 @@ class CreditRepository:
             return EffectiveEnforcement(_as_utc(global_at), "global")
         scope = await self.tenant_scope(tenant_id)
         return await self._marked_enforcement(
-            None if scope is None else scope.builder_id, marks_readable
+            None if scope is None else scope.builder_id,
+            marks_readable,
+            rule_readable,
+            at,
         )
 
     async def _marked_enforcement(
-        self, builder_id: UUID | None, marks_readable: bool | None
+        self,
+        builder_id: UUID | None,
+        marks_readable: bool | None,
+        rule_readable: bool | None = None,
+        at: datetime | None = None,
     ) -> EffectiveEnforcement:
-        """The global is unset: the builder's latest mark event decides."""
+        """The global is unset: the builder's latest mark event decides, and
+        without a mark the courtesy rule (precedence global > mark >
+        courtesy, DESIGN Decision 13)."""
 
         if builder_id is None:
             return NOT_ENFORCED
         if not self.enforcement_marks_readable(marks_readable):
-            return EffectiveEnforcement(
-                None, None, builder_id=builder_id, mark_unread=True
+            # Below 047 the marks table does not exist, so no builder can be
+            # marked: the rule decides alone (``mark_unread`` stays the
+            # truthful context for the per-tenant D1).
+            return await self._courtesy_enforcement(
+                builder_id, rule_readable, at, mark_unread=True
             )
         mark = CreditEnforcementMark
         row = (
@@ -2036,10 +2358,217 @@ class CreditRepository:
             )
         ).one_or_none()
         if row is None or str(row.kind) != "mark":
-            return EffectiveEnforcement(None, None, builder_id=builder_id)
+            return await self._courtesy_enforcement(builder_id, rule_readable, at)
         return EffectiveEnforcement(
             _as_utc(row.occurred_at), "mark", builder_id=builder_id
         )
+
+    async def _courtesy_enforcement(
+        self,
+        builder_id: UUID,
+        rule_readable: bool | None,
+        at: datetime | None,
+        *,
+        mark_unread: bool = False,
+    ) -> EffectiveEnforcement:
+        """Neither the global nor a mark: the courtesy rule, behind the 046
+        gate (closed: nothing read, ``rule_unread``)."""
+
+        if not self.courtesy_rule_readable(rule_readable):
+            return EffectiveEnforcement(
+                None,
+                None,
+                builder_id=builder_id,
+                mark_unread=mark_unread,
+                rule_unread=True,
+            )
+        reading = await self.courtesy_rule(builder_id, at=at)
+        state = reading.state
+        if state is None:
+            return EffectiveEnforcement(
+                None, None, builder_id=builder_id, mark_unread=mark_unread
+            )
+        return EffectiveEnforcement(
+            reading.first_grant_at,
+            "courtesy",
+            builder_id=builder_id,
+            mark_unread=mark_unread,
+            state=state,
+        )
+
+    # -- the courtesy rule (debito-cortesia-automatico, DESIGN item 1) -------
+    #
+    # Computed on every read, from ``credit_lots`` and the sums of its ledger
+    # entries, never stored: no table, no migration (DESIGN Decision 22).
+    # The ASAAS tables are read only when the builder's courtesy is spent
+    # (wish Decision 8), and only ever read.  Callers gate the reads on 046
+    # (``effective_enforcement`` does, through ``courtesy_rule_readable``).
+
+    async def courtesy_rule(
+        self, builder_id: UUID, *, at: datetime | None = None
+    ) -> CourtesyRuleReading:
+        """The courtesy rule of ``builder_id`` at ``at`` (default now): ONE
+        statement over its courtesy lots (count, first grant, spendable), and
+        -- only when nothing is spendable -- :meth:`paid_plan_in_force` (one
+        more).  A builder that never had courtesy reads one statement.
+        Plain reads, no lock."""
+
+        instant = _as_utc(at or datetime.now(timezone.utc))
+        lot = CreditLot
+        balance, granted_at = _courtesy_lot_sums()
+        rows = (
+            await self.session.execute(
+                select(
+                    lot.id,
+                    lot.expires_at,
+                    balance.label("balance"),
+                    granted_at.label("granted_at"),
+                )
+                .outerjoin(*_courtesy_lot_entries())
+                .where(lot.builder_id == builder_id, lot.lot_kind == "courtesy")
+                .group_by(lot.id, lot.expires_at)
+            )
+        ).all()
+        reading = _courtesy_rule_reading(rows, instant)
+        if not reading.under_rule or reading.spendable_mc > 0:
+            return reading
+        return _with_paid_plan(
+            reading, await self.paid_plan_in_force(builder_id, at=instant)
+        )
+
+    async def courtesy_rules_for_builders(
+        self, builder_ids: Iterable[UUID], *, at: datetime | None = None
+    ) -> dict[UUID, CourtesyRuleReading]:
+        """:meth:`courtesy_rule` of several builders (the master-admin
+        table, DESIGN item 13) in a bounded number of statements whatever
+        their number: ONE over the courtesy lots of all of them and -- only
+        when some builder has courtesy but nothing spendable --
+        :meth:`paid_plans_in_force_for` of those (one more, wish Decision 8).
+        The same expressions and the same reduction as the single-builder
+        reader; a builder absent from the map never had courtesy.  It reads
+        neither the global nor the marks: the caller applies the precedence.
+        Plain reads, no lock."""
+
+        instant = _as_utc(at or datetime.now(timezone.utc))
+        wanted = sorted(set(builder_ids), key=str)
+        if not wanted:
+            return {}
+        lot = CreditLot
+        balance, granted_at = _courtesy_lot_sums()
+        rows = (
+            await self.session.execute(
+                select(
+                    lot.builder_id,
+                    lot.id,
+                    lot.expires_at,
+                    balance.label("balance"),
+                    granted_at.label("granted_at"),
+                )
+                .outerjoin(*_courtesy_lot_entries())
+                .where(lot.builder_id.in_(wanted), lot.lot_kind == "courtesy")
+                .group_by(lot.builder_id, lot.id, lot.expires_at)
+            )
+        ).all()
+        by_builder: dict[UUID, list[Any]] = {}
+        for row in rows:
+            by_builder.setdefault(UUID(str(row.builder_id)), []).append(row)
+        readings = {
+            builder_id: _courtesy_rule_reading(lots, instant)
+            for builder_id, lots in by_builder.items()
+        }
+        spent = [
+            builder_id
+            for builder_id, reading in readings.items()
+            if reading.under_rule and reading.spendable_mc == 0
+        ]
+        if spent:
+            plans = await self.paid_plans_in_force_for(spent, at=instant)
+            for builder_id in spent:
+                readings[builder_id] = _with_paid_plan(
+                    readings[builder_id], plans[builder_id]
+                )
+        return readings
+
+    async def paid_plan_in_force(
+        self, builder_id: UUID, *, at: datetime | None = None
+    ) -> PaidPlanInForce:
+        """:class:`PaidPlanInForce` of ``builder_id`` at ``at`` (wish
+        Decision 5), in ONE statement of three subqueries; never
+        ``binding_coverage`` (it stops before the lots under a quarantine
+        and needs a positive top-up balance).  The grace is
+        ``credit_lifecycle.binding_grace_end`` of the latest active binding
+        of an active ASAAS subscription, from its ``cycle_end``.  Read-only;
+        nothing here writes an ASAAS table."""
+
+        instant = _as_utc(at or datetime.now(timezone.utc))
+        paid_lot, last_cycle_end, unbound_paid_cycle = _paid_plan_subqueries(
+            builder_id, instant
+        )
+        row = (
+            await self.session.execute(
+                select(
+                    paid_lot.label("paid_lot"),
+                    last_cycle_end.label("last_cycle_end"),
+                    unbound_paid_cycle.label("unbound_paid_cycle"),
+                )
+            )
+        ).one()
+        return _paid_plan_reading(row, instant)
+
+    async def paid_plans_in_force_for(
+        self, builder_ids: Iterable[UUID], *, at: datetime | None = None
+    ) -> dict[UUID, PaidPlanInForce]:
+        """:meth:`paid_plan_in_force` of several builders in ONE statement
+        (the same three subqueries, correlated to
+        ``credit_accounts.builder_id``).  Anchored on the accounts, not on
+        ``builders`` (which ``credit_accounts`` has no foreign key to): every
+        builder with a credit lot has an account (the lots' foreign key), so
+        every builder :meth:`courtesy_rules_for_builders` asks about is in
+        the map -- with or without a ``builders`` row, as the single reader
+        answers it.  A builder id with no account is absent.  Read-only."""
+
+        instant = _as_utc(at or datetime.now(timezone.utc))
+        wanted = sorted(set(builder_ids), key=str)
+        if not wanted:
+            return {}
+        account = CreditAccount
+        paid_lot, last_cycle_end, unbound_paid_cycle = _paid_plan_subqueries(
+            account.builder_id, instant
+        )
+        rows = await self.session.execute(
+            select(
+                account.builder_id,
+                paid_lot.label("paid_lot"),
+                last_cycle_end.label("last_cycle_end"),
+                unbound_paid_cycle.label("unbound_paid_cycle"),
+            ).where(account.builder_id.in_(wanted))
+        )
+        return {
+            UUID(str(row.builder_id)): _paid_plan_reading(row, instant) for row in rows
+        }
+
+    async def latest_courtesy_grant_effect_id(self, builder_id: UUID) -> str | None:
+        """The grant effect id of the builder's MOST RECENT courtesy grant
+        (its ``grant`` entry's ``occurred_at``, ties by the effect id): the
+        arm of the courtesy-basis thresholds (DESIGN item 4).  A plain read."""
+
+        lot, entry = CreditLot, CreditLedgerEntry
+        return (
+            await self.session.execute(
+                select(lot.grant_effect_id)
+                .join(
+                    entry,
+                    and_(
+                        entry.builder_id == lot.builder_id,
+                        entry.lot_id == lot.id,
+                        entry.entry_type == "grant",
+                    ),
+                )
+                .where(lot.builder_id == builder_id, lot.lot_kind == "courtesy")
+                .order_by(entry.occurred_at.desc(), lot.grant_effect_id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
 
     async def any_enforcement_mark(self, *, marks_readable: bool | None = None) -> bool:
         """Whether ANY mark event was ever recorded (``mark`` or ``unmark``,

@@ -73,6 +73,7 @@ from src.models.credit import (
     CreditEffect,
     CreditEnforcementState,
     CreditLedgerEntry,
+    CreditLot,
 )
 from src.models.tenant import Tenant
 from src.ops import credit_charge_mark as ops
@@ -415,6 +416,37 @@ def test_the_enforcement_origin_is_global_then_mark_then_none() -> None:
         "effective_at": T0.isoformat(),
         "origin": "global",
     }
+
+
+@pytest.mark.parametrize("state", ["charged", "blocked"])
+def test_the_courtesy_origin_prints_its_state(state: str) -> None:
+    """debito-cortesia-automatico (DESIGN item 13): under the courtesy rule
+    the origin is ``courtesy``, at the first grant, with the rule's state;
+    no other origin prints a state.  The vocabularies are closed."""
+
+    from src.repositories.credit import EffectiveEnforcement
+
+    assert ops.ORIGINS == ("global", "mark", "courtesy", "none")
+    assert ops.COURTESY_STATES == ("charged", "blocked")
+    rule = EffectiveEnforcement(T0, "courtesy", builder_id=BUILDER, state=state)  # type: ignore[arg-type]
+    assert ops.enforcement_document(rule) == {
+        "global_at": None,
+        "effective_at": T0.isoformat(),
+        "origin": "courtesy",
+        "state": state,
+    }
+    # A state never leaks into another origin's document, which keeps the
+    # three keys it had before the rule (dominance of the printed output).
+    marked = EffectiveEnforcement(T0, "mark", state=state)  # type: ignore[arg-type]
+    assert set(ops.enforcement_document(marked)) == {
+        "global_at",
+        "effective_at",
+        "origin",
+    }
+    with pytest.raises(ValueError, match="courtesy state"):
+        ops.enforcement_document(EffectiveEnforcement(T0, "courtesy"))
+    with pytest.raises(ValueError, match="origin"):
+        ops.enforcement_document(EffectiveEnforcement(T0, "other"))  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -1555,6 +1587,84 @@ async def test_the_global_instant_wins_over_a_mark(world: _World) -> None:
     assert datetime.fromisoformat(document["enforcement"]["global_at"]) == armed
     assert datetime.fromisoformat(document["enforcement"]["effective_at"]) == armed
     assert document["marks"]["summary"] == "latest mark"
+
+
+async def test_status_shows_the_courtesy_rule_and_its_state(world: _World) -> None:
+    """debito-cortesia-automatico (DESIGN item 13): a builder with courtesy,
+    no mark and no global prints origin ``courtesy`` at its first grant,
+    ``charged`` while courtesy is spendable and ``blocked`` once it is all
+    removed ("Tirar tudo", no paid plan); a later mark wins over the rule;
+    below 046 the rule reads nothing (``none``).  Read-only throughout."""
+
+    from src.services import credit_courtesy
+
+    async def grant() -> Any:
+        async with world.sessions() as session, session.begin():
+            return await credit_courtesy.grant(
+                session,
+                builder_id=BUILDER,
+                credits=3,
+                reason="cortesia",
+                actor_user_id=ACTOR,
+                idempotency_key=f"status-{uuid4()}",
+            )
+
+    await _at(world, "047")
+    first = await grant()
+    await grant()  # a second grant never moves the rule's instant
+    code, document, _ = await _run(world)
+    assert code == 0, document
+    assert document["enforcement"] == {
+        "global_at": None,
+        "effective_at": document["enforcement"]["effective_at"],
+        "origin": "courtesy",
+        "state": "charged",
+    }
+    assert datetime.fromisoformat(document["enforcement"]["effective_at"]) == (
+        first.occurred_at.astimezone(timezone.utc)
+    )
+    _assert_read_only(world)
+
+    async with world.sessions() as session:
+        lots = [
+            row.id
+            for row in (
+                await session.execute(
+                    select(CreditLot).where(CreditLot.builder_id == BUILDER)
+                )
+            ).scalars()
+        ]
+    for lot_id in lots:
+        async with world.sessions() as session, session.begin():
+            await credit_courtesy.remove(
+                session,
+                lot_id=lot_id,
+                remove_all=True,
+                reason="tirar tudo",
+                actor_user_id=ACTOR,
+                idempotency_key=f"status-removal-{uuid4()}",
+            )
+    code, document, _ = await _run(world)
+    assert (document["enforcement"]["origin"], document["enforcement"]["state"]) == (
+        "courtesy",
+        "blocked",
+    )
+
+    # A mark wins over the rule (precedence global > mark > courtesy).
+    await _mark(world, "mark", T0, "piloto")
+    code, document, _ = await _run(world)
+    assert document["enforcement"]["origin"] == "mark"
+    assert "state" not in document["enforcement"]
+
+    # Below 046 the rule is not read: no origin at all.
+    await _at(world, "045")
+    code, document, _ = await _run(world)
+    assert code == 0, document
+    assert document["enforcement"] == {
+        "global_at": None,
+        "effective_at": None,
+        "origin": "none",
+    }
 
 
 async def test_the_linked_tenants_with_and_without_a_provider(world: _World) -> None:

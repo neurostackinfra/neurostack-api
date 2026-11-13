@@ -129,6 +129,8 @@ A dependência é de procedimento: a flag `agent_media_send_enabled` e a Decisã
 
 O seguimento `uazapi-credit-enforcement` depende deste wish e precisa entrar antes do L10 do `neurostack-credit-system`.
 
+**Atualização (2026-11-13, wish `debito-cortesia-automatico`).** O adaptador cobrado da uazapi vem do wish `debito-cortesia-automatico` e só cobra builders sob a regra da cortesia (`docs/runbooks/credit-courtesy-rule.md`; `tests/integration/test_credit_uazapi_enforced_postgres.py`). A guarda do L10, `uazapi_enforced_credit_adapter_available()` (`src/services/credit_rollout.py`), continua fechada e devolve sempre `False`. Ninguém deve abrir um wish `uazapi-credit-enforcement` duplicado para o adaptador: retirar a guarda é decisão do owner sobre esse trabalho já feito. A autenticação do webhook (`uazapi_webhook_auth_enforced`) é a mitigação das mensagens forjadas da uazapi sob a regra.
+
 ## Success Criteria
 
 - [ ] **Sombra.** Com a flag ausente ou `false`, a resposta, a origem (`UNKNOWN`), o roteamento (`.first()`), o claim, a linha observacional e a ordem dos efeitos ficam iguais aos de hoje. As únicas mudanças são o log, o contador com `mode="shadow"` e a linha de trace da verificação em `test_webhook_auth_order.py`, que muda por construção.

@@ -32,6 +32,19 @@ runbook covers operating it.
   a `mark` (at its `occurred_at`), else none
   (`CreditRepository.effective_enforcement`, `src/repositories/credit.py`).
   `status` prints exactly that reader's answer.
+- **The courtesy rule** (debito-cortesia-automatico) comes after the mark:
+  global > mark > courtesy. A builder with neither that ever received a
+  courtesy lot shows `origin: "courtesy"` and its `state` (`charged` or
+  `blocked`) in `status` (`test_status_shows_the_courtesy_rule_and_its_state`
+  and `test_the_courtesy_origin_prints_its_state` in
+  `tests/ops/test_credit_charge_mark.py`). A protected builder (courtesy
+  spent, a paid plan in force) shows `origin: "none"`, as
+  `CreditRepository.effective_enforcement` returns no origin for it
+  (`enforcement_document` in `src/ops/credit_charge_mark.py`). `mark` refuses
+  `window_already_opened` also when the rule opened the current month's
+  window (docstring of `src/ops/credit_charge_mark.py`). Under a mark,
+  Uazapi and Evolution stay observational; only the rule charges them. See
+  [`credit-courtesy-rule.md`](./credit-courtesy-rule.md).
 
 ## Preconditions (before the first `mark`)
 

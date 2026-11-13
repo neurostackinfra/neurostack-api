@@ -2397,3 +2397,232 @@ async def test_the_mode_without_request_follows_read_credit_mode(
         # Never seen: unreadable keeps the caller observational.
         fallback = await read_credit_mode_without_request(session)
         assert fallback.observational
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Groups 3 and 4: Uazapi's and Evolution's
+# outbound media charge only under the courtesy rule; a rule-blocked
+# builder's file never goes out (on every provider: the shared gate gets the
+# captured mode).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rule_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process reading at this image's head: the 046 (courtesy) and 047
+    (marks) gates open -- SQLite has no ``alembic_version``."""
+
+    from src.services.credit_switch import (
+        CreditSwitch,
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+    credit_metering.forget_enforcement_rule_seen()
+    credit_metering.forget_enforcement_mark_seen()
+
+
+async def _rule_courtesy(db: _Db, *, keep: bool) -> None:
+    from src.services import credit_courtesy
+    from src.services.credit_ledger import CreditLedger
+
+    async with db.sessions() as session, session.begin():
+        granted = await credit_courtesy.grant(
+            session,
+            builder_id=db.builder,
+            credits=5,
+            reason="courtesy rule",
+            actor_user_id=uuid4(),
+            idempotency_key=f"rule-{uuid4()}",
+            ledger=CreditLedger(session),
+        )
+    if keep:
+        return
+    async with db.sessions() as session, session.begin():
+        await credit_courtesy.remove(
+            session,
+            lot_id=granted.lot_id,
+            remove_all=True,
+            reason="courtesy rule",
+            actor_user_id=uuid4(),
+            idempotency_key=f"rule-removal-{uuid4()}",
+            ledger=CreditLedger(session),
+        )
+
+
+async def _rule_mark(db: _Db) -> None:
+    from src.models.credit import CreditEnforcementMark
+
+    await db.add(
+        CreditEnforcementMark(
+            id=uuid4(),
+            builder_id=db.builder,
+            kind="mark",
+            occurred_at=datetime.now(timezone.utc) - timedelta(days=90),
+            actor_user_id=uuid4(),
+            reason="teste",
+        )
+    )
+
+
+@pytest.fixture
+def rule_reads(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Every per-tenant mode read of the delivery, with its keywords."""
+
+    seen: list[dict[str, Any]] = []
+    original = credit_metering.read_tenant_enforcement
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(dict(kwargs))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(credit_metering, "read_tenant_enforcement", spy)
+    return seen
+
+
+@pytest.mark.parametrize("provider", ["uazapi", "evolution"])
+@pytest.mark.parametrize(
+    ("mode", "outcome", "credit"),
+    [
+        ("none", "sent", "observe"),
+        ("mark", "sent", "observe"),
+        ("charged", "sent", "charge"),
+        ("blocked", "credit_refused", None),
+        ("global", "sent", "charge"),
+    ],
+)
+async def test_uazapi_media_is_charged_only_under_the_courtesy_rule(
+    harness: _Harness,
+    switch: Callable[[bool], None],
+    rule_gates: None,
+    rule_reads: list[dict[str, Any]],
+    mode: str,
+    outcome: str,
+    credit: str | None,
+    provider: str,
+) -> None:
+    """DESIGN items 8 and 9: Uazapi's (Group 3) and Evolution's (Group 4) file
+    reads the tenant's mode -- the global as before, then (only with it
+    unset) the courtesy rule, ``rule_only``, once -- and is charged only
+    under ``courtesy``; under a mark or nothing it is observational, as
+    before; under the global, charged as before (no new read); ``blocked``
+    never goes out (``tenant_suspended``, the notice)."""
+
+    switch(True)
+    harness.channel.provider = provider  # type: ignore[assignment]
+    db = harness.db
+    if mode == "mark":
+        await _rule_mark(db)
+        await _rule_courtesy(db, keep=True)  # the mark decides first
+    elif mode in ("charged", "blocked"):
+        await _rule_courtesy(db, keep=mode == "charged")
+    elif mode == "global":
+        await _enforce(db)
+    media_id = await _store(db, _asset(db.tenant, payload=_pdf(2_222)))
+
+    result = await harness.deliver(media_id)
+
+    assert result.outcome == outcome
+    if mode == "global":
+        assert rule_reads == []  # the global read decided, as before
+    else:
+        assert [read["rule_only"] for read in rule_reads] == [True]
+    if credit is None:
+        assert harness.reasons() == ["tenant_suspended"]
+        assert "claim" not in harness.trace and "send" not in harness.trace
+        assert harness.trace[-3:] == ["release", "notice", "record"]
+        await _nothing_written(db)
+        return
+    assert credit in harness.trace and harness.trace.index(
+        credit
+    ) < harness.trace.index("send")
+    other = "charge" if credit == "observe" else "observe"
+    assert other not in harness.trace
+    async with db.sessions() as session:
+        deliveries = list(
+            (await session.execute(select(CreditEgressDelivery))).scalars()
+        )
+    expected = "enforced" if credit == "charge" else "observational"
+    assert [(d.mode, d.bytes) for d in deliveries] == [(expected, 2_222)]
+    if mode == "mark":
+        # A Uazapi read never learns the mark (rule_only): no other request's
+        # D1 changes because of it.
+        assert not credit_metering.enforcement_mark_seen(db.tenant)
+
+
+@pytest.mark.parametrize("provider", ["zapi", "meta"])
+async def test_a_rule_blocked_builder_s_media_never_goes_out_on_zapi_or_meta(
+    harness: _Harness,
+    switch: Callable[[bool], None],
+    rule_gates: None,
+    provider: str,
+) -> None:
+    """The shared gate gets the captured mode (``tenant_suspended(captured=)``):
+    a builder blocked by its courtesy rule has no episode, yet its file is
+    refused before the claim on the per-builder channels too."""
+
+    switch(True)
+    harness.channel.provider = provider  # type: ignore[assignment]
+    await _rule_courtesy(harness.db, keep=False)
+    media_id = await _store(harness.db, _asset(harness.db.tenant))
+
+    result = await harness.deliver(media_id)
+
+    assert result == ReplyMediaResult("credit_refused", notice_sent=True)
+    assert harness.reasons() == ["tenant_suspended"]
+    assert "claim" not in harness.trace and "send" not in harness.trace
+    await _nothing_written(harness.db)
+
+
+@pytest.mark.parametrize("provider", ["uazapi", "evolution"])
+async def test_a_uazapi_tenant_seen_under_the_rule_whose_rule_fails_is_refused(
+    harness: _Harness,
+    switch: Callable[[bool], None],
+    rule_gates: None,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+) -> None:
+    """The rule's per-tenant D1 binds the Uazapi (and, Group 4, the
+    Evolution) file too: once seen under the rule, a failed read refuses it
+    (never the free path)."""
+
+    switch(True)
+    harness.channel.provider = provider  # type: ignore[assignment]
+    await _rule_courtesy(harness.db, keep=True)
+    first = await _store(harness.db, _asset(harness.db.tenant))
+    assert (await harness.deliver(first)).outcome == "sent"
+    assert credit_metering.enforcement_rule_seen(harness.db.tenant)
+    original = CreditRepository.tenant_effective_enforcement
+    calls = {"n": 0}
+
+    async def unreadable(self: CreditRepository, tenant_id: UUID) -> Any:
+        calls["n"] += 1
+        raise OperationalError("SELECT", {}, Exception("credit_lots down"))
+
+    monkeypatch.setattr(CreditRepository, "tenant_effective_enforcement", unreadable)
+    second = await _store(harness.db, _asset(harness.db.tenant, filename="segundo.pdf"))
+    result = await harness.deliver(second)
+    assert result == ReplyMediaResult("credit_refused", notice_sent=True)
+    assert harness.reasons()[-1] == "credit_enforcement_unavailable"
+    assert calls["n"] == 1
+    assert original is not unreadable
+
+
+def test_the_rule_only_channels_are_exactly_uazapi_and_evolution() -> None:
+    """debito-cortesia-automatico Groups 3 and 4: the channels charged ONLY by
+    the courtesy rule are the two without an enforced mark adapter -- never
+    a per-builder (mark) channel, and every one a delivery provider."""
+
+    from src.services.reply_media import (
+        MEDIA_DELIVERY_PROVIDERS,
+        PER_BUILDER_PROVIDERS,
+        RULE_ONLY_PROVIDERS,
+    )
+
+    assert RULE_ONLY_PROVIDERS == frozenset({"uazapi", "evolution"})
+    assert not RULE_ONLY_PROVIDERS & PER_BUILDER_PROVIDERS
+    assert RULE_ONLY_PROVIDERS | PER_BUILDER_PROVIDERS == set(MEDIA_DELIVERY_PROVIDERS)

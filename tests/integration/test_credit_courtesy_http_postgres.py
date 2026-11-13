@@ -438,7 +438,24 @@ async def test_at_046_a_super_admin_grants_removes_and_reads_over_http(
             "available_mc": 0,
         }
         assert [s for s in statements if "credit_courtesy_events" in s] == []
-        assert len([s for s in statements if "credit_lots" in s]) == 1
+        # The courtesy summary is one statement; the courtesy rule's state
+        # (debito-cortesia-automatico Group 5a) is its own single batch read
+        # of the lots of the listed builders, never one per builder.
+        assert (
+            len([s for s in statements if "credit_lots" in s and " having " in s]) == 1
+        )
+        assert (
+            len(
+                [
+                    s
+                    for s in statements
+                    if "as granted_at from credit_lots" in s
+                    and "where credit_lots.builder_id in (" in s
+                ]
+            )
+            == 1
+        )
+        assert mine["courtesy_rule"] == "charged"
     assert await _courtesy_rows(databases.head, world.builder) == (1, 2, 2)
     assert await _billing_counts(databases.head) == billing_before
 

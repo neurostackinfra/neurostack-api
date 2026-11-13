@@ -95,6 +95,16 @@ class CreditStateResponse(_Frozen):
     ``active``.  ``export_deadline_at`` is the
     retention deadline of the open episode (export before it); ``mode`` is
     ``observational`` until ``credit_enforcement_at``: nothing is charged.
+
+    Under the courtesy rule (a builder that received courtesy, with neither
+    the global enforcement nor an operator mark): ``mode`` is ``enforced``
+    and there is no episode -- ``state`` is ``active`` while courtesy is
+    spendable and ``suspended`` once it is not and no paid plan is in force,
+    with ``exhausted_at``, ``suspension_due_at``, ``deletion_due_at`` and
+    ``export_deadline_at`` null.  ``quarantine`` stays in
+    ``pending_reasons`` (a top-up stays refused) without making the state
+    ``pending``, and ``reconciliation`` never applies: the rule debits only
+    courtesy lots.
     """
 
     as_of: datetime
@@ -133,6 +143,8 @@ class CreditBalanceResponse(_Frozen):
     reservation is a debit: it is not subtracted again).
     ``courtesy_available_mc`` is what the courtesy lots a super admin granted
     still hold (creditos-cortesia): capacity like a top-up, never money.
+    Under the courtesy rule (``/v1/credits/state``) ``net_available_mc`` is
+    the spendable courtesy: the rule spends nothing else and makes no debt.
     """
 
     as_of: datetime
@@ -239,7 +251,13 @@ class CreditThresholdAlertItem(_Frozen):
 
 
 class CreditThresholdsResponse(_Frozen):
-    """50/90/100 % of the capacity in force consumed, counting open debt."""
+    """50/90/100 % of the capacity in force consumed, counting open debt.
+
+    Under the courtesy rule: of the courtesy in force (what the unexpired
+    courtesy lots brought, net of removals) against the spendable courtesy,
+    with the alerts of the latest courtesy grant's arm.  Zero courtesy
+    capacity in force (a blocked builder) reads every amount 0,
+    ``used_percent`` 100 and nothing reached."""
 
     as_of: datetime
     capacity_mc: int

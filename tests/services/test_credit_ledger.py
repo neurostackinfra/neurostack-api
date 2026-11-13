@@ -2116,3 +2116,234 @@ async def test_the_adapter_debit_applies_o5_at_the_instant_it_acts_at(
             ).scalars()
         )
     assert moves == Counter({"grant": 1, "debt": 1, "debt_settlement": 1, "debit": 1})
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico: the debit of the courtesy rule (DESIGN item 3,
+# Decision 4) -- only courtesy lots, FEFO among them, no debt, no settlement.
+# ---------------------------------------------------------------------------
+
+RULE_AT = T0 - timedelta(days=2)
+COURTESY_HOLD = SpendHold(quarantined=False, enforced=True, courtesy_at=RULE_AT)
+
+
+def _courtesy(book: LedgerBook, credits: int, *, at: datetime = T0) -> UUID:
+    return book.grant_courtesy(uuid4(), credits * 1_000, at=at).id
+
+
+def _loaded_lot(
+    kind: str, granted: int, expires_at: datetime, **extra: Any
+) -> LotState:
+    return LotState(
+        id=uuid4(),
+        lot_kind=kind,
+        paid_at=date(2026, 10, 1),
+        expires_at=expires_at,
+        granted_mc=granted,
+        grant_effect_id=f"{kind}:{uuid4()}:grant",
+        sums=Counter({"grant": granted}),
+        **extra,
+    )
+
+
+def _rule_book(hold: SpendHold = COURTESY_HOLD) -> tuple[LedgerBook, UUID, UUID]:
+    """A loaded book: 7 credits of old open debt, a started monthly
+    allowance, a top-up and two courtesy lots (the earlier-expiring one
+    holds 2 credits, the later one 5); ``hold`` is the mode it was opened
+    with.  Returns the book and the two courtesy lots (early, late)."""
+
+    early = _loaded_lot("courtesy", 2_000, T0 + timedelta(days=5))
+    late = _loaded_lot("courtesy", 5_000, T0 + timedelta(days=25))
+    monthly = _loaded_lot(
+        "monthly",
+        1_000,
+        monthly_lot_expires_at(date(2026, 11, 12)),
+        subscription_id=SUB,
+        cycle_start=date(2026, 10, 12),
+        cycle_end=date(2026, 11, 12),
+        payment_id="pay-m",
+    )
+    topup = _loaded_lot(
+        "topup", 1_000, T0 + timedelta(days=150), order_id=uuid4(), payment_id="p"
+    )
+    debt = DebtState(
+        id=uuid4(),
+        created_at=T0 - timedelta(days=10),
+        source_kind="consumption",
+        source_effect_id="trace:old",
+        original_lot_id=None,
+        amount_mc=7_000,
+    )
+    book = _book(
+        lots=[late, monthly, early, topup],
+        debts=[debt],
+        known_effects={"trace:old", "trace:known"},
+        spend_hold=hold,
+        ledger_debt_mc=7_000,
+    )
+    return book, early.id, late.id
+
+
+def test_the_rule_debits_only_courtesy_fefo_and_forgives_the_rest() -> None:
+    book, early, late = _rule_book()
+    paid_lots = [lot.id for lot in book.lots if lot.lot_kind != "courtesy"]
+    debt_before = book.open_debt_mc
+    assert debt_before == 7_000
+    spendable = book.courtesy_spendable_mc(T0)
+    first = book.debit("trace:1", 1_000, at=T0, effect_kind="trace")
+    assert (first.status, first.debited_mc, first.debt_mc, first.forgiven_mc) == (
+        "applied",
+        1_000,
+        0,
+        0,
+    )
+    # FEFO among courtesy lots: the earliest expiry pays first.
+    [entry] = [e for e in book.writes.entries if e["effect_id"] == "trace:1"]
+    assert (entry["entry_type"], entry["lot_id"]) == ("debit", early)
+    # Drain to the last partial debit: what is missing is forgiven.
+    rest = spendable - 1_000
+    last = book.debit("trace:2", rest + 400, at=T0, effect_kind="trace")
+    assert (last.debited_mc, last.debt_mc, last.forgiven_mc) == (rest, 0, 400)
+    assert book.courtesy_spendable_mc(T0) == 0
+    after = book.debit("trace:3", 1_000, at=T0, effect_kind="trace")
+    assert (after.status, after.debited_mc, after.forgiven_mc) == ("applied", 0, 1_000)
+    assert "trace:3" in book.writes.effect_ids  # the decision's boundary
+    # Never debt, never a settlement, never a paid lot.
+    assert book.writes.debts == [] and book.writes.settlements == []
+    assert book.open_debt_mc == debt_before
+    assert {e["entry_type"] for e in book.writes.entries} == {"debit"}
+    assert all(e["lot_id"] not in paid_lots for e in book.writes.entries)
+    assert {e["lot_id"] for e in book.writes.entries} == {early, late}
+    assert book.debit("trace:known", 1_000, at=T0, effect_kind="trace").status == (
+        "duplicate"
+    )
+
+
+def test_outside_the_rule_the_same_book_spends_paid_lots_and_owes_debt() -> None:
+    """The control of the test above (its mutant guard): with the plain
+    hold, the same history settles first and spends the paid lots."""
+
+    book, _early, _late = _rule_book(SpendHold(quarantined=False, enforced=True))
+    result = book.debit("trace:1", 20_000, at=T0, effect_kind="trace")
+    assert result.debt_mc > 0 and result.forgiven_mc == 0
+    assert book.writes.settlements and book.writes.debts
+
+
+def test_the_quarantine_hold_never_refuses_under_the_rule() -> None:
+    """DESIGN item 7: quarantined and enforced, but the courtesy rule --
+    the hold is not active and the courtesy is debited."""
+
+    hold = SpendHold(quarantined=True, enforced=True, courtesy_at=RULE_AT)
+    assert hold.courtesy and not hold.active
+    assert SpendHold(quarantined=True, enforced=True).active
+    book = _book(spend_hold=hold)
+    lot = _courtesy(book, 3)
+    result = book.debit("trace:1", 1_000, at=T0, effect_kind="trace")
+    assert (result.status, result.debited_mc) == ("applied", 1_000)
+    assert book.lot(lot).sums["debit"] == 1_000
+
+
+def test_the_courtesy_spendable_counts_unexpired_courtesy_lots_only() -> None:
+    book = _book()
+    gone = _courtesy(book, 4, at=T0 - timedelta(days=40))  # expired by T0
+    live = _courtesy(book, 3, at=T0)
+    _topup(book, grant=9_000, at=T0)
+    assert book.lot(gone).expired(T0)
+    assert book.courtesy_spendable_mc(T0) == book.lot(live).spendable_mc(T0) == 3_000
+
+
+def test_a_spending_sweep_under_the_rule_catches_nothing_up() -> None:
+    """The rule settles nothing (DESIGN item 3): the sweep of a book opened
+    to spend under it skips the start catch-up; the plain sweep does it."""
+
+    def history() -> tuple[LedgerBook, UUID]:
+        book = _book()
+        book.debit("trace:old", 1, at=T0, effect_kind="trace")
+        renewal = _monthly(book, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+        return book, renewal
+
+    skipped, renewal = history()
+    skipped.sweep_expired(NEXT_SPEND + timedelta(hours=1), catch_up=False)
+    assert skipped.open_debt_mc == 1 and skipped.lot(renewal).balance_mc == 10_000
+    assert skipped.writes.settlements == []
+    caught, renewal = history()
+    caught.sweep_expired(NEXT_SPEND + timedelta(hours=1))
+    assert caught.open_debt_mc == 0 and caught.writes.settlements
+
+
+async def test_the_adapter_debits_by_the_captured_courtesy_without_a_reread(
+    sessions: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESIGN Decision 14: a captured courtesy mode is the mode -- the
+    adapter never re-reads the enforcement (a re-read would raise here).
+    The history: the courtesy spent, 1 mc of debt and an early renewal (a
+    paid plan in force, so the builder is protected now: the capture is
+    stale, the race of the final phase).  The captured debit pays nothing
+    and forgives it all, the renewal that started is NOT caught up against
+    the old debt (the rule settles nothing) and no paid lot moves."""
+
+    from src.repositories.credit import EffectiveEnforcement
+
+    builder_id = uuid4()
+    async with sessions() as session, session.begin():
+        ledger = _ledger(session, T0)
+        book = await ledger.open_book(builder_id, at=T0)
+        lot = book.grant_courtesy(uuid4(), 2_000, at=T0).id
+        spent = book.debit("trace:old", 2_001, at=T0, effect_kind="trace")
+        assert (spent.debited_mc, spent.debt_mc) == (2_000, 1)
+        renewal = _monthly(book, grant=10_000, start=NEXT_START, end=NEXT_END, at=T0)
+        assert book.open_debt_mc == 1  # the renewal has not started
+        await ledger.persist(book, lifecycle_source=None)
+
+    async def never(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the captured mode was re-read")
+
+    monkeypatch.setattr(CreditRepository, "effective_enforcement", never)
+    captured = EffectiveEnforcement(T0, "courtesy", state="charged")
+    later = NEXT_SPEND + timedelta(hours=1)
+    async with sessions() as session, session.begin():
+        result = await _ledger(session, later).debit(
+            builder_id,
+            "trace:rule",
+            1_000,
+            at=later,
+            effect_kind="trace",
+            captured=captured,
+        )
+    assert (result.status, result.debited_mc, result.debt_mc) == ("applied", 0, 0)
+    assert result.forgiven_mc == 1_000
+    async with sessions() as session:
+        effects = (
+            await session.execute(
+                select(CreditEffect.effect_id).where(
+                    CreditEffect.builder_id == builder_id
+                )
+            )
+        ).scalars()
+        rule_entries = await session.scalar(
+            select(func.count())
+            .select_from(CreditLedgerEntry)
+            .where(CreditLedgerEntry.effect_id == "trace:rule")
+        )
+        settlements = await session.scalar(
+            select(func.count()).select_from(CreditDebtSettlement)
+        )
+        debts = await session.scalar(select(func.count()).select_from(CreditDebt))
+        renewal_moves = (
+            await session.execute(
+                select(CreditLedgerEntry.entry_type).where(
+                    CreditLedgerEntry.lot_id == renewal
+                )
+            )
+        ).scalars()
+        lot_moves = (
+            await session.execute(
+                select(CreditLedgerEntry.entry_type).where(
+                    CreditLedgerEntry.lot_id == lot
+                )
+            )
+        ).scalars()
+    assert "trace:rule" in set(effects) and rule_entries == 0
+    assert list(renewal_moves) == ["grant"]  # never touched, never caught up
+    assert sorted(lot_moves) == ["debit", "grant"]
+    assert (settlements, debts) == (0, 1)  # the old debt stays open

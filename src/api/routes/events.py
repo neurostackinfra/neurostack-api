@@ -189,8 +189,13 @@ RESPONSES_PROCESS_EVENT: dict[int | str, dict[str, Any]] = {
             "(`credit_pending`: a clinic without a builder account, or a "
             "builder whose payment is in quarantine). No LLM runs and nothing "
             "is recorded; the rate-limit slot stays consumed. "
-            "`credit_suspended`: the builder's 72 hours of debt service after "
-            "exhaustion are over (the agent is suspended); no LLM runs."
+            "`credit_suspended`: the agent is suspended and no LLM runs -- "
+            "for a builder charged by an operator's mark (or the global "
+            "enforcement), its 72 hours of debt service after exhaustion "
+            "are over; for a builder charged from its courtesy credits, "
+            "they are spent or expired and no paid plan is in force (no "
+            "debt and no 72 hours: a new courtesy grant or a paid plan "
+            "lifts it at once). Nothing is recorded."
         ),
         "content": {
             "application/json": {
@@ -735,7 +740,9 @@ async def _process_enforced_event(
         if precheck == "credit_pending":
             return JSONResponse(status_code=402, content={"code": CREDIT_PENDING_CODE})
         if precheck == "credit_suspended":
-            # Group 5: suspended after its 72 h of debt (no LLM, no claim).
+            # Group 5: suspended after its 72 h of debt, or -- under the
+            # courtesy rule (debito-cortesia-automatico) -- blocked with its
+            # courtesy spent and no paid plan (no LLM, no claim).
             return JSONResponse(
                 status_code=402, content={"code": CREDIT_SUSPENDED_CODE}
             )

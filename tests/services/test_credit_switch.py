@@ -64,6 +64,7 @@ from src.services.credit_switch import (
     CreditUnavailableError,
     ImageMigrationChainError,
     capture_credit_switch,
+    courtesy_rule_gate_open,
     credit_router,
     credit_switch_effective,
     credit_switch_reading,
@@ -420,6 +421,48 @@ def test_the_mark_gate_reads_nothing_beyond_the_reading_it_is_given(
     assert enforcement_mark_gate_open(reading) is True
     below = CreditSwitchReading(True, "schema_ready", "046")
     assert enforcement_mark_gate_open(below) is False
+
+
+@pytest.mark.parametrize(
+    ("reading", "expected"),
+    [
+        (CreditSwitchReading(True, "schema_ready", "045"), False),
+        (CreditSwitchReading(True, "schema_ready", "042"), False),
+        (CreditSwitchReading(True, "schema_ready", "046"), True),
+        (CreditSwitchReading(True, "schema_ready", "047"), True),
+        (CreditSwitchReading(True, "schema_ready", None), False),
+        (CreditSwitchReading(True, "schema_ready", "999"), False),
+        (CreditSwitchReading(False, "config_disabled"), False),
+        (CreditSwitchReading(False, "read_error", "047"), False),
+        (CreditSwitchReading(False, "schema_below_minimum", "047"), False),
+    ],
+)
+def test_the_courtesy_rule_gate_opens_only_at_046_or_later(
+    reading: CreditSwitchReading, expected: bool
+) -> None:
+    """debito-cortesia-automatico: the rule reads courtesy lots only on a
+    046 schema or later (DESIGN item 1); the mark gate stays at 047."""
+
+    assert courtesy_rule_gate_open(reading) is expected
+
+
+def test_any_exception_closes_the_courtesy_rule_gate_and_reads_nothing_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+        raise RuntimeError("boom")
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the gate read the switch on its own")
+
+    monkeypatch.setattr(credit_switch, "credit_switch_reading", refuse)
+    monkeypatch.setattr(CreditSwitch, "reading", refuse)
+    reading = CreditSwitchReading(True, "schema_ready", "046")
+    assert courtesy_rule_gate_open(reading) is True
+    monkeypatch.setattr(credit_switch, "load_image_migration_chain", broken)
+    with structlog.testing.capture_logs() as records:
+        assert courtesy_rule_gate_open(reading) is False
+    assert any(r["event"].startswith("credit courtesy rule gate") for r in records)
 
 
 # ---------------------------------------------------------------------------

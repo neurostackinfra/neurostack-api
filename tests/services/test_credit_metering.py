@@ -84,13 +84,14 @@ from src.models.event import Event as EventRow
 from src.models.handoff import HandoffRecord
 from src.models.session import Session
 from src.models.tenant import Tenant
-from src.repositories.credit import CreditRepository
+from src.repositories.credit import NOT_ENFORCED, CreditRepository, EffectiveEnforcement
 from src.repositories.database import (
     _patch_jsonb_for_sqlite,
     get_db_engine,
     get_db_session,
 )
-from src.services import credit_metering
+from src.services import credit_lifecycle, credit_metering
+from src.services.credit_ledger import CreditLedger, DebitResult
 from src.services.credit_metering import (
     DECISION_DIGEST_SCHEMA,
     OBSERVATIONAL_WRITE_BUDGET_SECONDS,
@@ -4135,12 +4136,20 @@ def test_uazapi_and_evolution_never_take_the_enforced_path(
 ) -> None:
     prechecks: list[Any] = []
     original = credit_metering.precheck_webhook
+    original_decide = credit_metering.decide_webhook
 
     async def spy(*args: Any, **kwargs: Any) -> Any:
         prechecks.append(kwargs.get("source"))
         return await original(*args, **kwargs)
 
+    async def decide_spy(db: Any, capture: Any) -> Any:
+        # Uazapi and Evolution decide through ``decide_webhook`` on their own
+        # capture, never ``precheck_webhook``: only this spy can see them.
+        prechecks.append(capture.source)
+        return await original_decide(db, capture)
+
     monkeypatch.setattr(credit_metering, "precheck_webhook", spy)
+    monkeypatch.setattr(credit_metering, "decide_webhook", decide_spy)
     world = enforced
     if source == "uazapi":
         response = client.post(
@@ -4211,6 +4220,12 @@ def test_a_d1_latch_answers_503_once_the_enforcement_was_seen(
 
 
 async def test_a_webhook_without_an_authenticated_principal_is_never_enforced() -> None:
+    """No proof, another tenant's proof or the switch off: main's path with
+    nothing read.  (An UNAUTHENTICATED principal -- ``authenticated=False``
+    -- is read since debito-cortesia-automatico and enforced only under the
+    courtesy rule: ``test_an_unauthenticated_principal_is_enforced_only_
+    under_the_rule`` below.)"""
+
     tenant = uuid4()
     db = MagicMock(spec=AsyncSession)
     db.execute.side_effect = AssertionError("credit_enforcement_at was read")
@@ -4220,9 +4235,9 @@ async def test_a_webhook_without_an_authenticated_principal_is_never_enforced() 
     )
     for request, identity in (
         (off, credit_identity("zapi", tenant)),  # the switch off
+        (off, credit_identity("uazapi", tenant)),  # the switch off, unauthenticated
         (on, None),  # no proof
         (on, credit_identity("zapi", uuid4())),  # another tenant's proof
-        (on, credit_identity("uazapi", tenant)),  # authenticated=False
     ):
         verdict = await credit_metering.precheck_webhook(
             request,  # type: ignore[arg-type]
@@ -4529,3 +4544,1109 @@ def test_the_final_transaction_writes_the_reply_row_after_the_debit(
     events = positions("insert into events")
     assert effects and entries and accounts and events
     assert max(effects + entries + accounts + events) < outbox
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 2: the courtesy rule on the shared enforced
+# path -- the block at the pre-checks, no ASAAS nor episode gate under the
+# rule, the race by ``(origin, at, state)``, the rule's per-tenant D1,
+# ``unknown`` enforced only under the rule, the real origin in every digest
+# and the capture passed down to the debit.  The same through the real app
+# on PostgreSQL: tests/integration/test_credit_effective_enforcement_postgres.py.
+# ---------------------------------------------------------------------------
+
+_RULE_AT = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+
+
+def _rule(
+    state: str = "charged", *, builder: UUID | None = None, **context: Any
+) -> EffectiveEnforcement:
+    return EffectiveEnforcement(
+        _RULE_AT,
+        "courtesy",
+        builder_id=builder,
+        state=state,  # type: ignore[arg-type]
+        **context,
+    )
+
+
+class _LockedReads:
+    """The repository of ``require_captured_enforcement``: records the
+    account calls; ``effective_enforcement`` answers ``locked`` (or raises
+    it)."""
+
+    def __init__(self, locked: Any) -> None:
+        self.locked = locked
+        self.calls: list[tuple[str, UUID | None]] = []
+
+    async def ensure_account(self, builder_id: UUID) -> None:
+        self.calls.append(("ensure", builder_id))
+
+    async def lock_account(self, builder_id: UUID) -> None:
+        self.calls.append(("lock", builder_id))
+
+    async def effective_enforcement(self, builder_id: UUID | None) -> Any:
+        self.calls.append(("read", builder_id))
+        if isinstance(self.locked, BaseException):
+            raise self.locked
+        return self.locked
+
+
+@pytest.fixture
+def fresh_latches() -> Iterator[None]:
+    """A fresh process for the D1 latches (the global and both sets)."""
+
+    def forget() -> None:
+        credit_metering.forget_enforcement_seen()
+        credit_metering.forget_enforcement_mark_seen()
+        credit_metering.forget_enforcement_rule_seen()
+
+    forget()
+    yield
+    forget()
+
+
+def test_the_rule_block_is_computed_from_the_captured_mode() -> None:
+    block = credit_lifecycle.courtesy_block
+    assert block(None) is None
+    assert block(NOT_ENFORCED) is None
+    assert block(EffectiveEnforcement(_RULE_AT, "mark")) is None
+    assert block(EffectiveEnforcement(_RULE_AT, "global")) is None
+    assert block(_rule("charged")) is False
+    assert block(_rule("blocked")) is True
+
+
+def test_the_reparent_rule_holds_for_a_captured_courtesy_rule() -> None:
+    builder, other = uuid4(), uuid4()
+    reparented = credit_metering.reparented_since_capture
+    assert reparented(_rule(builder=builder), other)
+    assert not reparented(_rule(builder=builder), builder)
+    assert not reparented(_rule(builder=builder), None)  # LOW-5's own branch
+    assert reparented(EffectiveEnforcement(_RULE_AT, "mark", builder_id=builder), other)
+    assert not reparented(EffectiveEnforcement(_RULE_AT, "global"), other)
+    assert not reparented(None, other)
+
+
+async def test_a_captured_rule_is_rechecked_by_origin_instant_and_state(
+    fresh_latches: None,
+) -> None:
+    builder, tenant = uuid4(), uuid4()
+    captured = _rule(builder=builder)
+    # The same verdict passes -- its context may differ (the 047 gate closed
+    # since: the rule still decides alone) -- read under the account lock.
+    same = _LockedReads(_rule(builder=builder, mark_unread=True))
+    await credit_metering.require_captured_enforcement(
+        same, builder, captured, tenant_id=tenant
+    )
+    assert same.calls == [("ensure", builder), ("lock", builder), ("read", builder)]
+    assert credit_metering.enforcement_rule_seen(tenant)
+    for locked in (
+        _rule("blocked", builder=builder),  # spent, removed or expired since
+        EffectiveEnforcement(
+            _RULE_AT + timedelta(seconds=1), "courtesy", state="charged"
+        ),
+        NOT_ENFORCED,  # protected by a paid plan since, or relinked
+        EffectiveEnforcement(_RULE_AT, "mark"),  # marked since
+    ):
+        with pytest.raises(
+            credit_metering.CreditEnforcementChanged, match="changed before its lock"
+        ):
+            await credit_metering.require_captured_enforcement(
+                _LockedReads(locked), builder, captured, tenant_id=tenant
+            )
+    # A blocked capture still blocked passes: the pre-check then suspends it.
+    await credit_metering.require_captured_enforcement(
+        _LockedReads(_rule("blocked")), builder, _rule("blocked"), tenant_id=tenant
+    )
+
+
+async def test_an_unreadable_rule_after_a_rule_capture_is_503_not_a_change(
+    fresh_latches: None,
+) -> None:
+    """D1 for a ``courtesy`` capture acts on ``rule_unread`` (the 046 gate),
+    never on ``mark_unread``; a mark capture keeps acting on ``mark_unread``."""
+
+    builder, tenant = uuid4(), uuid4()
+    for locked in (
+        RuntimeError("courtesy lots unreadable"),
+        EffectiveEnforcement(None, None, builder_id=builder, rule_unread=True),
+        EffectiveEnforcement(
+            None, None, builder_id=builder, mark_unread=True, rule_unread=True
+        ),
+    ):
+        with pytest.raises(
+            credit_metering.CreditEnforcementUnavailable,
+            match="courtesy rule was seen",
+        ) as raised:
+            await credit_metering.require_captured_enforcement(
+                _LockedReads(locked), builder, _rule(builder=builder), tenant_id=tenant
+            )
+        assert not isinstance(raised.value, credit_metering.CreditEnforcementChanged)
+    with pytest.raises(
+        credit_metering.CreditEnforcementUnavailable, match="enforcement mark was seen"
+    ):
+        await credit_metering.require_captured_enforcement(
+            _LockedReads(EffectiveEnforcement(None, None, mark_unread=True)),
+            builder,
+            EffectiveEnforcement(_RULE_AT, "mark", builder_id=builder),
+            tenant_id=tenant,
+        )
+
+
+def _stub_tenant_reads(
+    monkeypatch: pytest.MonkeyPatch, answers: dict[UUID, Any]
+) -> MagicMock:
+    async def read(_self: CreditRepository, tenant_id: UUID, **_gates: Any) -> Any:
+        answer = answers[tenant_id]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(CreditRepository, "tenant_effective_enforcement", read)
+    db = MagicMock(spec=AsyncSession)
+    db.rollback = AsyncMock()
+    return db
+
+
+async def test_the_rule_d1_is_per_tenant_both_ways(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None
+) -> None:
+    tenant, other = uuid4(), uuid4()
+    answers: dict[UUID, Any] = {tenant: RuntimeError("down"), other: RuntimeError()}
+    db = _stub_tenant_reads(monkeypatch, answers)
+
+    async def mode(tenant_id: UUID, **kwargs: Any) -> Any:
+        return await credit_metering.read_tenant_enforcement(
+            db, tenant_id, global_seen=False, **kwargs
+        )
+
+    assert await mode(tenant) is None  # never seen: the free path, as before
+    answers[tenant] = _rule()
+    assert await mode(tenant) == _rule()
+    assert credit_metering.enforcement_rule_seen(tenant)
+    assert not credit_metering.enforcement_mark_seen(tenant)
+    answers[tenant] = RuntimeError("courtesy lots unreadable")
+    for kwargs in ({}, {"rule_only": True}):  # the rule's D1 binds both
+        with pytest.raises(
+            credit_metering.CreditEnforcementUnavailable,
+            match="courtesy rule was seen",
+        ):
+            await mode(tenant, **kwargs)
+    assert await mode(other) is None  # another tenant: unaffected
+    # The 046 gate closed (the rule read nothing): unreadable for the tenant.
+    answers[tenant] = EffectiveEnforcement(
+        None, None, mark_unread=True, rule_unread=True
+    )
+    with pytest.raises(
+        credit_metering.CreditEnforcementUnavailable, match="courtesy rule was seen"
+    ):
+        await mode(tenant)
+    # The 047 gate closed but the rule still reads: no refusal.
+    answers[tenant] = _rule(mark_unread=True)
+    assert await mode(tenant) == _rule()
+    # Read and known not under the rule (protected): cleared.
+    answers[tenant] = NOT_ENFORCED
+    assert await mode(tenant) == NOT_ENFORCED
+    assert not credit_metering.enforcement_rule_seen(tenant)
+    answers[tenant] = RuntimeError("down")
+    assert await mode(tenant) is None  # the free path again
+    # LOW-3: a ``courtesy`` read clears the MARK D1 when the marks were read
+    # (the builder is known not marked) ...
+    marked = EffectiveEnforcement(_RULE_AT, "mark", builder_id=uuid4())
+    answers[tenant] = marked
+    assert await mode(tenant) == marked
+    assert credit_metering.enforcement_mark_seen(tenant)
+    answers[tenant] = _rule()
+    assert await mode(tenant) == _rule()
+    assert not credit_metering.enforcement_mark_seen(tenant)
+    # ... and keeps it when they were not (``mark_unread``, the 047 gate):
+    # refused by the mark's D1, or -- a ``rule_only`` caller, never refused
+    # by it -- read with the set left as it was.
+    answers[tenant] = marked
+    assert await mode(tenant) == marked
+    answers[tenant] = _rule(mark_unread=True)
+    with pytest.raises(
+        credit_metering.CreditEnforcementUnavailable, match="enforcement mark was seen"
+    ):
+        await mode(tenant)
+    assert await mode(tenant, rule_only=True) == _rule(mark_unread=True)
+    assert credit_metering.enforcement_mark_seen(tenant)
+
+
+async def test_a_rule_only_caller_is_never_refused_by_the_global_or_a_mark(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None
+) -> None:
+    """``rule_only`` (an unauthenticated webhook principal): under the global
+    or a mark it is served free, so neither of their D1s refuses it."""
+
+    tenant = uuid4()
+    answers: dict[UUID, Any] = {
+        tenant: EffectiveEnforcement(_RULE_AT, "mark", builder_id=uuid4())
+    }
+    db = _stub_tenant_reads(monkeypatch, answers)
+    read = credit_metering.read_tenant_enforcement
+    assert (await read(db, tenant, global_seen=False)).origin == "mark"
+    assert credit_metering.enforcement_mark_seen(tenant)
+    answers[tenant] = RuntimeError("marks unreadable")
+    with pytest.raises(
+        credit_metering.CreditEnforcementUnavailable, match="enforcement mark was seen"
+    ):
+        await read(db, tenant, global_seen=False)
+    with pytest.raises(
+        credit_metering.CreditEnforcementUnavailable, match="credit_enforcement_at"
+    ):
+        await read(db, tenant, global_seen=True)
+    assert await read(db, tenant, global_seen=True, rule_only=True) is None
+    answers[tenant] = EffectiveEnforcement(None, None, mark_unread=True)
+    with pytest.raises(credit_metering.CreditEnforcementUnavailable):
+        await read(db, tenant, global_seen=False)
+    assert (await read(db, tenant, global_seen=False, rule_only=True)) == NOT_ENFORCED
+
+
+def _precheck_request() -> Any:
+    return SimpleNamespace(
+        scope={"state": {"credit_switch_effective": True}}, headers={}
+    )
+
+
+def _precheck_db(
+    monkeypatch: pytest.MonkeyPatch, builder: UUID | None, locked: Any
+) -> MagicMock:
+    """What a pre-check transaction touches, stubbed: the tenant ``builder``,
+    the account lock and the locked re-read ``locked``.  Under the rule the
+    ASAAS gates and the episode gate must never run: they fail the test."""
+
+    from src.services.credit_rollout import CreditRolloutService
+
+    db = MagicMock(spec=AsyncSession)
+    db.commit = AsyncMock()
+    db.rollback = AsyncMock()
+    scope = SimpleNamespace(builder_id=builder)
+    monkeypatch.setattr(CreditRepository, "tenant_scope", AsyncMock(return_value=scope))
+    monkeypatch.setattr(CreditRepository, "ensure_account", AsyncMock())
+    monkeypatch.setattr(CreditRepository, "lock_account", AsyncMock())
+    monkeypatch.setattr(
+        CreditRepository, "effective_enforcement", AsyncMock(return_value=locked)
+    )
+    forbidden = AsyncMock(side_effect=AssertionError("a gate ran under the rule"))
+    monkeypatch.setattr(CreditRepository, "quarantine_hold", forbidden)
+    monkeypatch.setattr(CreditRolloutService, "binding_coverage", forbidden)
+    monkeypatch.setattr(credit_lifecycle, "request_gate", forbidden)
+    return db
+
+
+def _events_enforcement(tenant: UUID, captured: Any) -> Any:
+    return credit_metering.EventsEnforcement(
+        tenant_id=tenant,
+        session_id=uuid4(),
+        principal_id=f"api_key:{tenant}",
+        payload_sha256="a" * 64,
+        idempotency_key="rule-1",
+        key_problem=None,
+        captured=captured,
+    )
+
+
+@pytest.mark.parametrize("state", ["charged", "blocked"])
+async def test_the_events_precheck_under_the_rule(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, state: str
+) -> None:
+    """``blocked`` is ``credit_suspended`` rolled back (nothing written);
+    ``charged`` is ``ok`` -- neither runs the quarantine hold, the binding
+    coverage nor the episode gate (a quarantined or uncovered builder with
+    courtesy is served)."""
+
+    tenant, builder = uuid4(), uuid4()
+    captured = _rule(state, builder=builder)
+    db = _precheck_db(monkeypatch, builder, captured)
+    outcome = await credit_metering.precheck_events(
+        db, _events_enforcement(tenant, captured)
+    )
+    if state == "blocked":
+        assert outcome == "credit_suspended"
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+    else:
+        assert outcome == "ok"
+        db.commit.assert_awaited_once()
+        db.rollback.assert_not_awaited()
+
+
+async def test_outside_the_rule_the_events_precheck_keeps_its_gates(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None
+) -> None:
+    """The control of the test above: a mark capture still reaches the
+    quarantine hold (here held: ``credit_pending``)."""
+
+    tenant, builder = uuid4(), uuid4()
+    mark = EffectiveEnforcement(_RULE_AT, "mark", builder_id=builder)
+    db = _precheck_db(monkeypatch, builder, mark)
+    monkeypatch.setattr(
+        CreditRepository, "quarantine_hold", AsyncMock(return_value=True)
+    )
+    assert (
+        await credit_metering.precheck_events(db, _events_enforcement(tenant, mark))
+        == "credit_pending"
+    )
+
+
+def _stub_capture(
+    monkeypatch: pytest.MonkeyPatch, effective: Any
+) -> list[dict[str, Any]]:
+    seen: list[dict[str, Any]] = []
+
+    async def read(_db: Any, _tenant_id: UUID, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return effective
+
+    monkeypatch.setattr(credit_metering, "read_tenant_enforcement", read)
+    return seen
+
+
+async def _webhook_precheck(db: Any, tenant: UUID, kind: str) -> Any:
+    return await credit_metering.precheck_webhook(
+        _precheck_request(),
+        db,
+        source="zapi",
+        tenant_id=tenant,
+        identity=lambda: credit_identity(kind, tenant),
+        provider_message_id="m-rule-1",
+        payload_sha256=lambda: "a" * 64,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ["global", "mark", "none", "courtesy-charged", "courtesy-blocked"]
+)
+async def test_an_unauthenticated_principal_is_enforced_only_under_the_rule(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, mode: str
+) -> None:
+    """DESIGN item 10: an unauthenticated principal (an unverified Uazapi or
+    any Evolution callback, the adapters of Groups 3 and 4) is read with
+    ``rule_only`` and enforced ONLY under the courtesy rule, as ``unknown``;
+    under the global or a mark it keeps main's free path, nothing locked,
+    and never sets the global latch."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = {
+        "global": EffectiveEnforcement(_RULE_AT, "global"),
+        "mark": EffectiveEnforcement(_RULE_AT, "mark", builder_id=builder),
+        "none": NOT_ENFORCED,
+        "courtesy-charged": _rule(builder=builder),
+        "courtesy-blocked": _rule("blocked", builder=builder),
+    }[mode]
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    if not mode.startswith("courtesy"):
+        monkeypatch.setattr(
+            CreditRepository,
+            "tenant_scope",
+            AsyncMock(side_effect=AssertionError("a free turn was locked")),
+        )
+    verdict = await _webhook_precheck(db, tenant, "uazapi")
+    assert [kwargs["rule_only"] for kwargs in seen] == [True]
+    if mode == "courtesy-charged":
+        assert isinstance(verdict, credit_metering.WebhookEnforcement)
+        assert verdict.origin is InteractionOrigin.UNKNOWN
+        assert verdict.principal_id == f"uazapi:{tenant}"
+        assert verdict.captured == effective
+        db.commit.assert_awaited_once()
+    elif mode == "courtesy-blocked":
+        assert verdict == "credit_suspended"
+        db.commit.assert_not_awaited()
+    else:
+        assert verdict is None
+        db.commit.assert_not_awaited()
+    assert not credit_metering.enforcement_seen()
+
+
+@pytest.mark.parametrize("state", ["charged", "blocked"])
+async def test_the_webhook_precheck_under_the_rule(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, state: str
+) -> None:
+    """Z-API/Meta (authenticated, ``production``): ``blocked`` answers
+    ``credit_suspended`` (the adapter's 200 skip: no session, no reply),
+    rolled back; ``charged`` is enforced without the ASAAS or episode
+    gates."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = _rule(state, builder=builder)
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    verdict = await _webhook_precheck(db, tenant, "zapi")
+    assert [kwargs["rule_only"] for kwargs in seen] == [False]
+    if state == "blocked":
+        assert verdict == "credit_suspended"
+        db.rollback.assert_awaited()
+        db.commit.assert_not_awaited()
+    else:
+        assert isinstance(verdict, credit_metering.WebhookEnforcement)
+        assert verdict.origin is InteractionOrigin.PRODUCTION
+        assert verdict.captured == effective
+        db.commit.assert_awaited_once()
+
+
+async def test_the_decision_debit_takes_the_capture_and_keeps_the_forgiven_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    async def debit(_self: Any, *_args: Any, **kwargs: Any) -> DebitResult:
+        seen.append(kwargs)
+        return DebitResult("applied", 400, 0, forgiven_mc=600)
+
+    monkeypatch.setattr(CreditLedger, "debit", debit)
+    log = MagicMock()
+    monkeypatch.setattr(credit_metering, "logger", log)
+    captured = _rule(builder=uuid4())
+    tenant = uuid4()
+    charge = await credit_metering._charge_decision(
+        MagicMock(spec=AsyncSession),
+        tenant_id=tenant,
+        builder_id=uuid4(),
+        effect_id="trace:rule",
+        digest="d" * 64,
+        captured=captured,
+    )
+    assert [kwargs["captured"] for kwargs in seen] == [captured]
+    assert (charge.debited_mc, charge.debt_mc, charge.forgiven_mc) == (400, 0, 600)
+    assert charge.effect_kind == "trace"
+    # The forgiven part is logged, with its amount (LOW-2).
+    log.info.assert_called_once_with(
+        credit_metering.ENFORCED_LOG,
+        reason="courtesy_forgiven",
+        tenant_id=str(tenant),
+        effect_id="trace:rule",
+        debited_mc=400,
+        debt_mc=0,
+        forgiven_mc=600,
+    )
+
+
+@pytest.mark.parametrize(
+    "origin", [InteractionOrigin.PRODUCTION, InteractionOrigin.UNKNOWN]
+)
+async def test_the_phases_digest_the_real_origin_and_debit_by_the_capture(
+    store: _Store, monkeypatch: pytest.MonkeyPatch, origin: InteractionOrigin
+) -> None:
+    """DESIGN item 10: the phase 1 handoff's charge and the final
+    transaction's carry the turn's own origin in ``decision_digest`` (no
+    fixed ``production``) and hand the capture to the debit (never
+    re-read)."""
+
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def debit(
+        _self: Any, _builder: UUID, effect_id: str, _amount: int, **kwargs: Any
+    ) -> DebitResult:
+        seen.append((effect_id, kwargs))
+        return DebitResult("applied", TRACE_COST_MC, 0)
+
+    monkeypatch.setattr(CreditLedger, "debit", debit)
+    monkeypatch.setattr(
+        CreditRepository, "link_handoff_credit_effect", AsyncMock(return_value=True)
+    )
+    captured = _rule(builder=store.builder)
+
+    def enforcement() -> Any:
+        return credit_metering.WebhookEnforcement(
+            source="zapi",
+            tenant_id=store.tenant,
+            principal_id=f"zapi:{store.tenant}",
+            provider_message_id=f"m-{uuid4().hex}",
+            payload_sha256="a" * 64,
+            captured=captured,
+            origin=origin,
+        )
+
+    handoff = uuid4()
+    handed = SimpleNamespace(handoff_summary={"id": str(handoff)}, event_id=None)
+    response = SimpleNamespace(
+        event_id=uuid4(),
+        prompt=SimpleNamespace(suggested_response="Olá!", deterministic=False),
+        handoff_summary=None,
+        decision=None,
+        mode=None,
+    )
+
+    async def pipeline() -> tuple[Any, Any, Any]:
+        return handed, None, []
+
+    async def no_bundle(_effect: str | None) -> None:
+        return None
+
+    async with store.sessions() as db:
+        await CreditRepository(db).ensure_account(store.builder)
+        await db.commit()
+        first, second = enforcement(), enforcement()
+        lease = await credit_metering.acquire_webhook_claim(db, first)
+        assert isinstance(lease, credit_metering.ClaimLease)
+        phase1 = await credit_metering.run_webhook_phase1(
+            db, first, lease, session_id=store.session, run_pipeline=pipeline
+        )
+        assert phase1 is not None and phase1.charge is not None
+        other = await credit_metering.acquire_webhook_claim(db, second)
+        assert isinstance(other, credit_metering.ClaimLease)
+        assert await CreditRepository(db).mark_webhook_claim_phase1(
+            other.claim_id, observed=other.observed, session_version=0
+        )
+        await db.commit()
+        final = await credit_metering.run_webhook_final(
+            db,
+            second,
+            other,
+            credit_metering.Phase1Outcome(
+                result=None,
+                clinic_config=None,
+                message_history=[],
+                session_version=0,
+                charge=None,
+                handoff_id=None,
+            ),
+            response=response,
+            write_bundle=no_bundle,
+            reply=None,
+        )
+    assert final is not None and final.charge is not None
+    decided = response_decision(response)
+    assert decided is not None
+    expected = {
+        trace_effect_id(store.tenant, lease.interaction_id, 1): decision_digest(
+            tenant_id=store.tenant,
+            interaction_id=lease.interaction_id,
+            decision_version=1,
+            origin=origin,
+            decision=credit_metering.phase1_decision(
+                handed, handoff, kind="zapi_phase1_handoff"
+            ),
+        ),
+        trace_effect_id(store.tenant, other.interaction_id, 1): decision_digest(
+            tenant_id=store.tenant,
+            interaction_id=other.interaction_id,
+            decision_version=1,
+            origin=origin,
+            decision=decided[1],
+        ),
+    }
+    assert {effect: kwargs["decision_digest"] for effect, kwargs in seen} == expected
+    assert [kwargs["captured"] for _, kwargs in seen] == [captured, captured]
+
+
+@pytest.mark.parametrize("state", ["charged", "blocked", "changed"])
+async def test_the_file_handoff_transaction_under_the_rule(
+    monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """The file handoff's one transaction (Meta and Z-API): a captured
+    ``charged`` rule skips the quarantine hold and debits by the capture,
+    its digest of the turn's origin; a ``blocked`` capture (never handed
+    over by the pre-check) is refused fail-closed with nothing written; a
+    capture the re-check under the lock finds ``changed`` raises
+    ``CreditEnforcementChanged`` before the claim, the handoff or the
+    effect."""
+
+    tenant, builder, session_id, handoff = uuid4(), uuid4(), uuid4(), uuid4()
+    captured = _rule("charged" if state == "changed" else state, builder=builder)
+    db = MagicMock(spec=AsyncSession)
+    db.commit = AsyncMock()
+    db.rollback = AsyncMock()
+    rechecked: list[Any] = []
+
+    async def recheck(*args: Any, **_kwargs: Any) -> None:
+        rechecked.append(args[2])
+        if state == "changed":
+            raise credit_metering.CreditEnforcementChanged("changed before its lock")
+
+    monkeypatch.setattr(credit_metering, "require_captured_enforcement", recheck)
+    monkeypatch.setattr(
+        CreditRepository,
+        "tenant_scope",
+        AsyncMock(return_value=SimpleNamespace(builder_id=builder)),
+    )
+    monkeypatch.setattr(CreditRepository, "lock_session", AsyncMock(return_value=4))
+    monkeypatch.setattr(CreditRepository, "ensure_account", AsyncMock())
+    monkeypatch.setattr(CreditRepository, "lock_account", AsyncMock())
+    monkeypatch.setattr(
+        CreditRepository,
+        "quarantine_hold",
+        AsyncMock(side_effect=AssertionError("the hold was read under the rule")),
+    )
+    monkeypatch.setattr(CreditRepository, "lock_lots", AsyncMock())
+    claim = SimpleNamespace(interaction_id=uuid4())
+    monkeypatch.setattr(
+        CreditRepository, "insert_webhook_claim", AsyncMock(return_value=claim)
+    )
+    monkeypatch.setattr(
+        CreditRepository, "link_handoff_credit_effect", AsyncMock(return_value=True)
+    )
+    charges: list[dict[str, Any]] = []
+
+    async def charge(_db: Any, **kwargs: Any) -> Any:
+        charges.append(kwargs)
+        return credit_metering.DecisionCharge(
+            kwargs["effect_id"], builder, "trace", forgiven_mc=TRACE_COST_MC
+        )
+
+    monkeypatch.setattr(credit_metering, "_charge_decision", charge)
+
+    initiated: list[UUID] = []
+
+    async def initiate() -> Any:
+        initiated.append(handoff)
+        return SimpleNamespace(id=handoff)
+
+    enforcement = credit_metering.WebhookEnforcement(
+        source="meta",
+        tenant_id=tenant,
+        principal_id=f"meta:{tenant}",
+        provider_message_id="wamid.rule-file-1",
+        payload_sha256="a" * 64,
+        captured=captured,
+        origin=InteractionOrigin.UNKNOWN,
+    )
+    if state == "changed":
+        with pytest.raises(credit_metering.CreditEnforcementChanged):
+            await credit_metering.run_meta_file_handoff(
+                db, enforcement, session_id=session_id, note="file", initiate=initiate
+            )
+        assert rechecked == [captured]
+        CreditRepository.insert_webhook_claim.assert_not_awaited()  # type: ignore[attr-defined]
+        assert initiated == [] and charges == []
+        CreditRepository.link_handoff_credit_effect.assert_not_awaited()  # type: ignore[attr-defined]
+        db.commit.assert_not_awaited()
+        db.rollback.assert_awaited()
+        return
+    outcome = await credit_metering.run_meta_file_handoff(
+        db, enforcement, session_id=session_id, note="file", initiate=initiate
+    )
+    assert rechecked == [captured]
+    if state == "blocked":
+        assert outcome.answer == credit_metering.CREDIT_SUSPENDED_SKIP
+        assert charges == [] and outcome.handoff is None
+        db.commit.assert_not_awaited()
+        return
+    assert outcome.handoff is not None and outcome.answer is None
+    [kwargs] = charges
+    assert kwargs["captured"] is captured
+    assert kwargs["digest"] == decision_digest(
+        tenant_id=tenant,
+        interaction_id=claim.interaction_id,
+        decision_version=1,
+        origin=InteractionOrigin.UNKNOWN,
+        decision=credit_metering.file_handoff_decision(handoff, "file"),
+    )
+    db.commit.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 3: the Uazapi pre-check
+# (``capture_uazapi`` / ``precheck_uazapi``).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def uazapi_egress(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """``uazapi_egress_enabled`` as the pre-check reads it: each read pops
+    the next answer (a read past the list fails the test)."""
+
+    from src.services import egress_policy
+
+    answers: list[bool] = [True]
+    reads: list[bool] = []
+
+    async def question() -> bool:
+        assert answers, "uazapi_egress_enabled read more often than expected"
+        reads.append(answers[0])
+        return answers.pop(0)
+
+    monkeypatch.setattr(egress_policy, "uazapi_egress_open", question)
+    return answers
+
+
+async def _uazapi_precheck(
+    db: Any, tenant: UUID, *, verified: bool = False, message: Any = None
+) -> Any:
+    return await credit_metering.precheck_uazapi(
+        _precheck_request(),
+        db,
+        tenant_id=tenant,
+        message=message if message is not None else {"messageid": "uz-rule-1"},
+        inbound_verified=verified,
+    )
+
+
+def test_the_uazapi_message_id_is_the_ingress_one() -> None:
+    """``messageid``, else ``id`` -- the observational ingress's derivation;
+    an idless message is claimed by its content, never by one shared id."""
+
+    assert credit_metering.uazapi_message_id({"messageid": "A", "id": "B"}) == "A"
+    assert credit_metering.uazapi_message_id({"id": "B"}) == "B"
+    assert credit_metering.uazapi_message_id({}) == ""
+    one = credit_metering._uazapi_claim_source({"text": "oi", "sender_pn": "1"})
+    other = credit_metering._uazapi_claim_source({"text": "olá", "sender_pn": "1"})
+    assert one.startswith("payload-sha256:") and one != other
+    assert credit_metering.provider_claim_id(one) == one  # stored as is
+    assert credit_metering._uazapi_claim_source({"messageid": "A"}) == "A"
+
+
+@pytest.mark.parametrize(
+    "mode", ["global", "mark", "none", "courtesy-charged", "courtesy-blocked"]
+)
+@pytest.mark.parametrize("verified", [False, True], ids=["unverified", "verified"])
+async def test_uazapi_is_enforced_only_under_the_rule_verified_or_not(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_latches: None,
+    uazapi_egress: list[bool],
+    mode: str,
+    verified: bool,
+) -> None:
+    """DESIGN Decision 18: Uazapi charges ONLY under the courtesy rule -- a
+    verified callback (authenticated, ``production``) as much as an
+    unverified one (``unknown``).  Read ``rule_only`` either way; under the
+    global, a mark or nothing it is main's path with nothing locked, no
+    global latch and no egress question; the block is decided without
+    reading ``uazapi_egress_enabled`` (wish Decision 7)."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = {
+        "global": EffectiveEnforcement(_RULE_AT, "global"),
+        "mark": EffectiveEnforcement(_RULE_AT, "mark", builder_id=builder),
+        "none": NOT_ENFORCED,
+        "courtesy-charged": _rule(builder=builder),
+        "courtesy-blocked": _rule("blocked", builder=builder),
+    }[mode]
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    if not mode.startswith("courtesy"):
+        monkeypatch.setattr(
+            CreditRepository,
+            "tenant_scope",
+            AsyncMock(side_effect=AssertionError("a free turn was locked")),
+        )
+    verdict = await _uazapi_precheck(db, tenant, verified=verified)
+    assert [kwargs["rule_only"] for kwargs in seen] == [True]
+    assert [kwargs["source"] for kwargs in seen] == ["uazapi"]
+    if mode == "courtesy-charged":
+        assert isinstance(verdict, credit_metering.WebhookEnforcement)
+        assert verdict.source == "uazapi"
+        assert verdict.provider_message_id == "uz-rule-1"
+        assert verdict.origin is (
+            InteractionOrigin.PRODUCTION if verified else InteractionOrigin.UNKNOWN
+        )
+        assert verdict.principal_id == f"uazapi:{tenant}"
+        assert verdict.captured == effective
+        assert uazapi_egress == []  # the one read of the flag
+        db.commit.assert_awaited_once()
+    elif mode == "courtesy-blocked":
+        assert verdict == "credit_suspended"
+        assert uazapi_egress == [True]  # never read
+        db.commit.assert_not_awaited()
+    else:
+        assert verdict is None
+        assert uazapi_egress == [True]  # never read
+        db.commit.assert_not_awaited()
+    assert not credit_metering.enforcement_seen()
+
+
+async def test_a_charged_uazapi_turn_with_the_egress_closed_is_main_s_path(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, uazapi_egress: list[bool]
+) -> None:
+    """DESIGN Decision 19: ``charged`` with ``uazapi_egress_enabled`` closed
+    is NOT enforced (nothing would be delivered): main's path, nothing
+    locked nor written."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = _rule(builder=builder)
+    _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    monkeypatch.setattr(
+        CreditRepository,
+        "tenant_scope",
+        AsyncMock(side_effect=AssertionError("a closed-egress turn was locked")),
+    )
+    uazapi_egress[:] = [False]
+    assert await _uazapi_precheck(db, tenant) is None
+    assert uazapi_egress == []
+    db.commit.assert_not_awaited()
+
+
+async def test_the_uazapi_capture_is_decided_once_and_never_read_again(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, uazapi_egress: list[bool]
+) -> None:
+    """The route's capture (before the AI-off and pause gates, every patient
+    message) is the turn's ONE mode read: the pre-check decides on it and
+    reads nothing more; the rule's D1 is raised by the capture itself (the
+    503 at once); any other
+    D1 (``rule_only`` never raises one) would be held and raised by the
+    pre-check, where the route answers it -- as on Z-API."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = _rule(builder=builder)
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    early = await credit_metering.capture_uazapi(
+        _precheck_request(),
+        db,
+        tenant_id=tenant,
+        message={"messageid": "uz-early-1"},
+        inbound_verified=False,
+    )
+    assert early.unavailable is None and early.capture is not None
+    assert not early.blocked
+    verdict = await credit_metering.precheck_uazapi(
+        _precheck_request(),
+        db,
+        tenant_id=tenant,
+        message={"messageid": "uz-early-1"},
+        inbound_verified=False,
+        early=early,
+    )
+    assert isinstance(verdict, credit_metering.WebhookEnforcement)
+    assert len(seen) == 1
+
+    async def unreadable(_db: Any, _tenant_id: UUID, **kwargs: Any) -> Any:
+        raise credit_metering.CreditEnforcementUnavailable(
+            "rule", reason=credit_metering.ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY
+        )
+
+    monkeypatch.setattr(credit_metering, "read_tenant_enforcement", unreadable)
+    with pytest.raises(credit_metering.CreditEnforcementUnavailable, match="rule"):
+        await credit_metering.capture_uazapi(
+            _precheck_request(),
+            db,
+            tenant_id=tenant,
+            message={"messageid": "uz-early-2"},
+            inbound_verified=False,
+        )
+
+    async def mark_unreadable(_db: Any, _tenant_id: UUID, **kwargs: Any) -> Any:
+        raise credit_metering.CreditEnforcementUnavailable(
+            "mark", reason=credit_metering.ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED
+        )
+
+    monkeypatch.setattr(credit_metering, "read_tenant_enforcement", mark_unreadable)
+    held = await credit_metering.capture_uazapi(
+        _precheck_request(),
+        db,
+        tenant_id=tenant,
+        message={"messageid": "uz-early-3"},
+        inbound_verified=False,
+    )
+    assert held.capture is None and held.unavailable is not None
+    assert not held.blocked
+    monkeypatch.setattr(
+        credit_metering,
+        "read_tenant_enforcement",
+        AsyncMock(side_effect=AssertionError("the pre-check read the mode again")),
+    )
+    with pytest.raises(credit_metering.CreditEnforcementUnavailable, match="mark"):
+        await credit_metering.precheck_uazapi(
+            _precheck_request(),
+            db,
+            tenant_id=tenant,
+            message={"messageid": "uz-early-3"},
+            inbound_verified=False,
+            early=held,
+        )
+    assert uazapi_egress == []  # the charged turn's one read; nothing more
+
+
+async def test_a_rule_only_read_never_learns_a_mark(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None
+) -> None:
+    """A Uazapi read under a mark changes no other request's D1: the marks'
+    per-tenant set is neither filled nor emptied by a ``rule_only`` read,
+    while the rule's set still is."""
+
+    tenant = uuid4()
+    marked = EffectiveEnforcement(_RULE_AT, "mark", builder_id=uuid4())
+    answers: dict[UUID, Any] = {tenant: marked}
+    db = _stub_tenant_reads(monkeypatch, answers)
+    read = credit_metering.read_tenant_enforcement
+    assert (await read(db, tenant, global_seen=False, rule_only=True)) == marked
+    assert not credit_metering.enforcement_mark_seen(tenant)
+    assert (await read(db, tenant, global_seen=False)) == marked
+    assert credit_metering.enforcement_mark_seen(tenant)
+    answers[tenant] = _rule()
+    assert (await read(db, tenant, global_seen=False, rule_only=True)) == _rule()
+    assert credit_metering.enforcement_mark_seen(tenant)  # left as it was
+    assert credit_metering.enforcement_rule_seen(tenant)
+    answers[tenant] = NOT_ENFORCED
+    assert (await read(db, tenant, global_seen=False, rule_only=True)) == NOT_ENFORCED
+    assert credit_metering.enforcement_mark_seen(tenant)
+    assert not credit_metering.enforcement_rule_seen(tenant)
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 4: the Evolution pre-check
+# (``capture_evolution`` / ``precheck_evolution``).  Evolution has no origin
+# proof (``unknown``, unauthenticated) and no egress flag.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_egress_question(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Evolution has no egress clause (wish Decision 7): the Uazapi flag is
+    never read for it."""
+
+    from src.services import egress_policy
+
+    async def question() -> bool:
+        raise AssertionError("an egress flag was read for Evolution")
+
+    monkeypatch.setattr(egress_policy, "uazapi_egress_open", question)
+
+
+def _evolution_data(message_id: Any = "evo-rule-1") -> dict[str, Any]:
+    return {
+        "key": {"remoteJid": "5511900000401@s.whatsapp.net", "id": message_id},
+        "message": {"conversation": "Olá"},
+    }
+
+
+def test_the_evolution_message_id_is_the_ingress_one() -> None:
+    """``data.key.id`` stripped -- the one derivation the observational
+    ingress and the enforced pre-check share; no key, no id."""
+
+    assert credit_metering.evolution_message_id(_evolution_data(" E1 ")) == "E1"
+    assert credit_metering.evolution_message_id(_evolution_data(None)) == ""
+    assert credit_metering.evolution_message_id({"key": "E1"}) == ""
+    assert credit_metering.evolution_message_id({}) == ""
+
+
+@pytest.mark.parametrize(
+    "mode", ["global", "mark", "none", "courtesy-charged", "courtesy-blocked"]
+)
+async def test_evolution_is_enforced_only_under_the_rule(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_latches: None,
+    no_egress_question: None,
+    mode: str,
+) -> None:
+    """DESIGN items 9 and 10: every Evolution callback is ``unknown`` and
+    charged ONLY under the courtesy rule.  Read ``rule_only``, once; under
+    the global, a mark or nothing it is main's path with nothing locked and
+    no global latch; ``blocked`` is ``credit_suspended`` and ``charged`` is
+    enforced -- the claim id ``data.key.id``, the origin ``unknown``, the
+    principal ``evolution:{tenant}`` -- and no egress flag is ever read."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = {
+        "global": EffectiveEnforcement(_RULE_AT, "global"),
+        "mark": EffectiveEnforcement(_RULE_AT, "mark", builder_id=builder),
+        "none": NOT_ENFORCED,
+        "courtesy-charged": _rule(builder=builder),
+        "courtesy-blocked": _rule("blocked", builder=builder),
+    }[mode]
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    if not mode.startswith("courtesy"):
+        monkeypatch.setattr(
+            CreditRepository,
+            "tenant_scope",
+            AsyncMock(side_effect=AssertionError("a free turn was locked")),
+        )
+    verdict = await credit_metering.precheck_evolution(
+        _precheck_request(), db, tenant_id=tenant, data=_evolution_data()
+    )
+    assert [kwargs["rule_only"] for kwargs in seen] == [True]
+    assert [kwargs["source"] for kwargs in seen] == ["evolution"]
+    if mode == "courtesy-charged":
+        assert isinstance(verdict, credit_metering.WebhookEnforcement)
+        assert verdict.source == "evolution"
+        assert verdict.provider_message_id == "evo-rule-1"
+        assert verdict.origin is InteractionOrigin.UNKNOWN
+        assert verdict.principal_id == f"evolution:{tenant}"
+        assert verdict.payload_sha256 == provider_message_sha256(_evolution_data())
+        assert verdict.captured == effective
+        db.commit.assert_awaited_once()
+    elif mode == "courtesy-blocked":
+        assert verdict == "credit_suspended"
+        db.commit.assert_not_awaited()
+    else:
+        assert verdict is None
+        db.commit.assert_not_awaited()
+    assert not credit_metering.enforcement_seen()
+
+
+async def test_the_evolution_capture_is_decided_once_and_never_read_again(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, no_egress_question: None
+) -> None:
+    """The route's capture (before the AI-off and pause gates) is the turn's
+    ONE mode read: the pre-check decides on it and reads nothing more; the
+    rule's D1 is raised by the capture itself (the 503 at once); any other
+    D1 (``rule_only`` never raises one) would be held and raised by the
+    pre-check, where the route answers it -- as on Uazapi."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = _rule(builder=builder)
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    early = await credit_metering.capture_evolution(
+        _precheck_request(), db, tenant_id=tenant, data=_evolution_data("evo-e-1")
+    )
+    assert early.unavailable is None and early.capture is not None
+    assert early.capture.origin is InteractionOrigin.UNKNOWN
+    assert not early.blocked
+    verdict = await credit_metering.precheck_evolution(
+        _precheck_request(),
+        db,
+        tenant_id=tenant,
+        data=_evolution_data("evo-e-1"),
+        early=early,
+    )
+    assert isinstance(verdict, credit_metering.WebhookEnforcement)
+    assert verdict.provider_message_id == "evo-e-1"
+    assert len(seen) == 1
+
+    async def unreadable(_db: Any, _tenant_id: UUID, **kwargs: Any) -> Any:
+        raise credit_metering.CreditEnforcementUnavailable(
+            "rule", reason=credit_metering.ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY
+        )
+
+    monkeypatch.setattr(credit_metering, "read_tenant_enforcement", unreadable)
+    with pytest.raises(credit_metering.CreditEnforcementUnavailable, match="rule"):
+        await credit_metering.capture_evolution(
+            _precheck_request(), db, tenant_id=tenant, data=_evolution_data("evo-e-2")
+        )
+
+    async def mark_unreadable(_db: Any, _tenant_id: UUID, **kwargs: Any) -> Any:
+        raise credit_metering.CreditEnforcementUnavailable(
+            "mark", reason=credit_metering.ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED
+        )
+
+    monkeypatch.setattr(credit_metering, "read_tenant_enforcement", mark_unreadable)
+    held = await credit_metering.capture_evolution(
+        _precheck_request(), db, tenant_id=tenant, data=_evolution_data("evo-e-3")
+    )
+    assert held.capture is None and held.unavailable is not None
+    assert not held.blocked
+    monkeypatch.setattr(
+        credit_metering,
+        "read_tenant_enforcement",
+        AsyncMock(side_effect=AssertionError("the pre-check read the mode again")),
+    )
+    with pytest.raises(credit_metering.CreditEnforcementUnavailable, match="mark"):
+        await credit_metering.precheck_evolution(
+            _precheck_request(),
+            db,
+            tenant_id=tenant,
+            data=_evolution_data("evo-e-3"),
+            early=held,
+        )
+
+
+async def test_the_evolution_precheck_without_a_capture_captures_once(
+    monkeypatch: pytest.MonkeyPatch, fresh_latches: None, no_egress_question: None
+) -> None:
+    """Called without ``early`` (no route capture), the pre-check captures
+    itself -- ``rule_only``, once -- and decides on it."""
+
+    tenant, builder = uuid4(), uuid4()
+    effective = _rule("blocked", builder=builder)
+    seen = _stub_capture(monkeypatch, effective)
+    db = _precheck_db(monkeypatch, builder, effective)
+    verdict = await credit_metering.precheck_evolution(
+        _precheck_request(), db, tenant_id=tenant, data=_evolution_data()
+    )
+    assert verdict == "credit_suspended"
+    assert [(kw["source"], kw["rule_only"]) for kw in seen] == [("evolution", True)]

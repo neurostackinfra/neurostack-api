@@ -498,7 +498,13 @@ _LEGACY_KEYS = {
     "billing_cycle",
     "updated_at",
 }
-_NEW_KEYS = {"subscription", "subscription_unavailable", "courtesy", "charging"}
+_NEW_KEYS = {
+    "subscription",
+    "subscription_unavailable",
+    "courtesy",
+    "charging",
+    "courtesy_rule",
+}
 
 
 @contextmanager
@@ -677,7 +683,11 @@ class TestBuilderSubscriptions:
                 rows = self._rows(client, super_admin_headers, ids)
             assert all(rows[b]["courtesy"]["available_mc"] == 3_000 for b in ids[:2])
             assert [s for s in statements if "credit_courtesy_events" in s] == []
-            counts.append(len([s for s in statements if "credit_lots" in s]))
+            # The summary's statement (the courtesy rule's own reads are
+            # counted by the rule's tests below).
+            counts.append(
+                len([s for s in statements if "credit_lots" in s and " having " in s])
+            )
         assert counts == [1, 1]
 
     def test_a_failed_subscription_read_marks_only_its_row(
@@ -969,3 +979,362 @@ class TestBuilderSubscriptions:
         ]
         assert logged["error_type"] == "OperationalError"
         assert "secret" not in repr(records)
+        # The precedence is unknown without the marks: no rule state either.
+        assert row["courtesy_rule"] is None
+
+    # -- courtesy_rule (debito-cortesia-automatico Group 5a) ------------------
+
+    @staticmethod
+    def _remove_all(client: TestClient, lot_id: UUID) -> None:
+        from src.repositories.database import get_db_session
+        from src.services import credit_courtesy
+
+        async def run() -> None:
+            session = get_db_session()
+            try:
+                async with session.begin():
+                    await credit_courtesy.remove(
+                        session,
+                        lot_id=lot_id,
+                        remove_all=True,
+                        reason="teste",
+                        actor_user_id=uuid4(),
+                        idempotency_key=f"sub-removal-{uuid4()}",
+                    )
+            finally:
+                await session.close()
+
+        client._submit(run())  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _paid_topup(client: TestClient, builder_id: UUID) -> None:
+        """A paid top-up lot in force (a paid plan in force, wish Decision 5)."""
+
+        from src.repositories.database import get_db_session
+        from src.services.credit_ledger import (
+            CreditLedger,
+            GrantSpec,
+            civil_date,
+            topup_grant_effect_id,
+            topup_lot_expires_at,
+        )
+
+        async def run() -> None:
+            session = get_db_session()
+            try:
+                async with session.begin():
+                    ledger = CreditLedger(session)
+                    book = await ledger.open_book(
+                        builder_id, at=datetime.now(timezone.utc)
+                    )
+                    assert book.clock is not None
+                    order, paid = uuid4(), civil_date(book.clock)
+                    book.grant(
+                        GrantSpec(
+                            lot_kind="topup",
+                            effect_id=topup_grant_effect_id(order),
+                            payment_id=f"pay-{order}",
+                            paid_at=paid,
+                            granted_mc=1_000,
+                            expires_at=topup_lot_expires_at(paid),
+                            order_id=order,
+                        ),
+                        at=book.clock,
+                    )
+                    await ledger.persist(book, lifecycle_source=None)
+            finally:
+                await session.close()
+
+        client._submit(run())  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _effective(client: TestClient, builder_id: UUID) -> Any:
+        """The request path's own reader, for the batch's equivalence."""
+
+        from src.repositories.credit import CreditRepository
+        from src.repositories.database import get_db_session
+
+        async def run() -> Any:
+            session = get_db_session()
+            try:
+                return await CreditRepository(session).effective_enforcement(builder_id)
+            finally:
+                await session.close()
+
+        return client._submit(run())  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _is_rule_lots_read(statement: str) -> bool:
+        return "as granted_at" in statement and "credit_lots.builder_id in (" in (
+            statement
+        )
+
+    @staticmethod
+    def _is_paid_plan_read(statement: str) -> bool:
+        # The batch is anchored on the credit accounts (every builder with a
+        # courtesy lot has one; ``builders`` may lack the row).
+        return (
+            "as unbound_paid_cycle" in statement and "from credit_accounts" in statement
+        )
+
+    def _rule_world(self, client: TestClient) -> dict[str, UUID]:
+        charged, blocked, never, marked, protected, partial = self._builders(client, 6)
+        self._courtesy(client, charged, 5)
+        self._remove_all(client, self._courtesy(client, blocked, 4).lot_id)
+        self._mark(client, marked, ("mark", self._T0))
+        self._courtesy(client, marked, 4)
+        self._remove_all(client, self._courtesy(client, protected, 2).lot_id)
+        self._paid_topup(client, protected)
+        # Two lots, one removed: still courtesy left.
+        self._courtesy(client, partial, 1)
+        self._remove_all(client, self._courtesy(client, partial, 3).lot_id)
+        return {
+            "charged": charged,
+            "blocked": blocked,
+            "never": never,
+            "marked": marked,
+            "protected": protected,
+            "partial": partial,
+        }
+
+    def test_courtesy_rule_is_charged_blocked_or_null_like_the_request_reader(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        world = self._rule_world(client)
+        rows = self._rows(client, super_admin_headers, list(world.values()))
+        found = {
+            name: rows[builder]["courtesy_rule"] for name, builder in world.items()
+        }
+        assert found == {
+            "charged": "charged",
+            "blocked": "blocked",
+            "never": None,
+            "marked": None,
+            "protected": None,
+            "partial": "charged",
+        }
+        # The batch is the request path's reader, builder by builder.
+        for name, builder in world.items():
+            effective = self._effective(client, builder)
+            expected = effective.state if effective.origin == "courtesy" else None
+            assert found[name] == expected, name
+        # The mark's badge and the courtesy summary are what they were.
+        assert rows[world["marked"]]["charging"] == {
+            "marked_at": "2026-11-11T12:00:00Z"
+        }
+        assert rows[world["charged"]]["charging"] is None
+        assert rows[world["blocked"]]["courtesy"] == {
+            "active_expires_at": None,
+            "available_mc": 0,
+        }
+        assert rows[world["charged"]]["courtesy"]["available_mc"] == 5_000
+
+    def test_with_the_global_set_no_row_is_under_the_rule(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from src.models.credit import CreditEnforcementState
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        world = self._rule_world(client)
+        armed = datetime.now(timezone.utc) - timedelta(days=1)
+        _seed_entities(
+            client,
+            CreditEnforcementState(
+                id=1, credit_enforcement_at=armed, set_by="test", set_at=armed
+            ),
+        )
+        rows = self._rows(client, super_admin_headers, list(world.values()))
+        assert {row["courtesy_rule"] for row in rows.values()} == {None}
+        assert rows[world["marked"]]["charging"] is not None
+
+    def test_courtesy_rule_is_null_and_unread_without_the_switch_or_below_046(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        [builder] = self._builders(client, 1)
+        self._courtesy(client, builder, 2)
+        for effective, revision in (
+            (False, None),
+            (False, self._head()),
+            (True, self._below_046()),
+            (True, None),
+        ):
+            self._switch(monkeypatch, effective=effective, revision=revision)
+            with _sql() as statements:
+                row = self._rows(client, super_admin_headers, [builder])[builder]
+            assert row["courtesy_rule"] is None, (effective, revision)
+            assert [s for s in statements if self._is_rule_lots_read(s)] == []
+
+    def test_below_047_the_rule_decides_without_reading_marks(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        charged, blocked = self._builders(client, 2)
+        self._courtesy(client, charged, 2)
+        self._remove_all(client, self._courtesy(client, blocked, 2).lot_id)
+        self._switch(monkeypatch, effective=True, revision=self._below_047())
+        with _sql() as statements:
+            rows = self._rows(client, super_admin_headers, [charged, blocked])
+        assert rows[charged]["courtesy_rule"] == "charged"
+        assert rows[blocked]["courtesy_rule"] == "blocked"
+        assert [s for s in statements if "credit_enforcement_marks" in s] == []
+
+    def test_the_courtesy_rule_part_is_a_bounded_batch_for_the_whole_table(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One read of the lots for every builder and -- with some builder
+        spent -- one of the paid plans, whatever the size of the table:
+        never one read per builder (the cobranca badge's rule)."""
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        counts = []
+        for size in (2, 6):
+            ids = self._builders(client, size)
+            for builder in ids:
+                self._remove_all(client, self._courtesy(client, builder, 1).lot_id)
+            with _sql() as statements:
+                rows = self._rows(client, super_admin_headers, ids)
+            assert all(rows[b]["courtesy_rule"] == "blocked" for b in ids)
+            counts.append(
+                (
+                    len([s for s in statements if self._is_rule_lots_read(s)]),
+                    len([s for s in statements if self._is_paid_plan_read(s)]),
+                )
+            )
+        assert counts == [(1, 1), (1, 1)]
+
+    def test_with_nobody_spent_the_paid_plans_are_not_read(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Wish Decision 8: the subscription, binding and cycle reads happen
+        only for a builder with courtesy and nothing spendable."""
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        ids = self._builders(client, 2)
+        self._courtesy(client, ids[0], 1)
+        with _sql() as statements:
+            rows = self._rows(client, super_admin_headers, ids)
+        assert (rows[ids[0]]["courtesy_rule"], rows[ids[1]]["courtesy_rule"]) == (
+            "charged",
+            None,
+        )
+        assert len([s for s in statements if self._is_rule_lots_read(s)]) == 1
+        assert [s for s in statements if self._is_paid_plan_read(s)] == []
+
+    def test_charging_and_courtesy_rule_are_decided_on_one_switch_reading(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A switch reading that changes between two reads (a refresh) never
+        splits the table: the mark gate and the rule gate judge the SAME
+        reading, so a marked builder is never computed under the rule with
+        its marks unread."""
+
+        from src.api.routes import admin
+        from src.services.credit_switch import CreditSwitchReading
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        [marked] = self._builders(client, 1)
+        self._mark(client, marked, ("mark", self._T0))
+        self._courtesy(client, marked, 4)
+        # Every read is a new reading, alternating the head and below 046.
+        revisions = [self._head(), self._below_046()]
+        calls: list[CreditSwitchReading] = []
+
+        def flipping() -> CreditSwitchReading:
+            reading = CreditSwitchReading(
+                True, "schema_ready", revisions[len(calls) % 2]
+            )
+            calls.append(reading)
+            return reading
+
+        judged: dict[str, list[int]] = {"mark": [], "rule": []}
+        mark_gate, rule_gate = (
+            admin.enforcement_mark_gate_open,
+            admin.courtesy_rule_gate_open,
+        )
+
+        def mark_judged(reading: Any) -> bool:
+            judged["mark"].append(id(reading))
+            return bool(mark_gate(reading))
+
+        def rule_judged(reading: Any) -> bool:
+            judged["rule"].append(id(reading))
+            return bool(rule_gate(reading))
+
+        monkeypatch.setattr(admin, "credit_switch_reading", flipping)
+        monkeypatch.setattr(admin, "enforcement_mark_gate_open", mark_judged)
+        monkeypatch.setattr(admin, "courtesy_rule_gate_open", rule_judged)
+        row = self._rows(client, super_admin_headers, [marked])[marked]
+        assert len(judged["mark"]) == len(judged["rule"]) == 1
+        assert judged["mark"] == judged["rule"]
+        assert row["courtesy_rule"] is None
+
+    def test_a_failed_courtesy_rule_read_is_courtesy_rule_null_only(
+        self,
+        client: TestClient,
+        super_admin_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import structlog
+        from sqlalchemy import text
+
+        from src.api.routes import admin
+
+        self._switch(monkeypatch, effective=True, revision=self._head())
+        [builder] = self._builders(client, 1)
+        self._courtesy(client, builder, 2)
+
+        async def broken(session: Any, *_args: Any) -> Any:
+            await session.execute(text("SELECT * FROM no_such_table_secret"))
+
+        monkeypatch.setattr(admin, "_courtesy_rule_by_builder", broken)
+        with structlog.testing.capture_logs() as records:
+            row = self._rows(client, super_admin_headers, [builder])[builder]
+        assert row["courtesy_rule"] is None
+        assert row["courtesy"]["available_mc"] == 2_000
+        assert (row["subscription"], row["subscription_unavailable"]) == (None, False)
+        [logged] = [
+            r for r in records if r["event"].startswith("builder courtesy rule")
+        ]
+        assert logged["error_type"] == "OperationalError"
+        assert "secret" not in repr(records)
+
+    def test_the_description_documents_courtesy_rule(self) -> None:
+        from src.api.main import app
+
+        description = app.openapi()["paths"]["/v1/admin/builders/subscriptions"]["get"][
+            "description"
+        ]
+        for needle in (
+            "`courtesy_rule`",
+            '"charged"',
+            '"blocked"',
+            "never stored",
+            "no paid plan in force",
+            "global enforcement is set",
+            "below 046",
+            "`charging` does not change",
+        ):
+            assert needle in description, needle

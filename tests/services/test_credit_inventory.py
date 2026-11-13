@@ -1446,3 +1446,186 @@ def test_the_enqueue_obeys_the_switch_captured_at_request_entry(
     monkeypatch.setattr(credit_inventory, "credit_switch_effective", lambda: False)
     run(client, _enqueue_both(world.tenant, True))
     assert run(client, _object_job_rows()) == (4, 2)
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico: storage under the courtesy rule (DESIGN items 3
+# and 7, wish Decision 6), by the request's captured mode.
+# ---------------------------------------------------------------------------
+
+
+async def _courtesy(builder: UUID, credits: int, at: datetime) -> Any:
+    from src.services import credit_courtesy
+
+    session = get_db_session()
+    try:
+        async with session.begin():
+            return await credit_courtesy.grant(
+                session,
+                builder_id=builder,
+                credits=credits,
+                reason="courtesy rule",
+                actor_user_id=uuid4(),
+                idempotency_key=f"rule-{uuid4()}",
+                at=at,
+                ledger=CreditLedger(session),
+            )
+    finally:
+        await session.close()
+
+
+async def _remove_courtesy(lot_id: UUID, at: datetime) -> None:
+    from src.services import credit_courtesy
+
+    session = get_db_session()
+    try:
+        async with session.begin():
+            await credit_courtesy.remove(
+                session,
+                lot_id=lot_id,
+                remove_all=True,
+                reason="courtesy rule",
+                actor_user_id=uuid4(),
+                idempotency_key=f"rule-removal-{uuid4()}",
+                at=at,
+                ledger=CreditLedger(session),
+            )
+    finally:
+        await session.close()
+
+
+def _recheck_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """debito-cortesia-automatico Group 2: ``_enforced_book`` re-checks a
+    captured courtesy mode under the account lock by ``(origin, at,
+    state)`` (the race, proven in
+    tests/integration/test_credit_effective_enforcement_postgres.py and
+    tests/services/test_credit_metering.py).  The storage proofs below hold
+    one capture fixed across the operator's grants and removals to exercise
+    the allocation arithmetic alone -- this suite's focus, like its fixed
+    binding coverage -- so the re-check is a no-op here."""
+
+    async def elsewhere(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(credit_inventory, "require_captured_enforcement", elsewhere)
+
+
+async def _reserve_captured(
+    tenant: UUID, size: int, enforced_at: datetime, captured: Any, upload: UUID | None
+) -> tuple[UUID, credit_inventory.AllocationOutcome]:
+    asset = _media(tenant, size)
+    if upload is None:
+        await _store(asset)
+    session = get_db_session()
+    try:
+        outcome = await credit_inventory.reserve_upload(
+            session,
+            tenant_id=tenant,
+            category="media",
+            object_ids=[upload or asset.id],
+            upload_id=upload or asset.id,
+            enforcement_at=enforced_at,
+            captured=captured,
+        )
+        await session.commit()
+        return upload or asset.id, outcome
+    finally:
+        await session.close()
+
+
+def test_under_the_rule_a_reservation_pays_only_what_the_courtesy_holds(
+    client: Any, world: World, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.repositories.credit import EffectiveEnforcement
+
+    _recheck_elsewhere(monkeypatch)
+
+    async def scenario() -> None:
+        await _grant_topup(world.builder, 50_000, date(2026, 10, 1), clock.now)
+        granted = await _courtesy(world.builder, 1, clock.now)
+        at = granted.occurred_at
+        captured = EffectiveEnforcement(at, "courtesy", state="charged")
+        first, paid = await _reserve_captured(
+            world.tenant, 30_000_000, at, captured, None
+        )
+        # Target 1,500; the courtesy holds 1,000: that is all it pays.
+        assert (paid.status, paid.charged_mc, paid.target_mc) == (
+            "applied",
+            1_000,
+            1_500,
+        )
+        clock.now += timedelta(hours=1)
+        regrant = await _courtesy(world.builder, 2, clock.now)
+        _second, gap = await _reserve_captured(
+            world.tenant, 1_000_000, at, captured, None
+        )
+        # The next one bills the gap (500) and its own share (50).
+        assert (gap.charged_mc, gap.target_mc) == (550, 1_550)
+        await _remove_courtesy(regrant.lot_id, clock.now)
+        third, unpaid = await _reserve_captured(
+            world.tenant, 1_000_000, at, captured, None
+        )
+        assert (unpaid.status, unpaid.charged_mc, unpaid.target_mc) == (
+            "applied",
+            0,
+            1_600,
+        )
+        rows = {
+            row.source_key: (row.target_mc, row.charged_mc, row.effect_id)
+            for row in await _rows(
+                CreditAllocation, CreditAllocation.allocation_kind == "reservation"
+            )
+        }
+        unpaid_effect = f"media:{world.tenant}:{third}:reserve"
+        assert rows[f"media:{world.tenant}:{first}:reserve"][:2] == (1_000, 1_000)
+        assert rows[unpaid_effect] == (1_550, 0, None)
+        assert await _rows(CreditEffect, CreditEffect.effect_id == unpaid_effect) == []
+        # Its retry in the window is a duplicate, never a second row.
+        _same, again = await _reserve_captured(
+            world.tenant, 1_000_000, at, captured, third
+        )
+        assert again.status == "duplicate"
+        # Only courtesy paid; the top-up never moved; no debt.
+        ledger = await _ledger(world.builder)
+        topup_moves = [
+            moves
+            for effect, moves in ledger.items()
+            if effect.startswith("topup:") and moves != [("grant", 50_000)]
+        ]
+        assert topup_moves == []
+        assert not any(kind == "debt" for moves in ledger.values() for kind, _ in moves)
+
+    run(client, scenario())
+
+
+def test_under_the_rule_the_binding_coverage_and_the_hold_are_skipped(
+    client: Any, world: World, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESIGN item 7: a captured courtesy mode never reads the binding
+    coverage (a read raises here) and a quarantine never refuses it."""
+
+    from src.repositories.credit import EffectiveEnforcement
+
+    _recheck_elsewhere(monkeypatch)
+
+    async def never(*_args: Any, **_kwargs: Any) -> BindingCoverage:
+        raise AssertionError("binding_coverage was read under the rule")
+
+    async def scenario() -> None:
+        granted = await _courtesy(world.builder, 2, clock.now)
+        session = get_db_session()
+        try:
+            async with session.begin():
+                session.add(_quarantined_order(world.builder))
+        finally:
+            await session.close()
+        monkeypatch.setattr(CreditRolloutService, "binding_coverage", never)
+        captured = EffectiveEnforcement(
+            granted.occurred_at, "courtesy", state="charged"
+        )
+        _asset, outcome = await _reserve_captured(
+            world.tenant, 2_000_000, granted.occurred_at, captured, None
+        )
+        assert (outcome.status, outcome.charged_mc) == ("applied", 100)
+
+    run(client, scenario())

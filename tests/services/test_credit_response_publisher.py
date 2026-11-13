@@ -360,6 +360,7 @@ def test_the_send_timeout_covers_the_real_worst_case_of_a_reply() -> None:
     tts = _request_worst_cases("src/services/tts_service.py")
     zapi = _request_worst_cases("src/services/zapi_service.py")
     meta = _request_worst_cases("src/services/meta_service.py")
+    uazapi = _request_worst_cases("src/services/uazapi_service.py")
     synthesis = max(
         tts[name]
         for name in (
@@ -372,8 +373,24 @@ def test_the_send_timeout_covers_the_real_worst_case_of_a_reply() -> None:
     meta_reply = (
         synthesis + meta["send_meta_cloud_audio"] + meta["send_meta_cloud_text"]
     )
-    assert (synthesis, zapi_reply, meta_reply) == (100, 200, 235)
-    assert REPLY_SEND_TIMEOUT_SECONDS >= max(zapi_reply, meta_reply)
+    # debito-cortesia-automatico Group 3: a Uazapi reply charged under the
+    # courtesy rule goes through the same send (audio 65 s, text 35 s).
+    uazapi_reply = synthesis + uazapi["send_uazapi_audio"] + uazapi["send_uazapi_text"]
+    # Group 4: an Evolution reply charged under the courtesy rule, the same
+    # send (``zapi_service``: audio 65 s, text 35 s).
+    evolution_reply = (
+        synthesis + zapi["send_evolution_audio"] + zapi["send_evolution_text"]
+    )
+    assert (synthesis, zapi_reply, meta_reply, uazapi_reply, evolution_reply) == (
+        100,
+        200,
+        235,
+        200,
+        200,
+    )
+    assert REPLY_SEND_TIMEOUT_SECONDS >= max(
+        zapi_reply, meta_reply, uazapi_reply, evolution_reply
+    )
     # The bookkeeping bound covers its provider call (mark unread on Z-API).
     assert REPLY_RECORD_TIMEOUT_SECONDS >= zapi["mark_conversation_unread"]
 
@@ -1150,3 +1167,506 @@ async def test_preparation_cleanup_cannot_spend_the_reserved_send_budget(
     assert stalled and delivery.outcome == "failed"
     assert sender.sent == []
     assert (await _get(db, row)).state == "failed"
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 2 (DESIGN item 12, Decision 20): with no
+# global and no mark, a courtesy lot alone turns the publisher on.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_courtesy_lot_alone_turns_the_publisher_on(
+    db: _Db, switch: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process reading at head (the 046 and 047 gates open): with no
+    courtesy lot a tick reads the global, the marks and the courtesy lots --
+    one statement more than before -- and claims nothing; once a courtesy
+    lot exists it recovers the pending row."""
+
+    from src.services import credit_courtesy
+    from src.services.credit_ledger import CreditLedger
+    from src.services.credit_switch import (
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+    row = await _row(db, age=timedelta(days=3))
+    sender = _Sender()
+    with _Statements(db.engine) as statements:
+        dormant = await _publisher(db, sender).run_once()
+    assert dormant is not None and not dormant.enforced and dormant.outcomes == []
+    touched = [s.split("FROM")[1].split()[0] for s in statements.seen if "FROM" in s]
+    assert touched == [
+        "credit_enforcement_state",
+        "credit_enforcement_marks",
+        "credit_lots",
+    ]
+    assert sender.payloads == [] and (await _get(db, row)).state == "pending"
+    async with db.sessions() as session:
+        builder = await session.scalar(
+            select(Tenant.builder_id).where(Tenant.id == db.tenant)
+        )
+    assert builder is not None
+    async with db.sessions() as session, session.begin():
+        await credit_courtesy.grant(
+            session,
+            builder_id=builder,
+            credits=1,
+            reason="courtesy rule",
+            actor_user_id=uuid4(),
+            idempotency_key=f"rule-{uuid4()}",
+            ledger=CreditLedger(session),
+        )
+    tick = await _publisher(db, sender).run_once()
+    assert tick is not None and tick.enforced and tick.outcomes == ["delivered"]
+    assert (await _get(db, row)).state == "delivered"
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 3: the Uazapi branch of the route's real
+# sender (``webhook.CREDIT_REPLY_SENDER``), inline and recovered.
+# ---------------------------------------------------------------------------
+
+
+_UAZAPI_URL = "https://uazapi.invalid"
+_UAZAPI_TOKEN = "uazapi-outbound-token"
+
+
+async def _uazapi_credentials(db: _Db, **extra: Any) -> None:
+    from src.models.clinic_config_table import ClinicConfigTable
+
+    async with db.sessions() as session, session.begin():
+        session.add(
+            ClinicConfigTable(
+                tenant_id=db.tenant,
+                api_credentials={
+                    "whatsapp_provider": "uazapi",
+                    "uazapi_instance_name": "outbox-uazapi",
+                    "uazapi_api_url": _UAZAPI_URL,
+                    "uazapi_token": _UAZAPI_TOKEN,
+                    **extra,
+                },
+            )
+        )
+
+
+async def _stored_ids(db: _Db) -> list[str]:
+    async with db.sessions() as session:
+        row = await session.get(Session, db.session)
+        assert row is not None
+        return [
+            entry[0] for entry in (row.session_metadata or {}).get("ai_msg_ids", [])
+        ]
+
+
+@dataclass
+class _UazapiSends:
+    texts: list[tuple[Any, ...]]
+    audios: list[tuple[tuple[Any, ...], dict[str, Any]]]
+    answer: dict[str, Any]
+    error: Exception | None = None
+
+
+@pytest.fixture
+def uazapi_sends(monkeypatch: pytest.MonkeyPatch) -> _UazapiSends:
+    """The Uazapi senders of the route (nothing leaves the process) and no
+    Redis: the echo store is this process's memory."""
+
+    from src.api.routes import webhook
+
+    sends = _UazapiSends(texts=[], audios=[], answer={"id": "5511000:UAZ-REPLY-1"})
+
+    async def text(*args: Any) -> dict[str, Any]:
+        sends.texts.append(args)
+        if sends.error is not None:
+            raise sends.error
+        return dict(sends.answer)
+
+    async def audio(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        sends.audios.append((args, kwargs))
+        return {"messageid": "UAZ-AUDIO-1"}
+
+    monkeypatch.setattr(webhook, "send_uazapi_text", text)
+    monkeypatch.setattr(webhook, "send_uazapi_audio", audio)
+    monkeypatch.setattr(webhook, "_get_redis", lambda: None)
+    return sends
+
+
+async def test_the_uazapi_reply_is_main_s_uazapi_send_with_its_echo_recorded(
+    db: _Db, switch: Any, uazapi_sends: _UazapiSends
+) -> None:
+    """Inline: ``send_uazapi_text`` with the tenant's ``uazapi_api_url`` and
+    ``uazapi_token`` (re-read, never stored), then main's bookkeeping -- the
+    id normalised by ``_extract_normalised_send_id`` (``owner:MSGID`` ->
+    ``MSGID``, what the echo carries) tracked AND stored with
+    ``_store_ai_msg_id_to_db`` -- and the row ``delivered``, PII erased."""
+
+    from src.api.routes import webhook
+
+    await _uazapi_credentials(db)
+    row = await _row(db, payload=_reply(db, channel="uazapi"))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert delivery.outcome == "delivered"
+    assert uazapi_sends.texts == [(_UAZAPI_URL, _UAZAPI_TOKEN, _PHONE, _TEXT)]
+    assert uazapi_sends.audios == []
+    assert await _stored_ids(db) == ["UAZ-REPLY-1"]
+    assert "UAZ-REPLY-1" in webhook._INMEM_SENT
+    stored = await _get(db, row)
+    assert stored.state == "delivered" and "phone" not in stored.payload
+    assert not [k for k in stored.payload if "token" in k or "url" in k]
+
+
+async def test_an_audio_uazapi_reply_follows_main_s_tts_policy(
+    db: _Db,
+    switch: Any,
+    uazapi_sends: _UazapiSends,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``input_was_audio`` with TTS on: the synthesized audio goes through
+    ``send_uazapi_audio`` (its mime type), never the text."""
+
+    from src.api.routes import webhook
+
+    async def speech(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(content=b"ID3-fake", mime_type="audio/mpeg")
+
+    monkeypatch.setattr(webhook, "synthesize_speech", speech)
+    await _uazapi_credentials(db, tts_enabled=True, tts_reply_policy="audio_input")
+    row = await _row(db, payload=_reply(db, channel="uazapi", input_was_audio=True))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert delivery.outcome == "delivered"
+    assert uazapi_sends.texts == []
+    [(args, kwargs)] = uazapi_sends.audios
+    assert args == (_UAZAPI_URL, _UAZAPI_TOKEN, _PHONE, b"ID3-fake")
+    assert kwargs == {"mime_type": "audio/mpeg"}
+    assert await _stored_ids(db) == ["UAZ-AUDIO-1"]
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [("no_credentials", "no_credentials"), ("egress", "uazapi_egress_disabled")],
+)
+async def test_an_undeliverable_uazapi_reply_is_failed_with_main_s_reason(
+    db: _Db, switch: Any, uazapi_sends: _UazapiSends, case: str, reason: str
+) -> None:
+    """Missing ``uazapi_api_url``/``uazapi_token``: refused before any send.
+    ``uazapi_egress_enabled`` closed: the send refused before the network --
+    nothing sent, so the row is ``failed`` with main's reason, never an
+    uncertain ``send_failed``."""
+
+    from src.api.routes import webhook
+    from src.services.egress_policy import EgressDisabledError
+
+    if case == "egress":
+        await _uazapi_credentials(db)
+        uazapi_sends.error = EgressDisabledError("uazapi_egress_disabled")
+    else:
+        await _uazapi_credentials(db, uazapi_token="")
+    row = await _row(db, payload=_reply(db, channel="uazapi"))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert (delivery.outcome, delivery.reason) == ("failed", reason)
+    assert webhook._inline_answer(delivery) == {
+        "ok": True,
+        "replied": False,
+        "reason": reason,
+    }
+    assert (await _get(db, row)).state == "failed"
+    assert await _stored_ids(db) == []
+    assert len(uazapi_sends.texts) == (1 if case == "egress" else 0)
+
+
+async def test_the_publisher_recovers_a_pending_uazapi_reply_once(
+    db: _Db,
+    switch: Any,
+    uazapi_sends: _UazapiSends,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A charged Uazapi reply whose process died after the final commit: a
+    courtesy lot keeps the publisher on (no global, no mark) and it sends the
+    row once through the Uazapi branch, its echo recorded."""
+
+    from src.api.routes import webhook
+    from src.services import credit_courtesy
+    from src.services.credit_ledger import CreditLedger
+    from src.services.credit_switch import (
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+    await _uazapi_credentials(db)
+    async with db.sessions() as session:
+        builder = await session.scalar(
+            select(Tenant.builder_id).where(Tenant.id == db.tenant)
+        )
+    assert builder is not None
+    async with db.sessions() as session, session.begin():
+        await credit_courtesy.grant(
+            session,
+            builder_id=builder,
+            credits=1,
+            reason="courtesy rule",
+            actor_user_id=uuid4(),
+            idempotency_key=f"rule-{uuid4()}",
+            ledger=CreditLedger(session),
+        )
+    row = await _row(
+        db,
+        payload=_reply(db, channel="uazapi"),
+        age=timedelta(seconds=PUBLISHER_MIN_AGE_SECONDS + 1),
+    )
+    publisher = CreditResponsePublisher(
+        webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    tick = await publisher.run_once()
+    assert tick is not None and tick.enforced and tick.outcomes == ["delivered"]
+    assert uazapi_sends.texts == [(_UAZAPI_URL, _UAZAPI_TOKEN, _PHONE, _TEXT)]
+    assert await _stored_ids(db) == ["UAZ-REPLY-1"]
+    assert (await _get(db, row)).state == "delivered"
+    again = await publisher.run_once()
+    assert again is not None and again.outcomes == []
+    assert len(uazapi_sends.texts) == 1  # never twice
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 4: the Evolution branch of the route's real
+# sender (``webhook.CREDIT_REPLY_SENDER``), inline and recovered.
+# ---------------------------------------------------------------------------
+
+
+_EVOLUTION_URL = "https://evolution.invalid"
+_EVOLUTION_NAME = "outbox-evolution"
+_EVOLUTION_KEY = "evolution-outbound-key"
+
+
+async def _evolution_credentials(db: _Db, **extra: Any) -> None:
+    from src.models.clinic_config_table import ClinicConfigTable
+
+    async with db.sessions() as session, session.begin():
+        session.add(
+            ClinicConfigTable(
+                tenant_id=db.tenant,
+                api_credentials={
+                    "whatsapp_provider": "evolution",
+                    "evolution_instance_name": _EVOLUTION_NAME,
+                    "evolution_api_url": _EVOLUTION_URL,
+                    "evolution_api_key": _EVOLUTION_KEY,
+                    **extra,
+                },
+            )
+        )
+
+
+@dataclass
+class _EvolutionSends:
+    texts: list[tuple[Any, ...]]
+    audios: list[tuple[tuple[Any, ...], dict[str, Any]]]
+    error: Exception | None = None
+
+
+@pytest.fixture
+def evolution_sends(monkeypatch: pytest.MonkeyPatch) -> _EvolutionSends:
+    """The Evolution senders of the route (nothing leaves the process) and no
+    Redis: the echo store is this process's memory."""
+
+    from src.api.routes import webhook
+
+    sends = _EvolutionSends(texts=[], audios=[])
+
+    async def text(*args: Any) -> dict[str, Any]:
+        sends.texts.append(args)
+        if sends.error is not None:
+            raise sends.error
+        # Evolution v2's send answer: the Baileys message, its id at key.id.
+        return {"key": {"remoteJid": "x", "fromMe": True, "id": "EVO-REPLY-1"}}
+
+    async def audio(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        sends.audios.append((args, kwargs))
+        return {"key": {"id": "EVO-AUDIO-1"}}
+
+    monkeypatch.setattr(webhook, "send_evolution_text", text)
+    monkeypatch.setattr(webhook, "send_evolution_audio", audio)
+    monkeypatch.setattr(webhook, "_get_redis", lambda: None)
+    return sends
+
+
+async def test_the_evolution_reply_is_main_s_evolution_send_with_its_echo_recorded(
+    db: _Db, switch: Any, evolution_sends: _EvolutionSends
+) -> None:
+    """Inline: ``send_evolution_text`` with the tenant's
+    ``evolution_api_url`` / ``evolution_instance_name`` /
+    ``evolution_api_key`` (re-read, never stored), then main's bookkeeping --
+    the id normalised by ``_extract_normalised_send_id`` (``key.id``) tracked
+    AND stored with ``_store_ai_msg_id_to_db`` -- and the row ``delivered``,
+    PII erased."""
+
+    from src.api.routes import webhook
+
+    await _evolution_credentials(db)
+    row = await _row(db, payload=_reply(db, channel="evolution"))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert delivery.outcome == "delivered"
+    assert evolution_sends.texts == [
+        (_EVOLUTION_URL, _EVOLUTION_NAME, _EVOLUTION_KEY, _PHONE, _TEXT)
+    ]
+    assert evolution_sends.audios == []
+    assert await _stored_ids(db) == ["EVO-REPLY-1"]
+    assert "EVO-REPLY-1" in webhook._INMEM_SENT
+    stored = await _get(db, row)
+    assert stored.state == "delivered" and "phone" not in stored.payload
+    assert not [k for k in stored.payload if "token" in k or "url" in k or "key" in k]
+
+
+async def test_an_audio_evolution_reply_follows_main_s_tts_policy(
+    db: _Db,
+    switch: Any,
+    evolution_sends: _EvolutionSends,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With TTS on for every input (the Evolution route only takes text, so
+    ``input_was_audio`` is always ``False`` there): the synthesized audio goes
+    through ``send_evolution_audio`` exactly as main calls it (no mime type),
+    never the text; its ``key.id`` is the stored echo id."""
+
+    from src.api.routes import webhook
+
+    async def speech(*_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(content=b"ID3-fake", mime_type="audio/mpeg")
+
+    monkeypatch.setattr(webhook, "synthesize_speech", speech)
+    await _evolution_credentials(db, tts_enabled=True, tts_reply_policy="all_inputs")
+    row = await _row(db, payload=_reply(db, channel="evolution"))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert delivery.outcome == "delivered"
+    assert evolution_sends.texts == []
+    [(args, kwargs)] = evolution_sends.audios
+    assert args == (
+        _EVOLUTION_URL,
+        _EVOLUTION_NAME,
+        _EVOLUTION_KEY,
+        _PHONE,
+        b"ID3-fake",
+    )
+    assert kwargs == {}
+    assert await _stored_ids(db) == ["EVO-AUDIO-1"]
+
+
+@pytest.mark.parametrize(
+    "missing", ["evolution_api_url", "evolution_instance_name", "evolution_api_key"]
+)
+async def test_an_evolution_reply_without_credentials_is_failed_before_a_send(
+    db: _Db, switch: Any, evolution_sends: _EvolutionSends, missing: str
+) -> None:
+    """Main's check: any of the three Evolution fields empty is
+    ``no_credentials`` -- refused before any send, so the row is ``failed``
+    with main's reason, never an uncertain ``send_failed``."""
+
+    from src.api.routes import webhook
+
+    await _evolution_credentials(db, **{missing: ""})
+    row = await _row(db, payload=_reply(db, channel="evolution"))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert (delivery.outcome, delivery.reason) == ("failed", "no_credentials")
+    assert webhook._inline_answer(delivery) == {
+        "ok": True,
+        "replied": False,
+        "reason": "no_credentials",
+    }
+    assert (await _get(db, row)).state == "failed"
+    assert evolution_sends.texts == [] and await _stored_ids(db) == []
+
+
+async def test_a_failed_evolution_send_is_failed_at_once_like_main(
+    db: _Db, switch: Any, evolution_sends: _EvolutionSends
+) -> None:
+    """The provider refused the send: ``failed`` at once (OD-1, main's lost
+    reply), nothing stored for the echo."""
+
+    from src.api.routes import webhook
+
+    await _evolution_credentials(db)
+    evolution_sends.error = RuntimeError("Evolution 500")
+    row = await _row(db, payload=_reply(db, channel="evolution"))
+    delivery = await deliver_reply_inline(
+        row, sender=webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    assert (delivery.outcome, delivery.reason) == ("failed", "send_failed")
+    assert (await _get(db, row)).state == "failed"
+    assert len(evolution_sends.texts) == 1 and await _stored_ids(db) == []
+
+
+async def test_the_publisher_recovers_a_pending_evolution_reply_once(
+    db: _Db,
+    switch: Any,
+    evolution_sends: _EvolutionSends,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A charged Evolution reply whose process died after the final commit: a
+    courtesy lot keeps the publisher on (no global, no mark) and it sends the
+    row once through the Evolution branch, its echo recorded."""
+
+    from src.api.routes import webhook
+    from src.services import credit_courtesy
+    from src.services.credit_ledger import CreditLedger
+    from src.services.credit_switch import (
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+    await _evolution_credentials(db)
+    async with db.sessions() as session:
+        builder = await session.scalar(
+            select(Tenant.builder_id).where(Tenant.id == db.tenant)
+        )
+    assert builder is not None
+    async with db.sessions() as session, session.begin():
+        await credit_courtesy.grant(
+            session,
+            builder_id=builder,
+            credits=1,
+            reason="courtesy rule",
+            actor_user_id=uuid4(),
+            idempotency_key=f"rule-{uuid4()}",
+            ledger=CreditLedger(session),
+        )
+    row = await _row(
+        db,
+        payload=_reply(db, channel="evolution"),
+        age=timedelta(seconds=PUBLISHER_MIN_AGE_SECONDS + 1),
+    )
+    publisher = CreditResponsePublisher(
+        webhook.CREDIT_REPLY_SENDER, session_factory=db.sessions
+    )
+    tick = await publisher.run_once()
+    assert tick is not None and tick.enforced and tick.outcomes == ["delivered"]
+    assert evolution_sends.texts == [
+        (_EVOLUTION_URL, _EVOLUTION_NAME, _EVOLUTION_KEY, _PHONE, _TEXT)
+    ]
+    assert await _stored_ids(db) == ["EVO-REPLY-1"]
+    assert (await _get(db, row)).state == "delivered"
+    again = await publisher.run_once()
+    assert again is not None and again.outcomes == []
+    assert len(evolution_sends.texts) == 1  # never twice

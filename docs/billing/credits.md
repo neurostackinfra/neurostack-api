@@ -223,6 +223,8 @@ nothing.
   thresholds are computed over it. Consumption spends the monthly lot first,
   then the other lots by earliest expiry (FEFO): a courtesy lot is spent
   after the monthly allowance and before a top-up that expires later.
+  Under the courtesy rule a rule builder spends only its courtesy lots (see
+  "Courtesy rule").
 - **L10 coverage**: the cutoff report counts a builder whose only coverage
   is a usable courtesy lot (`usable_courtesy`: unexpired, positive balance)
   as `covered`, unless it is quarantined or in an identity conflict, like
@@ -230,7 +232,9 @@ nothing.
   (`usable`, the absence of a quarantine, an identity conflict or a
   reconciliation failure, is unchanged), so a courtesy never hides an ASAAS
   divergence. `GET /v1/admin/credits/rollout/bindings/{builder_id}` reports
-  `usable_courtesy`. Courtesy never changes the enforcement instant.
+  `usable_courtesy`. Courtesy never changes the global enforcement instant;
+  under the courtesy rule a builder's own instant is its first grant (see
+  "Courtesy rule").
 - **Idempotency**: every POST requires an `Idempotency-Key` (1 to 200
   characters), unique across **every** builder. The request's digest covers
   the operation, the builder, the lot of a removal and the whole body: the
@@ -252,6 +256,46 @@ nothing.
   kinds (it ignores the new fields), so a builder holding a courtesy lot
   would see a failed credit read.
 - Operations: [`credit-courtesy.md`](../runbooks/credit-courtesy.md).
+
+## Courtesy rule
+
+debito-cortesia-automatico: a builder with no global enforcement and no
+operator mark that ever received a `courtesy` lot is charged from its
+courtesy automatically. Operations, the pre-deploy list and the rollback:
+[`credit-courtesy-rule.md`](../runbooks/credit-courtesy-rule.md).
+
+- **Precedence**: global > mark > courtesy. `CreditRepository.effective_enforcement`
+  returns `origin` `courtesy`, `at` = the first grant's `occurred_at`, and
+  `state` `charged` (spendable courtesy > 0) or `blocked` (0 spendable, no
+  paid plan in force); with 0 spendable and a paid plan in force the
+  builder is protected (`origin` `none`, observational). Gated on `046`
+  (`tests/integration/test_credit_courtesy_rule_postgres.py`).
+- **Paid plan in force** (`CreditRepository.paid_plan_in_force`): a
+  `monthly`/`topup` lot with a future `expires_at`; an active subscription
+  inside `credit_binding_grace_days` of its last active binding's
+  `cycle_end`; or an active subscription whose current cycle is paid with
+  no binding yet.
+- **Debits**: only courtesy lots, FEFO; the rest is forgiven, never debt;
+  `monthly` and `topup` are never touched. A turn with no reply
+  (`trace_no_response`) costs zero.
+- **Block**: immediate, no episode: `POST /v1/events` 402
+  `credit_suspended`; webhooks 200 `{"ok": true, "skipped":
+  "credit_suspended"}`; RAG/media uploads 402 before the body is read or
+  anything is written (API key and panel); RAG search and media download by
+  API key 402; `/v1/credits/state` `suspended` with null deadlines; the
+  panel's reads and the export stay open
+  (`test_charged_then_blocked_then_unblocked_over_http`,
+  `tests/integration/test_credit_courtesy_surfaces_postgres.py`).
+- **Channels**: `/v1/events`, Z-API, Meta, and Uazapi/Evolution only under
+  the rule; under the rule `/v1/events` without `Idempotency-Key` answers
+  400 `idempotency_key_required`.
+- **Quarantine**: a charged builder in quarantine is served from courtesy;
+  `/v1/credits/state` keeps `quarantine`, never `reconciliation`; the top-up
+  stays blocked
+  (`test_a_charged_builder_in_quarantine_is_served_from_courtesy_only`).
+- `GET /v1/admin/builders/subscriptions` carries a read-only
+  `courtesy_rule` per row (master-admin "Cortesia: cobrando" / "Cortesia:
+  bloqueado").
 
 ## UI
 

@@ -329,13 +329,17 @@ def _document_not_found(document_id: UUID) -> HTTPException:
 
 _CREDIT_PENDING = {"code": "credit_pending"}
 _CATEGORY_EXHAUSTED = {"code": "credit_category_exhausted"}
+_CREDIT_SUSPENDED = {"code": CREDIT_SUSPENDED_CODE}
 _CREDIT_PENDING_RESPONSE: dict[int | str, dict[str, Any]] = {
     402: {
         "description": (
             "After credit_enforcement_at only: the tenant has no credit "
             "account (standalone) or its builder is on a quarantine hold "
             "(credit_pending), or its builder is exhausted and this upload "
-            "needs new capacity (credit_category_exhausted); nothing was stored"
+            "needs new capacity (credit_category_exhausted); under the "
+            "courtesy rule, its builder has no courtesy left and no paid plan "
+            "in force (credit_suspended, for every caller, before anything "
+            "is read or written); nothing was stored"
         ),
         "model": ErrorResponse,
     },
@@ -346,6 +350,45 @@ def _credit_pending() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=_CREDIT_PENDING
     )
+
+
+def _credit_suspended() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=_CREDIT_SUSPENDED
+    )
+
+
+def _verdict_refusal(verdict: credit_lifecycle.CategoryVerdict) -> HTTPException | None:
+    """The answer of a reservation's category verdict: ``ok`` is served;
+    ``category_exhausted`` (an exhausted builder's upload that needs new
+    capacity) and ``suspended`` (debito-cortesia-automatico: the courtesy
+    rule's block of the captured mode) are each their own 402 -- never
+    ``suspended`` taken as ``ok``."""
+
+    if verdict == "suspended":
+        return _credit_suspended()
+    if verdict == "category_exhausted":
+        return HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=_CATEGORY_EXHAUSTED
+        )
+    return None
+
+
+async def _refuse_blocked(
+    session: AsyncSession, mode: credit_inventory.CreditMode
+) -> None:
+    """debito-cortesia-automatico (DESIGN item 5): a builder the courtesy
+    rule blocks (captured ``courtesy``/``blocked``: nothing spendable, no
+    paid plan in force) adds no RAG content -- ``402 credit_suspended``
+    before any row is written or any body is read, whoever uploads (an API
+    key or the panel).  The block is the captured mode's, computed and never
+    stored (``credit_lifecycle.courtesy_block``); a mode that changes after
+    the capture is the reservation lock's 503, as for a mark.  Nothing
+    outside the rule is refused here."""
+
+    if credit_lifecycle.courtesy_block(mode.captured):
+        await session.rollback()
+        raise _credit_suspended()
 
 
 def _enforcement_unavailable() -> HTTPException:
@@ -404,20 +447,23 @@ async def _reserve_or_refuse(
     # Group 5: decided with the reservation, under the account lock it took:
     # an exhausted builder adds no RAG content that needs new capacity
     # (402 credit_category_exhausted, everything rolled back).
+    # debito-cortesia-automatico: with the captured mode, so the courtesy
+    # rule decides for its builders (``suspended`` when blocked; ``ok`` when
+    # charged, whatever episode a mark era left open).
     scope = await CreditRepository(session).tenant_scope(tenant_id)
     if scope is not None and scope.builder_id is not None:
-        verdict = await credit_lifecycle.reservation_verdict(
-            session,
-            builder_id=scope.builder_id,
-            effect_id=reservation_effect_id(tenant_id, "rag", upload_id),
-            charged_mc=outcome.charged_mc,
-        )
-        if verdict == "category_exhausted":
-            await session.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail=_CATEGORY_EXHAUSTED,
+        refusal = _verdict_refusal(
+            await credit_lifecycle.reservation_verdict(
+                session,
+                builder_id=scope.builder_id,
+                effect_id=reservation_effect_id(tenant_id, "rag", upload_id),
+                charged_mc=outcome.charged_mc,
+                captured=mode.captured,
             )
+        )
+        if refusal is not None:
+            await session.rollback()
+            raise refusal
 
 
 async def _refuse_standalone(
@@ -512,6 +558,7 @@ async def upload_document(
     mode = await _credit_mode(http_request, session, effective_tenant_id)
     await _require_tenant_row(session, effective_tenant_id)
     if mode.enforced:
+        await _refuse_blocked(session, mode)
         # The PDF's 500,000-character limit is the multipart route's only
         # (owner decision H): this schema's 100,000 always refuses first.
         await _refuse_standalone(session, effective_tenant_id, mode)
@@ -698,6 +745,8 @@ async def upload_document_files(
     )
     mode = await _credit_mode(request, session, effective_tenant_id)
     await _require_tenant_row(session, effective_tenant_id)
+    # A builder the courtesy rule blocks: refused before the body is read.
+    await _refuse_blocked(session, mode)
     # Authorized: end the read transaction so no pooled connection is held
     # while the body arrives and its files are parsed (a tenant deleted
     # meanwhile is caught by the writes below).
@@ -786,6 +835,8 @@ while the credit switch is not effective, before the body is read.
   500,000 extracted characters per document and no encrypted PDF; the
   documents' RAG reservation is debited, and a standalone tenant or a
   quarantine hold is `402 credit_pending` (nothing stored).
+- Under the courtesy rule, a builder with no courtesy left and no paid plan
+  in force is `402 credit_suspended` before the body is read.
     """,
     responses={
         201: {"description": "Documents stored", "model": DocumentBatchUploadResponse},
@@ -872,7 +923,9 @@ accepted only for a builder that owns the clinic or a super admin.
             "description": (
                 "After credit_enforcement_at only, for an API key caller: the "
                 "builder is suspended after its 72 hours of debt service "
-                "(credit_suspended); nothing was searched"
+                "(credit_suspended) -- or, under the courtesy rule, has no "
+                "courtesy left and no paid plan in force (credit_suspended); "
+                "nothing was searched"
             ),
             "model": ErrorResponse,
         },
@@ -902,8 +955,10 @@ async def search_knowledge(
     ):
         # Group 5: past its 72 h of debt a suspended builder's RAG is
         # suspended too (the gate's transition commits either way).
+        # debito-cortesia-automatico: the captured mode decides for the
+        # courtesy rule (its block; never an episode a mark era left).
         suspended = await credit_lifecycle.tenant_suspended(
-            session, effective_tenant_id
+            session, effective_tenant_id, captured=mode.captured
         )
         await session.commit()
         if suspended:
