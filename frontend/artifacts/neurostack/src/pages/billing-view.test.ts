@@ -10,6 +10,8 @@ import type {
 } from "./billing-contract";
 import {
   PLAN_NAMES,
+  chargedInQuarantine,
+  creditBalanceStanding,
   creditLedgerStanding,
   deriveBillingView,
   deriveTopupState,
@@ -372,6 +374,48 @@ describe("creditLedgerStanding", () => {
   });
 });
 
+// ── creditBalanceStanding (debito-cortesia-automatico, wish Decision 4) ──────
+
+describe("creditBalanceStanding", () => {
+  const LIFECYCLE = ["pending", "active", "grace", "suspended", "deletion_due"] as const;
+  const REASONS = [[], ["quarantine"], ["reconciliation"], ["a_future_reason"], ["standalone"], ["standalone", "quarantine"], ["quarantine", "reconciliation"]];
+
+  it("shows the balance of a builder charged under the rule in quarantine, whose top-up stays on hold", () => {
+    const charged = { mode: "enforced", state: "active", pending_reasons: ["quarantine"] } as const;
+    expect(chargedInQuarantine(charged)).toBe(true);
+    expect(creditBalanceStanding(charged)).toBe("standing");
+    // The money rule is unchanged: the top-up still reads the hold.
+    expect(creditLedgerStanding(charged)).toBe("pending");
+    expect(creditBalanceStanding({ ...charged, pending_reasons: ["quarantine", "quarantine"] })).toBe("standing");
+  });
+
+  it.each(LIFECYCLE.flatMap((state) => REASONS.map((reasons) => [state, reasons] as const)))(
+    "follows the ledger's standing in %s with %j outside the charged-in-quarantine pair",
+    (state, reasons) => {
+      for (const mode of ["enforced", "observational"] as const) {
+        const value = { mode, state, pending_reasons: [...reasons] };
+        if (mode === "enforced" && state === "active" && reasons.length === 1 && reasons[0] === "quarantine") continue;
+        expect(chargedInQuarantine(value)).toBe(false);
+        expect(creditBalanceStanding(value)).toBe(creditLedgerStanding(value));
+      }
+    },
+  );
+
+  it("keeps suspended + quarantine (the rule's blocked builder or a marked one) on hold", () => {
+    for (const mode of ["enforced", "observational"] as const) {
+      expect(creditBalanceStanding({ mode, state: "suspended", pending_reasons: ["quarantine"] })).toBe("pending");
+      expect(creditBalanceStanding({ mode, state: "pending", pending_reasons: ["quarantine"] })).toBe("pending");
+    }
+  });
+
+  it("fails closed: an observational active + quarantine, or quarantine next to another reason, stays on hold", () => {
+    expect(creditBalanceStanding({ mode: "observational", state: "active", pending_reasons: ["quarantine"] })).toBe("pending");
+    expect(creditBalanceStanding({ mode: "enforced", state: "active", pending_reasons: ["quarantine", "reconciliation"] })).toBe("pending");
+    expect(creditBalanceStanding({ mode: "enforced", state: "active", pending_reasons: ["quarantine", "a_future_reason"] })).toBe("pending");
+    expect(creditBalanceStanding({ mode: "enforced", state: "active", pending_reasons: ["reconciliation"] })).toBe("pending");
+  });
+});
+
 // ── deriveTopupState ─────────────────────────────────────────────────────────
 
 const P500 = "package_credits_500_v1";
@@ -450,6 +494,23 @@ describe("deriveTopupState", () => {
       expect(result.status === "blocked" && result.reason).toMatch(/pendência financeira/);
     },
   );
+
+  // debito-cortesia-automatico (wish Decision 4): the rule's charged builder
+  // in quarantine sees its balance, yet Recarregar stays blocked.
+  it("is blocked for a builder charged under the rule in quarantine (active + quarantine)", () => {
+    const result = topup({ credit: credit("active", ["quarantine"]) });
+    expect(result.status).toBe("blocked");
+    expect(result.status === "blocked" && result.reason).toBe(
+      "Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.",
+    );
+    // The same with a live checkout or unread packages: the hold is checked first.
+    expect(topup({ credit: credit("active", ["quarantine"]), checkoutLive: true })).toEqual(result);
+    expect(topup({ credit: credit("active", ["quarantine"]), creditCatalog: { status: "error" } })).toEqual(result);
+  });
+
+  it("offers top-ups to a builder charged under the rule without quarantine", () => {
+    expect(topup({ credit: credit("active") }).status).toBe("offered");
+  });
 
   it("is blocked while a checkout is live, and when the packages cannot be read", () => {
     const live = topup({ checkoutLive: true });

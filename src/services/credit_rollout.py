@@ -109,9 +109,11 @@ ORPHAN_CLOSURE_BATCH: Final = 500
 ORPHAN_PASS_SKIPPED: Final = -1
 # Sources whose observational claims are cut off as unknown traffic.  A
 # verified Uazapi callback (an enforced envelope-token match) is still counted
-# here on purpose: the ``uazapi-credit-enforcement`` follow-up, which adds the
-# enforced Uazapi adapter, is what changes this label; until then the L10 guard
-# keeps arming refused anyway.
+# here on purpose: the enforced Uazapi adapter (debito-cortesia-automatico)
+# charges only under the courtesy rule, never under the global enforcement
+# this cutoff is for, so the label stays; the L10 planning (the follow-up once
+# named ``uazapi-credit-enforcement``) is what changes it, and until then the
+# L10 guard keeps arming refused anyway.
 UNKNOWN_INGRESS_SOURCES: Final = frozenset({"uazapi", "evolution"})
 # Non-terminal ASAAS subscription statuses (``ck_billing_subscriptions_status``
 # of ``src/models/billing.py``; terminal are ``inactive`` and ``cancelled``).
@@ -181,8 +183,13 @@ class BindingCoverage:
     # creditos-cortesia (DESIGN Decision 11): an unexpired courtesy lot with
     # a positive swept balance.  It feeds ONLY :attr:`covered` (the cutoff
     # report of the enforcement): never :attr:`usable` nor
-    # ``reconciliation_failure``, so a courtesy never hides an ASAAS
-    # quarantine, conflict or divergence and the enforced path is unchanged.
+    # ``reconciliation_failure``, so under the global enforcement or an
+    # operator mark a courtesy never hides an ASAAS quarantine, conflict or
+    # divergence.  debito-cortesia-automatico (DESIGN item 7, Decision 17):
+    # under the courtesy rule the enforced path consults neither this
+    # coverage nor the quarantine hold at all -- it debits only courtesy
+    # lots, which depend on no ASAAS fact -- so this field gates nothing
+    # there either.
     usable_courtesy: bool = False
 
     @property
@@ -295,18 +302,25 @@ def uazapi_enforced_credit_adapter_available() -> bool:
 
     Always ``False``.  A Uazapi callback whose envelope token the route
     verified is metered as an authenticated production turn
-    (uazapi-webhook-auth), but no enforced adapter charges or blocks it: its
-    webhook never calls the pre-check nor the enforced sender.  Arming now
-    would therefore leave that traffic served for free, so
-    :meth:`CreditRolloutService.arm_enforcement` refuses unconditionally and
-    ``python -m src.ops.credit_enforcement status`` says so beforehand.
+    (uazapi-webhook-auth).  The enforced Uazapi adapter (the pre-check, the
+    PostgreSQL claim, the enforced sender and the publisher) comes from
+    debito-cortesia-automatico, and it charges ONLY under the courtesy rule
+    (origin ``courtesy``): under the global enforcement this guard is about
+    -- and under an operator mark -- Uazapi stays observational, its turns
+    served without a charge.  Arming now would therefore still leave that
+    traffic served for free, so :meth:`CreditRolloutService.arm_enforcement`
+    refuses unconditionally and ``python -m src.ops.credit_enforcement
+    status`` says so beforehand.  The guard stays closed.
 
     It reads no environment variable, configuration, flag or database row on
     purpose: nothing an operator can set lifts it, and the refusal is not a
-    cutoff finding ``accept_cutoff`` could accept.  Only the follow-up wish
-    ``uazapi-credit-enforcement`` removes this guard, with this predicate.
-    Tests that prove a successful arm replace it through an explicit fixture;
-    no production code path does.
+    cutoff finding ``accept_cutoff`` could accept.  Only the L10 planning
+    (its cutoff report, the treatment of ``unknown`` traffic at the cutoff
+    and the owner's decision) removes this guard, with this predicate --
+    the follow-up once named ``uazapi-credit-enforcement`` is that work, not
+    a second Uazapi adapter (debito-cortesia-automatico already built it; no
+    duplicate wish is opened).  Tests that prove a successful arm replace it
+    through an explicit fixture; no production code path does.
     """
 
     return False
@@ -506,8 +520,13 @@ class CreditRolloutService:
         :attr:`BindingCoverage.covered` only; it changes neither ``usable``
         nor ``reconciliation_failure``.  It is read ONLY with
         ``include_courtesy=True`` (the cutoff report and the admin binding
-        status): an enforced request reads ``usable`` alone and so pays no
-        extra statement.
+        status): an enforced request of the global or an operator mark reads
+        ``usable`` alone and so pays no extra statement.  A request under
+        the courtesy rule (debito-cortesia-automatico, DESIGN item 7) never
+        reads this coverage nor the quarantine hold: its debits touch only
+        courtesy lots, so no ASAAS state refuses them -- the rule's own
+        "paid plan in force" is ``CreditRepository.paid_plan_in_force``,
+        never this coverage.
         """
 
         instant = at or datetime.now(timezone.utc)
@@ -1289,6 +1308,34 @@ class CreditRolloutService:
             .correlate(CreditEffect)
             .scalar_subquery()
         )
+        # debito-cortesia-automatico (DESIGN Decision 4): a trace debited
+        # under the courtesy rule pays only from courtesy lots and FORGIVES
+        # the rest -- never debt -- so ``debit + debt`` falls short for good.
+        # Outside the rule ``LedgerBook.debit`` turns every unpaid remainder
+        # into debt, so the forgiven shape is exact: no debt, less than one
+        # trace debited, no debit entry on a lot that is not ``courtesy``,
+        # and a builder that ever had a courtesy lot (the rule's own
+        # precondition: a trace with no entry at all of a builder that never
+        # had courtesy stays a partial debit).  The effect stores no marker
+        # of the rule's decision (``decision_digest`` is a hash), hence this.
+        paid_off_courtesy = exists().where(
+            CreditLedgerEntry.builder_id == CreditEffect.builder_id,
+            CreditLedgerEntry.effect_id == CreditEffect.effect_id,
+            CreditLedgerEntry.entry_type == "debit",
+            CreditLot.builder_id == CreditLedgerEntry.builder_id,
+            CreditLot.id == CreditLedgerEntry.lot_id,
+            CreditLot.lot_kind != "courtesy",
+        )
+        had_courtesy = exists().where(
+            CreditLot.builder_id == CreditEffect.builder_id,
+            CreditLot.lot_kind == "courtesy",
+        )
+        forgiven = and_(
+            debt == 0,
+            debit < TRACE_COST_MC,
+            ~paid_off_courtesy.correlate(CreditEffect),
+            had_courtesy.correlate(CreditEffect),
+        )
         partial = int(
             await self.session.scalar(
                 select(func.count())
@@ -1297,6 +1344,7 @@ class CreditRolloutService:
                     CreditEffect.effect_kind == "trace",
                     recent(CreditEffect.created_at),
                     debit + debt != TRACE_COST_MC,
+                    ~forgiven,
                 )
             )
             or 0
@@ -1644,8 +1692,9 @@ class CreditRolloutService:
         never at ``at``.  Tests control the instant by patching
         ``CreditRepository.database_now``.
 
-        Until the follow-up wish ``uazapi-credit-enforcement`` lands, every
-        call that passes the clock checks is refused by the L10 guard
+        Until the L10 planning (the follow-up once named
+        ``uazapi-credit-enforcement``) lifts it, every call that passes the
+        clock checks is refused by the L10 guard
         (:func:`uazapi_enforced_credit_adapter_available`) before the first
         write, whatever the readiness, the orphans and the cutoff say.
         """
@@ -1678,7 +1727,8 @@ class CreditRolloutService:
             )
         # L10 guard (uazapi-webhook-auth): refused before anything is written
         # (the orphan closures below are this transaction's first write).
-        # Only the follow-up wish ``uazapi-credit-enforcement`` removes this.
+        # Only the L10 planning (once named ``uazapi-credit-enforcement``)
+        # removes this.
         if not uazapi_enforced_credit_adapter_available():
             raise CreditEnforcementRejected("uazapi has no enforced credit adapter")
         if (await self.reconcile_orphans()).open_count:
@@ -1729,6 +1779,28 @@ async def _try_orphan_pass_lock(session: AsyncSession) -> bool:
     return bool(acquired)
 
 
+async def any_courtesy_lot(
+    session: AsyncSession, *, rule_readable: bool | None = None
+) -> bool:
+    """Whether ANY ``courtesy`` lot was ever granted (any builder, expired or
+    not): the workers' trigger after the global and the marks
+    (debito-cortesia-automatico, DESIGN item 12, Decision 20) -- a builder
+    under the courtesy rule writes enforced claims, effects and outbox rows
+    with the global unset and no mark, and production has no marks.  Behind
+    the courtesy rule's 046 gate (``CreditRepository.courtesy_rule_readable``,
+    the process reading's unless ``rule_readable`` says): closed, ``False``
+    with nothing read.  One plain read."""
+
+    if not CreditRepository.courtesy_rule_readable(rule_readable):
+        return False
+    found = (
+        await session.execute(
+            select(CreditLot.id).where(CreditLot.lot_kind == "courtesy").limit(1)
+        )
+    ).scalar_one_or_none()
+    return found is not None
+
+
 @dataclass
 class OrphanSweepState:
     """Per-worker memory of the low-cadence full sweep.
@@ -1762,7 +1834,9 @@ async def run_credit_orphan_reconciliation_once(
     Before the effective switch and the immutable enforcement timestamp the
     worker performs no query beyond the timestamp read and emits no metric;
     with the timestamp unset it runs once any per-builder mark event was ever
-    recorded (cobranca-credito-por-builder), after one read more.
+    recorded (cobranca-credito-por-builder), after one read more, or -- with
+    neither -- once any courtesy lot exists (debito-cortesia-automatico,
+    :func:`any_courtesy_lot`), after one read more still.
     Afterward it is read-only except for idempotent deleted-tenant closure
     effects (age-independent, :data:`ORPHAN_CLOSURE_BATCH` per pass); every
     other orphan remains visible to the operator as a bounded gauge and
@@ -1793,10 +1867,14 @@ async def run_credit_orphan_reconciliation_once(
             # enforced claims, effects and outbox rows need it, and it only
             # ever anchors on what enforced requests wrote.  One read more
             # (none with the 047 gate closed), and nothing else when no mark
-            # event exists.
+            # event exists.  debito-cortesia-automatico (DESIGN Decision 20):
+            # with neither, any courtesy lot keeps it on too -- the rule's
+            # enforced requests write the same claims, effects and rows --
+            # after one read more (none with the 046 gate closed).
             if (
                 await repository.enforcement_at() is None
                 and not await repository.any_enforcement_mark()
+                and not await any_courtesy_lot(session)
             ):
                 await session.rollback()
                 return 0
@@ -1961,6 +2039,7 @@ __all__ = [
     "OrphanReport",
     "PRODUCTION_SERVING",
     "ReadbackReport",
+    "any_courtesy_lot",
     "credit_orphan_pass_advisory_key",
     "cutoff_digest",
     "derive_operational_role",

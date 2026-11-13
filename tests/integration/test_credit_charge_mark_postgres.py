@@ -875,3 +875,117 @@ async def test_unmark_of_a_clean_account_is_accepted(world: _Harness) -> None:
         "open_debts": 0,
     }
     assert (await _effective(world, builder)).origin is None
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 5a: ``status`` prints the courtesy rule,
+# and ``mark`` refuses a window the rule opened (accepted by the design).
+# ---------------------------------------------------------------------------
+
+
+async def _status_of(harness: _Harness, builder: UUID) -> dict[str, Any]:
+    out, err = io.StringIO(), io.StringIO()
+    code = await ops.amain(
+        ["status", "--builder-id", str(builder)],
+        session_factory=harness.sessions,
+        stdout=out,
+        stderr=err,
+    )
+    (line,) = out.getvalue().splitlines()
+    document: dict[str, Any] = json.loads(line)
+    assert code == 0 and document["verdict"] == "ok", document
+    return document
+
+
+async def test_status_prints_the_courtesy_rule_and_its_state(world: _Harness) -> None:
+    from tests.integration.credit_rollout_world import grant_courtesy, remove_courtesy
+
+    builder = await make_builder(world)
+    first = await grant_courtesy(world, builder, 3)
+    await grant_courtesy(world, builder, 2)  # never moves the rule's instant
+    with _statements(world.engine) as seen:
+        document = await _status_of(world, builder)
+    assert document["enforcement"] == {
+        "global_at": None,
+        "effective_at": first.occurred_at.isoformat(),
+        "origin": "courtesy",
+        "state": "charged",
+    }
+    assert _writes(seen) == []  # still read-only
+    async with world.engine.connect() as connection:
+        lots = [
+            UUID(str(lot))
+            for lot in (
+                await connection.execute(
+                    text(
+                        "SELECT id FROM credit_lots WHERE builder_id = :b "
+                        "AND lot_kind = 'courtesy'"
+                    ),
+                    {"b": builder},
+                )
+            ).scalars()
+        ]
+    for lot_id in lots:
+        await remove_courtesy(world, lot_id)
+    document = await _status_of(world, builder)
+    assert (document["enforcement"]["origin"], document["enforcement"]["state"]) == (
+        "courtesy",
+        "blocked",
+    )
+
+
+async def _rule_opens_the_window(harness: _Harness, builder: UUID) -> None:
+    """The builder's enforced traffic under the rule: a charged trace debit,
+    captured on the rule as a request captures it, opens the current
+    window (its free baseline, DESIGN item 2)."""
+
+    from src.services.credit_ledger import CreditLedger
+    from tests.integration.credit_rollout_world import effective_of
+
+    captured = await effective_of(harness, builder, rule_readable=True)
+    assert (captured.origin, captured.state) == ("courtesy", "charged")
+    async with harness.sessions() as session, session.begin():
+        result = await CreditLedger(session).debit(
+            builder,
+            f"trace:{uuid4()}:decision:1",
+            1_000,
+            at=datetime.now(timezone.utc),
+            effect_kind="trace",
+            captured=captured,
+        )
+    assert result.status == "applied", result
+
+
+async def test_mark_refuses_a_window_opened_under_the_courtesy_rule(
+    world: _Harness,
+) -> None:
+    from tests.integration.credit_rollout_world import grant_courtesy
+
+    author = await make_user(world)
+    builder = await make_builder(world)
+    await grant_courtesy(world, builder, 5)
+    await _rule_opens_the_window(world, builder)
+    window = accounting_window((), datetime.now(timezone.utc))
+    openings = await scalar(
+        world,
+        "SELECT count(*) FROM credit_allocations WHERE builder_id = :b "
+        "AND window_start = :start AND allocation_kind IN ('baseline', "
+        "'maintenance')",
+        b=builder,
+        start=window.start,
+    )
+    assert int(openings) >= 1
+    outcome = await run(world, "mark", builder, author)
+    _refused(outcome, "mark", "window_already_opened")
+    assert outcome.document["change"]["window"] == {
+        "window_start": window.start.isoformat(),
+        "window_opened": True,
+        "latest_mark_at": None,  # never marked: the rule opened it
+    }
+    assert await mark_events(world, builder) == []
+
+    # Control: a builder under the rule whose traffic opened nothing yet is
+    # not refused for the window.
+    other = await make_builder(world)
+    await grant_courtesy(world, other, 5)
+    assert (await run(world, "mark", other, author)).code == 0

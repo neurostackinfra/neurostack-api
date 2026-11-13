@@ -38,7 +38,11 @@ Reusable guards for the credit surfaces of Groups 2-7:
   route captured, never by a read of its own);
 * ``enforcement_mark_gate_open`` (cobranca-credito-por-builder: code that
   reads ``credit_enforcement_marks`` also needs the schema at
-  ``ENFORCEMENT_MARK_SCHEMA_MIN_REVISION``, judged the same way).
+  ``ENFORCEMENT_MARK_SCHEMA_MIN_REVISION``, judged the same way);
+* ``courtesy_rule_gate_open`` (debito-cortesia-automatico: the courtesy
+  rule of ``CreditRepository.effective_enforcement`` reads courtesy lots
+  only with the schema at ``COURTESY_SCHEMA_MIN_REVISION``, judged the same
+  way; below it the rule reads nothing).
 
 This module touches no ``credit_*`` table and never reads ``tests/``.
 """
@@ -285,6 +289,25 @@ def enforcement_mark_gate_open(reading: CreditSwitchReading) -> bool:
         reading,
         ENFORCEMENT_MARK_SCHEMA_MIN_REVISION,
         "credit enforcement mark gate unreadable; treating it as closed",
+    )
+
+
+def courtesy_rule_gate_open(reading: CreditSwitchReading) -> bool:
+    """Whether the courtesy rule may be read on the schema of ``reading``
+    (debito-cortesia-automatico, DESIGN item 1).
+
+    The courtesy routes' gate (``COURTESY_SCHEMA_MIN_REVISION``, 046) for a
+    different reader: ``CreditRepository.effective_enforcement`` reads a
+    builder's courtesy lots -- and, with no courtesy left, its paid plan --
+    only when this is open; below 046, not effective, without a revision or
+    on any exception it is closed (the rule reads nothing and no builder is
+    under it), and it never raises.  The caller passes a reading it already
+    holds; this reads nothing else."""
+
+    return _revision_gate_open(
+        reading,
+        COURTESY_SCHEMA_MIN_REVISION,
+        "credit courtesy rule gate unreadable; treating it as closed",
     )
 
 
@@ -649,6 +672,7 @@ __all__ = [
     "credit_unavailable_exception_handler",
     "credit_unavailable_response",
     "courtesy_gate_open",
+    "courtesy_rule_gate_open",
     "enforcement_mark_gate_open",
     "evaluate_schema_revision",
     "load_credit_panel",

@@ -24,13 +24,23 @@ from src.models.content_retention import (
     CreditLifecycleEpisode,
     CreditLifecycleTransition,
 )
-from src.models.credit import CreditAccount, CreditEnforcementState, CreditIngressClaim
+from src.models.credit import (
+    CreditAccount,
+    CreditEffect,
+    CreditEnforcementState,
+    CreditIngressClaim,
+    CreditLedgerEntry,
+    CreditObservationalEffect,
+)
 from src.repositories.database import get_db_session
 from tests.api.test_events_credit_enforced import (
+    EVENTS,
     World,
+    _body,
     _FakeLLM,
     _forbid_pipeline,
     _grant,
+    _jwt,
     _post,
 )
 
@@ -182,3 +192,137 @@ def test_with_the_switch_off_an_overdue_episode_changes_nothing(
     assert response.status_code == 200
     assert llm.calls == 1
     assert _transitions(client) == []
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 2: ``POST /v1/events`` under the courtesy
+# rule, with NO ``credit_enforcement_at``.  A blocked builder is 402
+# ``credit_suspended`` with nothing recorded; a charged one is served even
+# with an overdue episode left from a mark era.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rule_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The process reading at this image's head (046 and 047 gates open)."""
+
+    from src.services.credit_switch import (
+        CreditSwitch,
+        CreditSwitchReading,
+        load_image_migration_chain,
+    )
+
+    reading = CreditSwitchReading(
+        True, "schema_ready", load_image_migration_chain()[-1]
+    )
+    monkeypatch.setattr(CreditSwitch, "reading", lambda _self: reading)
+
+
+async def _courtesy(builder: UUID, *, keep: bool) -> None:
+    from src.services import credit_courtesy
+    from src.services.credit_ledger import CreditLedger
+
+    database = get_db_session()
+    try:
+        async with database.begin():
+            granted = await credit_courtesy.grant(
+                database,
+                builder_id=builder,
+                credits=5,
+                reason="courtesy rule",
+                actor_user_id=uuid4(),
+                idempotency_key=f"rule-{uuid4()}",
+                ledger=CreditLedger(database),
+            )
+        if not keep:
+            async with database.begin():
+                await credit_courtesy.remove(
+                    database,
+                    lot_id=granted.lot_id,
+                    remove_all=True,
+                    reason="courtesy rule",
+                    actor_user_id=uuid4(),
+                    idempotency_key=f"rule-removal-{uuid4()}",
+                    ledger=CreditLedger(database),
+                )
+    finally:
+        await database.close()
+
+
+def test_a_blocked_rule_builder_is_402_credit_suspended_and_not_served(
+    client: Any,
+    world: World,
+    switch: Any,
+    llm: _FakeLLM,
+    rule_reading: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client._submit(_courtesy(world.builder, keep=False))
+    _forbid_pipeline(monkeypatch)
+    response = _post(client, world, key="rule-blocked-1")
+    assert response.status_code == 402
+    assert response.json() == {"code": "credit_suspended"}
+    assert llm.calls == 0
+    assert client._submit(_rows(CreditIngressClaim)) == []
+    assert _transitions(client) == []
+    # DESIGN Risk 4 (accepted): the rule is the enforced path, so a call
+    # without an Idempotency-Key is refused before the block.
+    keyless = _post(client, world, key=None)
+    assert keyless.status_code == 400
+    assert keyless.json() == {"code": "idempotency_key_required"}
+
+
+def test_the_panel_simulator_is_served_free_for_a_rule_blocked_builder(
+    client: Any, world: World, switch: Any, llm: _FakeLLM, rule_reading: None
+) -> None:
+    """The runbook promises the panel's simulator stays open for a builder
+    the courtesy rule BLOCKS: only origin ``production`` is ever enforced
+    on ``/v1/events`` -- ``capture_events_enforcement`` returns for any
+    other origin before it reads the builder's mode -- so a panel (JWT,
+    ``simulator``) turn is served without an ``Idempotency-Key``, charges
+    nothing and suspends nothing, while the same builder's API key is
+    refused."""
+
+    client._submit(_courtesy(world.builder, keep=False))
+    # (a) The block is in effect for this builder, under the RULE (no
+    # global, no mark).
+    assert client._submit(_rows(CreditEnforcementState)) == []
+    blocked = _post(client, world, key="rule-blocked-panel-1")
+    assert blocked.status_code == 402
+    assert blocked.json() == {"code": "credit_suspended"}
+    assert llm.calls == 0
+    effects = len(client._submit(_rows(CreditEffect)))
+    entries = len(client._submit(_rows(CreditLedgerEntry)))
+    observed = {row.id for row in client._submit(_rows(CreditObservationalEffect))}
+    # (b) The panel turn, with no Idempotency-Key, is served.
+    response = client.post(
+        EVENTS, json=_body(world.jwt_session), headers=_jwt(world.jwt_tenant)
+    )
+    assert response.status_code == 200, response.text
+    assert llm.calls == 1
+    # (c) Nothing claimed, charged or suspended.
+    assert client._submit(_rows(CreditIngressClaim)) == []
+    assert len(client._submit(_rows(CreditEffect))) == effects
+    assert len(client._submit(_rows(CreditLedgerEntry))) == entries
+    assert _transitions(client) == []
+    # (d) Its observational row (the global is unset, so the writer records
+    # it; the ``switch`` fixture gives that write a generous budget) says
+    # simulator and would debit nothing.
+    (row,) = [
+        row
+        for row in client._submit(_rows(CreditObservationalEffect))
+        if row.id not in observed
+    ]
+    assert (row.origin, row.would_debit_mc) == ("simulator", 0)
+    assert row.tenant_id == world.jwt_tenant
+
+
+def test_a_charged_rule_builder_with_a_stale_overdue_episode_is_served(
+    client: Any, world: World, switch: Any, llm: _FakeLLM, rule_reading: None
+) -> None:
+    client._submit(_courtesy(world.builder, keep=True))
+    client._submit(_plant_episode(world.builder, overdue=True))  # a mark era's
+    response = _post(client, world, key="rule-charged-1")
+    assert response.status_code == 200, response.text
+    assert llm.calls == 1
+    assert _transitions(client) == []  # never suspended by that episode

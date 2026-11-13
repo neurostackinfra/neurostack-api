@@ -35,8 +35,11 @@ The checks run in this order and in no other (WISH Group 5, DESIGN Scope IN
    (:func:`~src.services.credit_inventory.read_credit_mode_without_request`;
    per builder -- the tenant's builder's effective enforcement -- only on
    Meta and Z-API, :data:`PER_BUILDER_PROVIDERS`, the global alone on Uazapi
-   and Evolution) and, when enforced, the builder's suspension --
-   unavailable or suspended: ``credit_refused``;
+   and Evolution -- where, the global unset, the tenant's courtesy rule is
+   read next, :data:`RULE_ONLY_PROVIDERS`, so Uazapi and Evolution charge
+   only under ``courtesy``) and, when enforced, the builder's suspension (under the
+   rule its computed block, ``captured``) -- unavailable or suspended:
+   ``credit_refused``;
 6. the 24-hour claim -- taken within the window: ``deduplicated``, in
    silence;
 7. the egress: off records nothing; observational records what it WOULD
@@ -119,6 +122,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, TypeVar, cast, get_args
 from uuid import UUID, uuid4
@@ -134,6 +138,7 @@ from src.repositories import media_deliveries
 from src.services import (
     credit_inventory,
     credit_lifecycle,
+    credit_metering,
     egress_policy,
     meta_service,
     uazapi_service,
@@ -192,6 +197,14 @@ def _request_seconds(timeout: httpx.Timeout) -> float:
 # On Uazapi and Evolution its outgoing media keeps the GLOBAL read (like its
 # text): observational, recorded, never charged nor gated by its mark.
 PER_BUILDER_PROVIDERS: Final[frozenset[str]] = frozenset({"meta", "zapi"})
+# debito-cortesia-automatico Groups 3 and 4 (DESIGN items 8 and 9): the
+# delivery channels charged ONLY by the courtesy rule -- the global as
+# before, never a mark.
+# With the global unset (the global read observational), their tenant's
+# builder is read once more, ``rule_only``: under ``courtesy`` the file is
+# charged (only courtesy lots) or, ``blocked``, refused; under a mark or
+# nothing it stays observational, as before.
+RULE_ONLY_PROVIDERS: Final[frozenset[str]] = frozenset({"uazapi", "evolution"})
 # How many ``MEDIA_SEND_TIMEOUT`` requests one media send makes: Meta
 # uploads, then sends; the others post one request.
 _MEDIA_SEND_REQUESTS: Final[Mapping[str, int]] = MappingProxyType(
@@ -700,12 +713,14 @@ async def _deliver_with_permit(
     # 5. The credit mode (and, enforced, the suspension).  Per builder
     # (cobranca-credito-por-builder) only on a channel a marked builder is
     # charged on (Meta, Z-API); Uazapi and Evolution keep the global read, so
-    # a marked builder's file there stays observational like its text.
+    # a marked builder's file there stays observational like its text --
+    # and both then read their courtesy rule (debito-cortesia-automatico).
     mode = await _credit_mode(
         session_factory,
         tenant_id,
         credit_switch_on,
         per_builder=channel.provider in PER_BUILDER_PROVIDERS,
+        rule_only=channel.provider in RULE_ONLY_PROVIDERS,
     )
     # 6. The claim, committed before anything else happens.
     claimed = await _step(
@@ -788,12 +803,43 @@ async def _read_payload(
     return payload
 
 
+async def _courtesy_mode(
+    session: AsyncSession, tenant_id: UUID, observational: CreditMode
+) -> CreditMode:
+    """A :data:`RULE_ONLY_PROVIDERS` delivery whose global read found no
+    enforcement: its tenant's courtesy rule, read ONCE, ``rule_only`` (only
+    the rule's per-tenant D1 can refuse it -- raised; a mark never decides
+    and is never learned).  ``courtesy`` is the mode to charge or gate;
+    anything else -- a mark, nothing, a failed read before the rule was seen
+    -- keeps ``observational``, the global read's answer."""
+
+    effective = await credit_metering.read_tenant_enforcement(
+        session,
+        tenant_id,
+        global_seen=credit_metering.enforcement_seen(),
+        rule_only=True,
+        log=logger,
+        event=DELIVERY_LOG,
+    )
+    if (
+        effective is None
+        or effective.origin != "courtesy"
+        or not isinstance(effective.at, datetime)
+    ):
+        return observational
+    at = effective.at
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return CreditMode(True, at, "courtesy", effective.state)
+
+
 async def _credit_mode(
     session_factory: Callable[[], AsyncSession],
     tenant_id: UUID,
     credit_switch_on: bool | None,
     *,
     per_builder: bool,
+    rule_only: bool = False,
 ) -> CreditMode:
     # Opening and closing the session are inside the ``try`` too: the
     # delivery never raises (a cancellation is not an ``Exception``).
@@ -807,6 +853,10 @@ async def _credit_mode(
                     switch_on=credit_switch_on,
                     tenant_id=tenant_id if per_builder else None,
                 )
+                if rule_only and mode.observational:
+                    # The global unset: the tenant's courtesy rule decides
+                    # (debito-cortesia-automatico, DESIGN item 8).
+                    mode = await _courtesy_mode(session, tenant_id, mode)
             except CreditEnforcementUnavailable:
                 raise _Refused(
                     "credit_refused", "credit_enforcement_unavailable"
@@ -820,8 +870,13 @@ async def _credit_mode(
             try:
                 await session.rollback()  # end the read before the gate's locks
                 # The gate may record the builder's transition: committed
-                # either way, as by the download route.
-                suspended = await credit_lifecycle.tenant_suspended(session, tenant_id)
+                # either way, as by the download route.  Under the courtesy
+                # rule the answer is its computed block, ``blocked`` included
+                # (debito-cortesia-automatico): the captured mode, never a
+                # mark era's episode; on the global or a mark, as before.
+                suspended = await credit_lifecycle.tenant_suspended(
+                    session, tenant_id, captured=mode.captured
+                )
                 await session.commit()
             except Exception as error:
                 raise _Refused(
@@ -970,6 +1025,7 @@ __all__ = [
     "MEDIA_DELIVERY_PROVIDERS",
     "NOTICE_OUTCOMES",
     "PER_BUILDER_PROVIDERS",
+    "RULE_ONLY_PROVIDERS",
     "REPLY_MEDIA_MAX_SECONDS",
     "REPLY_MEDIA_NOTICES",
     "REPLY_MEDIA_NOTICE_TIMEOUT_SECONDS",

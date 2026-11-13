@@ -43,6 +43,13 @@ concurrency are PostgreSQL-only):
   first), and a phase 1 holding a session never blocks the final
   transaction of another session of the same builder.
 
+debito-cortesia-automatico Group 2, on a database with neither the global
+nor a mark (a courtesy grant alone puts a builder on the enforced path):
+two requests of one key run phase 1 once and debit the courtesy lot once;
+a Z-API reply whose process died after the final commit is recovered by
+the publisher (on that courtesy lot alone) and its redelivery is
+``duplicate_message`` with no second debit or reply.
+
 Needs ``POSTGRES_SMOKE_DATABASE_URL``; without it the module skips, and only
 ``scripts/check-credit-integration.sh`` turns that skip into a failure.
 """
@@ -3914,3 +3921,163 @@ async def test_every_writer_discard_moves_the_drop_counter_on_postgres(
     assert outcome == reason
     assert _dropped(reason) == before + 1
     assert await _rows(direct, seeded.tenant_id) == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 2: the courtesy rule on the shared enforced
+# path, on a database with NO ``credit_enforcement_at`` and no mark -- only a
+# courtesy grant puts a builder there.  The fences are the global's: two
+# requests of one key run phase 1 once and debit courtesy once; a crashed
+# inline send is recovered by the publisher (on a courtesy lot alone, DESIGN
+# Decision 20) and a redelivery of its message is a duplicate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+async def rule_pg(pg: _PG) -> AsyncIterator[_PG]:
+    """A third database at head: no global, no mark; each test's world is
+    under the rule only through its own courtesy grant."""
+
+    name = await pg.cluster.fresh()
+    url = pg.cluster.url(name)
+    await _migrate(url, "upgrade", "head")
+    yield _PG(cluster=pg.cluster, url=url)
+
+
+@pytest.fixture
+async def rule_direct(rule_pg: _PG) -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine(rule_pg.url, poolclass=NullPool)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+async def _courtesy_world(direct: AsyncEngine, world: Any, credits: int = 10) -> UUID:
+    """The world's builder under the rule: a courtesy grant, nothing else."""
+
+    from tests.integration.credit_rollout_world import grant_courtesy
+
+    granted = await grant_courtesy(direct, UUID(world.builder), credits)
+    return granted.lot_id
+
+
+async def _courtesy_lot_debits(direct: AsyncEngine, builder: UUID) -> list[Any]:
+    async with direct.connect() as connection:
+        return list(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT e.amount_mc, l.lot_kind FROM credit_ledger_entries e "
+                        "JOIN credit_lots l ON l.builder_id = e.builder_id AND "
+                        "l.id = e.lot_id WHERE e.builder_id = :b AND "
+                        "e.entry_type = 'debit'"
+                    ),
+                    {"b": builder},
+                )
+            ).all()
+        )
+
+
+async def test_under_the_rule_two_requests_of_one_key_debit_courtesy_once(
+    rule_pg: _PG, rule_direct: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The claim's fences under the rule, with no global: one claim, one
+    phase 1, one trace -- debited from the courtesy lot, never debt."""
+
+    from src.services.event_service import EventService
+
+    both = _Gate(parties=2)
+    inserted: list[Any] = []
+    _pause(
+        monkeypatch,
+        CreditRepository,
+        "insert_enforced_claim",
+        both,
+        calls=frozenset({1, 2}),
+        results=inserted,
+    )
+    pipelines: list[Any] = []
+    _pause(
+        monkeypatch,
+        EventService,
+        "run_pipeline",
+        _Gate(),
+        calls=frozenset(),
+        results=pipelines,
+    )
+    async with _running_app(rule_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _courtesy_world(rule_direct, world)
+        body = _events_body(world.api_session)
+        async with asyncio.timeout(_TURN_SECONDS):
+            tasks = [
+                asyncio.create_task(
+                    client.post(
+                        "/v1/events", json=body, headers=_api(world, "rule-twice")
+                    )
+                )
+                for _ in range(2)
+            ]
+            await both.reached.wait()
+            both.opened.set()
+            answers = await asyncio.gather(*tasks)
+    assert sum(row is not None for row in inserted) == 1 and len(pipelines) == 1
+    assert any(answer.status_code == 200 for answer in answers), [
+        answer.text for answer in answers
+    ]
+    seen = await _enforced_rows(rule_direct, world)
+    [claim] = seen.claims
+    assert claim.mode == "enforced"  # the orphan pass anchors on it
+    assert seen.effects == [(_trace(world, claim), "trace")]
+    assert seen.entries == {"grant": 10_000, "debit": 1_000}
+    assert await _courtesy_lot_debits(rule_direct, UUID(world.builder)) == [
+        (1_000, "courtesy")
+    ]
+
+
+async def test_under_the_rule_a_crashed_reply_is_recovered_and_a_redelivery_is_a_duplicate(
+    rule_pg: _PG,
+    rule_direct: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    redis_down: None,
+) -> None:
+    """A charged Z-API decision whose process died right after the final
+    commit: with no global and no mark, the publisher (the route's real
+    sender) still recovers the pending reply -- a courtesy lot keeps it on --
+    and delivers it once; the provider's redelivery of the message is
+    ``duplicate_message`` (the PostgreSQL claim, Redis down) with no second
+    debit and no second reply."""
+
+    from src.api.routes import webhook
+    from src.repositories.database import get_db_session_factory
+
+    _no_app_publisher(monkeypatch)
+    monkeypatch.setattr(credit_metering, "PUBLISHER_MIN_AGE_SECONDS", 0)
+    phone = "5511900019801"
+    async with _running_app(rule_pg, monkeypatch) as running:
+        world, client = running.world, running.client
+        await _courtesy_world(rule_direct, world)
+        await _seed_patient(rule_pg.url, world.zapi_tenant, phone)
+        async with asyncio.timeout(_TURN_SECONDS):
+            await _crash_after_the_final_commit(client, world, "rule-recover-1", phone)
+            pending = await _webhook_rows(rule_direct, UUID(world.zapi_tenant))
+            tick = await credit_metering.CreditResponsePublisher(
+                webhook.CREDIT_REPLY_SENDER, session_factory=get_db_session_factory()
+            ).run_once()
+            replies = _sent_to(webhook.send_text_message, phone)
+            redelivered = await client.post(
+                f"/v1/webhook/zapi/{world.zapi_token}",
+                json=_zapi_message(world, "rule-recover-1", phone, "Olá"),
+            )
+        replies_after = _sent_to(webhook.send_text_message, phone)
+    assert [state for _e, state, _p, _a in pending.outbox] == ["pending"]
+    assert tick is not None and tick.enforced and tick.outcomes == ["delivered"]
+    assert len(replies) == 1 and replies_after == replies
+    assert redelivered.json() == {"ok": True, "skipped": "duplicate_message"}
+    seen = await _webhook_rows(rule_direct, UUID(world.zapi_tenant))
+    assert [mode for _i, _s, mode, *_rest in seen.claims] == ["enforced"]
+    assert [kind for _e, kind in seen.effects] == ["trace"]
+    assert seen.entries == {"debit": 1_000}
+    [(_effect, state, payload, _attempts)] = seen.outbox
+    assert state == "delivered" and "phone" not in payload

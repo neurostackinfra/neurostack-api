@@ -22,6 +22,11 @@ the same window reuses the coverage a deletion freed.  A debit beyond the
 capacity becomes debt, as any debit.  Nothing extra is subtracted from
 ``available_trace_mc``: the reservation has already left the lots.
 
+Under the courtesy rule (debito-cortesia-automatico) a charge debits only
+what the courtesy lots can pay (:func:`courtesy_payable`): the rest is no
+debt, the allocation records -- and the coverage advances by -- the paid
+part alone, so the window's next charge bills the gap.
+
 RAG reprocessing (deliverable 3): within a window, re-indexing up to 100 % of
 the active characters is included; what exceeds it is added to the units of
 the RAG target (:func:`rag_units`), so the excess is charged through the same
@@ -98,6 +103,18 @@ def charge_delta(target_mc: int, coverage_mc: int) -> int:
     _non_negative(target_mc, "target_mc")
     _non_negative(coverage_mc, "coverage_mc")
     return max(target_mc - coverage_mc, 0)
+
+
+def courtesy_payable(delta_mc: int, courtesy_spendable_mc: int) -> int:
+    """What a window charge of ``delta_mc`` debits under the courtesy rule
+    (debito-cortesia-automatico, DESIGN item 3, wish Decision 6): only what
+    the courtesy can pay now.  The rest is no debt and stays OUTSIDE the
+    coverage -- the coverage advances by the returned amount alone -- so
+    the window's next charge bills the gap.  0 means no effect at all."""
+
+    _non_negative(delta_mc, "delta_mc")
+    _non_negative(courtesy_spendable_mc, "courtesy_spendable_mc")
+    return min(delta_mc, courtesy_spendable_mc)
 
 
 def rag_units(active_characters: int, reprocessed_characters: int) -> int:
@@ -252,6 +269,7 @@ __all__ = [
     "accounting_window",
     "aggregate_target_mc",
     "charge_delta",
+    "courtesy_payable",
     "egress_allowance_bytes",
     "egress_effect_id",
     "egress_target_mc",

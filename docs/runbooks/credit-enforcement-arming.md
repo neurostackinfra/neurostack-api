@@ -35,8 +35,9 @@ credit switch is effective enforces the credits:
   envelope token matched while `uazapi_webhook_auth_enforced` is on
   ([`uazapi-webhook-auth.md`](./uazapi-webhook-auth.md)): that turn is
   metered as an authenticated production turn, but no enforced adapter
-  charges or blocks it yet. That is why `arm` refuses until the follow-up
-  wish `uazapi-credit-enforcement` lands (prerequisite 7).
+  charges or blocks it under the global (the one that exists charges only
+  under the courtesy rule; see below). That is why `arm` refuses until the
+  follow-up wish `uazapi-credit-enforcement` lands (prerequisite 7).
 
 **An acceptance is not an exemption** (Decision 11). Accepting a cutoff
 finding only lets the arming transaction proceed with that tenant as it is.
@@ -93,6 +94,21 @@ private record at arming time (write the rationale under "Owner record
 per finding", then step "3. `accept`"). The L10 code and report are
 unchanged. After the global is armed, `mark` and `unmark` are refused
 (`global_enforcement_armed`) and the mark is redundant.
+
+### Builders under the courtesy rule (`credit_courtesy_rule`)
+
+A builder under the courtesy rule
+([`credit-courtesy-rule.md`](./credit-courtesy-rule.md)) also runs the
+enforced path, Uazapi and Evolution included: its charged traffic writes no
+observational credit effect, so the cutoff report raises
+`message_without_observation` for its tenants
+(`CutoffFinding(..., "message_without_observation")` in
+`src/services/credit_rollout.py`). Accept them the same way. The rule does
+**not** open the L10 guard: `uazapi_enforced_credit_adapter_available()`
+in `src/services/credit_rollout.py` still returns `False`, so `arm` still
+refuses `uazapi_enforced_credit_adapter_missing`. The charged Uazapi
+adapter now exists (wish `debito-cortesia-automatico`), but lifting the
+guard is a separate owner decision.
 
 ## Running a step
 

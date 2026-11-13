@@ -20,6 +20,15 @@ Modes, read ONCE per request by :func:`read_credit_mode`:
   -- :func:`reserve_upload` (or :func:`charge_egress` before a download is
   answered) debits the reservation.
 
+Under the courtesy rule (debito-cortesia-automatico: the mode's origin
+``courtesy``) the request is enforced from the first courtesy grant; its
+captured mode skips the binding coverage and the quarantine hold
+(:func:`_enforced_book`), and every charge -- the window's maintenance, a
+reservation, egress -- debits only what the courtesy can pay: the
+allocation records that alone, the coverage advances by it, the next charge
+of the window bills the gap, and a charge the courtesy pays nothing of is
+recorded with ``charged_mc = 0`` and no effect (wish Decision 6).
+
 Enforced transaction, in the lock order of :mod:`src.repositories.credit`:
 tenant ``FOR SHARE`` (a standalone tenant: ``credit_pending``) -> account
 ``FOR UPDATE`` (created on demand) -> the quarantine hold (``credit_pending``,
@@ -80,6 +89,7 @@ from src.models.knowledge import KnowledgeDocument
 from src.models.media_asset import MediaAsset
 from src.models.tenant import Tenant
 from src.repositories.credit import (
+    CourtesyRuleState,
     CreditRepository,
     EffectiveEnforcement,
     EnforcementOrigin,
@@ -93,6 +103,7 @@ from src.services.credit_allocations import (
     accounting_window,
     aggregate_target_mc,
     charge_delta,
+    courtesy_payable,
     egress_allowance_bytes,
     egress_effect_id,
     egress_target_mc,
@@ -160,11 +171,13 @@ class CreditMode:
     """Captured once per request: the switch, and the effective enforcement
     instant of the request's tenant with its origin (the global
     ``credit_enforcement_at``, else its builder's mark;
-    cobranca-credito-por-builder)."""
+    cobranca-credito-por-builder; else the courtesy rule with its
+    ``state``, debito-cortesia-automatico)."""
 
     switch_on: bool
     enforcement_at: datetime | None = None
     origin: EnforcementOrigin | None = None
+    state: CourtesyRuleState | None = None
 
     @property
     def enforced(self) -> bool:
@@ -182,7 +195,7 @@ class CreditMode:
 
         if not self.enforced or self.origin is None:
             return None
-        return EffectiveEnforcement(self.enforcement_at, self.origin)
+        return EffectiveEnforcement(self.enforcement_at, self.origin, state=self.state)
 
 
 CREDIT_OFF: Final = CreditMode(False)
@@ -289,7 +302,7 @@ async def _read_enforcement_mode(
             return CreditMode(True, None)
         if effective.origin == "global":
             _enforcement_seen = True
-        return CreditMode(True, _aware(effective.at), effective.origin)
+        return CreditMode(True, _aware(effective.at), effective.origin, effective.state)
     try:
         enforced_at = await CreditRepository(session).enforcement_at()
     except Exception as error:
@@ -468,6 +481,10 @@ class WindowWork:
         self.ledger = ledger
         self.book = book
         self.enforcement_at = _aware(enforcement_at)
+        # debito-cortesia-automatico: the book spends under the courtesy rule
+        # (its captured mode): only what the courtesy pays is charged and
+        # covered (DESIGN item 3, wish Decision 6).
+        self.courtesy = book.spend_hold.courtesy
         self.at = book.clock
         self.repository = CreditInventoryRepository(session)
         self.window = accounting_window(
@@ -524,9 +541,12 @@ class WindowWork:
         # Owner decision E: the window open AT the enforcement -- one that
         # starts exactly then included ([start, end) contains it) -- gets a
         # free baseline; maintenance starts with a window that begins after.
+        # Under the courtesy rule the enforcement is the first courtesy
+        # grant (DESIGN item 2: its window opens as a free baseline).
         maintenance = self.window.starts_at > self.enforcement_at
         effect_id: str | None = None
         charged = 0
+        covered = target
         if maintenance and target > 0:
             effect_id = maintenance_effect_id(self.window, category)
             existing = await CreditRepository(self.session).existing_effect_ids(
@@ -534,24 +554,61 @@ class WindowWork:
             )
             if existing:
                 raise LedgerInvariantError("a maintenance effect without its opening")
-            result = self.book.debit(
-                effect_id, target, at=self.at, effect_kind=MAINTENANCE_EFFECT_KIND
-            )
-            if result.status != "applied":
-                raise LedgerInvariantError(f"the maintenance debit was {result.status}")
-            charged = target
+            charged = self._payable(target)
+            covered = charged
+            if charged:
+                self._debit(
+                    effect_id,
+                    charged,
+                    effect_kind=MAINTENANCE_EFFECT_KIND,
+                    what="maintenance",
+                )
+            else:
+                effect_id = None
         self._allocation(
             category,
             "maintenance" if maintenance else "baseline",
             source_key=opening_source_key(self.window, category),
             units=units,
-            target=target,
+            target=covered,
             charged=charged,
             effect_id=effect_id,
             digest=snapshot.digest(category, exclude),
         )
-        self.state.coverage[category] = max(self.state.coverage[category], target)
+        self.state.coverage[category] = max(self.state.coverage[category], covered)
         self.state.opened.add(category)
+
+    def _payable(self, delta: int) -> int:
+        """What a charge of ``delta`` debits: all of it outside the courtesy
+        rule (a shortfall becomes debt, as any debit); under the rule only
+        what the courtesy lots can pay now (the rest stays OUTSIDE the
+        coverage, never debt: the next charge of the window bills the gap,
+        DESIGN item 3)."""
+
+        if not self.courtesy or delta <= 0:
+            return delta
+        return courtesy_payable(delta, self.book.courtesy_spendable_mc(self.at))
+
+    def _debit(
+        self,
+        effect_id: str,
+        amount: int,
+        *,
+        effect_kind: str,
+        what: str,
+        tenant_id: UUID | None = None,
+    ) -> None:
+        result = self.book.debit(
+            effect_id,
+            amount,
+            at=self.at,
+            effect_kind=effect_kind,
+            tenant_id=tenant_id,
+        )
+        if result.status != "applied":
+            raise LedgerInvariantError(f"the {what} debit was {result.status}")
+        if self.courtesy and result.debited_mc != amount:
+            raise LedgerInvariantError(f"the courtesy did not pay the {what} debit")
 
     def charge(
         self,
@@ -567,33 +624,39 @@ class WindowWork:
         always_record: bool = False,
     ) -> int:
         """Debit ``target - coverage`` (never negative) under ``effect_id``
-        and record the allocation; returns the charged millicredits."""
+        and record the allocation; returns the charged millicredits.
+
+        Under the courtesy rule (debito-cortesia-automatico, wish Decision 6)
+        only what the courtesy pays is debited, recorded and covered: the
+        coverage advances by that alone, the unpaid rest is no debt and is
+        billed by the window's next charge; a charge the courtesy pays
+        nothing of creates no effect and is recorded with ``charged_mc = 0``
+        and no ``effect_id``."""
 
         coverage = self.state.coverage[category]
         delta = charge_delta(target, coverage)
-        if delta:
-            result = self.book.debit(
+        paid = self._payable(delta)
+        if paid:
+            self._debit(
                 effect_id,
-                delta,
-                at=self.at,
+                paid,
                 effect_kind=category,
+                what=category,
                 tenant_id=tenant_id,
             )
-            if result.status != "applied":
-                raise LedgerInvariantError(f"the {category} debit was {result.status}")
         if delta or always_record:
             self._allocation(
                 category,
                 kind,
                 source_key=source_key,
                 units=units,
-                target=max(coverage, target),
-                charged=delta,
-                effect_id=effect_id if delta else None,
+                target=coverage + paid,
+                charged=paid,
+                effect_id=effect_id if paid else None,
                 digest=digest,
             )
-        self.state.coverage[category] = max(coverage, target)
-        return delta
+        self.state.coverage[category] = coverage + paid
+        return paid
 
     def _allocation(
         self,
@@ -653,7 +716,14 @@ async def open_window_for_debit(
     :class:`InventoryReadbackFailed` (the debit answers
     ``credit_pending``)."""
 
-    enforcement_at = (await ledger.repository.effective_enforcement(book.builder_id)).at
+    if book.spend_hold.courtesy_at is not None:
+        # debito-cortesia-automatico: the book's own (captured) mode, never a
+        # re-read; its window opening is paid only by courtesy.
+        enforcement_at: datetime | None = book.spend_hold.courtesy_at
+    else:
+        enforcement_at = (
+            await ledger.repository.effective_enforcement(book.builder_id)
+        ).at
     if enforcement_at is None:
         return None
     work = WindowWork(ledger.session, ledger, book, enforcement_at)
@@ -701,6 +771,12 @@ async def _enforced_book(
     caller rolls back -- so a tenant unlinked from a marked builder in
     between is never ``credit_pending``, and a builder it was relinked to is
     never charged for it.
+
+    debito-cortesia-automatico (DESIGN item 7, Decision 17): a captured
+    COURTESY mode skips both ASAAS gates -- the binding coverage and the
+    quarantine hold -- because its book debits only courtesy lots, which
+    depend on no ASAAS fact; the book is opened in that captured mode
+    (never re-read).
     """
 
     repository = CreditRepository(session)
@@ -718,14 +794,24 @@ async def _enforced_book(
         )
     if scope.builder_id is None:
         return None
-    from src.services.credit_rollout import CreditRolloutService
+    courtesy = captured is not None and captured.origin == "courtesy"
+    if not courtesy:
+        from src.services.credit_rollout import CreditRolloutService
 
-    if not (
-        await CreditRolloutService(session).binding_coverage(scope.builder_id, at=at)
-    ).usable:
-        return None
+        if not (
+            await CreditRolloutService(session).binding_coverage(
+                scope.builder_id, at=at
+            )
+        ).usable:
+            return None
     ledger = CreditLedger(session)
-    book = await ledger.open_book(scope.builder_id, at=at, effect_ids=effect_ids)
+    book = await ledger.open_book(
+        scope.builder_id,
+        at=at,
+        effect_ids=effect_ids,
+        captured=captured,
+        spending=True,
+    )
     if book.spend_hold.active:
         return None
     return scope, ledger, book
@@ -775,6 +861,11 @@ async def reserve_upload(
     except InventoryReadbackFailed as error:
         _log_pending("readback_failed", tenant_id, error=str(error))
         return _PENDING
+    if effect_id in work.state.source_keys:
+        # debito-cortesia-automatico: a reservation the courtesy paid
+        # nothing of left its allocation without an effect (wish Decision
+        # 6); its retry in the window is a duplicate all the same.
+        return AllocationOutcome("duplicate")
     assert work.snapshot is not None
     units = work.snapshot.units(category)
     if category == "rag":
@@ -870,17 +961,22 @@ async def charge_rag_reprocessing(
     characters: int,
     enforcement_at: datetime,
     at: datetime | None = None,
+    captured: EffectiveEnforcement | None = None,
 ) -> AllocationOutcome:
     """One reprocessing (re-index) job of one document (the Group 4b jobs
     call it): included up to 100 % of the window's active characters, the
     excess charged through the aggregate delta; a retry of the same job is a
-    duplicate."""
+    duplicate.  ``captured``: as :func:`reserve_upload`'s."""
 
     if type(characters) is not int or characters < 0:
         raise ValueError("characters must be a non-negative integer")
     source_key = reprocessing_effect_id(tenant_id, object_id, job_id)
     opened = await _enforced_book(
-        session, tenant_id, at=at or _now(), effect_ids=(source_key,)
+        session,
+        tenant_id,
+        at=at or _now(),
+        effect_ids=(source_key,),
+        captured=captured,
     )
     if opened is None:
         _log_pending("standalone_or_hold", tenant_id, category="rag")

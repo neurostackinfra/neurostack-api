@@ -35,6 +35,12 @@ A tenant whose ``builder_id`` is NULL is standalone.
 
 ``TenantIdentityMiddleware`` publishes the identity it authenticated on
 ``request.state.credit_identity``; a rejected request publishes nothing.
+
+debito-cortesia-automatico (DESIGN item 10): ``authenticated=False`` still
+means zero debit under the global and under an operator's mark; only a
+builder under the courtesy rule is charged for such a turn, as origin
+``unknown`` (the decision is ``credit_metering.precheck_webhook``'s; this
+derivation does not change).
 """
 
 from __future__ import annotations

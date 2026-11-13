@@ -316,7 +316,9 @@ class _ReplyTarget:
     the arguments of ``_send_reply_with_optional_tts`` the response does not
     carry.  Never a credential."""
 
-    channel: str  # "zapi" | "meta"
+    # "zapi" | "meta" | "uazapi" | "evolution" (the last two only under the
+    # courtesy rule)
+    channel: str
     phone: str
     input_was_audio: bool
 
@@ -343,7 +345,12 @@ _META_MEDIA_PROVIDER: Final = _route_media_provider("meta_cloud")
 # The enforced replies' channels (``_ReplyTarget.channel``) -> the same
 # providers, for the file of a stored reply.
 _CREDIT_MEDIA_PROVIDERS: Final[Mapping[str, MediaDeliveryProvider]] = MappingProxyType(
-    {"zapi": _ZAPI_MEDIA_PROVIDER, "meta": _META_MEDIA_PROVIDER}
+    {
+        "zapi": _ZAPI_MEDIA_PROVIDER,
+        "meta": _META_MEDIA_PROVIDER,
+        "uazapi": _UAZAPI_MEDIA_PROVIDER,
+        "evolution": _EVOLUTION_MEDIA_PROVIDER,
+    }
 )
 
 
@@ -566,6 +573,14 @@ class _PreparedReply:
     credentials: dict[str, Any]
 
 
+# The channels of a stored reply (``_ReplyTarget.channel``) and their log
+# labels -- Uazapi and Evolution only under the courtesy rule
+# (debito-cortesia-automatico Groups 3 and 4).
+_CREDIT_REPLY_LABELS: Final[Mapping[str, str]] = MappingProxyType(
+    {"zapi": "Z-API", "meta": "Meta", "uazapi": "Uazapi", "evolution": "Evolution"}
+)
+
+
 class CreditReplySender:
     """The send adapter of a stored webhook reply (credit Group 3b-2), used
     inline by the route and by the response-outbox publisher (injected from
@@ -579,6 +594,26 @@ class CreditReplySender:
     stores it with ``_store_ai_msg_id_to_db`` -- so the ``fromMe`` echo is
     recognised as the bot's -- and, on Z-API, marks a handoff's conversation
     unread.  Each bookkeeping step only logs its failure.
+
+    Uazapi (debito-cortesia-automatico Group 3, a reply charged under the
+    courtesy rule): main's Uazapi reply -- ``send_uazapi_text`` /
+    ``send_uazapi_audio`` with ``uazapi_api_url`` / ``uazapi_token``; a
+    closed ``uazapi_egress_enabled`` refuses before the network
+    (``uazapi_egress_disabled``, main's reason); the sent id normalised by
+    ``_extract_normalised_send_id`` (``owner:MSGID`` -> ``MSGID``, what the
+    echo carries) for both dedup layers, so the echo of a charged reply never
+    reads as the clinic's message and never pauses the session; no unread
+    mark (Uazapi has none).
+
+    Evolution (debito-cortesia-automatico Group 4, a reply charged under the
+    courtesy rule): main's Evolution reply -- ``send_evolution_text`` /
+    ``send_evolution_audio`` with ``evolution_api_url`` /
+    ``evolution_instance_name`` / ``evolution_api_key``, exactly the values
+    main reads (no egress flag exists for Evolution); the sent id normalised
+    by ``_extract_normalised_send_id`` (Evolution's ``key.id``) tracked and
+    stored for both dedup layers, as main does, so an echo of a charged reply
+    is the bot's (``ai_echo`` / ``ai_echo_db``) and never pauses the session;
+    no unread mark (Evolution has none).
     """
 
     async def prepare(
@@ -594,7 +629,7 @@ class CreditReplySender:
             raise CreditReplyUndeliverable("payload_unusable") from error
         if (
             payload.get("kind") != REPLY_PAYLOAD_KIND
-            or channel not in ("zapi", "meta")
+            or channel not in _CREDIT_REPLY_LABELS
             or not phone
             or not text
         ):
@@ -604,6 +639,17 @@ class CreditReplySender:
             ready = (creds.get("zapi_token") or "").strip() and (
                 creds.get("zapi_instance_id") or ""
             ).strip()
+        elif channel == "uazapi":
+            ready = (creds.get("uazapi_api_url") or "").strip() and (
+                creds.get("uazapi_token") or ""
+            ).strip()
+        elif channel == "evolution":
+            # Main's check, on main's values: the three present, unstripped.
+            ready = (
+                creds.get("evolution_api_url")
+                and creds.get("evolution_instance_name")
+                and creds.get("evolution_api_key")
+            )
         else:
             ready = (creds.get("meta_phone_number_id") or "").strip() and (
                 creds.get("meta_permanent_token") or ""
@@ -611,7 +657,7 @@ class CreditReplySender:
         if not ready:
             logger.warning(
                 "%s credentials missing for tenant %s",
-                "Z-API" if channel == "zapi" else "Meta",
+                _CREDIT_REPLY_LABELS[channel],
                 tenant_id,
             )
             raise CreditReplyUndeliverable("no_credentials")
@@ -653,6 +699,46 @@ class CreditReplySender:
                 ),
                 force_text=prepared.force_text,
             )
+        elif prepared.channel == "uazapi":
+            u_url = (creds.get("uazapi_api_url") or "").strip()
+            u_token = (creds.get("uazapi_token") or "").strip()
+            try:
+                send_result, sent_as_audio = await _send_reply_with_optional_tts(
+                    credentials=creds,
+                    text=text,
+                    language_code=prepared.language_code,
+                    channel="Uazapi",
+                    phone=phone,
+                    input_was_audio=prepared.input_was_audio,
+                    send_audio=lambda audio, mime: send_uazapi_audio(
+                        u_url, u_token, phone, audio, mime_type=mime
+                    ),
+                    send_text=lambda: send_uazapi_text(u_url, u_token, phone, text),
+                    force_text=prepared.force_text,
+                )
+            except EgressDisabledError as closed:
+                # Refused before the network boundary: nothing was sent
+                # (main answers ``uazapi_egress_disabled``).
+                raise CreditReplyUndeliverable(closed.code) from closed
+        elif prepared.channel == "evolution":
+            evol_url = creds.get("evolution_api_url", "")
+            evol_name = creds.get("evolution_instance_name", "")
+            evol_key = creds.get("evolution_api_key", "")
+            send_result, sent_as_audio = await _send_reply_with_optional_tts(
+                credentials=creds,
+                text=text,
+                language_code=prepared.language_code,
+                channel="Evolution",
+                phone=phone,
+                input_was_audio=prepared.input_was_audio,
+                send_audio=lambda audio, _mime: send_evolution_audio(
+                    evol_url, evol_name, evol_key, phone, audio
+                ),
+                send_text=lambda: send_evolution_text(
+                    evol_url, evol_name, evol_key, phone, text
+                ),
+                force_text=prepared.force_text,
+            )
         else:
             meta_pnid = (creds.get("meta_phone_number_id") or "").strip()
             meta_token = (creds.get("meta_permanent_token") or "").strip()
@@ -673,7 +759,7 @@ class CreditReplySender:
             )
         logger.info(
             "%s reply sent to %s (%d chars, format=%s)",
-            "Z-API" if prepared.channel == "zapi" else "Meta",
+            _CREDIT_REPLY_LABELS[prepared.channel],
             phone,
             len(text),
             "audio" if sent_as_audio else "text",
@@ -694,6 +780,15 @@ class CreditReplySender:
                 reply_mid = send_result.get("messageId") or send_result.get(
                     "zapiMessageId", ""
                 )
+            elif prepared.channel in ("uazapi", "evolution"):
+                # Main's Uazapi and Evolution bookkeeping (Decisions 4 + 11 of
+                # uazapi-parity): the normalised id for both layers
+                # (Evolution's is ``key.id``).
+                reply_mid = _extract_normalised_send_id(send_result)
+                if reply_mid:
+                    _track_sent_message({"messageid": reply_mid})
+                else:
+                    _track_sent_message(send_result)
             else:
                 _track_meta_sent_message(send_result)
                 reply_mid = extract_meta_message_id(send_result) or ""
@@ -3319,6 +3414,40 @@ async def _process_zapi_authenticated_body(
     if not phone:
         return {"ok": True, "skipped": "missing_fields"}
 
+    is_from_me = bool(body.get("fromMe", False))
+
+    # ── credit capture (debito-cortesia-automatico, DESIGN item 5) ──
+    # A patient message's effective enforcement is read ONCE, before the
+    # first thing a builder BLOCKED by its courtesy rule must not do: the
+    # audio download, STT and fallback of a patient audio, else the read
+    # receipt (owner decisions 11 and 16) -- so the paths that leave earlier
+    # read nothing, as before.  The decision itself stays at the pre-check
+    # below, on this capture (no second read).  The rule's D1 answers 503 at
+    # once (whether the builder is blocked cannot be known); a global or
+    # mark D1 is held and answered at the pre-check, where it was before.
+    # Captured on the rule, ``blocked`` (``rule_blocked``): no download, no
+    # STT, no fallback, no read receipt; the AI-off and pause gates still run
+    # (a paused session keeps capturing the text, never a transcription) and
+    # the pre-check answers ``credit_suspended``.
+    early_capture: Optional[credit_metering.EarlyWebhookCapture] = None
+
+    async def _capture_credit() -> Optional[JSONResponse]:
+        nonlocal early_capture
+        if early_capture is not None or request is None or is_from_me:
+            return None
+        try:
+            early_capture = await credit_metering.capture_zapi(
+                request, db, tenant_id=tenant_id, body=body
+            )
+        except CreditEnforcementUnavailable:
+            # The rule's D1; like every 503 here it drops the message (main's
+            # replay claim is already spent).
+            return JSONResponse(
+                status_code=503,
+                content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+            )
+        return None
+
     # ── load clinic_config early so audio/text handling can use credentials ──
     service = get_event_service()
     clinic_config = await service._load_clinic_config(tenant_id)
@@ -3342,7 +3471,6 @@ async def _process_zapi_authenticated_body(
     if text_obj and isinstance(text_obj, dict):
         message_text = (text_obj.get("message") or "").strip()
 
-    is_from_me = bool(body.get("fromMe", False))
     original_message_text = message_text
     patient_audio_input = (
         bool(audio_obj) and not original_message_text and not is_from_me
@@ -3378,7 +3506,12 @@ async def _process_zapi_authenticated_body(
     # A patient audio above ``audio_max_seconds``: never downloaded or
     # transcribed, handed off to the team at the insertion point below.
     audio_too_long = False
-    if audio_obj and not message_text and not is_from_me:
+    if patient_audio_input:
+        unavailable = await _capture_credit()
+        if unavailable is not None:
+            return unavailable
+    rule_blocked = early_capture is not None and early_capture.blocked
+    if audio_obj and not message_text and not is_from_me and not rule_blocked:
         audio_url = audio_obj.get("url") or audio_obj.get("audioUrl")
         mimetype = audio_obj.get("mimeType") or "audio/ogg"
         # Everything that follows is guarded by this *inner* condition, and
@@ -3502,11 +3635,14 @@ async def _process_zapi_authenticated_body(
     # patient file is the other: it has no text of its own (a caption is the
     # file's, never the patient's message) and never takes the fromMe block.
     # A long patient audio is the third: it is handed off, never transcribed.
+    # A rule-blocked patient audio is the fourth: never transcribed, it is
+    # answered ``credit_suspended`` by the pre-check below.
     if (
         not message_text
         and not staff_audio
         and patient_file_kind is None
         and not audio_too_long
+        and not (rule_blocked and patient_audio_input)
     ):
         return {"ok": True, "skipped": "empty"}
 
@@ -3535,15 +3671,24 @@ async def _process_zapi_authenticated_body(
         return result
 
     # ── mark message as read (blue checkmarks) ──
-    try:
-        _creds = await _tenant_creds()
-        _inst = _creds.get("zapi_instance_id", "")
-        _tok = _creds.get("zapi_token", "")
-        _ct = _creds.get("zapi_client_token", "")
-        if _inst and _tok:
-            await mark_message_read(_inst, _tok, phone, body.get("messageId", ""), _ct)
-    except Exception:
-        pass  # fire-and-forget
+    # Never for a rule-blocked builder (owner decision 16): the message stays
+    # unread on the clinic's phone and the patient does not see it read.
+    unavailable = await _capture_credit()
+    if unavailable is not None:
+        return unavailable
+    rule_blocked = early_capture is not None and early_capture.blocked
+    if not rule_blocked:
+        try:
+            _creds = await _tenant_creds()
+            _inst = _creds.get("zapi_instance_id", "")
+            _tok = _creds.get("zapi_token", "")
+            _ct = _creds.get("zapi_client_token", "")
+            if _inst and _tok:
+                await mark_message_read(
+                    _inst, _tok, phone, body.get("messageId", ""), _ct
+                )
+        except Exception:
+            pass  # fire-and-forget
 
     # ── bot_active check — if AI is paused, send offline msg once then skip ──
     bot_skip = await _check_bot_active(tenant_id, phone, db)
@@ -3562,17 +3707,20 @@ async def _process_zapi_authenticated_body(
     # ── credit pre-check (neurostack-credit-system Group 3b-2) ──
     # Right after the pause check and before the session exists: under a
     # hold (or for a standalone tenant) once credits are enforced, a new
-    # patient gets no session row and no LGPD notice.  Accepted per channel
-    # (D4/OWNER-c): on Z-API the STT and its fallback ran above and their
-    # fixed messages already reached the patient, and the message was
-    # already marked read.  ``audio_too_long`` is no longer among them: its
-    # handoff and notice run below, so under a hold, as on Meta, neither
-    # happens.
+    # patient gets no session row and no LGPD notice.  It decides on the
+    # capture taken above (``early_capture``: no second read).  Accepted per
+    # channel (D4/OWNER-c) under the global and a mark: on Z-API the STT and
+    # its fallback ran above and their fixed messages already reached the
+    # patient, and the message was already marked read.  Under the courtesy
+    # rule a BLOCKED builder skipped all of them (see ``rule_blocked``); a
+    # charged one keeps that order.  ``audio_too_long`` is no longer among
+    # them: its handoff and notice run below, so under a hold, as on Meta,
+    # neither happens.
     enforcement: Optional[WebhookEnforcement] = None
     if request is not None:
         try:
             verdict = await credit_metering.precheck_zapi(
-                request, db, tenant_id=tenant_id, body=body
+                request, db, tenant_id=tenant_id, body=body, early=early_capture
             )
         except CreditEnforcementUnavailable:
             # D1 latch.  In practice this DROPS the message: main's replay
@@ -3978,6 +4126,19 @@ async def evolution_webhook(
     """
     Evolution API sends a POST for every event.
 
+    Credits (debito-cortesia-automatico Group 4, DESIGN item 9): Evolution has
+    no origin proof, so every callback is ``unknown`` and charged only under
+    its builder's courtesy rule -- through the Z-API/Meta path, a blocked
+    builder answered ``credit_suspended`` with nothing sent
+    (``credit_metering.capture_evolution`` / ``precheck_evolution``); under
+    the global, a mark or nothing the turn stays observational.  Every
+    patient message reads the mode once, after the ``fromMe`` routing (the
+    AI echo and the call auto-reply) and before the AI-off and pause gates
+    (so a failed read never undoes the pause gate's lazy unpause); the
+    decision waits for the pre-check after them, before the session.  There
+    is no egress clause (Evolution has no egress flag), and the Evolution
+    route sends no read receipt.
+
     Expected payload (messages.upsert):
     {
       "event": "messages.upsert",
@@ -4077,6 +4238,29 @@ async def evolution_webhook(
         await db.commit()
         return result
 
+    # ── credit capture (debito-cortesia-automatico Group 4, DESIGN item 9) ──
+    # Every patient message's effective enforcement is read ONCE, here: after
+    # the Redis replay claim and the fromMe routing (the AI echo and the call
+    # auto-reply never read it), before the AI-off and pause gates -- a
+    # failed read rolls the session back, and after the pause gate it would
+    # undo the lazy unpause of an expired pause (flushed, not yet committed)
+    # while the turn is still answered.  Nothing a blocked builder must not
+    # do runs before the pre-check below (the route takes text only: no
+    # download, STT or description exists here).  Evolution is ``unknown``
+    # and charged only under the rule (``rule_only``): under the global, a
+    # mark or nothing the capture is main's path.  The rule's D1 answers 503
+    # at once (the message is lost: its Redis claim is spent, as on Z-API).
+    early_capture: Optional[credit_metering.EarlyWebhookCapture] = None
+    try:
+        early_capture = await credit_metering.capture_evolution(
+            request, db, tenant_id=tenant_id, data=data
+        )
+    except CreditEnforcementUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+
     # ── bot_active check — if AI is paused, send offline msg once then skip ──
     bot_skip = await _check_bot_active(tenant_id, phone, db)
     if bot_skip:
@@ -4084,12 +4268,39 @@ async def evolution_webhook(
         return JSONResponse(status_code=202, content=bot_skip)
 
     # ── pause check for patient messages ──
+    # A paused session keeps capturing the text, blocked or not.
     pause_result = await _check_pause_state(
         tenant_id, phone, db, message_text=message_text, origin=origin
     )
     if pause_result:
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
+
+    # ── credit pre-check (debito-cortesia-automatico Group 4, DESIGN item 9) ──
+    # Right after the AI-off and pause gates and before the session, the LGPD
+    # notice and every send: decided on the capture above (never read
+    # again).  ``blocked`` is ``credit_suspended`` -- no session, no reply, no
+    # LGPD notice --; ``charged`` is enforced: the PostgreSQL claim right
+    # before phase 1, on top of the Redis claim taken where it always is.  No
+    # egress clause (wish Decision 7).  Under the global, a mark or nothing:
+    # main's path.  A 503 after the Redis claim loses the message, as on
+    # Z-API and Meta.
+    enforcement: Optional[WebhookEnforcement] = None
+    try:
+        verdict = await credit_metering.precheck_evolution(
+            request, db, tenant_id=tenant_id, data=data, early=early_capture
+        )
+    except CreditEnforcementUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+    if verdict == "credit_pending":
+        return dict(credit_metering.CREDIT_PENDING_SKIP)
+    if verdict == "credit_suspended":
+        return dict(credit_metering.CREDIT_SUSPENDED_SKIP)
+    if isinstance(verdict, WebhookEnforcement):
+        enforcement = verdict
 
     # ── get or create a session for this phone ──
     session_id, is_new = await _get_or_create_session(tenant_id, phone, db)
@@ -4150,14 +4361,35 @@ async def evolution_webhook(
     )
 
     media = _inline_media(request, _EVOLUTION_MEDIA_PROVIDER)
-    response = await _run_pipeline_transactionally(
-        service=service,
-        event_request=event_request,
-        db=db,
-        context=context,
-        metering=evolution_ingress(request, data=data, context=context),
-        media=media,
-    )
+    try:
+        outcome = await _run_pipeline_transactionally(
+            service=service,
+            event_request=event_request,
+            db=db,
+            context=context,
+            metering=(
+                None
+                if enforcement is not None
+                else evolution_ingress(request, data=data, context=context)
+            ),
+            enforcement=enforcement,
+            reply=_ReplyTarget("evolution", phone, False),
+            media=media,
+        )
+    except CreditEnforcementUnavailable:
+        # The charged claim found the tenant relinked since the pre-check:
+        # nothing written; the pre-check's 503 (the message is lost: the
+        # Redis replay claim is spent).
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+    if isinstance(outcome, dict):
+        # Charged under the courtesy rule: claimed, charged and its reply
+        # sent from the outbox (``CreditReplySender``, Evolution branch), its
+        # file started after the text by the same sender.
+        return outcome
+    response = outcome
 
     # ── send LLM response back via Evolution API ──
     suggested = (
@@ -4823,6 +5055,16 @@ async def uazapi_webhook(
     only measures (``uazapi_webhook_auth``): the callback is routed by
     instance name and is ``unknown``, as it always was.
 
+    Credits (debito-cortesia-automatico Group 3): a builder under its
+    courtesy rule is charged here through the Z-API/Meta path -- verified or
+    not -- and a blocked one answered ``credit_suspended`` with nothing sent
+    (``credit_metering.capture_uazapi`` / ``precheck_uazapi``); under the
+    global, a mark or nothing, and with ``uazapi_egress_enabled`` closed,
+    the turn stays observational.  Every patient message reads the mode
+    once, before the AI-off and pause gates (so a failed read never undoes
+    the pause gate's lazy unpause); the decision waits for the pre-check
+    after them.  The Uazapi route sends no read receipt.
+
     Expected payload (text message, commercial schema):
     {
       "instanceName": "my-instance",
@@ -5112,6 +5354,39 @@ async def uazapi_webhook(
             return {"ok": True, "skipped": "duplicate_message"}
         return None
 
+    # ── credit capture (debito-cortesia-automatico Group 3, DESIGN item 8) ──
+    # Every patient message's effective enforcement is read ONCE, here: after
+    # the fromMe/echo routing, the 401 and the early non-actionable exits,
+    # before the AI-off and pause gates (as on Z-API) and so before the first
+    # thing a builder BLOCKED by its courtesy rule must not do -- a patient
+    # audio's download, STT and fallback; the image's egress gate, the
+    # session, the LGPD notice, the image description and every send.  Before
+    # the pause gate on purpose: a failed read rolls the session back, and
+    # after that gate it would undo the lazy unpause of an expired pause
+    # (flushed, not yet committed) while the turn is still answered.  The
+    # decision is the pre-check's, on this capture (no second read).  Uazapi
+    # is charged only under the rule (``rule_only``, Decision 18): under the
+    # global, a mark or nothing the capture is main's path.  The rule's D1
+    # answers 503 at once -- before a patient audio's own claim (the provider
+    # retries it), before a paused session's text capture; for a text, after
+    # its Redis claim (the message is lost, as on Z-API).  A global or mark
+    # D1, if one were ever raised, is held and answered at the pre-check.
+    early_capture: Optional[credit_metering.EarlyWebhookCapture] = None
+    try:
+        early_capture = await credit_metering.capture_uazapi(
+            request,
+            db,
+            tenant_id=tenant_id,
+            message=msg,
+            inbound_verified=inbound_verified,
+        )
+    except CreditEnforcementUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+    rule_blocked = early_capture is not None and early_capture.blocked
+
     # ── patient audio: transcribe via STT → multimodal → text reroute ──
     # Mirrors the Z-API audio block (webhook.py: ``_process_zapi_authenticated_body``)
     # gate order: STT-provider-unsupported → duration → capability →
@@ -5123,7 +5398,16 @@ async def uazapi_webhook(
     audio_too_long = False
     # Set only when this message is a transcribed audio.
     stt_usage_metadata: dict[str, Any] = {}
-    if audio_is_transcribable:
+    if audio_is_transcribable and rule_blocked:
+        # Blocked by its courtesy rule (owner decision 11): never downloaded,
+        # transcribed nor answered with a fallback.  Claimed where a patient
+        # audio always is -- before the AI-off and pause gates (a paused
+        # session keeps it, untranscribed: no text to capture) --, then
+        # answered ``credit_suspended`` by the pre-check below.
+        duplicate = _claim_deferred_message()
+        if duplicate is not None:
+            return duplicate
+    elif audio_is_transcribable:
         creds = await _tenant_creds()
         u_url = (creds.get("uazapi_api_url") or "").strip()
         u_token = (creds.get("uazapi_token") or "").strip()
@@ -5267,6 +5551,40 @@ async def uazapi_webhook(
         await db.commit()
         return JSONResponse(status_code=202, content=pause_result)
 
+    # ── credit pre-check (debito-cortesia-automatico Group 3, DESIGN item 8) ──
+    # Right after the AI-off and pause gates (a paused session keeps its
+    # text-only capture, blocked or not) and before the image's egress gate,
+    # the session, the LGPD notice, the long-audio handoff, the file forward,
+    # the image description and every send: decided on the capture above
+    # (never read again).  ``blocked`` is ``credit_suspended`` -- no
+    # session, no reply, no LGPD notice -- before ``uazapi_egress_enabled`` is
+    # read (wish Decision 7); ``charged`` with the egress closed is main's
+    # observational path (Decision 19); ``charged`` is enforced: the
+    # PostgreSQL claim right before phase 1, on top of the Redis claim taken
+    # where it always is.  Under the global, a mark or nothing: main's path.
+    # A 503 after the Redis claim loses the message, as on Z-API and Meta.
+    enforcement: Optional[WebhookEnforcement] = None
+    try:
+        verdict = await credit_metering.precheck_uazapi(
+            request,
+            db,
+            tenant_id=tenant_id,
+            message=msg,
+            inbound_verified=inbound_verified,
+            early=early_capture,
+        )
+    except CreditEnforcementUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+    if verdict == "credit_pending":
+        return dict(credit_metering.CREDIT_PENDING_SKIP)
+    if verdict == "credit_suspended":
+        return dict(credit_metering.CREDIT_SUSPENDED_SKIP)
+    if isinstance(verdict, WebhookEnforcement):
+        enforcement = verdict
+
     # ── patient image: egress gate before the session (Decision 9) ──
     # The image has no claim yet, so a closed egress answers the retryable
     # 503 here, before ``is_new`` is consumed: the redelivery still finds a
@@ -5334,8 +5652,10 @@ async def uazapi_webhook(
 
     # ── long patient audio: hand off to the team, never transcribed ──
     # Same decision as Meta's and Z-API's ``audio_too_long``, metered like
-    # the file forward below (observational: Uazapi has no enforcement). No
-    # pipeline and no ``message.in``. A pending file review is left as is.
+    # the file forward below: charged under the courtesy rule (the
+    # pre-check's enforcement: claim ``uazapi``, handoff and debit in one
+    # transaction), else observational. No pipeline and no ``message.in``.
+    # A pending file review is left as is.
     if audio_too_long:
         skipped = await _meta_file_handoff(
             tenant_id=tenant_id,
@@ -5344,10 +5664,17 @@ async def uazapi_webhook(
             note="audio_too_long",
             context=context,
             db=db,
-            metering=uazapi_ingress(
-                request, message=msg, context=context, inbound_verified=inbound_verified
+            metering=(
+                None
+                if enforcement is not None
+                else uazapi_ingress(
+                    request,
+                    message=msg,
+                    context=context,
+                    inbound_verified=inbound_verified,
+                )
             ),
-            enforcement=None,
+            enforcement=enforcement,
             clear_pending_review=False,
         )
         if skipped is not None:
@@ -5378,6 +5705,9 @@ async def uazapi_webhook(
         # take this branch. An expired or legacy flag counts as absent.
         if await _pending_file_review_active(session_id, db):
             if _detect_forward_intent(message_text or ""):
+                # Charged under the courtesy rule like Z-API's and Meta's
+                # (one transaction in ``run_meta_file_handoff``: claim
+                # ``uazapi``, handoff, debit), else the observational writer.
                 skipped = await _meta_file_handoff(
                     tenant_id=tenant_id,
                     session_id=session_id,
@@ -5385,13 +5715,17 @@ async def uazapi_webhook(
                     note="file_pending_review",
                     context=context,
                     db=db,
-                    metering=uazapi_ingress(
-                        request,
-                        message=msg,
-                        context=context,
-                        inbound_verified=inbound_verified,
+                    metering=(
+                        None
+                        if enforcement is not None
+                        else uazapi_ingress(
+                            request,
+                            message=msg,
+                            context=context,
+                            inbound_verified=inbound_verified,
+                        )
                     ),
-                    enforcement=None,
+                    enforcement=enforcement,
                     clear_pending_review=True,
                 )
                 if skipped is not None:
@@ -5455,16 +5789,39 @@ async def uazapi_webhook(
     )
 
     media = _inline_media(request, _UAZAPI_MEDIA_PROVIDER)
-    response = await _run_pipeline_transactionally(
-        service=service,
-        event_request=event_request,
-        db=db,
-        context=context,
-        metering=uazapi_ingress(
-            request, message=msg, context=context, inbound_verified=inbound_verified
-        ),
-        media=media,
-    )
+    try:
+        outcome = await _run_pipeline_transactionally(
+            service=service,
+            event_request=event_request,
+            db=db,
+            context=context,
+            metering=(
+                None
+                if enforcement is not None
+                else uazapi_ingress(
+                    request,
+                    message=msg,
+                    context=context,
+                    inbound_verified=inbound_verified,
+                )
+            ),
+            enforcement=enforcement,
+            reply=_ReplyTarget("uazapi", from_phone, audio_is_transcribable),
+            media=media,
+        )
+    except CreditEnforcementUnavailable:
+        # The charged claim found the tenant relinked since the pre-check:
+        # nothing written; the pre-check's 503 (the message is lost: the
+        # Redis replay claim is spent).
+        return JSONResponse(
+            status_code=503,
+            content={"error": credit_metering.CREDIT_ENFORCEMENT_UNAVAILABLE_CODE},
+        )
+    if isinstance(outcome, dict):
+        # Charged under the courtesy rule: claimed, charged and its reply
+        # sent from the outbox (``CreditReplySender``, Uazapi branch).
+        return outcome
+    response = outcome
 
     suggested = (
         response.prompt.suggested_response

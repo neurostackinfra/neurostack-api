@@ -144,9 +144,78 @@ own (:meth:`ReplySender.start_media`), never inside the publisher's serial
 tick nor under the send timeout or the lease, and a failure of the file
 never changes the text's row; a recovered row's file is deduplicated by the
 24-hour claim.  The Meta and Z-API file handoff is one enforced
-transaction (:func:`run_meta_file_handoff`).  Uazapi and Evolution never reach
-any of this: Evolution is ``unknown``, and Uazapi has no enforced adapter yet
-(a verified Uazapi turn is metered as authenticated, observationally only).
+transaction (:func:`run_meta_file_handoff`).  Under the global or a mark,
+Uazapi and Evolution never reach any of this: Evolution is ``unknown``, and a
+verified Uazapi turn is metered as authenticated, observationally only (the
+L10 guard stays closed).  Under the courtesy rule the Uazapi and Evolution
+adapters are the Z-API/Meta one (debito-cortesia-automatico Groups 3 and 4,
+below).
+
+The courtesy rule (debito-cortesia-automatico, Group 2; DESIGN items 5, 7,
+10, 11 and 12).  A builder with no global and no mark that ever received a
+courtesy lot is captured ``origin = "courtesy"`` by the same one read
+(:func:`read_tenant_enforcement`), with its ``state``:
+
+* ``blocked`` -> ``credit_suspended`` at the pre-check (402 on ``POST
+  /v1/events``, 200 ``{"ok": true, "skipped": "credit_suspended"}`` on a
+  webhook: no session, no reply, no LGPD notice), rolled back -- nothing
+  written; ``charged`` -> the enforced path.  Under the rule (either state)
+  the pre-check applies neither the binding coverage nor the quarantine
+  hold, and no episode gate: the block is the rule's, computed
+  (:func:`~src.services.credit_lifecycle.courtesy_block`), never stored;
+* the race (DESIGN item 11, Decision 15): :func:`require_captured_enforcement`
+  re-reads a captured courtesy mode under the account lock like a mark and
+  compares ``(origin, at, state)``: a grant, a removal or an expiry that
+  changed it is 503 ``credit_enforcement_unavailable`` before any write; a
+  tenant seen under the rule whose rule cannot be read any more (a failed
+  read, or the 046 gate closed: ``rule_unread``) is 503 for that tenant only
+  (the per-tenant D1, extended); :func:`reparented_since_capture` holds for
+  ``courtesy`` too.  The phases never re-read the mode (DESIGN Decision 14):
+  the capture is passed down to ``CreditLedger.debit(captured=)``, which
+  debits only courtesy lots and forgives the rest
+  (:attr:`DecisionCharge.forgiven_mc`) -- the final transaction never
+  answers 503 because of the rule;
+* origin ``unknown`` (DESIGN item 10): a webhook whose principal is not
+  authenticated enters the enforced path ONLY under the rule
+  (:func:`precheck_webhook`); under the global or a mark it stays main's free
+  path (credit-system Decision 25).  Every enforced decision's
+  ``decision_digest`` carries the turn's REAL origin
+  (:attr:`WebhookEnforcement.origin`, :attr:`EventsEnforcement.origin`);
+* the publisher (:class:`CreditResponsePublisher`) and the orphan pass also
+  run once ANY courtesy lot exists (DESIGN Decision 20: production has no
+  marks), so a pending charged reply is still recovered.
+
+The Uazapi adapter (debito-cortesia-automatico Group 3; DESIGN item 8,
+Decisions 16, 18 and 19, wish Decision 7).  Uazapi is charged ONLY under the
+courtesy rule: :func:`capture_uazapi` reads the mode once per patient
+message, ``rule_only`` whatever the principal (a verified callback is
+``production``, any other ``unknown``), after the ``fromMe``/echo routing and
+the 401 and before any download, STT, image description or send;
+:func:`precheck_uazapi` decides on it -- ``blocked`` is ``credit_suspended``
+BEFORE ``uazapi_egress_enabled`` is read, ``charged`` with the egress closed
+is main's observational path (nothing would be delivered), ``charged`` with it
+open is enforced, through the claim, the phases and the outbox above
+(``source = "uazapi"``).  The route keeps main's Redis replay claim on every
+turn, where it was; the PostgreSQL claim is added only for a charged turn.
+Under the global, a mark or nothing, a Uazapi turn reads the mode once more
+than before (one read per turn, its 1-5 statements) and is otherwise main's:
+the same writes and the same answers.
+
+The Evolution adapter (debito-cortesia-automatico Group 4; DESIGN items 9
+and 10, Decisions 12, 16 and 18, wish Decision 7).  Evolution has no origin
+proof: every callback is ``unknown`` (``authenticated=False``), so it is
+charged ONLY under the courtesy rule.  :func:`capture_evolution` reads the
+mode once per patient message (``rule_only``), after the ``fromMe`` routing
+(the AI echo and the instance's call auto-reply) and before the AI-off and
+pause gates; :func:`precheck_evolution` decides on it after those gates and
+before the session: ``blocked`` is ``credit_suspended``, ``charged`` is
+enforced through the claim, the phases and the outbox above (``source =
+"evolution"``, ``data.key.id``).  There is no egress clause: Evolution has
+no egress flag (wish Decision 7).  The route keeps main's Redis replay
+claim on every turn, where it was; the PostgreSQL claim is added only for a
+charged turn.  Under the global, a mark or nothing an Evolution turn reads
+the mode once more than before (one read per turn) and is otherwise main's:
+the same writes and the same answers.
 """
 
 from __future__ import annotations
@@ -179,7 +248,7 @@ from src.repositories.credit import (
     OutboxClaim,
     ResponseOutboxRow,
 )
-from src.services import credit_lifecycle
+from src.services import credit_lifecycle, egress_policy
 from src.services.credit_ledger import MILLICREDITS_PER_CREDIT, CreditLedger
 from src.services.credit_principal import (
     AuthenticatedIdentity,
@@ -517,6 +586,15 @@ def meta_ingress(
     )
 
 
+def uazapi_message_id(message: Mapping[str, Any]) -> str:
+    """The provider message id of a Uazapi callback: ``message.messageid``,
+    falling back to ``message.id`` -- the one derivation of the observational
+    ingress (:func:`uazapi_ingress`) and the enforced pre-check
+    (:func:`precheck_uazapi`)."""
+
+    return str(message.get("messageid") or message.get("id") or "")
+
+
 def uazapi_ingress(
     request: HTTPConnection,
     *,
@@ -540,8 +618,18 @@ def uazapi_ingress(
             inbound_verified=inbound_verified,
         ),
         payload_sha256=lambda: provider_message_sha256(message),
-        provider_message_id=str(message.get("messageid") or message.get("id") or ""),
+        provider_message_id=uazapi_message_id(message),
     )
+
+
+def evolution_message_id(data: Mapping[str, Any]) -> str:
+    """The provider message id of an Evolution callback: ``data.key.id``,
+    stripped -- the one derivation of the observational ingress
+    (:func:`evolution_ingress`) and the enforced pre-check
+    (:func:`precheck_evolution`)."""
+
+    key = data.get("key")
+    return str((key.get("id") if isinstance(key, Mapping) else None) or "").strip()
 
 
 def evolution_ingress(
@@ -553,16 +641,13 @@ def evolution_ingress(
     """Evolution: routed by instance name only (``authenticated=False``),
     ``data.key.id``."""
 
-    key = data.get("key")
     return _ingress(
         request,
         source="evolution",
         context=context,
         identity=lambda: credit_identity("evolution", context.effective_tenant_id),
         payload_sha256=lambda: provider_message_sha256(data),
-        provider_message_id=str(
-            (key.get("id") if isinstance(key, Mapping) else None) or ""
-        ).strip(),
+        provider_message_id=evolution_message_id(data),
     )
 
 
@@ -1076,7 +1161,18 @@ class CreditTenantGone(Exception):
 
 class CreditEnforcementUnavailable(Exception):
     """This process already saw ``credit_enforcement_at`` set and can no
-    longer read it: the request is answered 503, never as ``main`` (D1)."""
+    longer read it: the request is answered 503, never as ``main`` (D1).
+
+    ``reason``: the D1 that refused, when :func:`read_tenant_enforcement`
+    raised it (``enforcement_unreadable_after_enforced``,
+    ``enforcement_mark_unreadable_after_marked`` or
+    ``enforcement_rule_unreadable_after_courtesy``); ``None`` otherwise.  The
+    Z-API adapter answers the rule's at once and holds the others
+    (:func:`capture_zapi`)."""
+
+    def __init__(self, *args: object, reason: str | None = None) -> None:
+        super().__init__(*args)
+        self.reason = reason
 
 
 CREDIT_ENFORCEMENT_UNAVAILABLE_CODE: Final = "credit_enforcement_unavailable"
@@ -1130,6 +1226,29 @@ ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED: Final = (
 )
 ENFORCEMENT_CHANGED_UNDER_LOCK: Final = "enforcement_changed_under_lock"
 _mark_seen_tenants: set[UUID] = set()
+# debito-cortesia-automatico (DESIGN item 11): the per-tenant D1 of the
+# courtesy rule, the mark's extended.  The TENANT ids whose requests this
+# process saw under the rule (``origin == "courtesy"``); for such a tenant an
+# unreadable rule -- a failed read, or the 046 gate closed so the rule read
+# nothing (``rule_unread``) -- is 503 instead of the free path, for that
+# tenant only; a successful read known not to be under the rule removes it.
+# It acts on ``rule_unread``, never on ``mark_unread`` (below 047 the rule
+# still decides alone).  Per process, never persisted.
+ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY: Final = (
+    "enforcement_rule_unreadable_after_courtesy"
+)
+_rule_seen_tenants: set[UUID] = set()
+_UNREADABLE_MESSAGES: Final[Mapping[str, str]] = {
+    ENFORCEMENT_UNREADABLE_AFTER_ENFORCED: (
+        "credit_enforcement_at was set and can no longer be read"
+    ),
+    ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED: (
+        "the enforcement mark was seen and can no longer be read"
+    ),
+    ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY: (
+        "the courtesy rule was seen and can no longer be read"
+    ),
+}
 
 
 class CreditEnforcementChanged(CreditEnforcementUnavailable):
@@ -1156,15 +1275,46 @@ def forget_enforcement_mark_seen() -> None:
     _mark_seen_tenants.clear()
 
 
-def _note_mark_state(tenant_id: UUID, effective: EffectiveEnforcement) -> None:
-    """The two ways of the per-tenant D1 after a SUCCESSFUL read: enforced by
-    a mark adds the tenant; known not marked removes it.  The global origin
-    and an unread mark (the gate closed) leave the set as it is."""
+def enforcement_rule_seen(tenant_id: UUID) -> bool:
+    """Whether this process saw a request of ``tenant_id`` under the courtesy
+    rule (and no successful read known not to be under it since)."""
 
-    if effective.origin == "mark":
+    return tenant_id in _rule_seen_tenants
+
+
+def forget_enforcement_rule_seen() -> None:
+    """Back to a process that never saw the courtesy rule (tests only)."""
+
+    _rule_seen_tenants.clear()
+
+
+def _note_mark_state(
+    tenant_id: UUID, effective: EffectiveEnforcement, *, marks: bool = True
+) -> None:
+    """The two ways of the per-tenant D1s after a SUCCESSFUL read.
+
+    Marks: enforced by a mark adds the tenant; known not marked -- the marks
+    were read (``mark_unread`` false) and none decided, so the origin is
+    none or (debito-cortesia-automatico) the courtesy rule -- removes it.
+    The global origin and an unread mark (the gate closed) leave that set as
+    it is.  The courtesy rule: under it adds the tenant; known not under it
+    -- the global or a mark decided first (precedence global > mark >
+    courtesy), or the rule was read (``rule_unread`` false) and found
+    nothing -- removes it; an unread rule (the 046 gate closed) leaves it.
+
+    ``marks`` false (debito-cortesia-automatico Group 3): a caller a mark
+    never charges (``rule_only``: the Uazapi adapter, an unauthenticated
+    principal) leaves the marks' set as it is -- what it read changes no
+    other request's D1, exactly as before it read anything."""
+
+    if marks and effective.origin == "mark":
         _mark_seen_tenants.add(tenant_id)
-    elif effective.origin is None and not effective.mark_unread:
+    elif marks and effective.origin in (None, "courtesy") and not effective.mark_unread:
         _mark_seen_tenants.discard(tenant_id)
+    if effective.origin == "courtesy":
+        _rule_seen_tenants.add(tenant_id)
+    elif effective.origin is not None or not effective.rule_unread:
+        _rule_seen_tenants.discard(tenant_id)
 
 
 async def read_tenant_enforcement(
@@ -1172,6 +1322,7 @@ async def read_tenant_enforcement(
     tenant_id: UUID,
     *,
     global_seen: bool,
+    rule_only: bool = False,
     log: Any = None,
     event: str | None = None,
     **fields: Any,
@@ -1192,7 +1343,16 @@ async def read_tenant_enforcement(
     updated (:func:`_note_mark_state`) and the caller sets its global latch
     when the origin is ``global``.  ``log``/``event``/``fields``: the
     caller's logger, message and extra log fields (every line also carries
-    ``tenant_id``; the global alerts keep their fields)."""
+    ``tenant_id``; the global alerts keep their fields).
+
+    debito-cortesia-automatico: a tenant in the courtesy rule's per-tenant
+    set (:func:`enforcement_rule_seen`) is 503 too when the read fails
+    (reason ``enforcement_rule_unreadable_after_courtesy``) or the 046 gate
+    kept the rule unread (``rule_unread``).  ``rule_only``: the caller is
+    enforced ONLY under the rule (an unauthenticated webhook principal,
+    DESIGN item 10), so only the rule's D1 applies to it -- never the global
+    latch nor a mark's: under those it is main's free path either way --,
+    and it never learns a mark's state either (:func:`_note_mark_state`)."""
 
     logger_ = logger if log is None else log
     message = ENFORCED_LOG if event is None else event
@@ -1204,12 +1364,14 @@ async def read_tenant_enforcement(
     except Exception as error:
         with suppress(Exception):
             await session.rollback()
-        if global_seen or enforcement_mark_seen(tenant_id):
-            reason = (
-                ENFORCEMENT_UNREADABLE_AFTER_ENFORCED
-                if global_seen
-                else ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED
-            )
+        reason: str | None = None
+        if global_seen and not rule_only:
+            reason = ENFORCEMENT_UNREADABLE_AFTER_ENFORCED
+        elif enforcement_mark_seen(tenant_id) and not rule_only:
+            reason = ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED
+        elif enforcement_rule_seen(tenant_id):
+            reason = ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY
+        if reason is not None:
             logger_.error(
                 message,
                 alert="credit_enforcement_unavailable",
@@ -1218,9 +1380,7 @@ async def read_tenant_enforcement(
                 **fields,
             )
             raise CreditEnforcementUnavailable(
-                "credit_enforcement_at was set and can no longer be read"
-                if global_seen
-                else "the enforcement mark was seen and can no longer be read"
+                _UNREADABLE_MESSAGES[reason], reason=reason
             ) from error
         logger_.warning(
             message,
@@ -1230,7 +1390,7 @@ async def read_tenant_enforcement(
             **fields,
         )
         return None
-    if effective.mark_unread and enforcement_mark_seen(tenant_id):
+    if effective.mark_unread and enforcement_mark_seen(tenant_id) and not rule_only:
         logger_.error(
             message,
             alert="credit_enforcement_unavailable",
@@ -1239,9 +1399,22 @@ async def read_tenant_enforcement(
             **fields,
         )
         raise CreditEnforcementUnavailable(
-            "the enforcement mark was seen and can no longer be read"
+            "the enforcement mark was seen and can no longer be read",
+            reason=ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED,
         )
-    _note_mark_state(tenant_id, effective)
+    if effective.rule_unread and enforcement_rule_seen(tenant_id):
+        logger_.error(
+            message,
+            alert="credit_enforcement_unavailable",
+            reason=ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY,
+            error_type="CourtesyRuleGateClosed",
+            **fields,
+        )
+        raise CreditEnforcementUnavailable(
+            _UNREADABLE_MESSAGES[ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY],
+            reason=ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY,
+        )
+    _note_mark_state(tenant_id, effective, marks=not rule_only)
     return effective
 
 
@@ -1271,11 +1444,30 @@ async def require_captured_enforcement(
     write; a failed read, or the 047 gate closed since the capture (the
     marks unread), raises :class:`CreditEnforcementUnavailable` (the tenant
     captured a mark: the per-tenant D1).  The caller rolls back.
-    Only a captured MARK is re-checked: the global is irreversible, so a
-    request captured on it reads here nothing more than it read before."""
+    Only a captured MARK -- or courtesy rule -- is re-checked: the global is
+    irreversible, so a request captured on it reads here nothing more than
+    it read before.
 
-    if captured.origin != "mark":
+    debito-cortesia-automatico (DESIGN item 11, Decision 15): a captured
+    COURTESY mode is re-checked the same way, under the same account lock --
+    which a courtesy grant or removal and every debit of the builder also
+    take -- and the verdict compared is ``(origin, at, state)``: a grant, a
+    removal or an expiry that changed the state since the capture is
+    :class:`CreditEnforcementChanged`; a failed read, or the 046 gate
+    closed since the capture (``rule_unread``, never ``mark_unread``: below
+    047 the rule still decides alone), is :class:`CreditEnforcementUnavailable`
+    (reason ``enforcement_rule_unreadable_after_courtesy``, the rule's
+    per-tenant D1).  This runs only at a pre-check, in ``_enforced_book`` and
+    in the file handoff's one transaction: never in a phase after the LLM."""
+
+    if captured.origin not in ("mark", "courtesy"):
         return
+    rule = captured.origin == "courtesy"
+    unreadable = (
+        ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY
+        if rule
+        else ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED
+    )
     logger_ = logger if log is None else log
     message = ENFORCED_LOG if event is None else event
     fields = {**fields, "tenant_id": str(tenant_id)}
@@ -1288,33 +1480,38 @@ async def require_captured_enforcement(
         logger_.error(
             message,
             alert="credit_enforcement_unavailable",
-            reason=ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED,
+            reason=unreadable,
             error_type=type(error).__name__,
             **fields,
         )
-        raise CreditEnforcementUnavailable(
-            "the enforcement mark was seen and can no longer be read"
-        ) from error
-    if locked.mark_unread:
-        # The 047 gate closed since the capture: the mark is unreadable, not
-        # changed (D1 for this tenant, which captured a mark).
+        raise CreditEnforcementUnavailable(_UNREADABLE_MESSAGES[unreadable]) from error
+    gate_closed = locked.rule_unread if rule else locked.mark_unread
+    if gate_closed:
+        # The 047 gate (a mark) or the 046 gate (the rule) closed since the
+        # capture: unreadable, not changed (D1 for this tenant).
         logger_.error(
             message,
             alert="credit_enforcement_unavailable",
-            reason=ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED,
-            error_type="EnforcementMarkGateClosed",
+            reason=unreadable,
+            error_type=(
+                "CourtesyRuleGateClosed" if rule else "EnforcementMarkGateClosed"
+            ),
             **fields,
         )
-        raise CreditEnforcementUnavailable(
-            "the enforcement mark was seen and can no longer be read"
-        )
+        raise CreditEnforcementUnavailable(_UNREADABLE_MESSAGES[unreadable])
     if locked != captured:
+        states = (
+            {"captured_state": captured.state, "locked_state": locked.state}
+            if rule or locked.origin == "courtesy"
+            else {}
+        )
         logger_.warning(
             message,
             alert="credit_enforcement_unavailable",
             reason=ENFORCEMENT_CHANGED_UNDER_LOCK,
             captured_origin=captured.origin,
             locked_origin=locked.origin,
+            **states,
             **fields,
         )
         raise CreditEnforcementChanged(
@@ -1326,19 +1523,21 @@ async def require_captured_enforcement(
 def reparented_since_capture(
     captured: EffectiveEnforcement | None, builder_id: UUID | None
 ) -> bool:
-    """A request captured as enforced by its builder's MARK whose tenant is
-    linked to another builder now (a reparent between its pre-check and a
-    later transaction of the same request).  The claim's transaction then
-    refuses (:class:`CreditEnforcementChanged`, 503: no claim for the other
-    builder); phase 1 and the final transaction charge nothing -- like a
-    tenant turned standalone since the pre-check (LOW-5) -- so a builder
-    the request was not captured for (maybe not marked) is never debited.
-    Inert for the global origin (every builder is enforced then, as before)
-    and for a hand-built enforcement."""
+    """A request captured as enforced by its builder's MARK -- or, since
+    debito-cortesia-automatico (DESIGN item 11), by its builder's courtesy
+    rule -- whose tenant is linked to another builder now (a reparent
+    between its pre-check and a later transaction of the same request).  The
+    claim's transaction then refuses (:class:`CreditEnforcementChanged`,
+    503: no claim for the other builder); phase 1 and the final transaction
+    charge nothing -- like a tenant turned standalone since the pre-check
+    (LOW-5) -- so a builder the request was not captured for (maybe not
+    marked, maybe with courtesy of its own) is never debited.  Inert for the
+    global origin (every builder is enforced then, as before) and for a
+    hand-built enforcement."""
 
     return (
         captured is not None
-        and captured.origin == "mark"
+        and captured.origin in ("mark", "courtesy")
         and builder_id is not None
         and builder_id != captured.builder_id
     )
@@ -1380,6 +1579,10 @@ class EventsEnforcement:
     # transactions re-check a captured mark under the account lock.  ``None``
     # only for an enforcement a suite builds by hand (nothing re-checked).
     captured: EffectiveEnforcement | None = None
+    # debito-cortesia-automatico (DESIGN item 10): the turn's REAL origin,
+    # carried into every ``decision_digest`` of the decision (``production``:
+    # :func:`capture_events_enforcement` enforces nothing else here).
+    origin: InteractionOrigin = InteractionOrigin.PRODUCTION
 
 
 @dataclass(frozen=True)
@@ -1405,13 +1608,17 @@ class ClaimLease:
 @dataclass(frozen=True)
 class DecisionCharge:
     """The effect one enforced decision wrote: a debit (``trace``) or an
-    effect of zero (``trace_credit_pending``), under ``builder_id``."""
+    effect of zero (``trace_credit_pending``), under ``builder_id``.
+    ``forgiven_mc`` (debito-cortesia-automatico, DESIGN Decision 4): what a
+    debit under the captured courtesy rule could not pay from courtesy lots
+    and forgave -- never debt."""
 
     effect_id: str
     builder_id: UUID
     effect_kind: str
     debited_mc: int = 0
     debt_mc: int = 0
+    forgiven_mc: int = 0
 
 
 @dataclass(frozen=True)
@@ -1477,6 +1684,17 @@ async def capture_events_enforcement(
     ``credit_enforcement_at`` set, or saw this tenant enforced by a mark:
     then it raises :class:`CreditEnforcementUnavailable` (the route answers
     503) with its own alert (D1, per process and per tenant).
+
+    debito-cortesia-automatico: with neither the global nor a mark, the
+    builder's courtesy rule is enforced too, ``charged`` or ``blocked``
+    (:func:`precheck_events` answers the block, 402 ``credit_suspended``),
+    with the rule's own per-tenant D1.  A rule request is the enforced path
+    end to end, so a call without ``Idempotency-Key`` is 400
+    ``idempotency_key_required`` (DESIGN Risk 4, accepted).  Only
+    ``production`` is ever enforced here -- the panel (``simulator``) never
+    is, and ``unknown`` never reaches this route (``resolve_effective_tenant``
+    refuses every JWT outside the operational roles first) -- and the
+    request's origin is carried into its digests.
     """
 
     global _enforcement_seen
@@ -1512,6 +1730,7 @@ async def capture_events_enforcement(
         idempotency_key=key,
         key_problem=problem,
         captured=effective,
+        origin=context.origin,
     )
 
 
@@ -1635,6 +1854,14 @@ async def precheck_events(
     which a client may simply retry -- no claim exists yet.  So a tenant
     unlinked from a marked builder in between is never ``credit_pending``
     while the global is unset.
+
+    debito-cortesia-automatico (DESIGN items 5 and 7, Decision 17): a
+    request captured on its builder's COURTESY rule is re-checked the same
+    way (``(origin, at, state)``); then ``blocked`` is ``credit_suspended``,
+    rolled back (nothing written), and ``charged`` is ``ok`` -- with neither
+    the quarantine hold nor the binding coverage (its debits touch only
+    courtesy lots, which depend on no ASAAS fact) nor the episode gate (no
+    episode applies under the rule: a stale mark-era one never blocks it).
     """
 
     repository = CreditRepository(db)
@@ -1653,6 +1880,11 @@ async def precheck_events(
         if scope.builder_id is None:
             await db.rollback()
             return "credit_pending"
+        blocked = credit_lifecycle.courtesy_block(enforcement.captured)
+        if blocked is not None:
+            return await _courtesy_precheck(
+                db, blocked, tenant_id=enforcement.tenant_id
+            )
         await repository.ensure_account(scope.builder_id)
         if await repository.quarantine_hold(scope.builder_id):
             await db.rollback()
@@ -1688,6 +1920,28 @@ async def precheck_events(
         with suppress(Exception):
             await db.rollback()
         raise
+
+
+async def _courtesy_precheck(
+    db: AsyncSession, blocked: bool, *, tenant_id: UUID, **fields: Any
+) -> Literal["ok", "credit_suspended"]:
+    """The end of a pre-check under the courtesy rule, its capture re-checked
+    under the account lock: ``blocked`` rolls back (nothing written) and is
+    ``credit_suspended``; ``charged`` commits (the account the re-check
+    locked) and is ``ok``.  No ASAAS gate, no episode gate."""
+
+    if blocked:
+        await db.rollback()
+        logger.info(
+            ENFORCED_LOG,
+            reason=CREDIT_SUSPENDED_CODE,
+            origin="courtesy",
+            tenant_id=str(tenant_id),
+            **fields,
+        )
+        return "credit_suspended"
+    await db.commit()
+    return "ok"
 
 
 async def acquire_events_claim(
@@ -1847,12 +2101,21 @@ async def _charge_decision(
     builder_id: UUID,
     effect_id: str,
     digest: str,
+    captured: EffectiveEnforcement | None = None,
 ) -> DecisionCharge:
     """Account ``FOR UPDATE`` -> hold -> lots ``FOR UPDATE`` -> one trace of
     debit (debt for what the capacity does not cover, O5), or -- under a
     hold that appeared after the pre-check -- an effect of zero
     ``trace_credit_pending`` (D2): the decision is delivered, the ledger
-    does not change."""
+    does not change.
+
+    ``captured`` (debito-cortesia-automatico, DESIGN Decision 14): the
+    request's mode at its pre-check, passed to ``CreditLedger.debit`` so the
+    debit never re-reads it.  A captured courtesy mode pays only from
+    courtesy lots (FEFO), forgives the rest (``forgiven_mc``, logged) and
+    never answers ``credit_pending`` (no hold under the rule); the effect is
+    written even when nothing is paid (the decision's boundary).  Any other
+    capture debits as before."""
 
     result = await CreditLedger(db).debit(
         builder_id,
@@ -1862,6 +2125,7 @@ async def _charge_decision(
         effect_kind=TRACE_EFFECT_KIND,
         tenant_id=tenant_id,
         decision_digest=digest,
+        captured=captured,
     )
     if result.status == "credit_pending":
         await CreditRepository(db).insert_effect(
@@ -1878,12 +2142,23 @@ async def _charge_decision(
             effect_id=effect_id,
         )
         return DecisionCharge(effect_id, builder_id, CREDIT_PENDING_EFFECT_KIND)
+    if result.forgiven_mc:
+        logger.info(
+            ENFORCED_LOG,
+            reason="courtesy_forgiven",
+            tenant_id=str(tenant_id),
+            effect_id=effect_id,
+            debited_mc=result.debited_mc,
+            debt_mc=result.debt_mc,
+            forgiven_mc=result.forgiven_mc,
+        )
     return DecisionCharge(
         effect_id,
         builder_id,
         TRACE_EFFECT_KIND,
         debited_mc=result.debited_mc,
         debt_mc=result.debt_mc,
+        forgiven_mc=result.forgiven_mc,
     )
 
 
@@ -1926,6 +2201,7 @@ async def run_enforced_phase1(
         lock_timeout=PHASE1_LOCK_TIMEOUT_SECONDS,
         decision_kind="events_phase1_handoff",
         captured=enforcement.captured,
+        origin=enforcement.origin,
     )
 
 
@@ -1939,6 +2215,7 @@ async def _run_phase1(
     mark: Callable[[CreditRepository, int], Awaitable[bool]],
     lock_timeout: int | None,
     decision_kind: str,
+    origin: InteractionOrigin,
     observe: Callable[[CreditRepository], Awaitable[Any]] | None = None,
     captured: EffectiveEnforcement | None = None,
 ) -> Phase1Outcome | None:
@@ -1947,8 +2224,10 @@ async def _run_phase1(
     ``run_pipeline`` -> the phase 1 handoff's charge and link -> ``mark``
     (the claim's phase 1 marker, LAST) -> commit; ``None`` (rolled back)
     when the marker's fence did not hold.  A request captured on its
-    builder's mark whose tenant now belongs to another builder charges
-    nothing here (:func:`reparented_since_capture`)."""
+    builder's mark (or courtesy rule) whose tenant now belongs to another
+    builder charges nothing here (:func:`reparented_since_capture`).  The
+    charge debits by ``captured`` (never re-read) and its digest carries the
+    turn's ``origin`` (debito-cortesia-automatico)."""
 
     repository = CreditRepository(db)
     if lock_timeout is not None:
@@ -1987,9 +2266,10 @@ async def _run_phase1(
                     tenant_id=tenant_id,
                     interaction_id=interaction_id,
                     decision_version=ENFORCED_DECISION_VERSION,
-                    origin=InteractionOrigin.PRODUCTION,
+                    origin=origin,
                     decision=phase1_decision(result, handoff_id, kind=decision_kind),
                 ),
+                captured=captured,
             )
             if not await repository.link_handoff_credit_effect(
                 tenant_id=tenant_id,
@@ -2081,6 +2361,7 @@ async def run_enforced_final(
         ),
         fence=fence,
         captured=enforcement.captured,
+        origin=enforcement.origin,
     )
 
 
@@ -2095,6 +2376,7 @@ async def _run_final(
     deliverable: bool,
     stored_answer: Callable[[UUID | None], tuple[dict[str, Any], str] | None],
     fence: Callable[[CreditRepository], Awaitable[bool]],
+    origin: InteractionOrigin,
     captured: EffectiveEnforcement | None = None,
 ) -> FinalOutcome | None:
     """The final transaction shared by ``POST /v1/events`` and the webhooks.
@@ -2104,9 +2386,16 @@ async def _run_final(
     decision that is not ``deliverable`` -- the effect of zero
     ``trace_no_response``) -> the response-outbox row ``stored_answer``
     returns (payload and state; none when it returns ``None``) -> ``fence``
-    -> commit.  A request captured on its builder's mark whose tenant now
-    belongs to another builder charges nothing, like a tenant turned
-    standalone (:func:`reparented_since_capture`).
+    -> commit.  A request captured on its builder's mark (or courtesy rule)
+    whose tenant now belongs to another builder charges nothing, like a
+    tenant turned standalone (:func:`reparented_since_capture`).
+
+    debito-cortesia-automatico (DESIGN item 11, Decision 14): the final
+    transaction NEVER re-reads the mode -- the debit takes ``captured`` --
+    so it never answers 503 because of the rule: under a captured courtesy
+    mode it debits what courtesy there is and forgives the rest, whatever
+    happened to the rule since the pre-check.  The digest carries the
+    turn's ``origin``.
     """
 
     repository = CreditRepository(db)
@@ -2155,7 +2444,7 @@ async def _run_final(
                 tenant_id=tenant_id,
                 interaction_id=interaction_id,
                 decision_version=ENFORCED_DECISION_VERSION,
-                origin=InteractionOrigin.PRODUCTION,
+                origin=origin,
                 decision=projection,
             )
             if deliverable:
@@ -2165,6 +2454,7 @@ async def _run_final(
                     builder_id=scope.builder_id,
                     effect_id=effect_id,
                     digest=digest,
+                    captured=captured,
                 )
             else:
                 charge = await _no_response_effect(
@@ -2240,7 +2530,7 @@ async def _no_response_effect(
 # outbox (Group 3b-2).
 # ---------------------------------------------------------------------------
 
-WebhookSource = Literal["zapi", "meta"]
+WebhookSource = Literal["zapi", "meta", "uazapi", "evolution"]
 WebhookPrecheck = Literal["credit_pending", "credit_suspended"]
 
 # The 200 bodies of the enforced webhook paths (the providers retry non-2xx).
@@ -2356,7 +2646,14 @@ class ReplySender(Protocol):
 class WebhookEnforcement:
     """One Z-API/Meta message captured as ENFORCED by its adapter's
     pre-check (switch on at entry, ``production`` with an authenticated
-    principal, ``credit_enforcement_at`` set, an account and no hold)."""
+    principal, ``credit_enforcement_at`` set, an account and no hold) --
+    or a Uazapi or Evolution one, only ever under the courtesy rule (Groups
+    3 and 4).
+
+    debito-cortesia-automatico: or captured on its builder's courtesy rule
+    (``charged``), where an unauthenticated principal is enforced too, as
+    ``unknown`` (DESIGN item 10) -- ``origin`` is the turn's REAL origin,
+    carried into every ``decision_digest`` of the decision."""
 
     source: WebhookSource
     tenant_id: UUID
@@ -2365,6 +2662,7 @@ class WebhookEnforcement:
     payload_sha256: str
     # As ``EventsEnforcement.captured`` (set by :func:`precheck_webhook`).
     captured: EffectiveEnforcement | None = None
+    origin: InteractionOrigin = InteractionOrigin.PRODUCTION
 
 
 def provider_claim_id(raw: str) -> str:
@@ -2387,6 +2685,7 @@ async def precheck_webhook(
     identity: Callable[[], AuthenticatedIdentity | None],
     provider_message_id: str,
     payload_sha256: Callable[[], str],
+    early: EarlyWebhookCapture | None = None,
 ) -> WebhookEnforcement | WebhookPrecheck | None:
     """The per-adapter pre-check (MEDIUM-4, D4, OWNER-c), the same as 3b-1's.
 
@@ -2403,9 +2702,111 @@ async def precheck_webhook(
     :class:`CreditEnforcementUnavailable` (D1) and
     the webhook answers 503 -- which in practice drops the message: main's
     replay claim (Redis, before this pre-check) is already spent, so the
-    provider's retry answers ``duplicate_message``.  Uazapi (no enforced
-    adapter yet, even for a verified callback) and Evolution never call this.
+    provider's retry answers ``duplicate_message``.  Uazapi and Evolution
+    never call this: :func:`precheck_uazapi` and :func:`precheck_evolution`
+    decide on their own captures (:func:`decide_webhook`).
+
+    debito-cortesia-automatico (DESIGN items 5, 7, 10 and 11):
+
+    * the courtesy rule is captured by the same read; its capture is
+      re-checked under the account lock (``(origin, at, state)``), then
+      ``blocked`` is ``credit_suspended`` (rolled back: no session, no reply,
+      no LGPD notice) and ``charged`` is enforced -- without the quarantine
+      hold, the binding coverage or the episode gate;
+    * an UNAUTHENTICATED principal (an unverified Uazapi callback, any
+      Evolution one: the adapters of Groups 3 and 4) is read too, but
+      enforced ONLY under the rule, as origin ``unknown``; under the global
+      or a mark it keeps main's free path (credit-system Decision 25), and
+      only the rule's per-tenant D1 can refuse it (``rule_only``).  An
+      authenticated principal is ``production``, exactly as before.
+
+    It is the composition of :func:`capture_webhook` (the one read) and
+    :func:`decide_webhook` (the transaction).  ``early``: the capture an
+    adapter already took earlier in the same request (Z-API,
+    :func:`capture_zapi`) -- then nothing is read again here; its held D1,
+    if any, is raised here, where the adapter answered it before.
     """
+
+    if early is not None:
+        if early.unavailable is not None:
+            raise early.unavailable
+        capture = early.capture
+    else:
+        capture = await capture_webhook(
+            request,
+            db,
+            source=source,
+            tenant_id=tenant_id,
+            identity=identity,
+            provider_message_id=provider_message_id,
+            payload_sha256=payload_sha256,
+        )
+    if capture is None or not isinstance(db, AsyncSession):
+        return None
+    return await decide_webhook(db, capture)
+
+
+@dataclass(frozen=True)
+class WebhookCapture:
+    """The capture half of :func:`precheck_webhook`: the request's effective
+    enforcement, read ONCE (:func:`read_tenant_enforcement`), for a message
+    that is not main's path.  No transaction was taken yet."""
+
+    source: WebhookSource
+    tenant_id: UUID
+    principal_id: str
+    provider_message_id: str
+    payload_sha256: Callable[[], str]
+    captured: EffectiveEnforcement
+    origin: InteractionOrigin
+
+    @property
+    def blocked(self) -> bool:
+        """Captured on its builder's courtesy rule, ``blocked`` (DESIGN item
+        5): the patient receives nothing.  The decision re-checks it under
+        the account lock (:func:`decide_webhook`)."""
+
+        return credit_lifecycle.courtesy_block(self.captured) is True
+
+
+@dataclass(frozen=True)
+class EarlyWebhookCapture:
+    """A capture an adapter took before its own pre-check position (Z-API:
+    before the STT and the read receipt), handed to :func:`precheck_webhook`
+    there.  ``capture`` ``None`` is main's path; ``unavailable`` is a global
+    or mark D1 held until that position, so those answers stay where they
+    were (the rule's D1 is answered at once by the adapter)."""
+
+    capture: WebhookCapture | None
+    unavailable: CreditEnforcementUnavailable | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.capture is not None and self.capture.blocked
+
+
+async def capture_webhook(
+    request: HTTPConnection,
+    db: object,
+    *,
+    source: WebhookSource,
+    tenant_id: UUID,
+    identity: Callable[[], AuthenticatedIdentity | None],
+    provider_message_id: str,
+    payload_sha256: Callable[[], str],
+    rule_only: bool = False,
+) -> WebhookCapture | None:
+    """The capture of :func:`precheck_webhook`: the switch, the identity and
+    the principal, :func:`read_tenant_enforcement` (ONCE), the
+    unauthenticated filter, the global latch and the origin.  ``None`` is
+    main's path; :class:`CreditEnforcementUnavailable` is a D1.
+
+    ``rule_only`` (debito-cortesia-automatico Group 3, DESIGN Decision 18):
+    the adapter is charged ONLY under the courtesy rule, whatever its
+    principal -- Uazapi, whose verified callback is authenticated but stays
+    observational under the global and a mark.  The read is ``rule_only``
+    (only the rule's D1 can refuse it; it learns no mark), and anything but
+    a ``courtesy`` capture is main's path, before the global latch."""
 
     global _enforcement_seen
 
@@ -2433,23 +2834,71 @@ async def precheck_webhook(
             error_type=type(error).__name__,
         )
         return None
-    if not principal.authenticated:
-        return None
-    repository = CreditRepository(db)
+    authenticated = principal.authenticated
+    rule_only = rule_only or not authenticated
     effective = await read_tenant_enforcement(
-        db, tenant_id, global_seen=_enforcement_seen, source=source
+        db,
+        tenant_id,
+        global_seen=_enforcement_seen,
+        rule_only=rule_only,
+        source=source,
     )
     if effective is None or not isinstance(effective.at, datetime):
         return None
+    if rule_only and effective.origin != "courtesy":
+        # DESIGN item 10: ``unknown`` is chargeable only by the rule; the
+        # global and a mark serve it free, as before (Decision 25) -- and so
+        # every Uazapi callback, verified or not (Decision 18).
+        return None
     if effective.origin == "global":
         _enforcement_seen = True
+    origin = (
+        InteractionOrigin.PRODUCTION if authenticated else InteractionOrigin.UNKNOWN
+    )
+    return WebhookCapture(
+        source=source,
+        tenant_id=tenant_id,
+        principal_id=principal.principal_id,
+        provider_message_id=provider_message_id,
+        payload_sha256=payload_sha256,
+        captured=effective,
+        origin=origin,
+    )
+
+
+async def decide_webhook(
+    db: AsyncSession, capture: WebhookCapture
+) -> WebhookEnforcement | WebhookPrecheck:
+    """The decision of :func:`precheck_webhook` on ``capture``, in one short
+    transaction: tenant ``FOR SHARE``, the captured mode re-checked under the
+    account lock (``require_captured_enforcement``), then the courtesy
+    block, the quarantine hold, the binding coverage and the episode gate.
+    The mode is not read again."""
+
+    source = capture.source
+    tenant_id = capture.tenant_id
+    effective = capture.captured
+    repository = CreditRepository(db)
+
+    def enforced() -> WebhookEnforcement:
+        return WebhookEnforcement(
+            source=source,
+            tenant_id=tenant_id,
+            principal_id=capture.principal_id,
+            provider_message_id=provider_claim_id(capture.provider_message_id),
+            payload_sha256=capture.payload_sha256(),
+            captured=effective,
+            origin=capture.origin,
+        )
+
     try:
         scope = await repository.tenant_scope(tenant_id, lock=True)
         if scope is not None:
-            # A captured mark is re-checked under the account lock; a change
-            # raises CreditEnforcementChanged, answered 503 by the adapter --
-            # which, like D1's 503, loses this message: main's Redis replay
-            # claim is already spent (wish Decision 6).
+            # A captured mark (or courtesy rule) is re-checked under the
+            # account lock; a change raises CreditEnforcementChanged,
+            # answered 503 by the adapter -- which, like D1's 503, loses this
+            # message: main's Redis replay claim is already spent (wish
+            # Decision 6).
             await require_captured_enforcement(
                 repository,
                 scope.builder_id,
@@ -2460,6 +2909,14 @@ async def precheck_webhook(
         if scope is None or scope.builder_id is None:
             await db.rollback()
             return "credit_pending"
+        blocked = credit_lifecycle.courtesy_block(effective)
+        if blocked is not None:
+            verdict = await _courtesy_precheck(
+                db, blocked, tenant_id=tenant_id, source=source
+            )
+            if verdict == "credit_suspended":
+                return "credit_suspended"
+            return enforced()
         await repository.ensure_account(scope.builder_id)
         if await repository.quarantine_hold(scope.builder_id):
             await db.rollback()
@@ -2488,20 +2945,20 @@ async def precheck_webhook(
             tenant_id=str(tenant_id),
         )
         return "credit_suspended"
-    return WebhookEnforcement(
-        source=source,
-        tenant_id=tenant_id,
-        principal_id=principal.principal_id,
-        provider_message_id=provider_claim_id(provider_message_id),
-        payload_sha256=payload_sha256(),
-        captured=effective,
-    )
+    return enforced()
 
 
 async def precheck_zapi(
-    request: HTTPConnection, db: object, *, tenant_id: UUID, body: Mapping[str, Any]
+    request: HTTPConnection,
+    db: object,
+    *,
+    tenant_id: UUID,
+    body: Mapping[str, Any],
+    early: EarlyWebhookCapture | None = None,
 ) -> WebhookEnforcement | WebhookPrecheck | None:
-    """Z-API: the capability token proved the tenant; ``body.messageId``."""
+    """Z-API: the capability token proved the tenant; ``body.messageId``.
+    ``early``: the request's :func:`capture_zapi` (decided here, never read
+    again)."""
 
     return await precheck_webhook(
         request,
@@ -2511,7 +2968,37 @@ async def precheck_zapi(
         identity=lambda: credit_identity("zapi", tenant_id),
         provider_message_id=str(body.get("messageId") or "").strip(),
         payload_sha256=lambda: zapi_payload_sha256(body),
+        early=early,
     )
+
+
+async def capture_zapi(
+    request: HTTPConnection, db: object, *, tenant_id: UUID, body: Mapping[str, Any]
+) -> EarlyWebhookCapture:
+    """Z-API's capture, taken right after the phone guard of a patient
+    message and before any download, STT, fallback or read receipt
+    (debito-cortesia-automatico, DESIGN item 5, owner decision 16): a
+    ``blocked`` rule builder's patient receives nothing.  The rule's D1
+    (``enforcement_rule_unreadable_after_courtesy``) raises here, answered
+    503 at once; a global or mark D1 is held (``unavailable``) and raised by
+    :func:`precheck_zapi` at the adapter's pre-check position, so those
+    answers stay where they were."""
+
+    try:
+        capture = await capture_webhook(
+            request,
+            db,
+            source="zapi",
+            tenant_id=tenant_id,
+            identity=lambda: credit_identity("zapi", tenant_id),
+            provider_message_id=str(body.get("messageId") or "").strip(),
+            payload_sha256=lambda: zapi_payload_sha256(body),
+        )
+    except CreditEnforcementUnavailable as error:
+        if error.reason == ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY:
+            raise
+        return EarlyWebhookCapture(capture=None, unavailable=error)
+    return EarlyWebhookCapture(capture=capture)
 
 
 async def precheck_meta(
@@ -2528,6 +3015,179 @@ async def precheck_meta(
         provider_message_id=str(message.get("id") or "").strip(),
         payload_sha256=lambda: provider_message_sha256(message),
     )
+
+
+def _uazapi_claim_source(message: Mapping[str, Any]) -> str:
+    """The raw provider id of a Uazapi callback for its enforced claim: its
+    message id (:func:`uazapi_message_id`) or -- a callback without one --
+    ``payload-sha256:<hex>`` of the message object, so an idless message is
+    deduplicated by its content instead of sharing ONE claim id with every
+    other idless message (``provider_claim_id("")`` is a constant)."""
+
+    raw = uazapi_message_id(message)
+    if raw:
+        return raw
+    return "payload-sha256:" + provider_message_sha256(message)
+
+
+async def capture_uazapi(
+    request: HTTPConnection,
+    db: object,
+    *,
+    tenant_id: UUID,
+    message: Mapping[str, Any],
+    inbound_verified: bool,
+) -> EarlyWebhookCapture:
+    """Uazapi's capture (debito-cortesia-automatico Group 3, DESIGN items 8
+    and 10, Decisions 18 and 19): the ONE mode read of a patient message,
+    taken after the ``fromMe``/echo routing and the 401 of the webhook
+    authentication, and before any download, STT, image description or send
+    to the patient -- so a ``blocked`` rule builder's patient receives
+    nothing.  ``rule_only`` always: Uazapi is charged only under the
+    courtesy rule (a verified callback as ``production``, any other as
+    ``unknown``); under the global, a mark or nothing it is main's path
+    (``capture`` ``None``).  The rule's D1 is raised here
+    (:class:`CreditEnforcementUnavailable`: the route answers 503 at once).
+    ``rule_only`` makes it the only D1 the read can raise; any other would
+    be held (``unavailable``) and raised by :func:`precheck_uazapi` at the
+    pre-check position, as :func:`capture_zapi` does."""
+
+    try:
+        capture = await capture_webhook(
+            request,
+            db,
+            source="uazapi",
+            tenant_id=tenant_id,
+            identity=lambda: credit_identity(
+                "uazapi", tenant_id, inbound_verified=inbound_verified
+            ),
+            provider_message_id=_uazapi_claim_source(message),
+            payload_sha256=lambda: provider_message_sha256(message),
+            rule_only=True,
+        )
+    except CreditEnforcementUnavailable as error:
+        if error.reason == ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY:
+            raise
+        return EarlyWebhookCapture(capture=None, unavailable=error)
+    return EarlyWebhookCapture(capture=capture)
+
+
+async def precheck_uazapi(
+    request: HTTPConnection,
+    db: object,
+    *,
+    tenant_id: UUID,
+    message: Mapping[str, Any],
+    inbound_verified: bool,
+    early: EarlyWebhookCapture | None = None,
+) -> WebhookEnforcement | WebhookPrecheck | None:
+    """Uazapi's pre-check, decided on its capture (``early``: the request's
+    :func:`capture_uazapi`, never read again; else captured here).
+
+    ``None`` -- main's observational path -- for no capture (the global, a
+    mark or nothing: Decision 18) and for a ``charged`` capture while
+    ``uazapi_egress_enabled`` is closed (Decision 19: nothing would be
+    delivered, so the turn is not charged).  The block is checked BEFORE that
+    flag (wish Decision 7): a ``blocked`` capture is decided without reading
+    it, so a blocked builder never runs the LLM even with the egress closed.
+    Otherwise :func:`decide_webhook` on the capture (what
+    :func:`precheck_webhook` does with an ``early`` capture): re-checked
+    under the account lock, ``credit_suspended`` for ``blocked``, enforced
+    for ``charged``.  A held D1 (``early.unavailable``) is raised here."""
+
+    if early is None:
+        early = await capture_uazapi(
+            request,
+            db,
+            tenant_id=tenant_id,
+            message=message,
+            inbound_verified=inbound_verified,
+        )
+    if early.unavailable is not None:
+        raise early.unavailable
+    capture = early.capture
+    if capture is None:
+        return None
+    if not capture.blocked and not await egress_policy.uazapi_egress_open():
+        logger.info(
+            ENFORCED_LOG,
+            reason="uazapi_egress_closed",
+            source="uazapi",
+            tenant_id=str(tenant_id),
+        )
+        return None
+    if not isinstance(db, AsyncSession):
+        return None
+    return await decide_webhook(db, capture)
+
+
+async def capture_evolution(
+    request: HTTPConnection,
+    db: object,
+    *,
+    tenant_id: UUID,
+    data: Mapping[str, Any],
+) -> EarlyWebhookCapture:
+    """Evolution's capture (debito-cortesia-automatico Group 4, DESIGN items 9
+    and 10, Decisions 12 and 18): the ONE mode read of a patient message,
+    taken after the ``fromMe`` routing (the AI echo and the instance's call
+    auto-reply) and before the AI-off and pause gates -- so a failed read's
+    rollback never undoes the pause gate's lazy unpause.  ``rule_only``:
+    every Evolution callback is ``unknown`` (no origin proof), charged only
+    under the courtesy rule; under the global, a mark or nothing it is
+    main's path (``capture`` ``None``).  The rule's D1 is raised here
+    (:class:`CreditEnforcementUnavailable`: the route answers 503 at once);
+    ``rule_only`` makes it the only D1 the read can raise -- any other would
+    be held (``unavailable``) and raised by :func:`precheck_evolution`, as
+    :func:`capture_uazapi` does.  The claim id is ``data.key.id``
+    (:func:`evolution_message_id`): the route answers an idless message
+    ``missing_message_id`` before any of this."""
+
+    try:
+        capture = await capture_webhook(
+            request,
+            db,
+            source="evolution",
+            tenant_id=tenant_id,
+            identity=lambda: credit_identity("evolution", tenant_id),
+            provider_message_id=evolution_message_id(data),
+            payload_sha256=lambda: provider_message_sha256(data),
+            rule_only=True,
+        )
+    except CreditEnforcementUnavailable as error:
+        if error.reason == ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY:
+            raise
+        return EarlyWebhookCapture(capture=None, unavailable=error)
+    return EarlyWebhookCapture(capture=capture)
+
+
+async def precheck_evolution(
+    request: HTTPConnection,
+    db: object,
+    *,
+    tenant_id: UUID,
+    data: Mapping[str, Any],
+    early: EarlyWebhookCapture | None = None,
+) -> WebhookEnforcement | WebhookPrecheck | None:
+    """Evolution's pre-check, decided on its capture (``early``: the
+    request's :func:`capture_evolution`, never read again; else captured
+    here), after the AI-off and pause gates and before the session.
+
+    ``None`` -- main's observational path -- for no capture (the global, a
+    mark or nothing: Decision 18).  Otherwise :func:`decide_webhook` on the
+    capture: re-checked under the account lock, ``credit_suspended`` for
+    ``blocked``, enforced for ``charged``.  No egress clause: Evolution has
+    no egress flag (wish Decision 7), so nothing else is read.  A held D1
+    (``early.unavailable``) is raised here."""
+
+    if early is None:
+        early = await capture_evolution(request, db, tenant_id=tenant_id, data=data)
+    if early.unavailable is not None:
+        raise early.unavailable
+    capture = early.capture
+    if capture is None or not isinstance(db, AsyncSession):
+        return None
+    return await decide_webhook(db, capture)
 
 
 async def _claimed_answer(
@@ -2644,6 +3304,7 @@ async def run_webhook_phase1(
         decision_kind=f"{enforcement.source}_phase1_handoff",
         observe=observe,
         captured=enforcement.captured,
+        origin=enforcement.origin,
     )
 
 
@@ -2694,13 +3355,15 @@ async def run_webhook_final(
         ),
         fence=fence,
         captured=enforcement.captured,
+        origin=enforcement.origin,
     )
 
 
 @dataclass(frozen=True)
 class FileHandoffOutcome:
-    """The enforced Meta or Z-API file handoff: ``handoff`` (committed with its
-    claim, debit and ``credit_effect_id``) or the 200 skip ``answer``."""
+    """The enforced Meta, Z-API or Uazapi file handoff: ``handoff`` (committed
+    with its claim, debit and ``credit_effect_id``) or the 200 skip
+    ``answer``."""
 
     handoff: Any = None
     answer: Mapping[str, Any] | None = None
@@ -2724,12 +3387,12 @@ async def run_meta_file_handoff(
     initiate: Callable[[], Awaitable[Any]],
     before_commit: Callable[[], Awaitable[None]] | None = None,
 ) -> FileHandoffOutcome:
-    """The file handoff of an enforced Meta or Z-API message as ONE
+    """The file handoff of an enforced Meta, Z-API or Uazapi message as ONE
     transaction in the route's session (O2, MEDIUM-5), in the documented
     order: tenant ``FOR SHARE`` -> session ``FOR UPDATE`` -> account ``FOR
     UPDATE`` -> hold (rollback, ``credit_pending``: no handoff, no ack) ->
     lots ``FOR UPDATE`` -> the enforced claim of ``(tenant_id,
-    enforcement.source, message_id)`` -- ``meta`` or ``zapi`` (a conflict rolls
+    enforcement.source, message_id)`` -- ``meta``, ``zapi`` or ``uazapi`` (a conflict rolls
     back: ``duplicate_message``, no second handoff nor debit) -> ``initiate``
     (``initiate_handoff(..., session=db)``: record and ``handoff.request``
     in this transaction) -> debit/debt -> the effect with its
@@ -2738,7 +3401,14 @@ async def run_meta_file_handoff(
     stand-by pause, and the forward clears the pending file review) ->
     commit.  No SRM, no LLM: the handoff IS the
     decision.  The caller dispatches the creation webhook after the commit.
-    Any exception rolls everything back and propagates."""
+    Any exception rolls everything back and propagates.
+
+    debito-cortesia-automatico: this one transaction is the decision's
+    re-check, like a pre-check's (no phase follows it): a captured courtesy
+    mode is re-checked under the account lock (``(origin, at, state)``, a
+    change is 503 before any write), skips the quarantine hold (DESIGN item
+    7), debits by the capture (only courtesy lots, the rest forgiven) and
+    the digest carries the turn's ``origin``."""
 
     repository = CreditRepository(db)
     tenant_id = enforcement.tenant_id
@@ -2768,7 +3438,12 @@ async def run_meta_file_handoff(
         builder_id = scope.builder_id
         await repository.ensure_account(builder_id)
         await repository.lock_account(builder_id)
-        if await repository.quarantine_hold(builder_id):
+        blocked = credit_lifecycle.courtesy_block(enforcement.captured)
+        if blocked:
+            # Never captured so (the pre-check answered it), kept fail-closed.
+            await db.rollback()
+            return FileHandoffOutcome(answer=CREDIT_SUSPENDED_SKIP)
+        if blocked is None and await repository.quarantine_hold(builder_id):
             await db.rollback()
             return FileHandoffOutcome(answer=CREDIT_PENDING_SKIP)
         await repository.lock_lots(builder_id)
@@ -2802,9 +3477,10 @@ async def run_meta_file_handoff(
                 tenant_id=tenant_id,
                 interaction_id=claim.interaction_id,
                 decision_version=ENFORCED_DECISION_VERSION,
-                origin=InteractionOrigin.PRODUCTION,
+                origin=enforcement.origin,
                 decision=file_handoff_decision(handoff_id, note),
             ),
+            captured=enforcement.captured,
         )
         if not await repository.link_handoff_credit_effect(
             tenant_id=tenant_id, handoff_id=handoff_id, effect_id=charge.effect_id
@@ -3270,7 +3946,8 @@ class PublisherTick:
     """What one publisher tick did (``None`` from :meth:`run_once` when the
     switch was off: nothing was read).  ``enforced``: the tick looked for
     rows -- the global ``credit_enforcement_at`` is set, or (with it unset)
-    a mark event was ever recorded (cobranca-credito-por-builder)."""
+    a mark event was ever recorded (cobranca-credito-por-builder), or (with
+    neither) a courtesy lot exists (debito-cortesia-automatico)."""
 
     enforced: bool = False
     outcomes: list[PublisherOutcome] = field(default_factory=list)
@@ -3286,7 +3963,10 @@ class CreditResponsePublisher:
     row -- nor before ``credit_enforcement_at`` unless a mark event was ever
     recorded (cobranca-credito-por-builder: a marked builder's requests write
     enforced rows with the global unset, and they still need recovering
-    after the last ``unmark``); claims ONE row at a time in a
+    after the last ``unmark``) or a courtesy lot exists
+    (debito-cortesia-automatico, DESIGN Decision 20: a courtesy builder's
+    requests write enforced rows under the rule, and production has no
+    marks); claims ONE row at a time in a
     short transaction (``FOR UPDATE SKIP LOCKED``) committed as ``sending``
     before the provider call -- two tasks never send one row at once, and no
     row lock is held across a send --; and sends a row at most ONCE: a row it
@@ -3352,8 +4032,17 @@ class CreditResponsePublisher:
             # read more (none with the 047 gate closed); it only ever finds
             # rows an enforced request wrote.
             marked = enforced_at is None and await repository.any_enforcement_mark()
+            # debito-cortesia-automatico (DESIGN Decision 20): with neither,
+            # any courtesy lot ever granted keeps it on too -- a builder
+            # under the rule writes enforced rows.  One read more (none with
+            # the 046 gate closed), only when nothing above turned it on.
+            from src.services.credit_rollout import any_courtesy_lot
+
+            courtesy = (
+                enforced_at is None and not marked and await any_courtesy_lot(session)
+            )
             await session.rollback()
-        if enforced_at is None and not marked:
+        if enforced_at is None and not marked and not courtesy:
             return tick
         tick.enforced = True
         for _ in range(self.batch):
@@ -3549,7 +4238,16 @@ __all__ = [
     "acquire_webhook_claim",
     "deliver_reply_inline",
     "file_handoff_decision",
+    "EarlyWebhookCapture",
+    "WebhookCapture",
+    "capture_evolution",
+    "capture_uazapi",
+    "capture_webhook",
+    "capture_zapi",
+    "decide_webhook",
+    "precheck_evolution",
     "precheck_meta",
+    "precheck_uazapi",
     "precheck_webhook",
     "precheck_zapi",
     "provider_claim_id",
@@ -3592,9 +4290,12 @@ __all__ = [
     "claim_lease",
     "ENFORCEMENT_CHANGED_UNDER_LOCK",
     "ENFORCEMENT_MARK_UNREADABLE_AFTER_MARKED",
+    "ENFORCEMENT_RULE_UNREADABLE_AFTER_COURTESY",
     "enforcement_mark_seen",
+    "enforcement_rule_seen",
     "enforcement_seen",
     "forget_enforcement_mark_seen",
+    "forget_enforcement_rule_seen",
     "forget_enforcement_seen",
     "read_tenant_enforcement",
     "reparented_since_capture",
@@ -3630,6 +4331,7 @@ __all__ = [
     "event_payload_sha256",
     "events_ingress",
     "evolution_ingress",
+    "evolution_message_id",
     "meta_ingress",
     "provider_message_sha256",
     "record_events_decision",
@@ -3640,6 +4342,7 @@ __all__ = [
     "sha256_hex",
     "trace_effect_id",
     "uazapi_ingress",
+    "uazapi_message_id",
     "valid_ingress_id",
     "would_debit_mc",
     "zapi_ingress",

@@ -66,6 +66,20 @@ net of reversals and courtesy removals) consumed, counting open debt (``used = c
 available_trace``); one alert per threshold per arm (closed-episode count
 and accounting window), ``UNIQUE`` in the database.
 
+The courtesy rule (debito-cortesia-automatico, DESIGN item 4).  Under it
+(the book's ``spend_hold.courtesy``, else the builder's effective
+enforcement read here) there is no episode: :meth:`CreditLifecycle.evaluate`
+opens, shortens, transitions and reactivates nothing, and only the
+thresholds run, on the courtesy basis (capacity: what the unexpired
+courtesy lots brought, net of removals; available: the courtesy spendable;
+arm ``c:{grant_effect_id}`` of the latest courtesy grant).
+:func:`evaluate_locked` writes nothing and :func:`request_gate` answers
+``ok``; the worker never selects a builder under the rule (it looks only at
+marked builders, or at every builder under the global, which the rule never
+applies to).  The rule's block is decided at each gate, not stored: the
+pre-checks, :func:`tenant_suspended` and :func:`reservation_verdict` share
+:func:`courtesy_block` over the request's captured mode (Group 2).
+
 Never reads ``tests/``.
 """
 
@@ -147,7 +161,9 @@ _PENDING_METRICS: Final = "credit_lifecycle_pending_metrics"
 LifecycleState = Literal["active", "grace", "suspended", "deletion_due"]
 LifecycleSource = Literal["effect", "worker"]
 GateVerdict = Literal["ok", "suspended"]
-CategoryVerdict = Literal["ok", "category_exhausted"]
+# ``suspended`` (debito-cortesia-automatico): the courtesy rule's block,
+# reported only for a caller that passes its captured mode.
+CategoryVerdict = Literal["ok", "category_exhausted", "suspended"]
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +306,37 @@ def thresholds_reached(capacity_mc: int, available_mc: int) -> tuple[int, ...]:
 
 def arm_key(closed_episodes: int, window_start: str) -> str:
     return f"g{closed_episodes}:w{window_start}"
+
+
+def courtesy_capacity_in_force_mc(book: LedgerBook, at: datetime) -> int:
+    """debito-cortesia-automatico (DESIGN item 4): the threshold capacity
+    under the courtesy rule -- what the unexpired ``courtesy`` lots brought,
+    net of courtesy removals and reversals (:func:`_funded_mc`)."""
+
+    return sum(
+        _funded_mc(lot)
+        for lot in book.lots
+        if lot.lot_kind == "courtesy" and not lot.expired(at)
+    )
+
+
+def courtesy_thresholds_reached(capacity_mc: int, available_mc: int) -> tuple[int, ...]:
+    """The thresholds of the courtesy basis: ``used = capacity - available``
+    (the courtesy spendable), with nothing reached while no courtesy is
+    funded in force -- a removal ("Tirar tudo") or an expiry lowers the
+    capacity and is never usage (DESIGN item 4)."""
+
+    if capacity_mc <= 0:
+        return ()
+    used = max(capacity_mc - max(available_mc, 0), 0)
+    return tuple(t for t in THRESHOLDS if used * 100 >= t * capacity_mc)
+
+
+def courtesy_arm_key(grant_effect_id: str) -> str:
+    """The arm of the courtesy-basis thresholds: the most recent courtesy
+    grant (``c:{grant_effect_id}``; ``arm_key`` is VARCHAR(120))."""
+
+    return f"c:{grant_effect_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -448,14 +495,72 @@ class CreditLifecycle:
         return as_utc(await CreditRepository(self.session).enforcement_at())
 
     async def _builder_enforcement_at(self, builder_id: UUID) -> datetime | None:
-        """The builder's effective enforcement instant (``evaluate``'s reader;
-        :meth:`enforcement_at`, the global one, stays the worker's)."""
+        """The builder's effective enforcement instant (:meth:`enforcement_at`,
+        the global one, stays the worker's)."""
+
+        return as_utc((await self._builder_effective(builder_id)).at)
+
+    async def _builder_effective(self, builder_id: UUID) -> EffectiveEnforcement:
+        """The builder's effective enforcement (``evaluate``'s reader)."""
 
         from src.repositories.credit import CreditRepository
 
-        return as_utc(
-            (await CreditRepository(self.session).effective_enforcement(builder_id)).at
-        )
+        return await CreditRepository(self.session).effective_enforcement(builder_id)
+
+    async def _evaluate_courtesy(
+        self,
+        book: LedgerBook,
+        at: datetime,
+        source: LifecycleSource,
+        writes: LedgerWrites | None,
+    ) -> LifecycleOutcome:
+        """The lifecycle under the courtesy rule (debito-cortesia-automatico,
+        DESIGN item 4): no episode is opened, shortened, transitioned or
+        reactivated -- the blocking is computed at each gate, never stored
+        (DESIGN Decision 8) -- and only the 50/90/100 thresholds run, on the
+        courtesy basis: capacity :func:`courtesy_capacity_in_force_mc`,
+        available the courtesy spendable, one alert per threshold per arm
+        :func:`courtesy_arm_key` of the most recent courtesy grant."""
+
+        from src.repositories.credit import CreditRepository
+
+        outcome = LifecycleOutcome(evaluated=True)
+        builder_id = book.builder_id
+        capacity = courtesy_capacity_in_force_mc(book, at)
+        available = book.courtesy_spendable_mc(at)
+        reached = courtesy_thresholds_reached(capacity, available)
+        if reached:
+            grant = await CreditRepository(
+                self.session
+            ).latest_courtesy_grant_effect_id(builder_id)
+            if grant is not None:
+                key = courtesy_arm_key(grant)
+                existing = await self.repository.threshold_alerts(builder_id, key)
+                for threshold in reached:
+                    if threshold in existing:
+                        continue
+                    if await self.repository.insert_threshold_alert(
+                        builder_id=builder_id,
+                        arm_key=key,
+                        threshold=threshold,
+                        capacity_mc=capacity,
+                        available_mc=available,
+                        effect_id=threshold_effect_id(builder_id, key, threshold),
+                        occurred_at=at,
+                    ):
+                        outcome.thresholds.append(threshold)
+        _queue_outcome(self.session, outcome, writes)
+        if outcome.thresholds:
+            logger.info(
+                LIFECYCLE_LOG,
+                builder_id=str(builder_id),
+                state=outcome.state,
+                transitions=outcome.transitions,
+                thresholds=outcome.thresholds,
+                source=source,
+                basis="courtesy",
+            )
+        return outcome
 
     async def evaluate(
         self,
@@ -477,9 +582,16 @@ class CreditLifecycle:
         at = book.clock
         if at is None:
             return _INERT
-        enforcement = enforcement_at or await self._builder_enforcement_at(
-            book.builder_id
-        )
+        if book.spend_hold.courtesy:
+            # debito-cortesia-automatico: the book's own (captured) mode.
+            return await self._evaluate_courtesy(book, at, source, writes)
+        if enforcement_at is not None:
+            enforcement: datetime | None = enforcement_at
+        else:
+            effective = await self._builder_effective(book.builder_id)
+            if effective.origin == "courtesy":
+                return await self._evaluate_courtesy(book, at, source, writes)
+            enforcement = as_utc(effective.at)
         if enforcement is None or at < enforcement:
             return _INERT
         outcome = LifecycleOutcome(evaluated=True)
@@ -768,6 +880,10 @@ async def evaluate_locked(
     ledger = CreditLedger(session)
     book = await ledger.open_book(builder_id, at=at)
     assert book.clock is not None
+    if book.spend_hold.courtesy:
+        # debito-cortesia-automatico (DESIGN item 4): no episode work and no
+        # settlement under the courtesy rule -- nothing is written.
+        return _INERT
     book.settle_open_debts(
         settlement_effect_id(builder_id, book.clock),
         at=book.clock,
@@ -778,7 +894,11 @@ async def evaluate_locked(
 
 
 async def request_gate(
-    session: AsyncSession, builder_id: UUID, *, now: datetime | None = None
+    session: AsyncSession,
+    builder_id: UUID,
+    *,
+    now: datetime | None = None,
+    captured: EffectiveEnforcement | None = None,
 ) -> GateVerdict:
     """The agent gate of a metered request (its pre-check transaction).
 
@@ -786,8 +906,16 @@ async def request_gate(
     the suspension deadline it evaluates under the account lock with the
     worker's effect ids (settling first, so an allowance that started pays
     and reactivates); ``suspended`` while the episode stays suspended or
-    deletion-due.  The caller commits the recorded transitions."""
+    deletion-due.  The caller commits the recorded transitions.
 
+    debito-cortesia-automatico (DESIGN item 4): inert under the courtesy
+    rule -- ``ok`` with no read for a request ``captured`` on it, and, past
+    a deadline, ``ok`` with nothing written when the locked book is under
+    the rule (:func:`evaluate_locked`).  The rule's own block is decided by
+    the request's pre-check, not by an episode."""
+
+    if captured is not None and captured.origin == "courtesy":
+        return "ok"
     instant = _aware(now or datetime.now(timezone.utc), "now")
     episode = await ContentRetentionRepository(session).open_episode(builder_id)
     if episode is None:
@@ -800,8 +928,30 @@ async def request_gate(
     return "suspended" if outcome.state in ("suspended", "deletion_due") else "ok"
 
 
+def courtesy_block(captured: EffectiveEnforcement | None) -> bool | None:
+    """The courtesy rule's computed block of a request's CAPTURED mode
+    (debito-cortesia-automatico, DESIGN items 5 and 8, Decision 8): ``True``
+    when it was captured ``courtesy``/``blocked`` (nothing spendable, no paid
+    plan in force: the agent, the RAG and the media are suspended now, with
+    no episode and no deadline), ``False`` when ``courtesy``/``charged``
+    (served -- an episode left from a mark era never blocks it), ``None``
+    when the rule does not govern the request (no capture, the global or a
+    mark: the episode gates decide, as before).  Pure: the block is never
+    stored, so a grant or a paid plan unblocks at the next capture.  The
+    one gate the pre-checks, :func:`tenant_suspended` and
+    :func:`reservation_verdict` share."""
+
+    if captured is None or captured.origin != "courtesy":
+        return None
+    return captured.state == "blocked"
+
+
 async def tenant_suspended(
-    session: AsyncSession, tenant_id: UUID, *, now: datetime | None = None
+    session: AsyncSession,
+    tenant_id: UUID,
+    *,
+    now: datetime | None = None,
+    captured: EffectiveEnforcement | None = None,
 ) -> bool:
     """The suspension gate of a production (API key) RAG search or media
     download -- Deliverable 3 ("suspender agente/RAG/mídia ... conforme
@@ -810,13 +960,24 @@ async def tenant_suspended(
     account lock past the deadline).  ``False`` for a vanished or
     standalone tenant (their own paths answer).  The caller calls it only
     after the enforcement with the switch effective, and commits (the gate
-    may record the transition).  The export is never gated."""
+    may record the transition).  The export is never gated.
+
+    debito-cortesia-automatico: ``captured`` is the caller's captured mode
+    (``CreditMode.captured``).  Under the courtesy rule the answer is the
+    rule's computed block (:func:`courtesy_block`) -- ``True`` for
+    ``blocked``, ``False`` for ``charged`` whatever episode a mark era left
+    -- with nothing read after the tenant lock; without a capture, or with
+    one on the global or a mark, the episode gate decides exactly as
+    before (no new read)."""
 
     from src.repositories.credit import CreditRepository
 
     scope = await CreditRepository(session).tenant_scope(tenant_id, lock=True)
     if scope is None or scope.builder_id is None:
         return False
+    blocked = courtesy_block(captured)
+    if blocked is not None:
+        return blocked
     return await request_gate(session, scope.builder_id, now=now) == "suspended"
 
 
@@ -826,6 +987,7 @@ async def reservation_verdict(
     builder_id: UUID,
     effect_id: str,
     charged_mc: int,
+    captured: EffectiveEnforcement | None = None,
 ) -> CategoryVerdict:
     """Deliverable 3: new content is blocked ONLY in the exhausted category.
 
@@ -841,8 +1003,19 @@ async def reservation_verdict(
     as debt (it opens the episode, like a trace).  The caller rolls back on
     a refusal: no object, reservation or episode survives it.  Traces are
     not affected, and content already stored stays usable until the
-    suspension."""
+    suspension.
 
+    debito-cortesia-automatico: ``captured`` is the upload's captured mode.
+    Under the courtesy rule the verdict is the rule's computed block
+    (:func:`courtesy_block`): ``suspended`` for ``blocked`` (the caller
+    answers 402 ``credit_suspended``), ``ok`` for ``charged`` -- the
+    courtesy paid what it could and the rest stays outside the coverage,
+    never debt, and no episode (a stale mark-era one included) applies.
+    Without a capture, or on the global or a mark: as before."""
+
+    blocked = courtesy_block(captured)
+    if blocked is not None:
+        return "suspended" if blocked else "ok"
     if charged_mc <= 0:
         return "ok"
     episode = await ContentRetentionRepository(session).open_episode(builder_id)
@@ -1093,6 +1266,7 @@ __all__ = [
     "binding_grace_end",
     "builder_state",
     "capacity_in_force_mc",
+    "courtesy_block",
     "deletion_due",
     "evaluate_locked",
     "lifecycle_state",

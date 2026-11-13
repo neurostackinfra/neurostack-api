@@ -80,8 +80,11 @@ enforced by the same deployment (see the [inventory](#inventory-of-uazapi-tenant
   `401 {"error":"invalid_webhook_auth"}` before the claim, the session or any
   event is created. A `match` routes to the one matching row, the turn is
   `InteractionOrigin.PRODUCTION`, and the credit identity is built with
-  `inbound_verified=True`, so the turn is metered as authenticated. Nothing
-  is charged for it (see [The L10 guard](#the-l10-guard-and-the-follow-up)).
+  `inbound_verified=True`, so the turn is metered as authenticated. Under
+  the global or a mark nothing is charged for it (see
+  [The L10 guard](#the-l10-guard-and-the-follow-up)); under the courtesy
+  rule it is charged like any rule turn
+  ([`credit-courtesy-rule.md`](./credit-courtesy-rule.md)).
 
 "Fail-closed" here means **no authentication**. `false` for any doubt is
 shadow: AppConfig disabled or unconfigured, the Agent unreachable, a failed
@@ -655,8 +658,10 @@ ROLLBACK;
   ([`../billing/credits.md`](../billing/credits.md), "Routes"). They answer
   `503 credit_unavailable` while the credit switch is not effective.
 - The database column `credit_enforcement_state.credit_enforcement_at`
-  `NULL` means not armed: the mode is `observational` and nothing is
-  charged.
+  `NULL` means the global is not armed. A builder under the courtesy rule
+  is still charged from its courtesy, Uazapi included: read `mode`
+  (`enforced`) from `GET /v1/credits/state`. A charged rule turn writes no
+  observational effect.
 - The recent observational effects show today's uazapi turns as
   `origin = 'unknown'`, `authenticated = false`, `would_debit_mc = 0`.
 
@@ -1107,10 +1112,11 @@ line. The same holds in the other direction after a rollback.
 
 ## Side effects of the switch to enforce
 
-- **Observed consumption rises.** Each verified turn with a deliverable
-  response records `would_debit_mc` of one trace, 1,000 mC
-  (`TRACE_COST_MC`), where it recorded 0. The `observed` totals of
-  `GET /v1/credits/consumption` rise accordingly. Nothing is charged.
+- **Observed consumption rises.** Outside the courtesy rule, each verified
+  turn with a deliverable response records `would_debit_mc` of one trace,
+  1,000 mC (`TRACE_COST_MC`), where it recorded 0. The `observed` totals of
+  `GET /v1/credits/consumption` rise accordingly. Nothing is charged
+  outside the courtesy rule.
 - **`status` of the credit enforcement task shows the guard reason, while
   the credit switch is effective.** This does not depend on the auth flag:
   from the deployment of the image that carries this check,
@@ -1128,9 +1134,9 @@ line. The same holds in the other direction after a rollback.
 ## The L10 guard and the follow-up
 
 A verified uazapi turn is metered as authenticated, but no enforced credit
-adapter charges or blocks it: the uazapi webhook never calls the enforced
-pre-check nor the enforced sender. Arming the credits now would serve that
-traffic for free. So `arm_enforcement` **always** refuses, before any write,
+adapter charges or blocks it under the global or a mark: the enforced
+pre-check and sender run only under the courtesy rule. Arming the credits
+now would serve that traffic for free. So `arm_enforcement` **always** refuses, before any write,
 through the predicate `uazapi_enforced_credit_adapter_available()` in
 `src/services/credit_rollout.py`, which always answers `False`. While the
 credit switch is effective:
@@ -1145,6 +1151,28 @@ With the credit switch off, `arm` and `status` both answer `switch_off`
 (exit 21) first, so the guard reason is not shown; nothing can be armed then
 either.
 
-Only the follow-up wish **`uazapi-credit-enforcement`** removes the guard,
-with the enforced uazapi adapter. **It must land before L10**
+Only the L10 planning removes the guard; the adapter itself now exists
+(update below). **The guard's removal must land before L10**
 ([`credit-enforcement-arming.md`](./credit-enforcement-arming.md)).
+
+**Update (debito-cortesia-automatico).** The charged Uazapi adapter now
+comes from wish `debito-cortesia-automatico`, and it charges only builders
+under the courtesy rule
+([`credit-courtesy-rule.md`](./credit-courtesy-rule.md);
+`test_a_charged_uazapi_turn_is_claimed_and_charged_once_on_postgres` and
+`test_under_a_mark_the_uazapi_turn_stays_observational_on_postgres` in
+`tests/integration/test_credit_uazapi_enforced_postgres.py`). The L10
+guard `uazapi_enforced_credit_adapter_available()` still returns `False`.
+Do not open a duplicate `uazapi-credit-enforcement` wish for the adapter;
+lifting the guard is an owner decision on top of that work.
+
+### Mitigation of forged Uazapi messages under the courtesy rule
+
+Under the rule a Uazapi turn spends courtesy, and a builder whose courtesy
+runs out is blocked at once. While this check is in shadow, a forged
+message to a courtesy builder's instance spends its courtesy and can mute
+the agent; the owner accepted that risk. The mitigation is this runbook's
+switch to enforce (`uazapi_webhook_auth_enforced`, "The enforce order"),
+which refuses with 401 every result other than `match`, not only a token
+that does not match (see "Results").
+Evolution has no equivalent.

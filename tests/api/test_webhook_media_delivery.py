@@ -903,9 +903,14 @@ def test_the_selection_and_the_delivery_name_the_route_s_provider(
 
 
 def test_the_credit_reply_channels_map_to_the_same_providers() -> None:
+    # debito-cortesia-automatico Groups 3 and 4: a Uazapi or Evolution reply
+    # charged under the courtesy rule starts its file through the route's own
+    # provider too.
     assert dict(webhook._CREDIT_MEDIA_PROVIDERS) == {
         "zapi": webhook._ZAPI_MEDIA_PROVIDER,
         "meta": webhook._META_MEDIA_PROVIDER,
+        "uazapi": webhook._UAZAPI_MEDIA_PROVIDER,
+        "evolution": webhook._EVOLUTION_MEDIA_PROVIDER,
     }
 
 

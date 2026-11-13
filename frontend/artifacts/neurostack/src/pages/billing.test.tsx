@@ -1026,7 +1026,9 @@ describe("Billing credits", () => {
       "GET /v1/billing/summary": () => response(summary),
       [`GET ${CREDIT_SUMMARY}`]: () =>
         response(
-          // Coherent with the server: nothing available is 100 % used,
+          // Coherent with the server: nothing available is 100 % used with
+          // every threshold reached (outside the courtesy rule the ledger
+          // basis reaches 50, 90 and 100 whenever nothing is available),
           // nothing expires and nothing was consumed or reserved.
           creditSummary({
             balance: {
@@ -1039,7 +1041,7 @@ describe("Billing credits", () => {
               reserved_mc: 0,
             },
             expiries: [],
-            thresholds: { capacity_mc: 0, available_mc: 0, used_mc: 0, used_percent: 100 },
+            thresholds: { capacity_mc: 0, available_mc: 0, used_mc: 0, used_percent: 100, reached: [50, 90, 100] },
           }),
         ),
       [`GET ${CREDIT_LOTS}`]: () => response(creditLots([])),
@@ -1049,6 +1051,13 @@ describe("Billing credits", () => {
     expect(await screen.findByTestId("credit-panel")).toBeInTheDocument();
     expect(metric("Disponível líquido")).toHaveTextContent(/^Disponível líquido0 créditos$/);
     expect(metric("Recargas")).toHaveTextContent("0 créditos");
+    // Zero capacity with thresholds reached is the ledger basis, not the
+    // courtesy rule's "no credits in force": the 100 % bar stays.
+    const thresholds = screen.getByTestId("credit-thresholds");
+    expect(thresholds).not.toHaveAttribute("data-state");
+    expect(thresholds).toHaveTextContent("Capacidade consumida100%");
+    expect(within(thresholds).getByRole("progressbar", { name: "Capacidade consumida" })).toBeInTheDocument();
+    expect(thresholds).toHaveTextContent("Alertas atingidos: 50%, 90%, 100%");
     const history = await screen.findByTestId("credit-history");
     await waitFor(() => expect(history).toHaveAttribute("data-state", "ready"));
     expect(within(history).getByTestId("credit-history-empty")).toHaveTextContent(
@@ -1982,6 +1991,456 @@ describe("Billing credits", () => {
     expect(await screen.findByRole("button", { name: "Recarregar" })).toBeEnabled();
     expect(within(screen.getByTestId("plan-usage")).queryByRole("button")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Comprar créditos/i })).not.toBeInTheDocument();
+  });
+});
+
+// ── debito-cortesia-automatico (Group 5b, wish Decision 4) ─────────────────
+// Under the courtesy rule the server answers `mode: "enforced"`, `state`
+// `active` (charged) or `suspended` (blocked), `quarantine` as the only
+// possible reason (never `reconciliation`), no episode deadline, the
+// spendable courtesy as `net_available_mc` and the thresholds on the
+// courtesy basis. Only `active` + `quarantine` (a pair only the rule
+// produces) shows the balance without "Pendente"; the top-up stays blocked
+// under `quarantine` whatever the state. A marked builder renders as before.
+
+const COURTESY_LOT = {
+  lot_id: "lot-c1",
+  kind: "courtesy",
+  expires_at: "2026-11-30T03:00:00Z",
+  available_mc: 4_000_000,
+  removed_mc: 0,
+};
+
+/** A builder under the rule, charged from 10.000 courtesy credits (6.000 used). */
+function ruleSummary(overrides: Record<string, unknown> = {}) {
+  return creditSummary({
+    ...overrides,
+    state: {
+      mode: "enforced",
+      enforcement_at: "2026-11-01T12:00:00Z",
+      state: "active",
+      pending_reasons: [],
+      ...((overrides.state as Record<string, unknown>) ?? {}),
+    },
+    balance: {
+      monthly_available_mc: 0,
+      monthly_not_started_mc: 0,
+      topup_available_mc: 0,
+      courtesy_available_mc: 4_000_000,
+      available_mc: 4_000_000,
+      net_available_mc: 4_000_000,
+      reserved_mc: 0,
+      ...((overrides.balance as Record<string, unknown>) ?? {}),
+    },
+    expiries: (overrides.expiries as unknown[] | undefined) ?? [COURTESY_LOT],
+    thresholds: {
+      capacity_mc: 10_000_000,
+      available_mc: 4_000_000,
+      used_mc: 6_000_000,
+      used_percent: 60,
+      reached: [50],
+      alerts: [{ threshold: 50, occurred_at: "2026-11-10T12:00:00Z" }],
+      ...((overrides.thresholds as Record<string, unknown>) ?? {}),
+    },
+  });
+}
+
+const courtesyHistory = () =>
+  response(
+    creditLots([
+      lot({
+        lot_id: "lot-c1",
+        kind: "courtesy",
+        granted_mc: 10_000_000,
+        available_mc: 4_000_000,
+        consumed_mc: 6_000_000,
+        paid_at: "2026-11-01",
+        expires_at: "2026-11-30T03:00:00Z",
+      }),
+    ]),
+  );
+
+/**
+ * The history the server answers for zero capacity: the only courtesy lot
+ * expired before any use (`_funded_mc` never subtracts consumption, so zero
+ * capacity means every courtesy lot expired or was removed in full before
+ * any use). Shape of `lot_view` (`src/api/routes/credits.py`): `expired`,
+ * nothing available, the whole grant in `expired_mc`.
+ */
+const expiredCourtesyHistory = () =>
+  response(
+    creditLots([
+      lot({
+        lot_id: "lot-c0",
+        kind: "courtesy",
+        status: "expired",
+        granted_mc: 10_000_000,
+        available_mc: 0,
+        consumed_mc: 0,
+        expired_mc: 10_000_000,
+        paid_at: "2026-09-01",
+        expires_at: "2026-10-01T03:00:00Z",
+      }),
+    ]),
+  );
+
+/**
+ * The history the server answers once the courtesy is spent in full and not
+ * yet expired: `lot_view` reports the lot `exhausted`, nothing available,
+ * the whole grant in `consumed_mc`. The summary then lists no expiry (only
+ * lots with something available are listed).
+ */
+const exhaustedCourtesyHistory = () =>
+  response(
+    creditLots([
+      lot({
+        lot_id: "lot-c1",
+        kind: "courtesy",
+        status: "exhausted",
+        granted_mc: 10_000_000,
+        available_mc: 0,
+        consumed_mc: 10_000_000,
+        paid_at: "2026-11-01",
+        expires_at: "2026-11-30T03:00:00Z",
+      }),
+    ]),
+  );
+
+/** A blocked builder whose courtesy expired or was removed in full before any use: zero capacity. */
+const ZERO_CAPACITY = { capacity_mc: 0, available_mc: 0, used_mc: 0, used_percent: 100, reached: [], alerts: [] };
+const NOTHING_LEFT = { courtesy_available_mc: 0, available_mc: 0, net_available_mc: 0 };
+
+/** The marked builder's episode deadlines (cobranca-credito-por-builder). */
+const MARKED_EPISODE = {
+  exhausted_at: "2026-10-20T12:00:00Z",
+  suspension_due_at: "2026-10-23T12:00:00Z",
+  deletion_due_at: "2026-11-19T12:00:00Z",
+  export_deadline_at: "2026-11-19T12:00:00Z",
+};
+
+describe("Billing credits: courtesy rule", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    Element.prototype.scrollIntoView = vi.fn();
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    fetchMock.mockReset();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.history.replaceState({}, "", "/");
+  });
+
+  /** Renders `/billing` with top-ups commercially open and waits until it settles. */
+  async function renderSettled(credit: unknown, lots: Route = () => response(creditLots([lot()]))) {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(topupSummary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(credit),
+      [`GET ${CREDIT_LOTS}`]: lots,
+    });
+    renderBilling();
+    const panel = await screen.findByTestId("credits-and-topups");
+    await waitFor(() => expect(panel).not.toHaveAttribute("data-state", "loading"));
+    await screen.findAllByTestId("credit-history-row");
+    await waitFor(() => expect(calls(fetchMock, "GET", CREDIT_CATALOG).length).toBeGreaterThan(0));
+    await screen.findByTestId(/^topup-(blocked|offer)$/);
+    return screen.getByTestId("credits-and-topups");
+  }
+
+  // Pinned byte for byte on the tree before this group: a marked builder
+  // (operator mark, episode deadlines) on hold renders exactly as before.
+  it("renders a marked builder in pending with quarantine exactly as before", async () => {
+    const panel = await renderSettled(creditSummary({ state: { state: "pending", pending_reasons: ["quarantine"] } }));
+    expect(panel.outerHTML).toMatchInlineSnapshot(`"<div class="space-y-3" data-testid="credits-and-topups" data-state="pending"><div class="rounded-xl border text-card-foreground shadow border-emerald-500/25 bg-card" data-testid="credit-panel"><div class="flex flex-col space-y-1.5 p-6 pb-3"><div class="flex flex-wrap items-center gap-x-2 gap-y-1"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-coins h-4 w-4 text-emerald-500" aria-hidden="true"><circle cx="8" cy="8" r="6"></circle><path d="M18.09 10.37A6 6 0 1 1 10.34 18"></path><path d="M7 6h1v4"></path><path d="m16.71 13.88.7.71-2.82 2.82"></path></svg><h3 class="text-sm font-semibold leading-none tracking-tight text-foreground">Saldo de créditos</h3><span class="ml-auto text-[10px] text-muted-foreground">Atualizado em 30/10/2026, 12:00</span></div></div><div class="p-6 pt-0 space-y-4"><div role="status" aria-live="polite" data-testid="credit-notices" class="empty:mb-0"><div data-testid="credit-state" data-state="pending" data-lifecycle="pending" class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true"><path d="M12 6v6l4 2"></path><circle cx="12" cy="12" r="10"></circle></svg><div class="space-y-1"><p class="font-semibold">Pendente</p><p>Pendência financeira: um pagamento está em verificação.</p><p>O saldo fica retido e não é exibido como disponível até o servidor concluir a verificação. Os lotes do histórico abaixo são registros do servidor, não saldo disponível.</p></div></div></div><div class="space-y-1.5 border-t border-border/40 pt-3"><button class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&amp;_svg]:pointer-events-none [&amp;_svg]:size-4 [&amp;_svg]:shrink-0 hover-elevate active-elevate-2 border [border-color:var(--button-outline)] shadow-xs active:shadow-none min-h-8 rounded-md px-3 text-xs gap-1.5" type="button"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-download h-3.5 w-3.5" aria-hidden="true"><path d="M12 15V3"></path><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path></svg>Exportar dados (ZIP)</button></div></div></div><p data-testid="topup-blocked" class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true"><path d="M12 6v6l4 2"></path><circle cx="12" cy="12" r="10"></circle></svg><span>Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.</span></p><div class="rounded-xl border text-card-foreground shadow border-border/60 bg-card" data-testid="credit-history" data-state="ready"><div class="flex flex-col space-y-1.5 p-6 pb-3"><h3 class="text-sm font-semibold leading-none tracking-tight text-foreground">Histórico de créditos</h3></div><div class="p-6 pt-0"><div class="@container"><div class="@min-[36rem]:overflow-x-auto @min-[36rem]:rounded-lg @min-[36rem]:border @min-[36rem]:border-border/60"><table role="table" aria-label="Histórico de créditos" class="block w-full @min-[36rem]:table @min-[36rem]:border-collapse"><thead role="rowgroup" class="hidden @min-[36rem]:table-header-group"><tr role="row"><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Data</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Origem</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Créditos</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Situação</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Expira em</th></tr></thead><tbody role="rowgroup" class="block space-y-2 @min-[36rem]:table-row-group @min-[36rem]:space-y-0"><tr role="row" data-testid="credit-history-row" class="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/10 p-3 @min-[36rem]:table-row @min-[36rem]:rounded-none @min-[36rem]:border-0 @min-[36rem]:bg-transparent @min-[36rem]:p-0"><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Data</span><span class="block text-xs tabular-nums text-foreground">20/10/2026</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Origem</span><span class="block text-xs text-foreground">Recarga</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Créditos</span><span class="block text-xs font-semibold tabular-nums text-foreground">500 créditos</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Situação</span><span data-testid="credit-lot-status" class="flex items-center gap-1 text-xs font-medium text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-pause h-3 w-3 shrink-0" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="10" x2="10" y1="15" y2="9"></line><line x1="14" x2="14" y1="15" y2="9"></line></svg>Retido</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Expira em</span><span class="block text-xs tabular-nums text-foreground">20/04/2027</span></td></tr></tbody></table></div></div></div></div></div>"`);
+  });
+
+  it("renders a marked builder in suspended with quarantine exactly as before", async () => {
+    const panel = await renderSettled(
+      creditSummary({ state: { state: "suspended", pending_reasons: ["quarantine"], ...MARKED_EPISODE } }),
+    );
+    expect(panel.outerHTML).toMatchInlineSnapshot(`"<div class="space-y-3" data-testid="credits-and-topups" data-state="pending"><div class="rounded-xl border text-card-foreground shadow border-emerald-500/25 bg-card" data-testid="credit-panel"><div class="flex flex-col space-y-1.5 p-6 pb-3"><div class="flex flex-wrap items-center gap-x-2 gap-y-1"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-coins h-4 w-4 text-emerald-500" aria-hidden="true"><circle cx="8" cy="8" r="6"></circle><path d="M18.09 10.37A6 6 0 1 1 10.34 18"></path><path d="M7 6h1v4"></path><path d="m16.71 13.88.7.71-2.82 2.82"></path></svg><h3 class="text-sm font-semibold leading-none tracking-tight text-foreground">Saldo de créditos</h3><span class="ml-auto text-[10px] text-muted-foreground">Atualizado em 30/10/2026, 12:00</span></div></div><div class="p-6 pt-0 space-y-4"><div role="status" aria-live="polite" data-testid="credit-notices" class="empty:mb-0"><div data-testid="credit-state" data-state="pending" data-lifecycle="suspended" class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true"><path d="M12 6v6l4 2"></path><circle cx="12" cy="12" r="10"></circle></svg><div class="space-y-1"><p class="font-semibold">Pendente</p><p>Pendência financeira: um pagamento está em verificação.</p><p data-testid="credit-hold-lifecycle">Serviço suspenso por falta de créditos. Exporte seus dados até 19/11/2026, 09:00.</p><p>O saldo fica retido e não é exibido como disponível até o servidor concluir a verificação. Os lotes do histórico abaixo são registros do servidor, não saldo disponível.</p></div></div></div><div class="space-y-1.5 border-t border-border/40 pt-3"><button class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&amp;_svg]:pointer-events-none [&amp;_svg]:size-4 [&amp;_svg]:shrink-0 hover-elevate active-elevate-2 border [border-color:var(--button-outline)] shadow-xs active:shadow-none min-h-8 rounded-md px-3 text-xs gap-1.5" type="button"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-download h-3.5 w-3.5" aria-hidden="true"><path d="M12 15V3"></path><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path></svg>Exportar dados (ZIP)</button></div></div></div><p data-testid="topup-blocked" class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true"><path d="M12 6v6l4 2"></path><circle cx="12" cy="12" r="10"></circle></svg><span>Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.</span></p><div class="rounded-xl border text-card-foreground shadow border-border/60 bg-card" data-testid="credit-history" data-state="ready"><div class="flex flex-col space-y-1.5 p-6 pb-3"><h3 class="text-sm font-semibold leading-none tracking-tight text-foreground">Histórico de créditos</h3></div><div class="p-6 pt-0"><div class="@container"><div class="@min-[36rem]:overflow-x-auto @min-[36rem]:rounded-lg @min-[36rem]:border @min-[36rem]:border-border/60"><table role="table" aria-label="Histórico de créditos" class="block w-full @min-[36rem]:table @min-[36rem]:border-collapse"><thead role="rowgroup" class="hidden @min-[36rem]:table-header-group"><tr role="row"><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Data</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Origem</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Créditos</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Situação</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Expira em</th></tr></thead><tbody role="rowgroup" class="block space-y-2 @min-[36rem]:table-row-group @min-[36rem]:space-y-0"><tr role="row" data-testid="credit-history-row" class="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/10 p-3 @min-[36rem]:table-row @min-[36rem]:rounded-none @min-[36rem]:border-0 @min-[36rem]:bg-transparent @min-[36rem]:p-0"><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Data</span><span class="block text-xs tabular-nums text-foreground">20/10/2026</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Origem</span><span class="block text-xs text-foreground">Recarga</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Créditos</span><span class="block text-xs font-semibold tabular-nums text-foreground">500 créditos</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Situação</span><span data-testid="credit-lot-status" class="flex items-center gap-1 text-xs font-medium text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-pause h-3 w-3 shrink-0" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="10" x2="10" y1="15" y2="9"></line><line x1="14" x2="14" y1="15" y2="9"></line></svg>Retido</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Expira em</span><span class="block text-xs tabular-nums text-foreground">20/04/2027</span></td></tr></tbody></table></div></div></div></div></div>"`);
+  });
+
+  // The rule's own `suspended` + `quarantine` (blocked, no deadline) keeps
+  // the "Pendente" box with the suspension inside, exactly as before.
+  it("renders a blocked builder under the rule with quarantine exactly as before", async () => {
+    const panel = await renderSettled(
+      ruleSummary({
+        state: { state: "suspended", pending_reasons: ["quarantine"] },
+        balance: NOTHING_LEFT,
+        thresholds: ZERO_CAPACITY,
+      }),
+      courtesyHistory,
+    );
+    expect(panel.outerHTML).toMatchInlineSnapshot(`"<div class="space-y-3" data-testid="credits-and-topups" data-state="pending"><div class="rounded-xl border text-card-foreground shadow border-emerald-500/25 bg-card" data-testid="credit-panel"><div class="flex flex-col space-y-1.5 p-6 pb-3"><div class="flex flex-wrap items-center gap-x-2 gap-y-1"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-coins h-4 w-4 text-emerald-500" aria-hidden="true"><circle cx="8" cy="8" r="6"></circle><path d="M18.09 10.37A6 6 0 1 1 10.34 18"></path><path d="M7 6h1v4"></path><path d="m16.71 13.88.7.71-2.82 2.82"></path></svg><h3 class="text-sm font-semibold leading-none tracking-tight text-foreground">Saldo de créditos</h3><span class="ml-auto text-[10px] text-muted-foreground">Atualizado em 30/10/2026, 12:00</span></div></div><div class="p-6 pt-0 space-y-4"><div role="status" aria-live="polite" data-testid="credit-notices" class="empty:mb-0"><div data-testid="credit-state" data-state="pending" data-lifecycle="suspended" class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true"><path d="M12 6v6l4 2"></path><circle cx="12" cy="12" r="10"></circle></svg><div class="space-y-1"><p class="font-semibold">Pendente</p><p>Pendência financeira: um pagamento está em verificação.</p><p data-testid="credit-hold-lifecycle">Serviço suspenso por falta de créditos. </p><p>O saldo fica retido e não é exibido como disponível até o servidor concluir a verificação. Os lotes do histórico abaixo são registros do servidor, não saldo disponível.</p></div></div></div><div class="space-y-1.5 border-t border-border/40 pt-3"><button class="inline-flex items-center justify-center whitespace-nowrap font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&amp;_svg]:pointer-events-none [&amp;_svg]:size-4 [&amp;_svg]:shrink-0 hover-elevate active-elevate-2 border [border-color:var(--button-outline)] shadow-xs active:shadow-none min-h-8 rounded-md px-3 text-xs gap-1.5" type="button"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-download h-3.5 w-3.5" aria-hidden="true"><path d="M12 15V3"></path><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path></svg>Exportar dados (ZIP)</button></div></div></div><p data-testid="topup-blocked" class="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-clock mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true"><path d="M12 6v6l4 2"></path><circle cx="12" cy="12" r="10"></circle></svg><span>Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.</span></p><div class="rounded-xl border text-card-foreground shadow border-border/60 bg-card" data-testid="credit-history" data-state="ready"><div class="flex flex-col space-y-1.5 p-6 pb-3"><h3 class="text-sm font-semibold leading-none tracking-tight text-foreground">Histórico de créditos</h3></div><div class="p-6 pt-0"><div class="@container"><div class="@min-[36rem]:overflow-x-auto @min-[36rem]:rounded-lg @min-[36rem]:border @min-[36rem]:border-border/60"><table role="table" aria-label="Histórico de créditos" class="block w-full @min-[36rem]:table @min-[36rem]:border-collapse"><thead role="rowgroup" class="hidden @min-[36rem]:table-header-group"><tr role="row"><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Data</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Origem</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Créditos</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Situação</th><th role="columnheader" scope="col" class="bg-muted/30 px-2 py-2 text-left align-bottom text-[10px] font-bold uppercase tracking-wider text-muted-foreground first:pl-3 last:pr-3">Expira em</th></tr></thead><tbody role="rowgroup" class="block space-y-2 @min-[36rem]:table-row-group @min-[36rem]:space-y-0"><tr role="row" data-testid="credit-history-row" class="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/10 p-3 @min-[36rem]:table-row @min-[36rem]:rounded-none @min-[36rem]:border-0 @min-[36rem]:bg-transparent @min-[36rem]:p-0"><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Data</span><span class="block text-xs tabular-nums text-foreground">01/11/2026</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Origem</span><span class="block text-xs text-foreground">Cortesia</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Créditos</span><span class="block text-xs font-semibold tabular-nums text-foreground">10.000 créditos</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Situação</span><span data-testid="credit-lot-status" class="flex items-center gap-1 text-xs font-medium text-amber-800 dark:text-amber-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-circle-pause h-3 w-3 shrink-0" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="10" x2="10" y1="15" y2="9"></line><line x1="14" x2="14" y1="15" y2="9"></line></svg>Retido</span></td><td role="cell" class="block min-w-0 @min-[36rem]:table-cell @min-[36rem]:border-t @min-[36rem]:border-border/60 @min-[36rem]:px-2 @min-[36rem]:py-2.5 @min-[36rem]:align-middle @min-[36rem]:first:pl-3 @min-[36rem]:last:pr-3"><span class="block text-[10px] uppercase tracking-wide text-muted-foreground @min-[36rem]:hidden">Expira em</span><span class="block text-xs tabular-nums text-foreground">30/11/2026</span></td></tr></tbody></table></div></div></div></div></div>"`);
+  });
+
+  it("charged: the courtesy balance, no observational notice, thresholds on the courtesy basis and Recarregar offered", async () => {
+    const panel = await renderSettled(ruleSummary(), courtesyHistory);
+
+    expect(panel).toHaveAttribute("data-state", "standing");
+    expect(screen.queryByTestId("credit-mode")).not.toBeInTheDocument();
+    expect(panel).not.toHaveTextContent(/Modo observacional|Pendente/);
+    expect(screen.queryByTestId("credit-state")).not.toBeInTheDocument();
+    expect(metric("Disponível líquido")).toHaveTextContent("4.000 créditos");
+    expect(metric("Cortesia")).toHaveTextContent("4.000 créditos");
+    const thresholds = screen.getByTestId("credit-thresholds");
+    expect(thresholds).toHaveTextContent("Capacidade consumida60%");
+    expect(thresholds).toHaveTextContent("Alertas atingidos: 50%");
+    expect(within(thresholds).getByRole("progressbar", { name: "Capacidade consumida" })).toBeInTheDocument();
+    expect(screen.getByTestId("credit-consumption")).toHaveTextContent(/^Consumo cobrado no ciclo/);
+    expect(screen.getByRole("button", { name: "Recarregar" })).toBeEnabled();
+    expect(screen.queryByTestId("topup-blocked")).not.toBeInTheDocument();
+    expect(screen.getByTestId("credit-lot-status")).toHaveTextContent("Em vigor");
+  });
+
+  it("charged in quarantine: the balance without Pendente, and Recarregar stays blocked", async () => {
+    const panel = await renderSettled(
+      ruleSummary({ state: { state: "active", pending_reasons: ["quarantine"] } }),
+      courtesyHistory,
+    );
+
+    expect(panel).toHaveAttribute("data-state", "standing");
+    expect(panel).not.toHaveTextContent(/Pendente|Pendência financeira: um pagamento|O saldo fica retido/);
+    expect(screen.queryByTestId("credit-state")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("credit-mode")).not.toBeInTheDocument();
+    // The balance is visible: the spendable courtesy is "Disponível líquido".
+    expect(metric("Disponível líquido")).toHaveTextContent("4.000 créditos");
+    expect(metric("Cortesia")).toHaveTextContent("4.000 créditos");
+    expect(metric("Recargas")).toHaveTextContent("0 créditos");
+    expect(screen.getByTestId("credit-thresholds")).toHaveTextContent("Alertas atingidos: 50%");
+    // The money rule is unchanged: no Recarregar under quarantine, only its reason.
+    expect(screen.queryByRole("button", { name: "Recarregar" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("topup-offer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("topup-blocked")).toHaveTextContent(
+      "Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.",
+    );
+    // The courtesy lot is spendable, not on hold.
+    expect(screen.getByTestId("credit-lot-status")).toHaveTextContent("Em vigor");
+  });
+
+  it("blocked with the courtesy expired or removed in full before use: Serviço suspenso, no deadline, and no misleading 100 % bar", async () => {
+    const panel = await renderSettled(
+      ruleSummary({ state: { state: "suspended" }, balance: NOTHING_LEFT, thresholds: ZERO_CAPACITY, expiries: [] }),
+      expiredCourtesyHistory,
+    );
+
+    expect(panel).toHaveAttribute("data-state", "standing");
+    const notice = screen.getByTestId("credit-state");
+    expect(notice).toHaveAttribute("data-state", "suspended");
+    // Top-ups are open, so the call to action stays as for any suspended account.
+    expect(notice).toHaveTextContent(/^Serviço suspenso por falta de créditos\. Recarregue para reativar\.$/);
+    expect(notice).not.toHaveTextContent(/Exporte seus dados|dívida/);
+    expect(panel).not.toHaveTextContent(/Pendente|Modo observacional/);
+    expect(metric("Disponível líquido")).toHaveTextContent("0 créditos");
+    const thresholds = screen.getByTestId("credit-thresholds");
+    expect(thresholds).toHaveAttribute("data-state", "no_capacity");
+    expect(thresholds).toHaveTextContent(/^Capacidade consumidaSem créditos em vigor$/);
+    expect(within(thresholds).queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(thresholds).not.toHaveTextContent(/%/);
+    expect(screen.getByRole("button", { name: "Recarregar" })).toBeEnabled();
+    expect(screen.getByTestId("credit-lot-status")).toHaveTextContent("Vencido");
+    // The plan purchase stays as it is.
+    expect(screen.getByRole("button", { name: /Assinar Plus/ })).toBeInTheDocument();
+  });
+
+  it("blocked after spending all its courtesy: 100 % with every threshold reached", async () => {
+    await renderSettled(
+      ruleSummary({
+        state: { state: "suspended" },
+        balance: NOTHING_LEFT,
+        thresholds: { available_mc: 0, used_mc: 10_000_000, used_percent: 100, reached: [50, 90, 100] },
+        expiries: [],
+      }),
+      exhaustedCourtesyHistory,
+    );
+
+    expect(screen.getByTestId("credit-state")).toHaveTextContent(/^Serviço suspenso por falta de créditos\./);
+    const thresholds = screen.getByTestId("credit-thresholds");
+    expect(thresholds).not.toHaveAttribute("data-state");
+    expect(thresholds).toHaveTextContent("Capacidade consumida100%");
+    expect(thresholds).toHaveTextContent("Alertas atingidos: 50%, 90%, 100%");
+    expect(within(thresholds).getByRole("progressbar", { name: "Capacidade consumida" })).toBeInTheDocument();
+    // The spent courtesy lot reads as used up, and nothing is left to expire.
+    expect(screen.getByTestId("credit-lot-status")).toHaveTextContent("Esgotado");
+    expect(screen.queryByTestId("credit-expiries")).not.toBeInTheDocument();
+  });
+
+  it("blocked in quarantine with the courtesy expired or removed in full before use keeps the Pendente box with the suspension inside and Recarregar blocked", async () => {
+    const panel = await renderSettled(
+      ruleSummary({
+        state: { state: "suspended", pending_reasons: ["quarantine"] },
+        balance: NOTHING_LEFT,
+        thresholds: ZERO_CAPACITY,
+        expiries: [],
+      }),
+      expiredCourtesyHistory,
+    );
+
+    expect(panel).toHaveAttribute("data-state", "pending");
+    const notice = screen.getByTestId("credit-state");
+    expect(notice).toHaveAttribute("data-state", "pending");
+    expect(notice).toHaveTextContent(/^Pendente/);
+    expect(screen.getByTestId("credit-hold-lifecycle")).toHaveTextContent("Serviço suspenso por falta de créditos.");
+    expect(screen.queryByRole("group", { name: "Disponível líquido" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recarregar" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("topup-blocked")).toHaveTextContent(/pendência financeira em verificação/);
+    // An expired lot keeps its own label on hold: only a spendable one reads "Retido".
+    expect(screen.getByTestId("credit-lot-status")).toHaveTextContent("Vencido");
+  });
+
+  it("protected (no courtesy left, a paid plan in force): observational, as before", async () => {
+    const panel = await renderSettled(
+      creditSummary({
+        state: { mode: "observational", enforcement_at: null, state: "active", pending_reasons: [] },
+        balance: { courtesy_available_mc: 0 },
+      }),
+    );
+
+    expect(panel).toHaveAttribute("data-state", "standing");
+    expect(screen.getByTestId("credit-mode")).toHaveTextContent(
+      "Modo observacional: o consumo é medido, mas ainda não é cobrado dos seus créditos.",
+    );
+    expect(panel).not.toHaveTextContent(/Pendente|Serviço suspenso/);
+    expect(metric("Disponível líquido")).toHaveTextContent("506 créditos");
+    expect(metric("Cortesia")).toHaveTextContent("0 créditos");
+    expect(screen.getByTestId("credit-consumption")).toHaveTextContent(/^Consumo estimado no ciclo \(não cobrado\)/);
+    expect(screen.getByRole("button", { name: "Recarregar" })).toBeEnabled();
+  });
+
+  // Owner decision 19: a builder charged in quarantine with no top-up area
+  // (commercial top-ups off) reads one neutral line; nothing else changes.
+  const VERIFICATION_NOTE = "Um pagamento está em verificação; o consumo da cortesia não é afetado.";
+
+  /** Renders `/billing` with top-ups commercially off and waits until it settles. */
+  async function renderTopupsOff(credit: unknown, lots: Route = () => response(creditLots([lot()])), locale?: "en") {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(summary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(credit),
+      [`GET ${CREDIT_LOTS}`]: lots,
+    });
+    renderBilling(locale);
+    const panel = await screen.findByTestId("credits-and-topups");
+    await waitFor(() => expect(panel).not.toHaveAttribute("data-state", "loading"));
+    await screen.findAllByTestId("credit-history-row");
+    return screen.getByTestId("credits-and-topups");
+  }
+
+  it("charged in quarantine with top-ups off: one neutral verification line, the balance and no top-up area", async () => {
+    const panel = await renderTopupsOff(
+      ruleSummary({ state: { state: "active", pending_reasons: ["quarantine"] } }),
+      courtesyHistory,
+    );
+
+    expect(panel).toHaveAttribute("data-state", "standing");
+    const note = screen.getByTestId("credit-verification-note");
+    expect(note).toHaveTextContent(new RegExp(`^${VERIFICATION_NOTE}$`));
+    expect(within(screen.getByTestId("credit-notices")).getByText(VERIFICATION_NOTE)).toBe(note);
+    expect(panel).not.toHaveTextContent(/Pendente|O saldo fica retido|Recarga indisponível/);
+    expect(screen.queryByTestId("credit-state")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("topup-blocked")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Recarregar" })).not.toBeInTheDocument();
+    expect(metric("Disponível líquido")).toHaveTextContent("4.000 créditos");
+    expect(screen.getAllByText(VERIFICATION_NOTE)).toHaveLength(1);
+  });
+
+  it("charged in quarantine with top-ups on: the top-up blocked line instead, never both", async () => {
+    const panel = await renderSettled(
+      ruleSummary({ state: { state: "active", pending_reasons: ["quarantine"] } }),
+      courtesyHistory,
+    );
+
+    expect(screen.getByTestId("topup-blocked")).toHaveTextContent(
+      "Recarga indisponível enquanto há uma pendência financeira em verificação pelo servidor.",
+    );
+    expect(screen.queryByTestId("credit-verification-note")).not.toBeInTheDocument();
+    expect(panel).not.toHaveTextContent(/o consumo da cortesia não é afetado/);
+  });
+
+  it.each([
+    [
+      "a marked builder in pending with quarantine",
+      () => creditSummary({ state: { state: "pending", pending_reasons: ["quarantine"] } }),
+      "pending",
+    ],
+    [
+      "a marked builder in suspended with quarantine",
+      () => creditSummary({ state: { state: "suspended", pending_reasons: ["quarantine"], ...MARKED_EPISODE } }),
+      "pending",
+    ],
+    [
+      "a blocked builder under the rule with quarantine",
+      () =>
+        ruleSummary({
+          state: { state: "suspended", pending_reasons: ["quarantine"] },
+          balance: NOTHING_LEFT,
+          thresholds: ZERO_CAPACITY,
+          expiries: [],
+        }),
+      "pending",
+    ],
+    ["a builder charged without quarantine", () => ruleSummary(), "standing"],
+    [
+      "a protected builder (observational, no courtesy left)",
+      () =>
+        creditSummary({
+          state: { mode: "observational", enforcement_at: null, state: "active", pending_reasons: [] },
+          balance: { courtesy_available_mc: 0 },
+        }),
+      "standing",
+    ],
+  ])("shows no verification line for %s with top-ups off", async (_label, credit, standing) => {
+    const panel = await renderTopupsOff(credit());
+
+    expect(panel).toHaveAttribute("data-state", standing);
+    expect(screen.queryByTestId("credit-verification-note")).not.toBeInTheDocument();
+    expect(panel).not.toHaveTextContent(/o consumo da cortesia não é afetado/);
+  });
+
+  it("in English: the charged-in-quarantine verification line with top-ups off", async () => {
+    await renderTopupsOff(
+      ruleSummary({ state: { state: "active", pending_reasons: ["quarantine"] } }),
+      courtesyHistory,
+      "en",
+    );
+
+    expect(screen.getByTestId("credit-verification-note")).toHaveTextContent(
+      /^A payment is being verified; courtesy usage is not affected\.$/,
+    );
+    expect(screen.queryByTestId("topup-blocked")).not.toBeInTheDocument();
+  });
+
+  it("in English: the zero-capacity line (courtesy expired or removed in full before use) and the charged-in-quarantine top-up block", async () => {
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(topupSummary),
+      [`GET ${CREDIT_SUMMARY}`]: () =>
+        response(
+          ruleSummary({ state: { state: "suspended" }, balance: NOTHING_LEFT, thresholds: ZERO_CAPACITY, expiries: [] }),
+        ),
+      [`GET ${CREDIT_LOTS}`]: expiredCourtesyHistory,
+    });
+    renderBilling("en");
+    const thresholds = await screen.findByTestId("credit-thresholds");
+    expect(thresholds).toHaveTextContent(/^Capacity usedNo credits in force$/);
+    expect(screen.getByTestId("credit-state")).toHaveTextContent(/^Service suspended for lack of credits\./);
+    cleanup();
+    fetchMock.mockReset();
+
+    routeFetch(fetchMock, {
+      "GET /v1/billing/summary": () => response(topupSummary),
+      [`GET ${CREDIT_SUMMARY}`]: () => response(ruleSummary({ state: { pending_reasons: ["quarantine"] } })),
+      [`GET ${CREDIT_LOTS}`]: courtesyHistory,
+    });
+    renderBilling("en");
+    expect(await screen.findByTestId("topup-blocked")).toHaveTextContent(
+      "Top-ups are unavailable while the server is verifying a financial pending item.",
+    );
+    expect(screen.getByTestId("credits-and-topups")).not.toHaveTextContent(/Pending/);
+    expect(metric("Net available")).toHaveTextContent("4,000 credits");
   });
 });
 

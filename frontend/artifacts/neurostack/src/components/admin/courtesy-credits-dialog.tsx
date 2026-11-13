@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -602,6 +602,25 @@ function RemovalForm({
               `Remove ${removedLabel} credits from this lot? ${formatCredits(remainingMc ?? 0, loc)} credits are left.`,
             )}
           </p>
+          {/* debito-cortesia-automatico: emptying a lot can end the builder's
+              courtesy; under the courtesy rule, with no paid plan in force,
+              the block is immediate (no grace). The dialog does not read the
+              other lots or the plan, so the warning is always shown when the
+              lot is left at 0 and says when it applies. */}
+          {remainingMc === 0 && (
+            <p
+              data-testid="courtesy-removal-block-warning"
+              className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-xs text-amber-800 dark:text-amber-300"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {txt(
+                  "Se este for o último saldo de cortesia do builder e ele não tiver plano pago em vigor, ele fica bloqueado na hora: o agente para de responder.",
+                  "If this is the builder's last courtesy balance and it has no paid plan in force, it is blocked immediately: the agent stops answering.",
+                )}
+              </span>
+            </p>
+          )}
           <div className="flex gap-2">
             <Button
               type="button"

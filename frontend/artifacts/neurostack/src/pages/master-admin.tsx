@@ -206,6 +206,16 @@ interface AdminChargingSummary {
   marked_at: string;
 }
 
+/** `courtesy_rule` of a row (debito-cortesia-automatico), read-only and
+ * computed by the server on every read: `charged`, the builder is under the
+ * courtesy rule and its usage is debited from courtesy; `blocked`, under the
+ * rule with no courtesy left and no paid plan in force, so its agent, RAG and
+ * media are suspended now. `null` for a builder not under the rule (never
+ * received courtesy, marked, protected by a paid plan in force) and for every
+ * row while the switch is off, the schema is below `046` or the read failed.
+ * Independent of `charging`. */
+type AdminCourtesyRule = "charged" | "blocked";
+
 interface BuilderSubscription {
   id: string;
   name: string;
@@ -220,6 +230,7 @@ interface BuilderSubscription {
   subscription_unavailable?: boolean;
   courtesy?: AdminCourtesySummary | null;
   charging?: AdminChargingSummary | null;
+  courtesy_rule?: AdminCourtesyRule | null;
 }
 
 type SubscriptionTone = "active" | "cancelled" | "pending" | "courtesy" | "none" | "unavailable";
@@ -336,6 +347,39 @@ function chargingBadge(
 }
 
 const CHARGING_BADGE_CLASSES = "bg-sky-500/15 text-sky-400 border-sky-500/30";
+
+/** The read-only courtesy rule badge of a row, by allowlist: `charged` and
+ * `blocked` only; `null`, a missing field (an older server) or a value this
+ * page does not know shows nothing. Independent of the mark badge. */
+function courtesyRuleBadge(
+  row: BuilderSubscription,
+  txt: Txt,
+): { rule: AdminCourtesyRule; label: string; title: string; className: string } | null {
+  switch (row.courtesy_rule) {
+    case "charged":
+      return {
+        rule: "charged",
+        label: txt("Cortesia: cobrando", "Courtesy: charging"),
+        title: txt(
+          "Regra da cortesia: o consumo é debitado dos créditos de cortesia.",
+          "Courtesy rule: usage is debited from the courtesy credits.",
+        ),
+        className: "bg-teal-500/15 text-teal-400 border-teal-500/30",
+      };
+    case "blocked":
+      return {
+        rule: "blocked",
+        label: txt("Cortesia: bloqueado", "Courtesy: blocked"),
+        title: txt(
+          "Regra da cortesia: sem cortesia e sem plano pago em vigor, o agente está bloqueado.",
+          "Courtesy rule: no courtesy and no paid plan in force, so the agent is blocked.",
+        ),
+        className: "bg-red-500/15 text-red-400 border-red-500/30",
+      };
+    default:
+      return null;
+  }
+}
 
 const SUBSCRIPTION_TONE_CLASSES: Record<SubscriptionTone, string> = {
   active: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
@@ -2357,6 +2401,7 @@ export default function MasterAdmin() {
                         {builderSubscriptions.map((s) => {
                           const rowState = subscriptionRowState(s, txt, locale as Locale);
                           const charging = chargingBadge(s, txt, locale as Locale);
+                          const courtesyRule = courtesyRuleBadge(s, txt);
                           return (
                             <tr key={s.id} className="border-b border-border/30 last:border-0">
                               <td className="py-2 pr-4 font-medium">{s.name}</td>
@@ -2392,6 +2437,16 @@ export default function MasterAdmin() {
                                         {charging.since}
                                       </span>
                                     </>
+                                  )}
+                                  {courtesyRule && (
+                                    <Badge
+                                      className={`${courtesyRule.className} text-[10px]`}
+                                      title={courtesyRule.title}
+                                      data-testid="courtesy-rule"
+                                      data-rule={courtesyRule.rule}
+                                    >
+                                      {courtesyRule.label}
+                                    </Badge>
                                   )}
                                 </div>
                                 {rowState.notice && (

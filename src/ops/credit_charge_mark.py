@@ -27,7 +27,11 @@ prints below.
 * ``enforcement``: the instant enforcement takes effect for the builder and
   its origin, in the order of the wish: the global ``credit_enforcement_state``
   row (``global``), else a latest event ``mark`` (``mark``, at its
-  ``occurred_at``), else ``none`` -- read by
+  ``occurred_at``), else -- debito-cortesia-automatico -- the courtesy rule
+  (``courtesy``, at the builder's first courtesy grant, with ``state``
+  ``charged`` while courtesy is spendable or ``blocked`` with none left and
+  no paid plan in force; behind the 046 gate, judged at the database
+  clock; ``state`` is printed under ``courtesy`` only), else ``none`` -- read by
   ``CreditRepository.effective_enforcement``, the request path's own reader
   (one implementation of the rule);
 * ``lifecycle``: the open exhaustion episode and the open debt, read as the
@@ -87,12 +91,16 @@ Then ``mark`` refuses, reporting every one that applies:
   clinic linked to the builder after the ``mark``, and a tenant holding
   Uazapi/Evolution keys with no ``whatsapp_provider``;
 * ``window_already_opened``: the current accounting window already has an
-  opening (``CreditRepository.mark_window_state``).  With the global unset
-  an opening only comes from an earlier mark; a re-mark in that window
-  would charge what was loaded while unmarked.  The next window admits it:
-  after an ``unmark``, a re-``mark`` of a builder whose enforced traffic
-  opened the current window is refused as ``window_already_opened`` until
-  the next civil month (the next accounting window).
+  opening (``CreditRepository.mark_window_state``: any ``baseline`` or
+  ``maintenance`` allocation of the window, whatever opened it).  With the
+  global unset an opening comes from an earlier mark or -- debito-cortesia-
+  automatico, accepted by its design -- from the courtesy rule (a builder
+  under it opens its windows as enforced traffic); a mark in that window
+  would charge what was loaded while not marked.  The next window admits
+  it: a ``mark`` of a builder whose enforced traffic (an earlier mark's or
+  the rule's) opened the current window is refused as
+  ``window_already_opened`` until the next civil month (the next
+  accounting window).
 
 And ``unmark`` refuses, read under the account lock of step 3:
 
@@ -182,6 +190,7 @@ try:
     from src.services.credit_rollout import CreditRolloutService
     from src.services.credit_switch import (
         CreditSwitchReading,
+        courtesy_rule_gate_open,
         credit_switch_effective,
         enforcement_mark_gate_open,
         refresh_credit_switch,
@@ -246,7 +255,9 @@ _INVISIBLE_FILLERS: Final = frozenset("\u115f\u1160\u3164\uffa0\u2800")
 # What ``marks.summary`` says.
 MARKS_TABLE_ABSENT: Final = "marks table absent"
 NO_MARKS: Final = "no marks"
-ORIGINS: Final = ("global", "mark", "none")
+ORIGINS: Final = ("global", "mark", "courtesy", "none")
+# ``enforcement.state``: the courtesy rule's, printed under ``courtesy`` only.
+COURTESY_STATES: Final = ("charged", "blocked")
 # A tenant's provider as printed: a known WhatsApp provider name, ``None``
 # (no config row, no key) or this word for any other stored value.
 UNRECOGNIZED_PROVIDER: Final = "unrecognized"
@@ -376,16 +387,27 @@ def marks_document(
 
 def enforcement_document(effective: EffectiveEnforcement) -> dict[str, object]:
     """The builder's :class:`~src.repositories.credit.EffectiveEnforcement`
-    as printed.  The rule itself (global first, then a latest ``mark``, else
-    none) is ``CreditRepository.effective_enforcement``'s, the request
-    path's own reader: this only formats it.  ``global_at`` is the global
-    instant, known exactly when it decided (it always wins)."""
+    as printed.  The rule itself (global first, then a latest ``mark``, then
+    the courtesy rule, else none) is ``CreditRepository.effective_enforcement``'s,
+    the request path's own reader: this only formats it.  ``global_at`` is
+    the global instant, known exactly when it decided (it always wins).
+    Under ``courtesy`` only, ``state`` is the rule's (``charged`` or
+    ``blocked``); every other origin prints exactly the three keys it
+    printed before the rule existed."""
 
-    return {
+    origin = "none" if effective.origin is None else effective.origin
+    if origin not in ORIGINS:
+        raise ValueError("origin outside the closed vocabulary")
+    document: dict[str, object] = {
         "global_at": _iso(effective.at if effective.origin == "global" else None),
         "effective_at": _iso(effective.at),
-        "origin": "none" if effective.origin is None else effective.origin,
+        "origin": origin,
     }
+    if origin == "courtesy":
+        if effective.state not in COURTESY_STATES:
+            raise ValueError("courtesy state outside the closed vocabulary")
+        document["state"] = effective.state
+    return document
 
 
 def tenants_document(rows: Sequence[TenantWhatsappProvider]) -> list[dict[str, object]]:
@@ -518,6 +540,7 @@ async def _status(
 ) -> RunResult:
     builder_id: UUID = args.builder_id
     gate_open = enforcement_mark_gate_open(reading)
+    rule_readable = courtesy_rule_gate_open(reading)
     async with sessions() as session:
         try:
             await _read_only(session)
@@ -535,7 +558,9 @@ async def _status(
                 )
             # Below 047 (the gate closed) the table does not exist and is not
             # touched; at 047 or later it is read.  Both reads take this
-            # command's own gate verdict, never the process cache's.
+            # command's own gate verdict, never the process cache's -- as
+            # does the courtesy rule (its 046 gate), judged at the database
+            # clock.
             latest = (
                 await repository.latest_enforcement_mark(
                     builder_id, marks_readable=True
@@ -544,7 +569,10 @@ async def _status(
                 else None
             )
             effective = await repository.effective_enforcement(
-                builder_id, marks_readable=gate_open
+                builder_id,
+                marks_readable=gate_open,
+                rule_readable=rule_readable,
+                at=now,
             )
             episode = await ContentRetentionRepository(session).open_episode(builder_id)
             # Copied before the rollback, which expires every loaded entity.
@@ -657,6 +685,7 @@ async def _change(
     if not enforcement_mark_gate_open(reading):
         # Below 047: the table does not exist and is not touched.
         return result("refused", "marks_table_absent")
+    rule_readable = courtesy_rule_gate_open(reading)
     async with sessions() as session:
         try:
             repository = CreditRepository(session)
@@ -672,7 +701,7 @@ async def _change(
             now = await repository.database_now()
             if await repository.enforcement_at() is not None:
                 effective = await repository.effective_enforcement(
-                    builder_id, marks_readable=True
+                    builder_id, marks_readable=True, rule_readable=rule_readable, at=now
                 )
                 await session.rollback()
                 return result(
@@ -742,7 +771,7 @@ async def _change(
                 marks_readable=True,
             )
             effective = await repository.effective_enforcement(
-                builder_id, marks_readable=True
+                builder_id, marks_readable=True, rule_readable=rule_readable, at=now
             )
             await session.commit()
         except BaseException:

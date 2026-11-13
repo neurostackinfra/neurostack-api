@@ -107,6 +107,36 @@ store crosses runs, and every run starts from a clone of one seeded template.
   inside a replay.  With the global set no worker reads the marks.  The
   workers' own proofs: tests/integration/test_credit_charge_workers_postgres.py.
 
+* debito-cortesia-automatico Group 1: with the global unset, the reader
+  of the effective enforcement of a builder that is not marked also runs
+  the courtesy rule's one statement (``CreditRepository.courtesy_rule``,
+  ``COURTESY_RULE_READ``) besides the mark read; the corpus grants no
+  courtesy, so nobody is under the rule, the paid plan is never read and
+  every answer, event and row is the one before.  With the global set the
+  rule is never read.
+
+* debito-cortesia-automatico Group 2: the rule's enforced path (its block,
+  its gates, ``unknown`` only under it, the capture passed down) is
+  reached only by a builder that ever received courtesy, and the corpus
+  grants none: every pre-check, phase, answer and row is the one before.
+  With the global unset and no mark event, a tick of the publisher or the
+  orphan pass reads one statement more, whether any courtesy lot exists
+  (``ANY_COURTESY_LOT_READ``), finds none and stops; with the global set no
+  worker reads it.
+
+* debito-cortesia-automatico Group 3 (the Uazapi section, at the end):
+  the Uazapi adapter charges only under the courtesy rule, so for a
+  Uazapi turn under no mode, a mark, the global, a protected courtesy or a
+  standalone tenant -- verified or not -- the real app answers, sends,
+  stores and meters exactly like the same turn with the adapter's capture
+  and pre-check taken out (``prod-fe800aec``'s route, which read no mode),
+  and its statements are that turn's plus ONE contiguous mode read: the
+  global (1 statement) and, with it unset, the tenant's builder (+1), the
+  builder's latest mark (+1), the courtesy rule (+1, with no mark) and the
+  paid plan (+1, only with the courtesy spent).  The corpus' own Uazapi
+  turns (a standalone tenant) read the global and the tenant, and nothing
+  else changes.
+
 Groups 3-7 append their surfaces to the corpus and to these runs, always
 also below the image's credit minimum.
 """
@@ -114,6 +144,7 @@ also below the image's credit minimum.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import hmac
@@ -1663,6 +1694,58 @@ async def test_the_effective_switch_only_meters_observationally(
     } == {}
 
 
+async def test_the_courtesy_rule_is_the_only_new_read(oracle: _Oracle) -> None:
+    """debito-cortesia-automatico Group 1 (wish Decision 8): with the switch
+    effective and the global unset, every read of the effective enforcement
+    of an unmarked builder adds the courtesy rule's ONE statement
+    (``CreditRepository.courtesy_rule``) to its mark read -- the corpus
+    grants no courtesy, so the paid plan's statement never runs, and
+    the answers, events and rows stay the ones above; with the global set
+    the rule is never read."""
+
+    from tests.integration.credit_rollout_world import (
+        COURTESY_RULE_READ,
+        PAID_PLAN_READ,
+    )
+
+    run = await oracle.run(_READY, enabled=True)
+    statements = [s.strip() for s in run["statements"]]
+    rule = [s for s in statements if COURTESY_RULE_READ.fullmatch(s)]
+    marks = [s for s in statements if _MARK_READ.fullmatch(s)]
+    # One rule read per mark read of an unmarked builder (the workers' ticks
+    # interleave their own statements, so only the counts are compared).
+    assert rule and len(rule) == len(marks)
+    assert not any(PAID_PLAN_READ.fullmatch(s) for s in statements)
+    enforced = await oracle.run(_READY, enabled=True, enforced=True)
+    assert not any(
+        COURTESY_RULE_READ.fullmatch(s.strip()) or PAID_PLAN_READ.fullmatch(s.strip())
+        for s in enforced["statements"]
+    )
+
+
+async def test_the_workers_courtesy_trigger_is_read_only_after_the_marks(
+    oracle: _Oracle,
+) -> None:
+    """debito-cortesia-automatico Group 2 (DESIGN Decision 20): the workers'
+    one new statement (``credit_rollout.any_courtesy_lot``) runs only after
+    the same tick's any-mark read -- never more of them than of it -- and
+    never with the global set; the corpus grants no courtesy, so it finds no
+    lot, and the answers, events and rows stay the ones above."""
+
+    from tests.integration.credit_rollout_world import ANY_COURTESY_LOT_READ
+
+    run = await oracle.run(_READY, enabled=True)
+    statements = [s.strip() for s in run["statements"]]
+    lots = sum(1 for s in statements if ANY_COURTESY_LOT_READ.fullmatch(s))
+    worker_marks = sum(1 for s in statements if _ANY_MARK_READ.fullmatch(s))
+    assert lots <= worker_marks
+    assert run["credit_rows"]["credit_lots"] == 0
+    enforced = await oracle.run(_READY, enabled=True, enforced=True)
+    assert not any(
+        ANY_COURTESY_LOT_READ.fullmatch(s.strip()) for s in enforced["statements"]
+    )
+
+
 def _event_id(run: dict[str, Any], case: str) -> str:
     [body] = [r["body"] for r in run["responses"] if r["id"] == case]
     return str(body["event_id"])
@@ -2478,12 +2561,584 @@ async def test_the_refresh_follows_an_upgrade_and_a_downgrade(
     # cobranca-credito-por-builder Group 3: at the 047 head, with the global
     # unset, the tick also reads whether any mark event exists
     # (``_ANY_MARK_READ``) -- none does, so it still claims nothing.
+    # debito-cortesia-automatico Group 2: with neither, the tick also reads
+    # whether any courtesy lot exists (``ANY_COURTESY_LOT_READ``) -- none
+    # does here, so it still claims nothing.
+    from tests.integration.credit_rollout_world import ANY_COURTESY_LOT_READ
+
     credit_sql = [s for s in statements if _CREDIT_SQL.search(s)]
     assert all(
-        _ENFORCEMENT_READ.fullmatch(s.strip()) or _ANY_MARK_READ.fullmatch(s.strip())
+        _ENFORCEMENT_READ.fullmatch(s.strip())
+        or _ANY_MARK_READ.fullmatch(s.strip())
+        or ANY_COURTESY_LOT_READ.fullmatch(s.strip())
         for s in credit_sql
     ), credit_sql
-    # The any-mark read always follows the same tick's global read.
+    # The any-mark read always follows the same tick's global read, and the
+    # courtesy-lot read the same tick's any-mark read.
     assert sum(1 for s in credit_sql if _ANY_MARK_READ.fullmatch(s.strip())) <= sum(
         1 for s in credit_sql if _ENFORCEMENT_READ.fullmatch(s.strip())
     ), credit_sql
+    assert sum(
+        1 for s in credit_sql if ANY_COURTESY_LOT_READ.fullmatch(s.strip())
+    ) <= sum(1 for s in credit_sql if _ANY_MARK_READ.fullmatch(s.strip())), credit_sql
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 3: the Uazapi section.  In one process --
+# the real app, its lifespan and pool, the LLM and the providers faked --
+# each mode is set, then three turns of the same Uazapi tenant run: a
+# warm-up and a baseline with the adapter's capture and pre-check taken out
+# (the route as ``prod-fe800aec`` ran it: no mode read), then the real one.
+# Only the statements of the request itself are compared (a context
+# variable tags them: the workers' ticks never carry it).
+# ---------------------------------------------------------------------------
+
+_IN_TURN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "credit_dominance_uazapi_turn", default=False
+)
+# ``CreditRepository.tenant_scope`` without the lock (lock order step 0).
+_TENANT_SCOPE_READ = re.compile(
+    r"SELECT tenants\.id, tenants\.builder_id\s+FROM tenants\s+"
+    r"WHERE tenants\.id = \$1::UUID"
+)
+
+
+@pytest.fixture(scope="module")
+async def uazapi_template() -> AsyncIterator[Any]:
+    """A head database of its own, never connected after its migration: each
+    proof runs on a clone of it (the oracle's templates are its own)."""
+
+    raw_admin_url = os.getenv("POSTGRES_SMOKE_DATABASE_URL")
+    if raw_admin_url is None:
+        pytest.skip("POSTGRES_SMOKE_DATABASE_URL is not configured")
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from tests.integration.test_asaas_billing_postgres import _validated_admin_url
+    from tests.integration.test_migration_036_postgres import _Cluster, _migrate
+
+    admin_url = _validated_admin_url(raw_admin_url)
+    admin = create_async_engine(
+        admin_url, isolation_level="AUTOCOMMIT", poolclass=NullPool
+    )
+    cluster = _Cluster(admin_url=admin_url, admin=admin, created=[])
+    try:
+        name = await cluster.fresh()
+        await _migrate(cluster.url(name), "upgrade", "head")
+        yield cluster, name
+    finally:
+        for created in list(reversed(cluster.created)):
+            await cluster.drop(created)
+        await admin.dispose()
+
+
+@pytest.fixture
+async def uazapi_head(uazapi_template: Any) -> Any:
+    """A fresh head database per proof (a clone of the template)."""
+
+    from tests.integration.test_credit_metering_postgres import _PG
+
+    cluster, template = uazapi_template
+    name = await cluster.clone(template)
+    return _PG(cluster=cluster, url=cluster.url(name))
+
+
+@contextmanager
+def _turn_statements() -> Iterator[list[str]]:
+    """Every statement any engine runs while ``_IN_TURN`` is set."""
+
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    seen: list[str] = []
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        if _IN_TURN.get():
+            seen.append(statement.strip())
+
+    event.listen(Engine, "before_cursor_execute", record)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", record)
+
+
+async def _uazapi_turn(
+    client: Any, body: dict[str, Any], statements: list[str]
+) -> tuple[list[str], Any]:
+    start = len(statements)
+    token = _IN_TURN.set(True)
+    try:
+        answer = await client.post("/v1/webhook/uazapi", json=body)
+    finally:
+        _IN_TURN.reset(token)
+    return statements[start:], answer
+
+
+def _uazapi_body(world: Any, message_id: str, phone: str, token: str | None) -> Any:
+    body: dict[str, Any] = {
+        "instanceName": world.uazapi_instance,
+        "message": {
+            "messageid": message_id,
+            "type": "text",
+            "text": "Olá, qual o valor da consulta?",
+            "fromMe": False,
+            "sender_pn": f"{phone}@s.whatsapp.net",
+        },
+        "chat": {"wa_chatid": f"{phone}@s.whatsapp.net"},
+    }
+    if token is not None:
+        body["token"] = token
+    return body
+
+
+async def _uazapi_writes(
+    direct: Any, tenant: UUID, message_id: str, phone: str, token: str | None
+) -> Any:
+    """What one turn wrote: its claim (its payload digest checked against
+    the turn's own message, which differs from turn to turn), its
+    observation, its events (type, content, origin), and every enforced
+    row."""
+
+    from sqlalchemy import text as sql
+
+    from src.services.credit_metering import provider_message_sha256
+
+    async with direct.connect() as connection:
+
+        async def rows(statement: str, **params: Any) -> list[Any]:
+            return [
+                tuple(row)
+                for row in (await connection.execute(sql(statement), params)).all()
+            ]
+
+        claim = await rows(
+            "SELECT source, mode, principal_id, payload_sha256 FROM "
+            "credit_ingress_claims WHERE tenant_id = :t AND "
+            "provider_message_id = :m",
+            t=tenant,
+            m=message_id,
+        )
+        observed = await rows(
+            "SELECT o.effect_kind, o.origin, o.authenticated, o.would_debit_mc "
+            "FROM credit_observational_effects o JOIN credit_ingress_claims c ON "
+            "c.tenant_id = o.tenant_id AND o.trace_id = c.interaction_id WHERE "
+            "c.tenant_id = :t AND c.provider_message_id = :m",
+            t=tenant,
+            m=message_id,
+        )
+        events = await rows(
+            "SELECT e.event_type, e.event_data ->> 'content', e.interaction_origin "
+            "FROM events e JOIN sessions s ON s.id = e.session_id WHERE "
+            "s.tenant_id = :t AND s.user_id = :p ORDER BY e.event_type, "
+            "e.event_data ->> 'content'",
+            t=tenant,
+            p=phone,
+        )
+        enforced = await rows(
+            "SELECT (SELECT count(*) FROM credit_ingress_claims WHERE tenant_id = :t "
+            "AND mode = 'enforced'), (SELECT count(*) FROM credit_effects WHERE "
+            "tenant_id = :t AND effect_kind = 'trace'), (SELECT count(*) FROM "
+            "credit_response_outbox WHERE tenant_id = :t), (SELECT count(*) FROM "
+            "credit_ledger_entries WHERE entry_type IN ('debit', 'debt'))",
+            t=tenant,
+        )
+    digest = provider_message_sha256(
+        _uazapi_body(_SimpleWorld(), message_id, phone, token)["message"]
+    )
+    assert all(row[3] == digest for row in claim), (claim, digest)
+    return {
+        "claim": [row[:3] for row in claim],
+        "observed": observed,
+        "events": events,
+        "enforced": enforced,
+    }
+
+
+class _SimpleWorld:
+    """Only what ``_uazapi_body`` reads of a world for the message object."""
+
+    uazapi_instance = ""
+
+
+def _inserted_block(baseline: list[str], real: list[str]) -> list[str]:
+    """The ONE contiguous block ``real`` has that ``baseline`` has not --
+    everything else equal and in order -- or a failed assertion."""
+
+    head = 0
+    while head < len(baseline) and head < len(real) and baseline[head] == real[head]:
+        head += 1
+    extra = len(real) - len(baseline)
+    assert extra >= 0, (baseline, real)
+    assert real[head + extra :] == baseline[head:], (head, baseline, real)
+    return real[head : head + extra]
+
+
+_UAZAPI_DELTA = {
+    "global": ("enforcement",),
+    "standalone": ("enforcement", "tenant"),
+    "mark": ("enforcement", "tenant", "mark"),
+    "none": ("enforcement", "tenant", "mark", "rule"),
+    "protected": ("enforcement", "tenant", "mark", "rule", "paid_plan"),
+}
+
+
+def _statement_kind(statement: str) -> str:
+    from tests.integration.credit_rollout_world import (
+        COURTESY_RULE_READ,
+        PAID_PLAN_READ,
+    )
+
+    for kind, pattern in (
+        ("enforcement", _ENFORCEMENT_READ),
+        ("tenant", _TENANT_SCOPE_READ),
+        ("mark", _MARK_READ),
+        ("rule", COURTESY_RULE_READ),
+        ("paid_plan", PAID_PLAN_READ),
+    ):
+        if pattern.fullmatch(statement):
+            return kind
+    return f"unexpected: {statement}"
+
+
+@pytest.mark.parametrize("verified", [False, True], ids=["unverified", "verified"])
+@pytest.mark.parametrize("mode", sorted(_UAZAPI_DELTA))
+async def test_a_uazapi_turn_outside_the_rule_is_main_s_plus_one_mode_read(
+    uazapi_head: Any, monkeypatch: pytest.MonkeyPatch, mode: str, verified: bool
+) -> None:
+    """Group 3 dominance (wish Decision 8, the Z-API amendment's precedent):
+    outside the courtesy rule a Uazapi turn -- verified or not -- answers,
+    sends and writes exactly what the same turn writes with the adapter's
+    capture and pre-check taken out (``prod-fe800aec`` read no mode on
+    Uazapi), and runs exactly its statements plus ONE contiguous mode read,
+    the exact statements of :data:`_UAZAPI_DELTA` -- never a second read,
+    never the egress question, never an enforced row."""
+
+    from types import SimpleNamespace
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from src.api.routes import webhook
+    from src.services import credit_metering, egress_policy
+    from tests.integration.credit_rollout_world import (
+        grant_courtesy,
+        make_topup,
+        record_mark,
+        relink_tenant,
+        remove_courtesy,
+    )
+    from tests.integration.test_credit_metering_postgres import _running_app
+
+    async def no_egress_question() -> bool:
+        raise AssertionError("the egress was read outside the rule")
+
+    monkeypatch.setattr(egress_policy, "uazapi_egress_open", no_egress_question)
+    monkeypatch.setattr(webhook, "_get_redis", lambda: None)
+    if verified:
+
+        async def enforced() -> bool:
+            return True
+
+        monkeypatch.setattr(webhook, "uazapi_webhook_auth_enforced", enforced)
+
+    async def no_capture(*_args: Any, **_kwargs: Any) -> Any:
+        return credit_metering.EarlyWebhookCapture(capture=None)
+
+    async def no_precheck(*_args: Any, **_kwargs: Any) -> Any:
+        return None
+
+    direct = create_async_engine(uazapi_head.url, poolclass=NullPool)
+    try:
+        async with _running_app(uazapi_head, monkeypatch) as running:
+            world, client = running.world, running.client
+            tenant, builder = UUID(world.uazapi_tenant), UUID(world.builder)
+            if mode != "standalone":
+                await relink_tenant(direct, tenant, builder)
+            if mode == "mark":
+                await record_mark(direct, builder)
+            elif mode == "global":
+                from sqlalchemy import text as sql
+
+                async with direct.begin() as connection:
+                    await connection.execute(
+                        sql(
+                            "INSERT INTO credit_enforcement_state (id, "
+                            "credit_enforcement_at, set_by, set_at) VALUES (1, "
+                            "clock_timestamp() - interval '1 minute', 'test', "
+                            "clock_timestamp())"
+                        )
+                    )
+            elif mode == "protected":
+                granted = await grant_courtesy(direct, builder, 3)
+                await remove_courtesy(direct, granted.lot_id)
+                await make_topup(SimpleNamespace(engine=direct), builder)
+            credit_metering.forget_enforcement_seen()
+            token: str | None = None
+            if verified:
+                from sqlalchemy import text as sql
+
+                async with direct.connect() as connection:
+                    token = (
+                        await connection.execute(
+                            sql(
+                                "SELECT api_credentials ->> 'uazapi_token' FROM "
+                                "clinic_configs WHERE tenant_id = :t"
+                            ),
+                            {"t": tenant},
+                        )
+                    ).scalar_one()
+            turns = [
+                (f"uazapi-dominance-{mode}-{n}", f"55119000{40 + n:02d}{n:03d}")
+                for n in range(3)
+            ]
+            with _turn_statements() as statements:
+                with monkeypatch.context() as baseline:
+                    baseline.setattr(credit_metering, "capture_uazapi", no_capture)
+                    baseline.setattr(credit_metering, "precheck_uazapi", no_precheck)
+                    for message_id, phone in turns[:2]:
+                        before, before_answer = await _uazapi_turn(
+                            client,
+                            _uazapi_body(world, message_id, phone, token),
+                            statements,
+                        )
+                message_id, phone = turns[2]
+                after, after_answer = await _uazapi_turn(
+                    client, _uazapi_body(world, message_id, phone, token), statements
+                )
+            sends = webhook.send_uazapi_text.await_args_list  # type: ignore[attr-defined]
+            texts = {call.args[2]: call.args[3] for call in sends}
+            writes = [
+                await _uazapi_writes(direct, tenant, message_id, phone, token)
+                for message_id, phone in turns[1:]
+            ]
+    finally:
+        await direct.dispose()
+        credit_metering.forget_enforcement_seen()
+
+    assert before_answer.status_code == after_answer.status_code == 200
+    assert before_answer.json() == after_answer.json() == {"ok": True, "replied": True}
+    assert texts[turns[1][1]] == texts[turns[2][1]] == _LLM_REPLY
+    baseline_writes, real_writes = writes
+    assert baseline_writes == real_writes, (baseline_writes, real_writes)
+    assert real_writes["enforced"] == [(0, 0, 0, 0)]
+    expected_claim = [] if mode == "global" else [("uazapi", "observational")]
+    assert [claim[:2] for claim in real_writes["claim"]] == expected_claim
+    delta = _inserted_block(before, after)
+    assert tuple(_statement_kind(s) for s in delta) == _UAZAPI_DELTA[mode], delta
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico Group 4 (wish Decision 8, the Uazapi amendment
+# extended to Evolution): outside the courtesy rule an Evolution turn is
+# main's turn plus ONE contiguous mode read.  Same method as the Uazapi proof
+# above: per mode, two warm-up/baseline turns with the adapter's capture and
+# pre-check taken out (the route as ``prod-fe800aec`` ran it: no mode read),
+# then the real one; only the request's own statements are compared.
+# ---------------------------------------------------------------------------
+
+
+def _evolution_body(world: Any, message_id: str, phone: str) -> Any:
+    return {
+        "event": "messages.upsert",
+        "instance": world.evolution_instance,
+        "data": {
+            "key": {
+                "remoteJid": f"{phone}@s.whatsapp.net",
+                "fromMe": False,
+                "id": message_id,
+            },
+            "message": {"conversation": "Olá, qual o valor da consulta?"},
+            "pushName": "Paciente",
+        },
+    }
+
+
+async def _evolution_turn(
+    client: Any, body: dict[str, Any], statements: list[str]
+) -> tuple[list[str], Any]:
+    start = len(statements)
+    token = _IN_TURN.set(True)
+    try:
+        answer = await client.post("/v1/webhook/evolution", json=body)
+    finally:
+        _IN_TURN.reset(token)
+    return statements[start:], answer
+
+
+async def _evolution_writes(
+    direct: Any, world: Any, tenant: UUID, message_id: str, phone: str
+) -> Any:
+    """What one Evolution turn wrote: its claim (its payload digest checked
+    against the turn's own ``data``), its observation, its events (type,
+    content, origin) and every enforced row."""
+
+    from sqlalchemy import text as sql
+
+    from src.services.credit_metering import provider_message_sha256
+
+    async with direct.connect() as connection:
+
+        async def rows(statement: str, **params: Any) -> list[Any]:
+            return [
+                tuple(row)
+                for row in (await connection.execute(sql(statement), params)).all()
+            ]
+
+        claim = await rows(
+            "SELECT source, mode, principal_id, payload_sha256 FROM "
+            "credit_ingress_claims WHERE tenant_id = :t AND "
+            "provider_message_id = :m",
+            t=tenant,
+            m=message_id,
+        )
+        observed = await rows(
+            "SELECT o.effect_kind, o.origin, o.authenticated, o.would_debit_mc "
+            "FROM credit_observational_effects o JOIN credit_ingress_claims c ON "
+            "c.tenant_id = o.tenant_id AND o.trace_id = c.interaction_id WHERE "
+            "c.tenant_id = :t AND c.provider_message_id = :m",
+            t=tenant,
+            m=message_id,
+        )
+        events = await rows(
+            "SELECT e.event_type, e.event_data ->> 'content', e.interaction_origin "
+            "FROM events e JOIN sessions s ON s.id = e.session_id WHERE "
+            "s.tenant_id = :t AND s.user_id = :p ORDER BY e.event_type, "
+            "e.event_data ->> 'content'",
+            t=tenant,
+            p=phone,
+        )
+        enforced = await rows(
+            "SELECT (SELECT count(*) FROM credit_ingress_claims WHERE tenant_id = :t "
+            "AND mode = 'enforced'), (SELECT count(*) FROM credit_effects WHERE "
+            "tenant_id = :t AND effect_kind = 'trace'), (SELECT count(*) FROM "
+            "credit_response_outbox WHERE tenant_id = :t), (SELECT count(*) FROM "
+            "credit_ledger_entries WHERE entry_type IN ('debit', 'debt'))",
+            t=tenant,
+        )
+        stored_echo = await rows(
+            "SELECT metadata -> 'ai_msg_ids' FROM sessions WHERE tenant_id = :t "
+            "AND user_id = :p",
+            t=tenant,
+            p=phone,
+        )
+    digest = provider_message_sha256(_evolution_body(world, message_id, phone)["data"])
+    assert all(row[3] == digest for row in claim), (claim, digest)
+    return {
+        "claim": [row[:3] for row in claim],
+        "observed": observed,
+        "events": events,
+        "enforced": enforced,
+        # The stored echo id (its timestamp is the turn's, so only the ids).
+        "echo": [[entry[0] for entry in (ids or [])] for (ids,) in stored_echo],
+    }
+
+
+@pytest.mark.parametrize("mode", sorted(_UAZAPI_DELTA))
+async def test_an_evolution_turn_outside_the_rule_is_main_s_plus_one_mode_read(
+    uazapi_head: Any, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Group 4 dominance (wish Decision 8, the Uazapi amendment extended):
+    outside the courtesy rule -- the global, a standalone tenant, a mark, no
+    mode, a protected courtesy (spent, a paid plan in force) -- an Evolution
+    turn answers, sends and writes exactly what the same turn writes with the
+    adapter's capture and pre-check taken out (``prod-fe800aec`` read no mode
+    on Evolution), and runs exactly its statements plus ONE contiguous mode
+    read, the exact statements of :data:`_UAZAPI_DELTA` (the same precedence
+    read) -- never a second read, never an egress question, never an enforced
+    row."""
+
+    from types import SimpleNamespace
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from src.api.routes import webhook
+    from src.services import credit_metering, egress_policy
+    from tests.integration.credit_rollout_world import (
+        grant_courtesy,
+        make_topup,
+        record_mark,
+        relink_tenant,
+        remove_courtesy,
+    )
+    from tests.integration.test_credit_metering_postgres import _running_app
+
+    async def no_egress_question() -> bool:
+        raise AssertionError("an egress flag was read for Evolution")
+
+    monkeypatch.setattr(egress_policy, "uazapi_egress_open", no_egress_question)
+    monkeypatch.setattr(webhook, "_get_redis", lambda: None)
+
+    async def no_capture(*_args: Any, **_kwargs: Any) -> Any:
+        return credit_metering.EarlyWebhookCapture(capture=None)
+
+    async def no_precheck(*_args: Any, **_kwargs: Any) -> Any:
+        return None
+
+    direct = create_async_engine(uazapi_head.url, poolclass=NullPool)
+    try:
+        async with _running_app(uazapi_head, monkeypatch) as running:
+            world, client = running.world, running.client
+            tenant, builder = UUID(world.evolution_tenant), UUID(world.builder)
+            # The shared world seeds the Evolution tenant under the builder.
+            if mode == "standalone":
+                await relink_tenant(direct, tenant, None)
+            elif mode == "mark":
+                await record_mark(direct, builder)
+            elif mode == "global":
+                from sqlalchemy import text as sql
+
+                async with direct.begin() as connection:
+                    await connection.execute(
+                        sql(
+                            "INSERT INTO credit_enforcement_state (id, "
+                            "credit_enforcement_at, set_by, set_at) VALUES (1, "
+                            "clock_timestamp() - interval '1 minute', 'test', "
+                            "clock_timestamp())"
+                        )
+                    )
+            elif mode == "protected":
+                granted = await grant_courtesy(direct, builder, 3)
+                await remove_courtesy(direct, granted.lot_id)
+                await make_topup(SimpleNamespace(engine=direct), builder)
+            credit_metering.forget_enforcement_seen()
+            turns = [
+                (f"evolution-dominance-{mode}-{n}", f"55119001{40 + n:02d}{n:03d}")
+                for n in range(3)
+            ]
+            with _turn_statements() as statements:
+                with monkeypatch.context() as baseline:
+                    baseline.setattr(credit_metering, "capture_evolution", no_capture)
+                    baseline.setattr(credit_metering, "precheck_evolution", no_precheck)
+                    for message_id, phone in turns[:2]:
+                        before, before_answer = await _evolution_turn(
+                            client,
+                            _evolution_body(world, message_id, phone),
+                            statements,
+                        )
+                message_id, phone = turns[2]
+                after, after_answer = await _evolution_turn(
+                    client, _evolution_body(world, message_id, phone), statements
+                )
+            sends = webhook.send_evolution_text.await_args_list  # type: ignore[attr-defined]
+            texts = {call.args[3]: call.args[4] for call in sends}
+            writes = [
+                await _evolution_writes(direct, world, tenant, message_id, phone)
+                for message_id, phone in turns[1:]
+            ]
+    finally:
+        await direct.dispose()
+        credit_metering.forget_enforcement_seen()
+
+    assert before_answer.status_code == after_answer.status_code == 200
+    assert before_answer.json() == after_answer.json() == {"ok": True, "replied": True}
+    assert texts[turns[1][1]] == texts[turns[2][1]] == _LLM_REPLY
+    baseline_writes, real_writes = writes
+    assert baseline_writes == real_writes, (baseline_writes, real_writes)
+    assert real_writes["enforced"] == [(0, 0, 0, 0)]
+    assert real_writes["echo"] == [["credit-dominance-evolution-reply"]]
+    expected_claim = [] if mode == "global" else [("evolution", "observational")]
+    assert [claim[:2] for claim in real_writes["claim"]] == expected_claim
+    delta = _inserted_block(before, after)
+    assert tuple(_statement_kind(s) for s in delta) == _UAZAPI_DELTA[mode], delta

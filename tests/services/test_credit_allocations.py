@@ -29,6 +29,7 @@ from src.services.credit_allocations import (
     accounting_window,
     aggregate_target_mc,
     charge_delta,
+    courtesy_payable,
     egress_allowance_bytes,
     egress_effect_id,
     egress_target_mc,
@@ -334,3 +335,49 @@ def test_identities_are_stable_and_scoped() -> None:
     assert opening_source_key(window, "media") == "window:2026-10-15:media:opening"
     with pytest.raises(ValueError):
         AccountingWindow(date(2026, 10, 15), date(2026, 10, 15), "cycle")
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico: a charge under the courtesy rule (wish
+# Decision 6) -- only what the courtesy pays, the rest outside the coverage.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("delta", "spendable", "paid"),
+    [(600, 5_000, 600), (1_500, 1_000, 1_000), (100, 0, 0), (0, 3_000, 0)],
+)
+def test_the_courtesy_pays_what_it_holds_and_nothing_more(
+    delta: int, spendable: int, paid: int
+) -> None:
+    assert courtesy_payable(delta, spendable) == paid
+    for bad in ((-1, 0), (0, -1)):
+        with pytest.raises(ValueError):
+            courtesy_payable(*bad)
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    targets=st.lists(st.integers(0, 50_000), min_size=1, max_size=8),
+    grants=st.lists(st.integers(0, 20_000), min_size=1, max_size=8),
+)
+def test_unpaid_charges_are_billed_by_the_next_one_and_never_twice(
+    targets: list[int], grants: list[int]
+) -> None:
+    """A window's charges in sequence, the courtesy topped up between them:
+    the coverage is what was paid, the paid total never exceeds the highest
+    target (nothing is billed twice), and once the courtesy suffices the
+    coverage catches the target up (the gap is billed then)."""
+
+    coverage = paid_total = courtesy = 0
+    highest = 0
+    for index, target in enumerate(targets):
+        courtesy += grants[index % len(grants)]
+        highest = max(highest, target)
+        paid = courtesy_payable(charge_delta(target, coverage), courtesy)
+        courtesy -= paid
+        coverage += paid
+        paid_total += paid
+        assert coverage == paid_total <= highest
+        if courtesy > 0:
+            assert coverage >= target

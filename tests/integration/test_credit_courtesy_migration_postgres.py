@@ -383,6 +383,33 @@ _COURTESY_FILES = frozenset(
         "src/services/credit_rollout.py",
     }
 )
+# The files that name "courtesy" only as the ENFORCEMENT ORIGIN of the
+# courtesy rule (debito-cortesia-automatico: ``effective_enforcement`` returns
+# ``origin="courtesy"``), never the courtesy schema nor the lot kind (both
+# still forbidden in them, below).
+_COURTESY_RULE_FILES = frozenset(
+    {
+        # ``_enforced_book`` skips the ASAAS gates when the captured origin is
+        # the rule (the reservation is paid from courtesy only).
+        "src/services/credit_inventory.py",
+        # The prechecks, the capture and the debit phases compare the
+        # captured origin (``mark`` vs ``courtesy``) and build the rule's
+        # captured mode.
+        "src/services/credit_metering.py",
+        # Uazapi/Evolution agent media are charged only under the rule
+        # (origin ``courtesy``).
+        "src/services/reply_media.py",
+    }
+)
+# What a courtesy-rule file must still never name: the courtesy schema...
+_COURTESY_SCHEMA = re.compile(
+    r"credit_courtesy_events|CreditCourtesyEvent|courtesy_removal"
+)
+# ...nor the courtesy LOT KIND (a ``lot_kind`` compared with "courtesy" on
+# one line, either order).
+_COURTESY_LOT_KIND = re.compile(
+    r"lot_kind[^\n]*['\"]courtesy['\"]|['\"]courtesy['\"][^\n]*lot_kind"
+)
 
 
 def test_the_bridge_maps_the_046_schema_and_nothing_writes_or_reads_it() -> None:
@@ -392,7 +419,13 @@ def test_the_bridge_maps_the_046_schema_and_nothing_writes_or_reads_it() -> None
     the files in ``_COURTESY_FILES``.  In the bridge release (PR-A) that
     allowlist is empty by design; the courtesy release (Decision 17) extends
     it only with the files that implement the feature, and each of them must
-    exist, so a rename cannot silently weaken the guard."""
+    exist, so a rename cannot silently weaken the guard.
+
+    debito-cortesia-automatico adds a second, separate list,
+    ``_COURTESY_RULE_FILES``: files that may name "courtesy" only as the
+    courtesy rule's enforcement origin.  They must exist too, and they must
+    still name neither the courtesy schema (``_COURTESY_SCHEMA``) nor the
+    courtesy lot kind (``_COURTESY_LOT_KIND``)."""
 
     import src.models  # noqa: F401  (registers every model on Base.metadata)
     from src.models.credit import LEDGER_ENTRY_TYPES, LOT_KINDS
@@ -405,13 +438,20 @@ def test_the_bridge_maps_the_046_schema_and_nothing_writes_or_reads_it() -> None
         r"|'courtesy'|\"courtesy\""
     )
     # PR-A's staged version had no allowlist: every file was scanned.
-    for allowed in _COURTESY_FILES:
+    assert not _COURTESY_FILES & _COURTESY_RULE_FILES
+    for allowed in _COURTESY_FILES | _COURTESY_RULE_FILES:
         assert (_ROOT / allowed).is_file(), allowed
     for root in ("src/services", "src/api"):
         for path in sorted((_ROOT / root).rglob("*.py")):
-            if path.relative_to(_ROOT).as_posix() in _COURTESY_FILES:
+            relative = path.relative_to(_ROOT).as_posix()
+            if relative in _COURTESY_FILES:
                 continue
-            assert pattern.search(path.read_text(encoding="utf-8")) is None, path
+            source = path.read_text(encoding="utf-8")
+            if relative in _COURTESY_RULE_FILES:
+                assert _COURTESY_SCHEMA.search(source) is None, path
+                assert _COURTESY_LOT_KIND.search(source) is None, path
+                continue
+            assert pattern.search(source) is None, path
 
 
 # ---------------------------------------------------------------------------

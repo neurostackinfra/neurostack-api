@@ -16,6 +16,7 @@ proofs (which read the wall clock) hold on any day.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -679,32 +680,195 @@ def force_credit_switch(
 
 
 def forget_enforcement_latches() -> None:
-    """A fresh process for every D1 latch: the two global ones and the
-    per-tenant mark set."""
+    """A fresh process for every D1 latch: the two global ones, the
+    per-tenant mark set and (debito-cortesia-automatico) the per-tenant
+    courtesy rule set."""
 
     from src.services import credit_inventory, credit_metering
 
     credit_inventory.forget_enforcement_seen()
     credit_metering.forget_enforcement_seen()
     credit_metering.forget_enforcement_mark_seen()
+    credit_metering.forget_enforcement_rule_seen()
+
+
+# ---------------------------------------------------------------------------
+# The courtesy rule (debito-cortesia-automatico, Group 1): the shared helpers
+# of every suite that grants, removes or reads courtesy under the rule
+# (wish Decision 2: later groups import these).  ``target`` is a harness or
+# an ``AsyncEngine``.
+# ---------------------------------------------------------------------------
+
+COURTESY_ACTOR = UUID("00000000-0000-4000-8000-0000000000c1")
+COURTESY_REASON = "courtesy rule test"
+# The rule's one statement (``CreditRepository.courtesy_rule``) and the paid
+# plan's (``CreditRepository.paid_plan_in_force``), by their exact text as
+# asyncpg runs them: the dominance suites tell them apart from every other
+# credit statement.
+COURTESY_RULE_READ = re.compile(
+    r"SELECT credit_lots\.id, credit_lots\.expires_at, coalesce\(sum\(CASE "
+    r".* AS balance, min\(CASE WHEN \(credit_ledger_entries\.entry_type = "
+    r"\$3::VARCHAR\) THEN credit_ledger_entries\.occurred_at END\) AS granted_at"
+    r"\s+FROM credit_lots LEFT OUTER JOIN credit_ledger_entries ON "
+    r"credit_ledger_entries\.builder_id = credit_lots\.builder_id AND "
+    r"credit_ledger_entries\.lot_id = credit_lots\.id\s+WHERE "
+    r"credit_lots\.builder_id = \$4::UUID AND credit_lots\.lot_kind = "
+    r"\$5::VARCHAR GROUP BY credit_lots\.id, credit_lots\.expires_at",
+    re.DOTALL,
+)
+PAID_PLAN_READ = re.compile(
+    r"SELECT EXISTS \(SELECT credit_lots\.id\s+FROM credit_lots\s+WHERE "
+    r"credit_lots\.builder_id = \$1::UUID AND credit_lots\.lot_kind IN .*"
+    r"AS unbound_paid_cycle",
+    re.DOTALL,
+)
+# debito-cortesia-automatico Group 2: the workers' one extra statement after
+# the global and the marks (``credit_rollout.any_courtesy_lot``).
+ANY_COURTESY_LOT_READ = re.compile(
+    r"SELECT credit_lots\.id\s+FROM credit_lots\s+"
+    r"WHERE credit_lots\.lot_kind = \$1::VARCHAR\s+LIMIT \$2::INTEGER"
+)
+
+
+def courtesy_captured(at: datetime, state: str = "charged") -> Any:
+    """The mode a pre-check captures for a builder under the rule."""
+
+    from src.repositories.credit import EffectiveEnforcement
+
+    return EffectiveEnforcement(at, "courtesy", state=state)  # type: ignore[arg-type]
+
+
+async def grant_courtesy(
+    target: Any,
+    builder_id: UUID,
+    credits: int,
+    *,
+    at: datetime | None = None,
+) -> Any:
+    """A super admin's grant through the real service (its own transaction);
+    returns ``CourtesyGrantResult``."""
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.services import credit_courtesy
+
+    async with AsyncSession(_engine_of(target)) as session, session.begin():
+        return await credit_courtesy.grant(
+            session,
+            builder_id=builder_id,
+            credits=credits,
+            reason=COURTESY_REASON,
+            actor_user_id=COURTESY_ACTOR,
+            idempotency_key=f"courtesy-rule-{uuid4()}",
+            at=at,
+        )
+
+
+async def remove_courtesy(
+    target: Any,
+    lot_id: UUID,
+    *,
+    credits: int | None = None,
+    at: datetime | None = None,
+) -> Any:
+    """A super admin's removal ("Tirar tudo" without ``credits``) through the
+    real service; returns ``CourtesyRemovalResult``."""
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.services import credit_courtesy
+
+    async with AsyncSession(_engine_of(target)) as session, session.begin():
+        return await credit_courtesy.remove(
+            session,
+            lot_id=lot_id,
+            credits=credits,
+            remove_all=credits is None,
+            reason=COURTESY_REASON,
+            actor_user_id=COURTESY_ACTOR,
+            idempotency_key=f"courtesy-rule-removal-{uuid4()}",
+            at=at,
+        )
+
+
+async def effective_of(
+    target: Any, builder_id: UUID | None, *, at: datetime | None = None, **gates: Any
+) -> Any:
+    """``CreditRepository.effective_enforcement`` in its own read (rolled
+    back): the rule judged at ``at`` (default now)."""
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.repositories.credit import CreditRepository
+
+    async with AsyncSession(_engine_of(target)) as session:
+        try:
+            return await CreditRepository(session).effective_enforcement(
+                builder_id, at=at, **gates
+            )
+        finally:
+            await session.rollback()
+
+
+async def paid_lot_moves(target: Any, builder_id: UUID) -> list[tuple[str, str, int]]:
+    """Every entry that is not a grant on the builder's ``monthly`` and
+    ``topup`` lots: what the rule must never write."""
+
+    async with _engine_of(target).connect() as connection:
+        rows = await connection.execute(
+            text(
+                "SELECT l.lot_kind, e.entry_type, e.amount_mc FROM "
+                "credit_ledger_entries e JOIN credit_lots l ON l.builder_id = "
+                "e.builder_id AND l.id = e.lot_id WHERE e.builder_id = :b AND "
+                "l.lot_kind IN ('monthly', 'topup') AND e.entry_type <> 'grant' "
+                "ORDER BY e.occurred_at, e.id"
+            ),
+            {"b": builder_id},
+        )
+        return [(str(kind), str(entry), int(amount)) for kind, entry, amount in rows]
+
+
+async def debt_rows(target: Any, builder_id: UUID) -> tuple[int, int]:
+    """``(credit_debts, credit_debt_settlements)`` rows of the builder."""
+
+    async with _engine_of(target).connect() as connection:
+        debts = await connection.scalar(
+            text("SELECT count(*) FROM credit_debts WHERE builder_id = :b"),
+            {"b": builder_id},
+        )
+        settlements = await connection.scalar(
+            text("SELECT count(*) FROM credit_debt_settlements WHERE builder_id = :b"),
+            {"b": builder_id},
+        )
+    return int(debts), int(settlements)
 
 
 __all__ = [
+    "ANY_COURTESY_LOT_READ",
+    "COURTESY_ACTOR",
+    "COURTESY_REASON",
+    "COURTESY_RULE_READ",
     "Grant",
     "MARK_ACTOR",
     "MARK_REASON",
+    "PAID_PLAN_READ",
     "SAO_PAULO",
     "SHA",
     "Subscribed",
     "civil_today",
     "clean",
+    "courtesy_captured",
+    "debt_rows",
+    "effective_of",
     "execute",
     "execute_on",
     "force_credit_switch",
     "forget_enforcement_latches",
+    "grant_courtesy",
     "mark_events",
     "record_mark",
     "relink_tenant",
+    "remove_courtesy",
     "make_builder",
     "make_cycle",
     "make_monthly_grant",
@@ -714,6 +878,7 @@ __all__ = [
     "message_in",
     "observation",
     "outbox_fact",
+    "paid_lot_moves",
     "plant",
     "reverse_binding",
     "scalar",

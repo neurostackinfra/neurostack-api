@@ -81,6 +81,30 @@ retirado.").
   grants no subscription.
 - The builder receives no notice of the grant or the removal.
 
+## Under the courtesy rule (debito-cortesia-automatico)
+
+Once the courtesy rule serves, a grant is no longer free capacity only: a
+builder with no global and no mark that ever received a courtesy lot is
+charged from its courtesy, and blocked at once when the courtesy runs out
+and no paid plan is in force (`CreditRepository.effective_enforcement`,
+`src/repositories/credit.py`; operating it:
+[`credit-courtesy-rule.md`](./credit-courtesy-rule.md)).
+
+- **The first grant puts the builder under the rule.** Its instant is the
+  first grant's `occurred_at`; the window it falls in opens free of storage
+  charge (`test_the_first_grant_window_is_free_and_later_ones_charge_courtesy_only`,
+  `tests/integration/test_credit_courtesy_rule_postgres.py`).
+- **A grant first pays old open debt**: a builder with old debt can stay
+  blocked after a grant smaller than that debt
+  (`test_a_grant_or_a_paid_plan_unblocks_and_old_debt_is_settled_first`).
+- **"Tirar tudo" can block immediately.** The confirmation warns that
+  without a paid plan in force the builder is blocked at once and the agent
+  stops answering
+  (`frontend/artifacts/neurostack/src/components/admin/courtesy-credits-dialog.tsx`).
+  There is no 72-hour grace under the rule.
+- A removal is never usage, also for the rule's thresholds
+  (`test_a_removal_is_never_usage_for_the_courtesy_thresholds`).
+
 ## After L10 enforcement is armed (DESIGN Risk 3)
 
 Once `credit_enforcement_at` is set, courtesy credit is real capacity and a

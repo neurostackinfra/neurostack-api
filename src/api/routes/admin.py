@@ -45,6 +45,7 @@ from src.api.schemas.admin import (
     BillingTopupCapabilityEnableRequest,
     BuilderChargingResponse,
     BuilderClinicResponse,
+    BuilderCourtesyRule,
     BuilderWithClinicsResponse,
     ClinicSlotResponse,
     ClinicUserResponse,
@@ -99,7 +100,9 @@ from src.services.billing_read_contract import (
 )
 from src.services.billing_rollout import BillingRolloutOperationService
 from src.services.credit_switch import (
+    CreditSwitchReading,
     courtesy_gate_open,
+    courtesy_rule_gate_open,
     credit_switch_reading,
     enforcement_mark_gate_open,
     request_credit_switch,
@@ -938,17 +941,32 @@ async def _courtesy_by_builder(
     return summary
 
 
-def _charging_readable(request: Request) -> bool:
+def _rule_switch_reading(request: Request) -> CreditSwitchReading | None:
+    """The ONE switch reading the ``charging`` and ``courtesy_rule`` fields
+    of a table are both decided on (a refresh between two reads could
+    otherwise compute the rule with no marks read): ``None`` when the credit
+    switch this request captured is not effective or the reading fails."""
+
+    if not request_credit_switch(request):
+        return None
+    try:
+        return credit_switch_reading()
+    except Exception:
+        return None
+
+
+def _charging_readable(reading: CreditSwitchReading | None) -> bool:
     """cobranca-credito-por-builder (wish Group 5): the ``charging`` field
     reads ``credit_enforcement_marks`` only with the credit switch this
     request captured effective AND the 047 gate open on the switch reading
-    (below 047 the table does not exist).  The reading is read once;
-    anything that fails is "not readable", never a 500."""
+    (below 047 the table does not exist), the reading of
+    :func:`_rule_switch_reading`.  Anything that fails is "not readable",
+    never a 500."""
 
-    if not request_credit_switch(request):
+    if reading is None:
         return False
     try:
-        return enforcement_mark_gate_open(credit_switch_reading())
+        return enforcement_mark_gate_open(reading)
     except Exception:
         return False
 
@@ -960,6 +978,58 @@ def _charging_row(mark: EnforcementMarkRow | None) -> Any:
     if mark is None or mark.kind != "mark":
         return None
     return BuilderChargingResponse(marked_at=mark.occurred_at).model_dump(mode="json")
+
+
+def _courtesy_rule_readable(reading: CreditSwitchReading | None) -> bool:
+    """debito-cortesia-automatico (DESIGN item 13): the ``courtesy_rule``
+    field reads the builders' courtesy lots only with the credit switch this
+    request captured effective AND the courtesy rule's 046 gate open on the
+    switch reading (below 046 no builder is under the rule) -- the SAME
+    reading the ``charging`` field was decided on
+    (:func:`_rule_switch_reading`).  Anything that fails is "not readable",
+    never a 500."""
+
+    if reading is None:
+        return False
+    try:
+        return courtesy_rule_gate_open(reading)
+    except Exception:
+        return False
+
+
+async def _courtesy_rule_by_builder(
+    session: AsyncSession,
+    builder_ids: list[UUID],
+    at: datetime,
+    marked: set[UUID],
+) -> dict[UUID, BuilderCourtesyRule]:
+    """The courtesy rule's state of every listed builder under it, in a
+    bounded number of statements whatever the number of builders: the
+    global (one), the courtesy lots of every builder (one) and -- only when
+    some builder has courtesy but nothing spendable -- the paid plan in
+    force of those builders (one, wish Decision 8).  A builder absent from
+    the map is not under the rule.
+
+    The lots and paid plans are read by
+    ``CreditRepository.courtesy_rules_for_builders``, the batch of the
+    request path's reader (``courtesy_rule``/``paid_plan_in_force``) built
+    from the same expressions; the precedence global > mark > courtesy is
+    applied here: with the global set nobody is under the rule, and a
+    ``marked`` builder never is.  Plain reads, judged at ``at``."""
+
+    repository = CreditRepository(session)
+    if await repository.enforcement_at() is not None:
+        return {}
+    wanted = set(builder_ids) - marked
+    if not wanted:
+        return {}
+    readings = await repository.courtesy_rules_for_builders(wanted, at=at)
+    states: dict[UUID, BuilderCourtesyRule] = {}
+    for builder_id, reading in readings.items():
+        state = reading.state
+        if state is not None:
+            states[builder_id] = state
+    return states
 
 
 def _subscription_row(subscription: SubscriptionReadback | None) -> Any:
@@ -997,7 +1067,18 @@ def _subscription_row(subscription: SubscriptionReadback | None) -> Any:
         "charged: if the global enforcement is ever armed every builder is "
         "charged and only the marked rows still carry it. No route marks or "
         "unmarks a builder: the only writer is the operator command "
-        "`credit_charge_mark` (a one-off operator task)."
+        "`credit_charge_mark` (a one-off operator task). And "
+        "`courtesy_rule`, read-only and computed on every read (never "
+        'stored): "charged" for a builder under the courtesy rule (it '
+        "received courtesy, the global enforcement is unset and it has no "
+        'operator mark) with courtesy left, debited from it; "blocked" '
+        "for one under the rule with no courtesy left and no paid plan in "
+        "force (its agent, RAG and media are suspended now); null for a "
+        "builder not under the rule (never received courtesy, marked, or "
+        "protected by a paid plan in force), and for every row while the "
+        "global enforcement is set, the credit switch is not effective, the "
+        "schema is below 046, or the read failed. `charging` does not change "
+        "with it."
     ),
     response_model=None,
 )
@@ -1021,15 +1102,15 @@ async def builder_subscriptions(
         }
         for b in result.scalars().all()
     ]
+    # One instant for the courtesy summary and the courtesy rule.
+    now = datetime.now(timezone.utc)
     courtesy: dict[UUID, dict[str, Any]] | None = None
     if _courtesy_shown(request):
         try:
             # A savepoint: a failed read never poisons the outer transaction
             # the subscription reads below still use.
             async with session.begin_nested():
-                courtesy = await _courtesy_by_builder(
-                    session, datetime.now(timezone.utc)
-                )
+                courtesy = await _courtesy_by_builder(session, now)
         except Exception as error:
             logger.warning(
                 "builder courtesy summary unreadable; courtesy is null",
@@ -1037,7 +1118,9 @@ async def builder_subscriptions(
             )
             courtesy = None
     marks: dict[UUID, EnforcementMarkRow] | None = None
-    if _charging_readable(request):
+    switch_reading = _rule_switch_reading(request)
+    charging_readable = _charging_readable(switch_reading)
+    if charging_readable:
         try:
             # ONE statement for every builder of the table, in its own
             # savepoint: a failed read is `charging` null for this response
@@ -1053,6 +1136,32 @@ async def builder_subscriptions(
                 error_type=type(error).__name__,
             )
             marks = None
+    # debito-cortesia-automatico (DESIGN item 13): the courtesy rule's state,
+    # a bounded batch for the whole table (never one read per builder), in
+    # its own savepoint.  The marks just read decide the precedence (a
+    # marked builder is never under the rule); below 047 no builder can be
+    # marked; a failed marks read leaves the precedence unknown, so the
+    # field is null for every row, as is a failed read of its own.
+    rule: dict[UUID, BuilderCourtesyRule] | None = None
+    if _courtesy_rule_readable(switch_reading) and (
+        marks is not None or not charging_readable
+    ):
+        marked = (
+            set()
+            if marks is None
+            else {builder for builder, mark in marks.items() if mark.kind == "mark"}
+        )
+        try:
+            async with session.begin_nested():
+                rule = await _courtesy_rule_by_builder(
+                    session, [UUID(row["id"]) for row in builders], now, marked
+                )
+        except Exception as error:
+            logger.warning(
+                "builder courtesy rule unreadable; courtesy_rule is null",
+                error_type=type(error).__name__,
+            )
+            rule = None
     rows: list[dict[str, Any]] = []
     for row in builders:
         builder_id = UUID(row["id"])
@@ -1086,6 +1195,7 @@ async def builder_subscriptions(
                 "charging": (
                     None if marks is None else _charging_row(marks.get(builder_id))
                 ),
+                "courtesy_rule": None if rule is None else rule.get(builder_id),
             }
         )
     return rows

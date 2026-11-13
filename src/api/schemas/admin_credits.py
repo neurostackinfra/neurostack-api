@@ -129,7 +129,10 @@ class CreditBindingStatus(_Strict):
         description=(
             "An unexpired courtesy lot with a positive balance: counts for the "
             "enforcement cutoff's coverage only, never for `usable` nor "
-            "`reconciliation_failure`."
+            "`reconciliation_failure`. Under the courtesy rule (a builder with "
+            "courtesy, neither the global enforcement nor an operator mark) "
+            "requests are not gated by this coverage nor by a quarantine at "
+            "all: they debit only courtesy lots, which need no ASAAS fact."
         ),
     )
     usable: bool

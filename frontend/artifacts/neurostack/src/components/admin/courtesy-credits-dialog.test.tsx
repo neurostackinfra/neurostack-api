@@ -511,6 +511,57 @@ describe("CourtesyCreditsDialog: Tirar créditos", () => {
     expect(postCalls()[0].body).toEqual({ remove_all: true, reason: REASON });
   });
 
+  // debito-cortesia-automatico: under the courtesy rule, a builder left with
+  // no courtesy and no paid plan in force is blocked at once (no grace).
+  const BLOCK_WARNING =
+    "Se este for o último saldo de cortesia do builder e ele não tiver plano pago em vigor, ele fica bloqueado na hora: o agente para de responder.";
+
+  it("Tirar tudo warns, in the confirmation, that without a paid plan the builder is blocked immediately", async () => {
+    renderDialog();
+    const removal = await openRemoval();
+    fireEvent.click(removal.getByRole("checkbox", { name: "Tirar tudo" }));
+    fireEvent.change(removal.getByLabelText("Motivo (obrigatório)"), { target: { value: REASON } });
+    // Not before the confirmation step.
+    expect(removal.queryByTestId("courtesy-removal-block-warning")).not.toBeInTheDocument();
+    fireEvent.click(removal.getByRole("button", { name: "Continuar" }));
+    const warning = removal.getByTestId("courtesy-removal-block-warning");
+    expect(warning.textContent).toBe(BLOCK_WARNING);
+    expect(warning.textContent ?? "").not.toMatch(/\u2014|\u2013/);
+    // The confirmation itself is unchanged.
+    expect(removal.getByText("Tirar 4.999,4 créditos deste lote? Sobram 0 créditos.")).toBeInTheDocument();
+    expect(removal.getByRole("button", { name: "Confirmar" })).toBeEnabled();
+  });
+
+  it("warns as well when a partial removal leaves the lot at exactly 0, and not when credits are left", async () => {
+    renderDialog([{ ...activeLot, available_mc: 5_000_000 }]);
+    let removal = await openRemoval();
+    fireEvent.change(removal.getByLabelText("Quantidade de créditos"), { target: { value: "5000" } });
+    fireEvent.change(removal.getByLabelText("Motivo (obrigatório)"), { target: { value: REASON } });
+    fireEvent.click(removal.getByRole("button", { name: "Continuar" }));
+    expect(removal.getByTestId("courtesy-removal-block-warning")).toHaveTextContent(BLOCK_WARNING);
+
+    fireEvent.click(removal.getByRole("button", { name: "Voltar" }));
+    removal = removalSection();
+    fireEvent.change(removal.getByLabelText("Quantidade de créditos"), { target: { value: "4999" } });
+    fireEvent.click(removal.getByRole("button", { name: "Continuar" }));
+    expect(removal.getByText("Tirar 4.999 créditos deste lote? Sobram 1 créditos.")).toBeInTheDocument();
+    expect(removal.queryByTestId("courtesy-removal-block-warning")).not.toBeInTheDocument();
+  });
+
+  it("shows the block warning in English too", async () => {
+    localStorage.setItem("ns_locale", "en");
+    renderDialog();
+    const lots = within(await screen.findByRole("region", { name: "Courtesy lots" }));
+    fireEvent.click(await lots.findByRole("button", { name: "Remove credits from the lot expiring on 12/09/2026" }));
+    const removal = within(screen.getByRole("region", { name: "Remove credits" }));
+    fireEvent.click(removal.getByRole("checkbox", { name: "Remove all" }));
+    fireEvent.change(removal.getByLabelText("Reason (required)"), { target: { value: REASON } });
+    fireEvent.click(removal.getByRole("button", { name: "Continue" }));
+    expect(removal.getByTestId("courtesy-removal-block-warning")).toHaveTextContent(
+      "If this is the builder's last courtesy balance and it has no paid plan in force, it is blocked immediately: the agent stops answering.",
+    );
+  });
+
   it("reuses the key on a retry and shows 409 / 404 refusals as text", async () => {
     renderDialog();
     postReplies = [

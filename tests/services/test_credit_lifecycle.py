@@ -1023,3 +1023,219 @@ def test_the_lifespan_starts_and_stops_the_lifecycle_worker() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert {"start_credit_lifecycle_worker", "stop_credit_lifecycle_worker"} <= called
+
+
+# ---------------------------------------------------------------------------
+# debito-cortesia-automatico: the lifecycle under the courtesy rule (DESIGN
+# item 4) -- no episode, thresholds on the courtesy basis, gates inert.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("capacity", "available", "expected"),
+    [
+        (10_000, 10_000, ()),
+        (10_000, 5_000, (50,)),
+        (10_000, 1_000, (50, 90)),
+        (10_000, 0, (50, 90, 100)),
+        # Nothing funded in force (a removal or an expiry): never usage.
+        (0, 0, ()),
+    ],
+)
+def test_courtesy_thresholds(
+    capacity: int, available: int, expected: tuple[int, ...]
+) -> None:
+    assert credit_lifecycle.courtesy_thresholds_reached(capacity, available) == (
+        expected
+    )
+
+
+def test_the_courtesy_capacity_counts_unexpired_courtesy_net_of_removals() -> None:
+    from src.services.credit_ledger import LedgerBook
+
+    book = LedgerBook(builder_id=uuid4(), account_id=uuid4())
+    instant = ENFORCED
+    old = book.grant_courtesy(uuid4(), 4_000, at=instant - timedelta(days=40))
+    live = book.grant_courtesy(uuid4(), 10_000, at=instant)
+    order = uuid4()
+    book.grant(
+        GrantSpec(
+            lot_kind="topup",
+            effect_id=topup_grant_effect_id(order),
+            payment_id="pay",
+            paid_at=instant.date(),
+            granted_mc=50_000,
+            expires_at=topup_lot_expires_at(instant.date()),
+            order_id=order,
+        ),
+        at=instant,
+    )
+    book.remove_courtesy(live.id, uuid4(), credits=3, at=instant)
+    book.debit("trace:1", 2_000, at=instant, effect_kind="trace")  # monthly-less FEFO
+    assert old.expired(instant)
+    assert credit_lifecycle.courtesy_capacity_in_force_mc(book, instant) == 7_000
+    assert credit_lifecycle.courtesy_arm_key("courtesy:e:grant") == (
+        "c:courtesy:e:grant"
+    )
+
+
+def _courtesy_rule_readable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 046 gate open on SQLite (the suite's reading is not a head one)."""
+
+    from src.repositories.credit import CreditRepository
+
+    monkeypatch.setattr(
+        CreditRepository,
+        "courtesy_rule_readable",
+        staticmethod(lambda rule_readable=None: rule_readable is not False),
+    )
+
+
+async def _courtesy_grant(builder: UUID, credits: int, instant: datetime) -> Any:
+    from src.services import credit_courtesy
+
+    session = get_db_session()
+    try:
+        async with session.begin():
+            return await credit_courtesy.grant(
+                session,
+                builder_id=builder,
+                credits=credits,
+                reason="courtesy rule",
+                actor_user_id=uuid4(),
+                idempotency_key=f"rule-{uuid4()}",
+                at=instant,
+                ledger=CreditLedger(session),
+            )
+    finally:
+        await session.close()
+
+
+async def _captured_debit(
+    world: World, amount: int, instant: datetime, captured: Any
+) -> Any:
+    session = get_db_session()
+    try:
+        async with session.begin():
+            return await CreditLedger(session).debit(
+                world.builder,
+                f"trace:{world.tenant}:{uuid4()}",
+                amount,
+                at=instant,
+                effect_kind="trace",
+                tenant_id=world.tenant,
+                captured=captured,
+            )
+    finally:
+        await session.close()
+
+
+def test_under_the_rule_no_episode_and_thresholds_on_the_courtesy_basis(
+    client: Any,
+    world: World,
+    clock: Clock,
+    switch: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.repositories.credit import EffectiveEnforcement
+
+    _courtesy_rule_readable(monkeypatch)
+    granted = run(client, _courtesy_grant(world.builder, 10, clock.now))
+    captured = EffectiveEnforcement(granted.occurred_at, "courtesy", state="charged")
+    for amount in (5_000, 4_000, 1_000, 1_000):
+        clock.now += timedelta(minutes=5)
+        result = run(client, _captured_debit(world, amount, clock.now, captured))
+        assert result.debt_mc == 0
+    key = f"c:courtesy:{granted.event_id}:grant"
+    assert run(client, _alerts(world.builder)) == [(key, 50), (key, 90), (key, 100)]
+    # Exhausted, yet no episode and no transition under the rule.
+    assert run(client, _episodes(world.builder)) == []
+    assert run(client, _transitions(world.builder)) == []
+    # The read of the rule on this database: blocked, at the first grant.
+    from src.repositories.credit import CreditRepository
+
+    async def effective() -> Any:
+        session = get_db_session()
+        try:
+            return await CreditRepository(session).effective_enforcement(
+                world.builder, at=clock.now
+            )
+        finally:
+            await session.close()
+
+    assert run(client, effective()) == EffectiveEnforcement(
+        granted.occurred_at, "courtesy", state="blocked"
+    )
+
+
+def test_the_request_gate_is_inert_for_a_captured_courtesy(
+    client: Any, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.repositories.credit import EffectiveEnforcement
+
+    async def never(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the gate read the episode under the rule")
+
+    monkeypatch.setattr(ContentRetentionRepository, "open_episode", never)
+
+    async def gate() -> str:
+        session = get_db_session()
+        try:
+            return await credit_lifecycle.request_gate(
+                session,
+                world.builder,
+                captured=EffectiveEnforcement(ENFORCED, "courtesy", state="blocked"),
+            )
+        finally:
+            await session.close()
+
+    assert run(client, gate()) == "ok"
+
+
+def test_the_locked_evaluation_writes_nothing_under_the_rule(
+    client: Any,
+    world: World,
+    clock: Clock,
+    switch: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate's and the worker's evaluation under the account lock: under
+    the rule nothing -- no settlement, no sweep, no episode -- is written."""
+
+    _courtesy_rule_readable(monkeypatch)
+    run(client, _courtesy_grant(world.builder, 3, clock.now))
+    clock.now += timedelta(days=60)  # the courtesy expired: a sweep would write
+
+    async def locked() -> Any:
+        session = get_db_session()
+        try:
+            async with session.begin():
+                return await credit_lifecycle.evaluate_locked(
+                    session, world.builder, at=clock.now, source="worker"
+                )
+        finally:
+            await session.close()
+
+    async def entries() -> int:
+        session = get_db_session()
+        try:
+            from sqlalchemy import func
+
+            from src.models.credit import CreditLedgerEntry
+
+            return int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(CreditLedgerEntry)
+                    .where(CreditLedgerEntry.builder_id == world.builder)
+                )
+                or 0
+            )
+        finally:
+            await session.close()
+
+    before = run(client, entries())
+    outcome = run(client, locked())
+    assert outcome.evaluated is False and outcome.transitions == []
+    assert run(client, entries()) == before
+    assert run(client, _episodes(world.builder)) == []
