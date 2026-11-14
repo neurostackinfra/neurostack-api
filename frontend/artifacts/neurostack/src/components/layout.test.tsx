@@ -785,7 +785,7 @@ describe("<Layout /> consultoria navigation", () => {
       const link = consulting[0];
       const dashboard = container.querySelector('a[href="/dashboard"]');
       expect(dashboard?.nextElementSibling).toBe(link);
-      expect(link).toHaveTextContent("Commercial Consulting");
+      expect(link).toHaveTextContent("Commercial Management");
 
       const roadmapHeader = within(link.closest("nav")!).getByText("Roadmap");
       expect(roadmapHeader.parentElement).not.toContainElement(link as HTMLElement);
@@ -812,7 +812,7 @@ describe("<Layout /> consultoria navigation", () => {
     expect(screen.getByTestId("nav-link-dashboard")).toBeInTheDocument();
     expect(container.querySelector('a[href="/consultoria"]')).toBeNull();
     expect(screen.queryByTestId("nav-link-consultoria")).not.toBeInTheDocument();
-    expect(screen.queryByText("Commercial Consulting")).not.toBeInTheDocument();
+    expect(screen.queryByText("Commercial Management")).not.toBeInTheDocument();
   });
 });
 

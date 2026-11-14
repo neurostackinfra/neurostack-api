@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { I18nProvider } from "@/context/i18n";
 import { CONSULTORIA_COPY } from "@/lib/consultoria-insights";
+import { en } from "@/locales/en";
+import { pt } from "@/locales/pt";
 import Consultoria from "./consultoria";
 import pageSource from "./consultoria.tsx?raw";
 
@@ -507,6 +509,20 @@ describe("<Consultoria /> content", () => {
       expect(pageSource).not.toContain(literal);
       expect(container.textContent).not.toContain(literal);
     }
+  });
+
+  it.each([
+    ["pt", "Gestão Comercial"],
+    ["en", "Commercial Management"],
+  ] as const)("shows the Gestão Comercial name and no old name in %s", async (locale, heading) => {
+    const { container } = renderPage(locale);
+    await waitForReady();
+
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(heading);
+    expect(container.textContent).not.toContain("onsultoria");
+    expect(container.textContent).not.toContain("onsulting");
+    expect(pt.nav_consulting).toBe("Gestão Comercial");
+    expect(en.nav_consulting).toBe("Commercial Management");
   });
 });
 

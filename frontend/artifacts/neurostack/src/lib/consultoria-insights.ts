@@ -123,9 +123,9 @@ type NamedBucket = Exclude<IntentBucket, "outras">;
 export const CONSULTORIA_COPY = {
   pt: {
     page: {
-      title: "Consultoria Comercial",
+      title: "Gestão Comercial",
       subtitle: "Leituras comerciais a partir dos dados reais da sua clínica.",
-      noClinic: "Selecione uma clínica para ver a consultoria.",
+      noClinic: "Selecione uma clínica para ver a gestão comercial.",
     },
     unavailable: {
       generic: "Não foi possível carregar este insight agora. Tente de novo em instantes.",
@@ -184,15 +184,15 @@ export const CONSULTORIA_COPY = {
         { name: "Analisador de gargalos", description: "onde os pacientes param de responder ao longo do atendimento, para você saber o que ajustar." },
         { name: "Tendências de procedimentos", description: "os procedimentos que estão ganhando espaço nas mensagens do mês." },
         { name: "Previsão de receita", description: "estimativa de agendamentos e receita a partir das mensagens em aberto." },
-        { name: "Relatório estratégico", description: "um relatório periódico com as recomendações da Consultoria para a sua clínica." },
+        { name: "Relatório estratégico", description: "um relatório periódico com as recomendações da Gestão Comercial para a sua clínica." },
       ],
     },
   },
   en: {
     page: {
-      title: "Commercial Consulting",
+      title: "Commercial Management",
       subtitle: "Commercial readings from your clinic's real data.",
-      noClinic: "Select a clinic to see the consulting.",
+      noClinic: "Select a clinic to see commercial management.",
     },
     unavailable: {
       generic: "Couldn't load this insight right now. Try again shortly.",
@@ -251,7 +251,7 @@ export const CONSULTORIA_COPY = {
         { name: "Bottleneck analyzer", description: "where patients stop replying along the way, so you know what to adjust." },
         { name: "Procedure trends", description: "the procedures gaining ground in this month's messages." },
         { name: "Revenue forecast", description: "an estimate of appointments and revenue from open messages." },
-        { name: "Strategic report", description: "a periodic report with Consulting's recommendations for your clinic." },
+        { name: "Strategic report", description: "a periodic report with Commercial Management's recommendations for your clinic." },
       ],
     },
   },
