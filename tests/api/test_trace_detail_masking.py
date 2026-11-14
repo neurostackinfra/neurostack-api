@@ -137,7 +137,11 @@ async def test_legacy_inline_context_and_prompt_are_masked(
             event_data={
                 "content": f"minha carteirinha é {CARD}",
                 "channel": "whatsapp",
-                "decision": {"intent": "agendar", "confidence": 0.9},
+                "decision": {
+                    "intent": "agendar",
+                    "confidence": 0.9,
+                    "reasoning": f"paciente enviou {CARD}",
+                },
                 "context": {
                     "session_summary": f"Paciente enviou {CARD}",
                     "recent_messages": [{"role": "user", "content": CARD}],
@@ -154,6 +158,29 @@ async def test_legacy_inline_context_and_prompt_are_masked(
             },
             created_at=created_at,
         ),
+        # Decoy inside the 5 s lookup window: with an inline prompt the
+        # legacy path must not read it.
+        Event(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            session_id=session_id,
+            event_type="prompt.generated",
+            event_data={
+                "system_prompt": "ISCA system prompt",
+                "context_summary": "ISCA context summary",
+                "suggested_response": "ISCA suggested response",
+                "context_sources": [
+                    {
+                        "origin": "config",
+                        "field": "isca",
+                        "title": "isca",
+                        "content": "ISCA context source",
+                    }
+                ],
+            },
+            event_metadata={},
+            created_at=created_at + timedelta(seconds=2),
+        ),
     )
 
     response = await async_client.get(
@@ -163,10 +190,14 @@ async def test_legacy_inline_context_and_prompt_are_masked(
     body = await _assert_masked_contract(
         response, trace_id=trace_id, session_id=session_id, processing_time_ms=87
     )
+    assert body["srm_decision"]["reasoning"] == f"paciente enviou {MASK_TOKEN}"
     assert body["full_context"]["session_summary"] == f"Paciente enviou {MASK_TOKEN}"
     assert body["full_prompt"]["system"] == f"Carteirinha do paciente: {MASK_TOKEN}"
     assert body["event_metadata"]["note"] == f"cartão {MASK_TOKEN}"
     assert body["event_metadata"]["processing_time_ms"] == 87
+    assert body["llm_response"] is None
+    assert body["selected_context"] == []
+    assert "ISCA" not in response.text
 
 
 @pytest.mark.asyncio
