@@ -102,7 +102,7 @@ function AuthenticatedRouter() {
         <Route path="/onboarding" component={Onboarding} />
         <Route path="/seguranca" component={Seguranca} />
         <Route path="/slm-cortex" component={SlmCortex} />
-        <Route path="/consultoria" component={Consultoria} />
+        {!isInvestor && <Route path="/consultoria" component={Consultoria} />}
         <Route path="/midias" component={Midias} />
         <Route path="/billing" component={Billing} />
         <Route path="/voice-ai" component={VoiceAiRedirect} />

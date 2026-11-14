@@ -764,6 +764,58 @@ describe("<Layout /> RLHF audit navigation", () => {
   });
 });
 
+describe("<Layout /> consultoria navigation", () => {
+  it.each([
+    ["clinic_admin", "clinic-admin@example.com", "clinic-admin-clinic", "clinic-admin-clinic"],
+    ["builder", "builder@example.com", "builder-hq", "builder-clinic-1"],
+    ["super_admin", "admin@example.com", "", "super-clinic-1"],
+  ] as const)(
+    "places Consultoria right after Dashboard in the main nav for %s, outside Roadmap and without a version badge",
+    async (role, email, clinicId, viewingClinicId) => {
+      setRole(role);
+      mocks.auth.email = email;
+      mocks.auth.clinicId = clinicId;
+      mocks.auth.viewingClinicId = viewingClinicId;
+
+      const { container } = renderLayout();
+      await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+
+      const consulting = container.querySelectorAll('a[href="/consultoria"]');
+      expect(consulting).toHaveLength(1);
+      const link = consulting[0];
+      const dashboard = container.querySelector('a[href="/dashboard"]');
+      expect(dashboard?.nextElementSibling).toBe(link);
+      expect(link).toHaveTextContent("Commercial Consulting");
+
+      const roadmapHeader = within(link.closest("nav")!).getByText("Roadmap");
+      expect(roadmapHeader.parentElement).not.toContainElement(link as HTMLElement);
+      expect(
+        link.compareDocumentPosition(roadmapHeader) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+
+      // Nav items do not carry a version badge (v2 / v3 / slm); roadmap items do.
+      expect(link.textContent).not.toMatch(/\bv2\b|\bv3\b|\bslm\b/i);
+    },
+  );
+
+  it("does not show Consultoria to investors", async () => {
+    setRole("investor");
+    mocks.auth.email = "investor@example.com";
+    mocks.auth.clinicId = "investor-clinic";
+    mocks.auth.viewingClinicId = "investor-clinic";
+
+    const { container } = renderLayout();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("nav-link-dashboard")).toBeInTheDocument();
+    expect(container.querySelector('a[href="/consultoria"]')).toBeNull();
+    expect(screen.queryByTestId("nav-link-consultoria")).not.toBeInTheDocument();
+    expect(screen.queryByText("Commercial Consulting")).not.toBeInTheDocument();
+  });
+});
+
 describe("<Layout /> media navigation", () => {
   it.each([
     { role: "clinic_admin" as const, clinic: "clinic-own" },
