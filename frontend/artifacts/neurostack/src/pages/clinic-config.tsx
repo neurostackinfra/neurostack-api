@@ -2306,8 +2306,8 @@ export default function ClinicConfig() {
                   <Field
                     label={txt("Mensagem do Link de Agendamento", "Scheduling Link Message")}
                     hint={txt(
-                      "Texto enviado ao paciente antes do link. A URL será adicionada logo abaixo.",
-                      "Text sent to the patient before the link. The URL will be appended right below.",
+                      "Texto enviado ao paciente antes do link. A URL será adicionada logo abaixo. Não diga que a consulta está marcada ou confirmada, nem que há horário livre: quem confere o agendamento é a equipe.",
+                      "Text sent to the patient before the link. The URL will be appended right below. Do not say the appointment is booked or confirmed, or that a time is available: the team checks the booking.",
                     )}
                   >
                     <Textarea
