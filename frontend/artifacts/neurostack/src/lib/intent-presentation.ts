@@ -116,6 +116,15 @@ export const INTENT_BUCKET = {
   faq: "outras",
 } as const satisfies Record<keyof typeof INTENT_PRESENTATION, IntentBucket>;
 
+export const BUCKET_ORDER: IntentBucket[] = [
+  "pedido_preco",
+  "agendar",
+  "interesse_tratamento",
+  "reclamacao",
+  "pos_atendimento_duvida",
+  "outras",
+];
+
 export const BUCKET_PRESENTATION = {
   pedido_preco: intent("intent_pedido_preco", "bg-blue-500", "hover:bg-blue-600", "#3b82f6"),
   agendar: intent("intent_agendar", "bg-green-500", "hover:bg-green-600", "#22c55e"),
