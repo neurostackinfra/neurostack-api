@@ -85,3 +85,22 @@ def mask_carteirinha_in_mapping(
     if isinstance(data, list):
         return [mask_carteirinha_in_mapping(item, keys) for item in data]
     return data
+
+
+def mask_carteirinha_deep(value: Any) -> Any:
+    """Return a copy of *value* with mask_carteirinha applied to every string.
+
+    - dict: walks every value recursively; keys are kept as they are.
+    - list: walks every element recursively.
+    - str: passed through mask_carteirinha.
+    - anything else (int, float, bool, None, ...): returned as-is.
+
+    The input is never mutated: dicts and lists are rebuilt.
+    """
+    if isinstance(value, str):
+        return mask_carteirinha(value)
+    if isinstance(value, dict):
+        return {key: mask_carteirinha_deep(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_carteirinha_deep(item) for item in value]
+    return value

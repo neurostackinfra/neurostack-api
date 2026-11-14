@@ -154,9 +154,17 @@ class TraceDetailResponse(TraceItem):
         }
     )
 
-    full_context: Optional[dict[str, Any]] = Field(
+    full_context: Optional[dict[str, Any] | str] = Field(
         default=None,
-        description="Full context object used in the decision",
+        description=(
+            "Context used in the decision: the inline context object of legacy "
+            "traces, or the context summary text of the associated "
+            "prompt.generated event"
+        ),
+        examples=[
+            {"recent_messages": [], "session_summary": "Nova sessao de agendamento"},
+            "Paciente novo buscando agendamento",
+        ],
     )
     full_prompt: Optional[dict[str, Any]] = Field(
         default=None,
