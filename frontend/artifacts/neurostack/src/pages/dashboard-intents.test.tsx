@@ -1,19 +1,49 @@
-import { render, screen } from "@testing-library/react";
-import type { ReactNode } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { cloneElement, type ReactElement, type ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TranslationKey } from "@/locales/en";
 import { en } from "@/locales/en";
 import { pt } from "@/locales/pt";
-import { INVESTOR_MOCK_STATS, IntentBreakdown } from "./dashboard";
+import { DonutTooltip, INVESTOR_MOCK_STATS, IntentBreakdown, UserAcquisitionMetrics } from "./dashboard";
+
+type ChartDatum = { name: string; value: number; total: number };
+
+// The mock records what each donut hands to recharts, so a test can feed a
+// slice back into the tooltip element exactly as recharts would.
+const charts = vi.hoisted(() => ({
+  pieData: [] as unknown[],
+  tooltips: [] as unknown[],
+}));
 
 vi.mock("recharts", () => ({
   ResponsiveContainer: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   PieChart: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  Pie: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  Pie: ({ children, data }: { children: ReactNode; data: unknown }) => {
+    charts.pieData.push(data);
+    return <div>{children}</div>;
+  },
   Cell: () => null,
-  Tooltip: () => null,
+  Tooltip: ({ content }: { content: unknown }) => {
+    charts.tooltips.push(content);
+    return null;
+  },
 }));
+
+beforeEach(() => {
+  charts.pieData.length = 0;
+  charts.tooltips.length = 0;
+});
+
+/** Renders the last donut's tooltip for one of its slices, as recharts would on hover. */
+function hoverSlice(name: string) {
+  const data = charts.pieData.at(-1) as ChartDatum[];
+  const datum = data.find((d) => d.name === name);
+  if (!datum) throw new Error(`no slice ${name}`);
+  const content = charts.tooltips.at(-1) as ReactElement<{ active?: boolean; payload?: unknown }>;
+  cleanup();
+  return render(cloneElement(content, { active: true, payload: [{ name: datum.name, value: datum.value, payload: datum }] }));
+}
 
 // Fixture spans raw keys inside and outside the 5 commercial buckets so the
 // aggregation path is exercised (saudacao + duvida_generica_sem_contexto
@@ -203,5 +233,117 @@ describe("<IntentBreakdown />", () => {
       />,
     );
     expect(screen.getAllByText("Other").length).toBeGreaterThan(0);
+  });
+});
+
+describe("<IntentBreakdown /> honest number", () => {
+  it("shows the fraction after the count below 20 messages", () => {
+    render(
+      <IntentBreakdown byIntent={{ pedido_preco: 3, saudacao: 7 }} t={t} locale="pt" intentFilter="" onIntentFilterChange={vi.fn()} />,
+    );
+    expect(screen.getByTestId("stat-intent-pedido_preco")).toHaveTextContent("3· 3 de 10");
+    expect(screen.getByTestId("stat-intent-outras")).toHaveTextContent("7· 7 de 10");
+    expect(screen.getByTestId("stat-intent-agendar")).toHaveTextContent("0· 0 de 10");
+  });
+
+  it("uses the English fraction", () => {
+    render(
+      <IntentBreakdown byIntent={{ pedido_preco: 3, saudacao: 7 }} t={tEn} locale="en" intentFilter="" onIntentFilterChange={vi.fn()} />,
+    );
+    expect(screen.getByTestId("stat-intent-pedido_preco")).toHaveTextContent("3· 3 of 10");
+  });
+
+  it("keeps today's 0· 0% rows when the period has no messages", () => {
+    render(<IntentBreakdown byIntent={{}} t={t} locale="pt" intentFilter="" onIntentFilterChange={vi.fn()} />);
+    expect(screen.getByTestId("stat-intent-pedido_preco")).toHaveTextContent("0· 0%");
+    expect(screen.getByTestId("stat-intent-outras")).toHaveTextContent("0· 0%");
+  });
+
+  it("shows value and share in the intent donut tooltip", () => {
+    render(<IntentBreakdown byIntent={byIntent} t={t} locale="pt" intentFilter="" onIntentFilterChange={vi.fn()} />);
+    hoverSlice(pt.intent_reclamacao);
+    expect(screen.getByText("12 · 4%")).toBeInTheDocument();
+  });
+
+  it("shows the fraction in the intent donut tooltip below 20 messages", () => {
+    render(
+      <IntentBreakdown byIntent={{ pedido_preco: 3, saudacao: 7 }} t={tEn} locale="en" intentFilter="" onIntentFilterChange={vi.fn()} />,
+    );
+    hoverSlice(en.intent_pedido_preco);
+    expect(screen.getByText("3 · 3 of 10")).toBeInTheDocument();
+  });
+});
+
+describe("<UserAcquisitionMetrics /> honest number", () => {
+  const audience = (overrides: Partial<typeof INVESTOR_MOCK_STATS>) => ({ ...INVESTOR_MOCK_STATS, ...overrides });
+
+  it("shows the legend percent from interaction counts", () => {
+    render(
+      <UserAcquisitionMetrics
+        stats={audience({
+          newUserInteractions: 116,
+          returningUserInteractions: 175,
+          identifiedUserInteractions: 291,
+        })}
+        locale="pt"
+      />,
+    );
+    // 116 / 291 = 39.86% and 175 / 291 = 60.14%
+    expect(screen.getByTestId("audience-new")).toHaveTextContent("40%");
+    expect(screen.getByTestId("audience-returning")).toHaveTextContent("60%");
+  });
+
+  it("shows the fraction below 20 identified interactions", () => {
+    render(
+      <UserAcquisitionMetrics
+        stats={audience({ newUserInteractions: 3, returningUserInteractions: 7, identifiedUserInteractions: 10 })}
+        locale="pt"
+      />,
+    );
+    expect(screen.getByTestId("audience-new")).toHaveTextContent("3 de 10");
+    expect(screen.getByTestId("audience-returning")).toHaveTextContent("7 de 10");
+  });
+
+  it("keeps today's dash with no identified interactions", () => {
+    render(
+      <UserAcquisitionMetrics
+        stats={audience({ newUserInteractions: 0, returningUserInteractions: 0, identifiedUserInteractions: 0 })}
+        locale="pt"
+      />,
+    );
+    expect(screen.getByTestId("audience-new")).toHaveTextContent("\u2014");
+    expect(screen.getByTestId("audience-returning")).toHaveTextContent("\u2014");
+  });
+
+  it("shows value and share in the users donut tooltip", () => {
+    render(
+      <UserAcquisitionMetrics
+        stats={audience({ newUserInteractions: 3, returningUserInteractions: 7, identifiedUserInteractions: 10 })}
+        locale="en"
+      />,
+    );
+    hoverSlice("Returning users");
+    expect(screen.getByText("7 · 7 of 10")).toBeInTheDocument();
+  });
+
+  it("renders the investor mock through the same path", () => {
+    render(<UserAcquisitionMetrics stats={INVESTOR_MOCK_STATS} locale="pt" />);
+    expect(screen.getByTestId("audience-new")).toHaveTextContent("40%");
+  });
+});
+
+describe("<DonutTooltip />", () => {
+  it.each([
+    { value: 12, total: 300, locale: "pt", text: "12 · 4%" },
+    { value: 3, total: 10, locale: "pt", text: "3 · 3 de 10" },
+    { value: 1, total: 300, locale: "en", text: "1 · <1%" },
+  ])("shows $text", ({ value, total, locale, text }) => {
+    render(<DonutTooltip active locale={locale} payload={[{ name: "Slice", value, payload: { total } }]} />);
+    expect(screen.getByText(text)).toBeInTheDocument();
+  });
+
+  it("renders nothing when inactive", () => {
+    const { container } = render(<DonutTooltip locale="pt" payload={[{ name: "Slice", value: 1, payload: { total: 1 } }]} />);
+    expect(container).toBeEmptyDOMElement();
   });
 });

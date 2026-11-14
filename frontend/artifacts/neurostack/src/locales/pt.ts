@@ -20,7 +20,7 @@ export const pt: Record<TranslationKey, string> = {
   nav_support: "Suporte",
   nav_security: "Segurança & Compliance",
   nav_rlhf: "Auditoria RLHF",
-  nav_consulting: "Consultoria Comercial",
+  nav_consulting: "Gestão Comercial",
   nav_media: "Mídias & Ativos",
   nav_billing: "Pagamento",
   investor_sales_cta: "Falar com comercial",

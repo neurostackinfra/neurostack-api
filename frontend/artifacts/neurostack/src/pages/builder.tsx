@@ -21,6 +21,7 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import { useI18n } from "@/context/i18n";
+import { formatShare } from "@/lib/honest-number";
 import { PasswordChangeDialog } from "@/components/password-change-dialog";
 import {
   PlanUsageSummary,
@@ -183,11 +184,9 @@ function HealthDot({ status }: { status: string }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${color}`} />;
 }
 
-function OutsideHoursClinicMetric({ clinic, locale }: { clinic: BuilderClinic; locale: string }) {
+export function OutsideHoursClinicMetric({ clinic, locale }: { clinic: BuilderClinic; locale: string }) {
   const txt = (pt: string, en: string) => locale === "en" ? en : pt;
-  const hasData = clinic.business_hours_configured
-    && clinic.conversational_trace_count_7d > 0
-    && clinic.outside_hours_pct_7d !== null;
+  const share = formatShare(clinic.outside_hours_count_7d, clinic.conversational_trace_count_7d, locale);
   const numberLocale = locale === "en" ? "en-US" : "pt-BR";
 
   return (
@@ -197,9 +196,9 @@ function OutsideHoursClinicMetric({ clinic, locale }: { clinic: BuilderClinic; l
       </div>
       {!clinic.business_hours_configured ? (
         <p className="mt-1 text-xs font-semibold text-amber-400">{txt("Não configurado", "Not configured")}</p>
-      ) : hasData ? (
+      ) : share !== null ? (
         <p className="mt-1 text-lg font-bold text-violet-400">
-          {clinic.outside_hours_pct_7d!.toLocaleString(numberLocale, { maximumFractionDigits: 1 })}%
+          {share.percent ?? share.fraction}
         </p>
       ) : (
         <p className="mt-1 text-xs font-semibold text-muted-foreground">{txt("Sem dados", "No data")}</p>

@@ -18,7 +18,7 @@ export const en = {
   nav_support: "Support",
   nav_security: "Security & Compliance",
   nav_rlhf: "RLHF Audit",
-  nav_consulting: "Commercial Consulting",
+  nav_consulting: "Commercial Management",
   nav_media: "Media & Assets",
   nav_billing: "Payment",
   investor_sales_cta: "Talk to sales",

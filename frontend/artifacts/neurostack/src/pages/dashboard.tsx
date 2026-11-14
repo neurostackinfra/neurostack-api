@@ -9,7 +9,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { DateRangePicker } from "@/components/date-range-picker";
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from "recharts";
 import { format } from "date-fns";
+import { formatShare } from "@/lib/honest-number";
 import {
+  BUCKET_ORDER,
   BUCKET_PRESENTATION,
   getBucketLabel,
   getBucketPresentation,
@@ -37,13 +39,14 @@ function getToken(): string | null {
 
 // -- Custom tooltip ---
 
-function DonutTooltip({ active, payload }: { active?: boolean; payload?: { name: string; value: number; payload: { pct: number } }[] }) {
+export function DonutTooltip({ active, payload, locale }: { active?: boolean; payload?: { name: string; value: number; payload: { total: number } }[]; locale: string }) {
   if (!active || !payload?.length) return null;
   const d = payload[0];
+  const share = formatShare(d.value, d.payload.total, locale);
   return (
     <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs shadow-lg">
       <p className="font-semibold text-foreground">{d.name}</p>
-      <p className="text-muted-foreground mt-0.5">{d.value} · {d.payload.pct.toFixed(1)}%</p>
+      <p className="text-muted-foreground mt-0.5">{d.value} · {share ? share.percent ?? share.fraction : "0%"}</p>
     </div>
   );
 }
@@ -59,15 +62,12 @@ interface KpiStats {
   modelBreakdown: { model: string; tokens: number }[];
   byIntent: Record<string, number>;
   outsideHoursCount: number;
-  outsideHoursPct: number | null;
   conversationalTraceCount: number;
   businessHoursConfigured: boolean;
   newUsersCount: number;
   returningUsersCount: number;
   newUserInteractions: number;
   returningUserInteractions: number;
-  newUserInteractionPct: number | null;
-  returningUserInteractionPct: number | null;
   identifiedUserInteractions: number;
   unidentifiedUserInteractions: number;
 }
@@ -77,9 +77,9 @@ interface KpiStats {
 export function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: TranslationKey) => string; locale: string }) {
   const maxModelTokens = stats.modelBreakdown[0]?.tokens ?? 0;
   const txt = (pt: string, en: string) => locale === "en" ? en : pt;
-  const outsideHoursHasData = stats.businessHoursConfigured
-    && stats.conversationalTraceCount > 0
-    && stats.outsideHoursPct !== null;
+  const outsideHoursShare = stats.businessHoursConfigured
+    ? formatShare(stats.outsideHoursCount, stats.conversationalTraceCount, locale)
+    : null;
 
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-6">
@@ -135,16 +135,16 @@ export function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: Transla
         <CardContent>
           {!stats.businessHoursConfigured ? (
             <div className="text-base font-semibold text-amber-400">{txt("Configure o horário", "Configure business hours")}</div>
-          ) : outsideHoursHasData ? (
-            <div className="text-2xl font-bold text-foreground">
-              {stats.outsideHoursPct!.toLocaleString(locale === "en" ? "en-US" : "pt-BR", { maximumFractionDigits: 1 })}%
+          ) : outsideHoursShare ? (
+            <div className="text-2xl font-bold text-foreground" data-testid="stat-outside-hours-value">
+              {outsideHoursShare.percent ?? outsideHoursShare.fraction}
             </div>
           ) : (
             <div className="text-base font-semibold text-muted-foreground">{txt("Sem dados", "No data")}</div>
           )}
           {stats.businessHoursConfigured && (
             <p className="text-xs text-muted-foreground mt-0.5 tabular-nums">
-              {stats.outsideHoursCount.toLocaleString(locale === "en" ? "en-US" : "pt-BR")} / {stats.conversationalTraceCount.toLocaleString(locale === "en" ? "en-US" : "pt-BR")} {txt("conversas", "conversations")}
+              {stats.outsideHoursCount.toLocaleString(locale === "en" ? "en-US" : "pt-BR")} / {stats.conversationalTraceCount.toLocaleString(locale === "en" ? "en-US" : "pt-BR")} {txt("mensagens processadas pela IA", "messages processed by the AI")}
             </p>
           )}
         </CardContent>
@@ -189,15 +189,6 @@ export function KpiCards({ stats, t, locale }: { stats: KpiStats; t: (k: Transla
 
 // -- Intent breakdown chart ---
 
-const BUCKET_ORDER: IntentBucket[] = [
-  "pedido_preco",
-  "agendar",
-  "interesse_tratamento",
-  "reclamacao",
-  "pos_atendimento_duvida",
-  "outras",
-];
-
 export function IntentBreakdown({
   byIntent, t, locale, intentFilter, onIntentFilterChange,
 }: {
@@ -229,7 +220,7 @@ export function IntentBreakdown({
     name: getBucketLabel(bucket, t),
     value: count,
     hex: getBucketPresentation(bucket).hex,
-    pct: periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0,
+    total: periodIntentTotal,
   }));
   const emptyChart = chartData.length === 0;
 
@@ -255,6 +246,7 @@ export function IntentBreakdown({
           <div className="space-y-3.5">
             {visibleIntentEntries.map(([bucket, count]) => {
               const pct = periodIntentTotal > 0 ? (count / periodIntentTotal) * 100 : 0;
+              const share = formatShare(count, periodIntentTotal, locale);
               const m = getBucketPresentation(bucket);
               return (
                 <div key={bucket} className="space-y-1" data-testid={`stat-intent-${bucket}`}>
@@ -266,7 +258,7 @@ export function IntentBreakdown({
                     <span className="text-xs font-bold text-foreground shrink-0 tabular-nums">
                       {count.toLocaleString(numberLocale)}
                       <span className="ml-1 font-medium text-muted-foreground">
-                        {"\u00b7 "}{pct.toLocaleString(numberLocale, { maximumFractionDigits: 1 })}%
+                        {"\u00b7 "}{share ? share.percent ?? share.fraction : "0%"}
                       </span>
                     </span>
                   </div>
@@ -286,7 +278,7 @@ export function IntentBreakdown({
               <ResponsiveContainer width="100%" height={200}>
                 <PieChart>
                   <Pie
-                    data={emptyChart ? [{ name: "Sem dados", value: 1, hex: "#1e293b", pct: 0 }] : chartData}
+                    data={emptyChart ? [{ name: "Sem dados", value: 1, hex: "#1e293b", total: 0 }] : chartData}
                     dataKey="value"
                     nameKey="name"
                     cx="50%"
@@ -302,7 +294,7 @@ export function IntentBreakdown({
                       <Cell key={i} fill={entry.hex} />
                     ))}
                   </Pie>
-                  {!emptyChart && <Tooltip content={<DonutTooltip />} />}
+                  {!emptyChart && <Tooltip content={<DonutTooltip locale={locale} />} />}
                 </PieChart>
               </ResponsiveContainer>
               <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
@@ -333,7 +325,7 @@ export function IntentBreakdown({
 
 // -- Commercial audience growth ---
 
-function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: string }) {
+export function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: string }) {
   const txt = (pt: string, en: string) => locale === "en" ? en : pt;
   const numberLocale = locale === "en" ? "en-US" : "pt-BR";
   const hasIdentifiedInteractions = stats.identifiedUserInteractions > 0;
@@ -341,13 +333,13 @@ function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: st
     {
       name: txt("Novos usuários", "New users"),
       value: stats.newUserInteractions,
-      pct: stats.newUserInteractionPct ?? 0,
+      total: stats.identifiedUserInteractions,
       hex: "#10b981",
     },
     {
       name: txt("Usuários recorrentes", "Returning users"),
       value: stats.returningUserInteractions,
-      pct: stats.returningUserInteractionPct ?? 0,
+      total: stats.identifiedUserInteractions,
       hex: "#3b82f6",
     },
   ];
@@ -393,7 +385,7 @@ function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: st
               <ResponsiveContainer width="100%" height={210}>
                 <PieChart>
                   <Pie
-                    data={hasIdentifiedInteractions ? chartData : [{ name: txt("Sem dados", "No data"), value: 1, pct: 0, hex: "#334155" }]}
+                    data={hasIdentifiedInteractions ? chartData : [{ name: txt("Sem dados", "No data"), value: 1, total: 0, hex: "#334155" }]}
                     dataKey="value"
                     nameKey="name"
                     cx="50%"
@@ -409,7 +401,7 @@ function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: st
                       <Cell key={index} fill={entry.hex} />
                     ))}
                   </Pie>
-                  {hasIdentifiedInteractions && <Tooltip content={<DonutTooltip />} />}
+                  {hasIdentifiedInteractions && <Tooltip content={<DonutTooltip locale={locale} />} />}
                 </PieChart>
               </ResponsiveContainer>
               <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
@@ -423,22 +415,25 @@ function UserAcquisitionMetrics({ stats, locale }: { stats: KpiStats; locale: st
             </div>
 
             <div className="space-y-3">
-              {chartData.map((item) => (
-                <div key={item.name} className="rounded-lg border border-border/70 bg-muted/15 p-3" data-testid={`audience-${item.hex === "#10b981" ? "new" : "returning"}`}>
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: item.hex }} />
-                      <span className="text-xs font-medium text-foreground truncate">{item.name}</span>
+              {chartData.map((item) => {
+                const share = formatShare(item.value, item.total, locale);
+                return (
+                  <div key={item.name} className="rounded-lg border border-border/70 bg-muted/15 p-3" data-testid={`audience-${item.hex === "#10b981" ? "new" : "returning"}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: item.hex }} />
+                        <span className="text-xs font-medium text-foreground truncate">{item.name}</span>
+                      </div>
+                      <span className="text-lg font-bold text-foreground tabular-nums">
+                        {hasIdentifiedInteractions && share ? share.percent ?? share.fraction : "—"}
+                      </span>
                     </div>
-                    <span className="text-lg font-bold text-foreground tabular-nums">
-                      {hasIdentifiedInteractions ? `${item.pct.toLocaleString(numberLocale, { maximumFractionDigits: 1 })}%` : "—"}
-                    </span>
+                    <p className="mt-1 pl-[18px] text-[11px] text-muted-foreground tabular-nums">
+                      {item.value.toLocaleString(numberLocale)} {txt("interações", "interactions")}
+                    </p>
                   </div>
-                  <p className="mt-1 pl-[18px] text-[11px] text-muted-foreground tabular-nums">
-                    {item.value.toLocaleString(numberLocale)} {txt("interações", "interactions")}
-                  </p>
-                </div>
-              ))}
+                );
+              })}
               {stats.unidentifiedUserInteractions > 0 && (
                 <p className="text-[11px] text-muted-foreground">
                   {stats.unidentifiedUserInteractions.toLocaleString(numberLocale)} {txt(
@@ -478,15 +473,12 @@ export const INVESTOR_MOCK_STATS: KpiStats = {
     saudacao: 45,
   },
   outsideHoursCount: 24,
-  outsideHoursPct: 8.2,
   conversationalTraceCount: 291,
   businessHoursConfigured: true,
   newUsersCount: 47,
   returningUsersCount: 83,
   newUserInteractions: 116,
   returningUserInteractions: 175,
-  newUserInteractionPct: 39.9,
-  returningUserInteractionPct: 60.1,
   identifiedUserInteractions: 291,
   unidentifiedUserInteractions: 0,
 };
@@ -528,15 +520,12 @@ export default function Dashboard() {
         modelBreakdown: data.model_breakdown ?? data.modelBreakdown ?? [],
         byIntent: data.intent_distribution ?? data.byIntent ?? {},
         outsideHoursCount: data.outside_hours_count ?? 0,
-        outsideHoursPct: data.outside_hours_pct ?? null,
         conversationalTraceCount: data.conversational_trace_count ?? 0,
         businessHoursConfigured: data.business_hours_configured === true,
         newUsersCount: data.new_users_count ?? 0,
         returningUsersCount: data.returning_users_count ?? 0,
         newUserInteractions: data.new_user_interactions ?? 0,
         returningUserInteractions: data.returning_user_interactions ?? 0,
-        newUserInteractionPct: data.new_user_interaction_pct ?? null,
-        returningUserInteractionPct: data.returning_user_interaction_pct ?? null,
         identifiedUserInteractions: data.identified_user_interactions ?? 0,
         unidentifiedUserInteractions: data.unidentified_user_interactions ?? 0,
       } as KpiStats;
