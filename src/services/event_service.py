@@ -478,6 +478,7 @@ async def _load_config_from_db(tenant_id: UUID) -> Optional[dict[str, Any]]:
                 "professionals": row.professionals or [],
                 "api_credentials": composed,
                 "lgpd": row.lgpd or {},
+                "scheduling": row.scheduling or {},
             }
     except Exception as exc:
         logger.warning("Failed to load clinic config", error=str(exc))
