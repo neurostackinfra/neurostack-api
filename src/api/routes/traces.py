@@ -35,7 +35,7 @@ from src.config.settings import settings
 from src.handoff.sla import resolve_clinic_zone
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
-from src.observability.pii import mask_carteirinha
+from src.observability.pii import mask_carteirinha_deep
 from src.repositories import get_db_session_dependency
 from src.services.export_window import (
     INVALID_DATE_RANGE,
@@ -54,6 +54,14 @@ from src.services.trace_service import (
 )
 
 _logger = get_logger(__name__)
+
+# Trace detail fields returned without carteirinha masking: identifiers and
+# ISO timestamps match the digit-run pattern, and selected_context is clinic
+# configuration (phone, address) shown to every role. Everything else in the
+# response passes through mask_carteirinha_deep.
+_TRACE_DETAIL_UNMASKED_FIELDS = frozenset(
+    {"id", "timestamp", "session_id", "processing_time_ms", "mode", "selected_context"}
+)
 
 _SafeTraceDay: TypeAlias = Annotated[
     date,
@@ -401,11 +409,6 @@ async def trace_detail(
     event_data = event.event_data or {}
     metadata = event.event_metadata or {}
 
-    # Mask carteirinha PII in the raw debug payload surfaced to the trace
-    # detail view — the user's message content is the main leak vector.
-    if isinstance(event_data.get("content"), str):
-        event_data = {**event_data, "content": mask_carteirinha(event_data["content"])}
-
     # Fetch the associated prompt.generated event for full prompt/context
     full_context = event_data.get("context")
     full_prompt = event_data.get("prompt")
@@ -427,26 +430,37 @@ async def trace_detail(
             full_context = prompt_data.get("context_summary")
             if not prompt_built:
                 prompt_built = prompt_data.get("system_prompt")
-            llm_response = mask_carteirinha(prompt_data.get("suggested_response"))
+            llm_response = prompt_data.get("suggested_response")
             selected_context = prompt_data.get("context_sources", [])
 
+    response: dict[str, Any] = {
+        "id": trace["id"],
+        "timestamp": trace["timestamp"],
+        "user_message": trace["user_message"],
+        "srm_decision": trace["srm_decision"],
+        "context_summary": trace["context_summary"],
+        "prompt_built": prompt_built,
+        "processing_time_ms": trace["processing_time_ms"],
+        "mode": trace["mode"],
+        "full_context": full_context,
+        "full_prompt": full_prompt,
+        "session_id": event.session_id,
+        "event_data": event_data,
+        "event_metadata": metadata,
+        "llm_response": llm_response,
+        "selected_context": selected_context,
+    }
+    # Mask carteirinha PII in every field outside the closed list, so a
+    # field added to the response later is masked by default. The raw
+    # number stays only in the underlying event store.
     return TraceDetailResponse.model_validate(
         {
-            "id": trace["id"],
-            "timestamp": trace["timestamp"],
-            "user_message": trace["user_message"],
-            "srm_decision": trace["srm_decision"],
-            "context_summary": trace["context_summary"],
-            "prompt_built": prompt_built,
-            "processing_time_ms": trace["processing_time_ms"],
-            "mode": trace["mode"],
-            "full_context": full_context,
-            "full_prompt": full_prompt,
-            "session_id": event.session_id,
-            "event_data": event_data,
-            "event_metadata": metadata,
-            "llm_response": llm_response,
-            "selected_context": selected_context,
+            field: (
+                value
+                if field in _TRACE_DETAIL_UNMASKED_FIELDS
+                else mask_carteirinha_deep(value)
+            )
+            for field, value in response.items()
         }
     )
 
