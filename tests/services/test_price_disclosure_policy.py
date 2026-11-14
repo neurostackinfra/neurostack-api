@@ -313,3 +313,41 @@ def test_a_price_turn_offers_media_exactly_when_the_prompt_quotes_a_price(
         may_quote = _rendered_pricing(result.system_prompt) == "may_quote"
         assert (excluded == "price_hidden") is (not may_quote)
         assert excluded in (None, "price_hidden")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        None,
+        "",
+        "yes",
+        "no",
+        "No",
+        "NO",
+        " no ",
+        "false",
+        "False",
+        "0",
+        "none",
+        "None",
+        "não",
+        "off",
+        "sim",
+        1,
+        0,
+    ],
+)
+def test_clinic_accepts_insurance_matches_the_core_rule(value: object) -> None:
+    from src.services.price_disclosure_policy import clinic_accepts_insurance
+
+    expected = resolve_price_disclosure({"accepts_insurance": value}).insurance_active
+    assert clinic_accepts_insurance(value) == expected
+
+
+def test_the_off_spellings_are_the_cores() -> None:
+    from neurostack_core.prompt import price_policy
+    from src.services.price_disclosure_policy import _INSURANCE_OFF_SPELLINGS
+
+    assert price_policy._INSURANCE_OFF_VALUES == _INSURANCE_OFF_SPELLINGS

@@ -899,8 +899,10 @@ class TestConvenioTriageGating:
     ) -> tuple[bool, bool]:
         """Mirror pipeline.py logic — kept in-test to guard the invariants
         without needing to spin up the whole async pipeline."""
+        from src.services.price_disclosure_policy import clinic_accepts_insurance
+
         ask_convenio_triage = (
-            bool(accepts_insurance)
+            clinic_accepts_insurance(accepts_insurance)
             and not atendimento_tipo
             and (turn_count == 2 or intent in ("pedido_preco", "agendar"))
         )

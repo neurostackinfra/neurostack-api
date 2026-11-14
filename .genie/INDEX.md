@@ -11,6 +11,7 @@
 - [Templates Meta para follow-up](brainstorms/meta-templates-followup/DESIGN.md) - Infra de templates da Meta Cloud API para futuros agentes ativos de follow-up.
 
 ## Poured
+- [Correção do link de agendamento e da triagem de convênio](wishes/correcao-link-convenio/WISH.md) - IN_PROGRESS (2026-11-14); design SHIP ([DESIGN](brainstorms/correcao-link-convenio/DESIGN.md)); etapa 0 do subagente de agendamento: o carregador de runtime passa a devolver `scheduling` (o link de agendamento nunca era enviado em turno real), a triagem de convênio ignora `"no"` e a mensagem do link é checada ao salvar e ao ligar o link; 3 grupos implementados no branch `fix/correcao-link-convenio`, cada um com revisão independente SHIP, revisão final SHIP e gates verdes contra a medição inicial; falta o inventário SQL e o QA ao vivo antes de cada deploy.
 - [Hierarquia da aba APIs](wishes/api-provider-catalog-presentation/WISH.md) - IN_PROGRESS; Grupo 1 frontend-only concluído, reviews SHIP e gates verdes; pronto para review/handoff, com matriz congelada em 14 active / 7 coming soon.
 - [Retomada contextual da IA após handoff](wishes/handoff-contextual-resumption/WISH.md) - IN_PROGRESS; os 4 grupos de execução estão concluídos com reviews independentes SHIP; aguardando PR #49 (resolução de conflitos) e merge humano.
 - [SLA de atendimento confirmado no handoff](wishes/handoff-sla-first-human-response/WISH.md) - IN_PROGRESS; dependência `handoff-export-open-closed` mergeada em `origin/main` (`bfa18f8`), iniciando o Grupo 1 sobre worktree isolado.

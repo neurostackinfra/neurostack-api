@@ -1,6 +1,7 @@
 """The clinic's price-disclosure policy, shared by the prompt and the media.
 
-envio-midia-agente Decisions 7 and 11.  Two pieces, each with ONE source:
+envio-midia-agente Decisions 7 and 11 (and correcao-link-convenio).  Three
+pieces, each with ONE source:
 
 * :func:`clinic_price_variables` -- the adapter from a clinic config to the
   prompt's price variables (``pricing_mode``, ``accepts_insurance``,
@@ -9,6 +10,11 @@ envio-midia-agente Decisions 7 and 11.  Two pieces, each with ONE source:
   the same config through it in phase 2;
 * :func:`can_show_price` (``neurostack_core.prompt``) -- the pure rule the
   normal template renders its pricing block from.
+
+* :func:`clinic_accepts_insurance` -- whether the clinic's
+  ``accepts_insurance`` value means insurance is on.  Its source is the core
+  rule (``neurostack_core.prompt.price_policy.resolve_price_disclosure``),
+  which it replicates and is parity-tested against.
 
 :func:`turn_can_show_price` joins them with the turn's care modality
 (``PipelineResult.atendimento_tipo``, the slot the pipeline turns into
@@ -34,6 +40,22 @@ from neurostack_core.prompt import (
 # The default disclosure mode when the clinic config names none: the
 # pipeline's historical default, which never quotes a price.
 DEFAULT_PRICING_MODE = "CONSULT_ONLY"
+
+# The spellings the core reads as "the clinic does not accept insurance"
+# (``neurostack_core.prompt.price_policy.resolve_price_disclosure``).
+_INSURANCE_OFF_SPELLINGS = ("no", "false", "0", "none")
+
+
+def clinic_accepts_insurance(value: object) -> bool:
+    """Whether the clinic's ``accepts_insurance`` value means insurance is on.
+
+    Replicates ``resolve_price_disclosure(custom).insurance_active`` from
+    ``neurostack_core.prompt.price_policy`` exactly: truthy and not one of
+    the off spellings (case-insensitive, no whitespace stripping).  The UI
+    stores the strings ``"yes"``/``"no"``, so ``bool(value)`` is wrong.
+    ``tests/services/test_price_disclosure_policy.py`` pins the parity.
+    """
+    return bool(value and str(value).lower() not in _INSURANCE_OFF_SPELLINGS)
 
 
 def _json_object(value: Any) -> Mapping[str, Any]:
@@ -92,6 +114,7 @@ def turn_can_show_price(
 __all__ = [
     "DEFAULT_PRICING_MODE",
     "can_quote_private_pay",
+    "clinic_accepts_insurance",
     "clinic_price_variables",
     "turn_can_show_price",
     "turn_price_variables",

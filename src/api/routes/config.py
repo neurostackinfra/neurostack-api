@@ -4,9 +4,9 @@ CRUD clinic configuration for the admin panel.
 """
 
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, Optional, cast
 from uuid import UUID, uuid4
 
 import jwt
@@ -41,6 +41,7 @@ from src.models.clinic_config import (
 from src.models.clinic_config_table import ClinicConfigTable
 from src.models.tenant import Tenant
 from src.observability.metrics import API_CREDENTIALS_CHANGE_EMIT_FAILURES_TOTAL
+from src.observability.scheduling_gate import detect_scheduling_violation
 from src.repositories import get_db_session_dependency
 from src.services.api_credentials import (
     STT_FIXED_API_BASES,
@@ -68,6 +69,52 @@ _HANDOFF_POLICY_FIELDS = (
 )
 _HANDOFF_POLICY_FIELD_SET = frozenset(_HANDOFF_POLICY_FIELDS)
 _CLINIC_ADMIN_ONLY_FIELD = "meta_minutos_atendimento"
+
+
+_LINK_MESSAGE_PROMISE_ERROR_TYPE = "scheduling_link_message_promise"
+_LINK_MESSAGE_PROMISE_ERROR_MSG = (
+    "A mensagem do link de agendamento não pode dizer que a consulta está "
+    "marcada ou confirmada, nem que há horário livre."
+)
+
+
+def _scheduling_link_effectively_on(bucket: Mapping[str, Any]) -> bool:
+    """Mirror the SRM rule: toggle on AND a non-empty URL.
+
+    Strict on purpose: only the boolean ``True`` counts as on, so a legacy
+    stored value such as ``"no"`` or ``None`` is treated as off (which makes
+    the save-time check run, never skip).
+    """
+    url = bucket.get("scheduling_link_url")
+    return (
+        bucket.get("scheduling_link_enabled") is True
+        and isinstance(url, str)
+        and url.strip() != ""
+    )
+
+
+def _link_message_promise(
+    prev: Mapping[str, Any], new: Mapping[str, Any]
+) -> Optional[str]:
+    """Return the detector category when the saved link message promises a booking.
+
+    ``prev`` is the stored scheduling bucket, ``new`` the merged and
+    validated one. The message is checked only when it changed (exact
+    string comparison) or when the link becomes effectively on in this save;
+    otherwise an old message never blocks saving other fields. The detector
+    is fail-open: ``None`` means the message is accepted.
+    """
+    message = new.get("scheduling_link_message")
+    if not message:
+        return None
+    message_changed = message != prev.get("scheduling_link_message")
+    link_switched_on = _scheduling_link_effectively_on(
+        new
+    ) and not _scheduling_link_effectively_on(prev)
+    if not (message_changed or link_switched_on):
+        return None
+    violation = detect_scheduling_violation(message)
+    return violation[0] if violation is not None else None
 
 
 def _can_access_clinic_admin_only_fields(tenant: TenantContext) -> bool:
@@ -720,6 +767,29 @@ async def patch_config(
                         detail=jsonable_encoder(exc.errors()),
                     )
                 validated_dump = validated.model_dump()
+                if bucket_name == "scheduling":
+                    promise_category = _link_message_promise(
+                        _prev_scheduling, validated_dump
+                    )
+                    if promise_category is not None:
+                        # Never log the clinic's message text.
+                        logger.warning(
+                            "scheduling link message rejected tenant=%s category=%s",
+                            tenant.tenant_id,
+                            promise_category,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=jsonable_encoder(
+                                [
+                                    {
+                                        "loc": ["body", "scheduling_link_message"],
+                                        "msg": _LINK_MESSAGE_PROMISE_ERROR_MSG,
+                                        "type": _LINK_MESSAGE_PROMISE_ERROR_TYPE,
+                                    }
+                                ]
+                            ),
+                        )
                 dropped_keys = sorted(set(merged) - set(validated_dump))
                 if dropped_keys:
                     logger.warning(

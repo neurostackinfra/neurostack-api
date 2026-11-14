@@ -558,6 +558,7 @@ class TestBuilderComposeInDBLoader:
                 self.handoff = payload.get("handoff", {})
                 self.professionals = payload.get("professionals", [])
                 self.lgpd = payload.get("lgpd", {})
+                self.scheduling = payload.get("scheduling", {})
                 self.api_credentials = payload.get("api_credentials", {})
 
         class _DrivenSession:
@@ -738,6 +739,7 @@ class TestBuilderComposeInDBLoader:
             handoff={},
             professionals=[],
             lgpd={},
+            scheduling={},
             api_credentials={"whatsapp_provider": "zapi"},
         )
         tenant_row = SimpleNamespace(id=TENANT, builder_id=builder_id)
