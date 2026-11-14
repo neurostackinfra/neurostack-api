@@ -71,6 +71,7 @@ from src.services import HandoffService, get_handoff_service
 from src.services.business_hours import format_business_hours
 from src.services.price_disclosure_policy import (
     can_quote_private_pay,
+    clinic_accepts_insurance,
     clinic_price_variables,
 )
 
@@ -940,7 +941,9 @@ class CognitivePipeline:
         atendimento_tipo = _patch_tipo or input_data.slots.get(CARE_MODALITY_SLOT)
         custom_vars[CARE_MODALITY_SLOT] = atendimento_tipo or ""
 
-        _accepts_insurance = bool(custom_vars.get("accepts_insurance"))
+        _accepts_insurance = clinic_accepts_insurance(
+            custom_vars.get("accepts_insurance")
+        )
         _price_or_schedule_intent = srm_decision.intent in ("pedido_preco", "agendar")
         custom_vars[INSURANCE_TRIAGE_CUSTOM_KEY] = (
             _accepts_insurance

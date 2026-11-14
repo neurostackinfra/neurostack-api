@@ -1300,3 +1300,85 @@ class TestPipelineContextEpisodeIdPropagation:
 
         assert "custom" in captured
         assert "prior_episode_context" not in captured["custom"]
+
+
+class TestConvenioTriageFollowsTheClinicInsuranceSetting:
+    """correcao-link-convenio Group 2: the UI stores ``accepts_insurance`` as
+    the string ``"yes"``/``"no"``; ``"no"`` must not turn on the triage."""
+
+    @staticmethod
+    async def _triage_flag(
+        pipeline,
+        monkeypatch,
+        accepts_insurance: str,
+        *,
+        message: str = "Quero agendar uma consulta para amanhã",
+        turn_count: int = 2,
+        slots: dict[str, Any] | None = None,
+        expected_intent: str | None = "agendar",
+    ):
+        from neurostack_core.prompt import INSURANCE_TRIAGE_CUSTOM_KEY
+
+        captured: dict[str, Any] = {}
+        original = pipeline._prompt.generate
+
+        async def _spy_generate(*, mode, variables, history):
+            captured["custom"] = dict(variables.custom or {})
+            return await original(mode=mode, variables=variables, history=history)
+
+        monkeypatch.setattr(pipeline._prompt, "generate", _spy_generate)
+
+        result = await pipeline.process(
+            PipelineInput(
+                tenant_id=uuid4(),
+                session_id=uuid4(),
+                message=message,
+                channel="whatsapp",
+                turn_count=turn_count,
+                slots=dict(slots or {}),
+                clinic_config={
+                    "business_rules": {"accepts_insurance": accepts_insurance}
+                },
+            )
+        )
+
+        if expected_intent is not None:
+            assert result.intent == expected_intent
+        assert "custom" in captured, "prompt engine was never called"
+        assert INSURANCE_TRIAGE_CUSTOM_KEY in captured["custom"]
+        return captured["custom"][INSURANCE_TRIAGE_CUSTOM_KEY]
+
+    @pytest.mark.asyncio
+    async def test_a_clinic_without_insurance_is_not_asked_convenio_or_particular(
+        self, pipeline, monkeypatch
+    ):
+        assert await self._triage_flag(pipeline, monkeypatch, "no") is False
+
+    @pytest.mark.asyncio
+    async def test_a_clinic_with_insurance_still_asks_convenio_or_particular(
+        self, pipeline, monkeypatch
+    ):
+        assert await self._triage_flag(pipeline, monkeypatch, "yes") is True
+
+    @pytest.mark.asyncio
+    async def test_no_triage_once_the_care_modality_is_chosen(
+        self, pipeline, monkeypatch
+    ):
+        from neurostack_core.prompt import CARE_MODALITY_SLOT
+
+        flag = await self._triage_flag(
+            pipeline, monkeypatch, "yes", slots={CARE_MODALITY_SLOT: "convenio"}
+        )
+        assert flag is False
+
+    @pytest.mark.asyncio
+    async def test_no_triage_on_a_first_turn_greeting(self, pipeline, monkeypatch):
+        flag = await self._triage_flag(
+            pipeline,
+            monkeypatch,
+            "yes",
+            message="Olá, bom dia!",
+            turn_count=1,
+            expected_intent=None,
+        )
+        assert flag is False
